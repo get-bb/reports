@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1711 cross-project child thread creation rejects a valid parent thread</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.medium { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .verdict { font-weight:600; }
+  .v-repro { color:var(--high); }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:6px; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1711 · Cross-project child thread creation rejects a valid parent thread</h1>
+  <p class="meta">
+    <span class="pill">Bug (behaves as designed; see TL;DR)</span> <span class="pill medium">Medium</span> <span class="pill">Effort: Small–Medium</span>
+    <span class="pill">threads</span>
+    <a href="https://github.com/get-bb/bb/issues/1711">open on GitHub</a>
+    <span>2026-08-18</span>
+    <span>base <code>16ceb3a540f81c1189efaffb27a39b1d9443abf5</code> (main)</span>
+  </p>
+  <p class="meta">
+    <span class="verdict v-repro">Verdict: REPRODUCED</span>
+    <span>· root-cause confidence: <b>high</b></span>
+    <span>· linked open PRs: none</span>
+  </p>
+
+  <h2>TL;DR</h2>
+  <p><b>What the user sees.</b> An agent running inside thread A (project <em>repo-a</em>) runs <code>bb thread spawn --project &lt;repo-b&gt; --parent-self …</code> to start a worker in a different project and have it report back. The CLI prints <code>Error: Failed to create thread: HTTP 400: Parent thread is invalid</code> and no thread is created. The same command with <code>--project &lt;repo-a&gt;</code> works.</p>
+  <p><b>What is actually happening.</b> The server's parent validator, <code>assertValidParentThread</code> in <code>apps/server/src/services/threads/thread-parent.ts</code>, refuses any parent whose <code>projectId</code> differs from the new thread's <code>projectId</code> and returns <code>400 parent_thread_invalid</code> with <code>details.reason = "wrong_project"</code>. The parent in the report is live (not archived, not deleted); it is rejected purely because it lives in another project. This is not an accidental bug: the guard was written intentionally (see PR <a href="https://github.com/get-bb/bb/pull/235">#235</a>, June 2026, which removed the equivalent guard for peer messaging but explicitly kept the parent guard "project-scoped" because sidebar grouping and depth caps assume one project). The CLI additionally drops the machine-readable <code>reason</code>, so the user only sees the generic "Parent thread is invalid" and cannot tell why.</p>
+  <p><b>Does anything else break if the guard is removed?</b> I removed the three-line check on my dev instance and re-ran the exact scenario: the cross-project child was created, ran, and its completion was posted into the parent's timeline as a <code>child-completed</code> system message (with the child's foreign <code>projectId</code> in the mention). So the notification pipeline is already project-agnostic. Two gaps remain and must be handled by a real fix: (1) <code>isLiveParentThread</code> (same file) also requires the same project and gates the <em>parent permission ceiling</em> from #1593 and the child's environment/visibility inheritance, so a naive removal would let a sandboxed parent spawn a full-access child in another project; (2) the sidebar builds the parent/child tree per project, so the child shows as a root row under <em>repo-b</em> instead of nested under its parent, and the parent's UI child list/count (per-project subset queries) will not include it. The issue's "clear indicator for the different project" does not exist yet.</p>
+
+  <h2>Claims vs findings</h2>
+  <table>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Starting a child in another project with <code>--parent-self</code> fails with <code>400 Parent thread is invalid</code></td><td class="ok">Verified</td><td>Live repro on my dev instance (step 5 below): <code>Error: Failed to create thread: HTTP 400: Parent thread is invalid</code>, exit 1. Raw API body: <code>{"code":"parent_thread_invalid",…"details":{"reason":"wrong_project","subject":"parent"}}</code>. Unit repro test fails on main at the same assertion.</td></tr>
+    <tr><td>The parent thread is "valid"</td><td class="ok">Verified (live, unarchived, undeleted, depth 1)</td><td>The same parent accepted a same-project child seconds earlier (control, step 6). Only the <code>projectId</code> comparison at <code>thread-parent.ts:161-163</code> rejects it.</td></tr>
+    <tr><td>The child "could not report completion to its parent"</td><td class="ok">Verified as a consequence</td><td>No child is created, so nothing can report. With the guard removed (experiment), the completion <em>did</em> reach the parent's timeline (<code>child-completed</code> row for <code>thr_97kkrjnm5i</code>, projectId <code>proj_kd47iuy7n8</code>), showing the notification path itself is not project-bound.</td></tr>
+    <tr><td>Expected: child remains under its parent in the thread view</td><td class="no">Not the case today even with the guard removed</td><td>Sidebar grouping (<code>projectThreadGroups.ts</code>) only nests a child under a parent that is in the same project's thread list; a foreign parent makes the child a root row of its own project (screenshot below). The parent's child list uses a per-project subset query (<code>ThreadDetailView.tsx:801-811</code>).</td></tr>
+    <tr><td>Expected: a clear indicator for the different project</td><td class="unv">Does not exist</td><td>No UI code renders a project marker on child rows. Feature work, not a bug.</td></tr>
+    <tr><td>Implicit: this is a regression / accidental bug</td><td class="no">Refuted</td><td>Guard exists since <code>b2cd3c445</code> (2026-05-22, lifecycle-aware API errors) and was deliberately kept in <a href="https://github.com/get-bb/bb/pull/235">PR #235</a> when the analogous sender guard was dropped. Not fixed on <code>origin/main</code> as of <code>a108fa7ef</code>.</td></tr>
+  </table>
+
+  <h2>Environment</h2>
+  <ul>
+    <li>Worktree <code>/home/sawyer/projects/bb/.claude/worktrees/wf_242c3e11-a10-9</code>. Note: the worktree HEAD was <code>a108fa7ef</code> (origin/main, 5 commits ahead of the brief's base <code>16ceb3a54</code>); <code>git diff 16ceb3a54 a108fa7ef</code> over <code>apps/server/src/services/threads</code>, <code>apps/server/src/routes/threads</code>, <code>apps/cli/src/commands/thread</code> and <code>packages/server-contract/src</code> touches only an unrelated timeline file, so all excerpts and permalinks below are identical at the base commit.</li>
+    <li>Linux 7.0.0-29-generic (host "bee"), node v24.18.0, pnpm workspace, Claude Code 2.1.234 (provider <code>claude-code</code>, model Opus 5 1M), codex-cli 0.147.0 (not used).</li>
+    <li>Dev instance: app <code>:14764</code>, server <code>:22764</code>, host daemon <code>:30764</code>, data dir <code>/home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_242c3e11-a10-9-af1f7a74646c</code>, host id <code>host_tidkqprk2n</code>.</li>
+    <li>Projects: <code>proj_smvrtcnbe4</code> (<em>repo-a</em>, <code>/tmp/bb1711-a</code>) and <code>proj_kd47iuy7n8</code> (<em>repo-b</em>, <code>/tmp/bb1711-b</code>). Parent thread <code>thr_3djzm7bexf</code> (repo-a). Same-project control child <code>thr_82cbrc7xgu</code>. Cross-project child (only with the guard patched out) <code>thr_97kkrjnm5i</code>.</li>
+  </ul>
+
+  <h2>Minimal reproduction</h2>
+  <h3>A. Unit-level (no dev instance, ~1 s)</h3>
+  <p>Test file: <a href="1711/repro/thread-parent-cross-project.repro.test.ts">1711/repro/thread-parent-cross-project.repro.test.ts</a>. Copy it to <code>apps/server/test/threads/</code> and run from <code>apps/server</code>: <code>pnpm exec vitest run test/threads/thread-parent-cross-project.repro.test.ts</code>. It creates two projects in in-memory SQLite, a live thread in project A, and calls <code>assertValidParentThread</code> with project B. Full output: <a href="1711/repro/unit-test-output.clean.txt">unit-test-output.clean.txt</a>.</p>
+  <pre>// Repro for get-bb/bb#1711: a live parent thread in another project is
+// rejected by assertValidParentThread with reason "wrong_project".
+import {
+  createConnection,
+  createProject,
+  createThread,
+  migrate,
+  noopNotifier,
+  upsertHost,
+} from "@bb/db";
+import { describe, expect, it } from "vitest";
+import { ApiError } from "../../src/errors.js";
+import { assertValidParentThread } from "../../src/services/threads/thread-parent.js";
+
+function setup() {
+  const db = createConnection(":memory:");
+  migrate(db);
+  const host = upsertHost(db, noopNotifier, {
+    name: "test-host",
+    type: "persistent",
+  });
+  const { project: projectA } = createProject(db, noopNotifier, {
+    name: "project-a",
+    source: { hostId: host.id, path: "/tmp/bb1711-a", type: "local_path" },
+  });
+  const { project: projectB } = createProject(db, noopNotifier, {
+    name: "project-b",
+    source: { hostId: host.id, path: "/tmp/bb1711-b", type: "local_path" },
+  });
+  return { db, projectA, projectB };
+}
+
+describe("issue #1711: cross-project parent thread", () =&gt; {
+  it("accepts a live, non-archived parent thread that lives in another project", () =&gt; {
+    const { db, projectA, projectB } = setup();
+    // Parent lives in project A and is perfectly healthy.
+    const parentThread = createThread(db, noopNotifier, {
+      projectId: projectA.id,
+      providerId: "codex",
+    });
+    expect(parentThread.archivedAt).toBeNull();
+    expect(parentThread.deletedAt).toBeNull();
+
+    // A child is being created in project B with --parent-thread &lt;A's thread&gt;.
+    let error: ApiError | null = null;
+    try {
+      assertValidParentThread(
+        { db },
+        { parentThreadId: parentThread.id, projectId: projectB.id },
+      );
+    } catch (caught) {
+      if (!(caught instanceof ApiError)) throw caught;
+      error = caught;
+    }
+
+    // On main this fails: the server answers
+    //   400 parent_thread_invalid "Parent thread is invalid" { reason: "wrong_project" }
+    expect(error).toBeNull();
+  });
+});</pre>
+  <p><b>Actual</b> on main — the <code>expect(error).toBeNull()</code> assertion at line 58 fails:</p>
+  <pre> FAIL   @bb/server  test/threads/thread-parent-cross-project.repro.test.ts &gt; issue #1711: cross-project parent thread &gt; accepts a live, non-archived parent thread that lives in another project
+AssertionError: expected Error: Parent thread is invalid { …(3) } to be null
+
+- Expected:
+null
+
++ Received:
+ApiError {
+  "message": "Parent thread is invalid",
+  "res": undefined,
+  "status": 400,
+  "body": {
+    "code": "parent_thread_invalid",
+    "details": {
+      "reason": "wrong_project",
+      "subject": "parent",
+    },
+    "message": "Parent thread is invalid",
+  },
+}
+
+ ❯ test/threads/thread-parent-cross-project.repro.test.ts:58:19</pre>
+
+  <h3>B. Live CLI repro (exactly the reporter's flow)</h3>
+  <ol>
+    <li>Build and start a dev instance: <code>pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build &amp;&amp; scripts/bb-dev-app current</code>. Export what it prints: <code>export BB_SERVER_URL=http://localhost:22764 BB_HOST_DAEMON_PORT=30764</code> (your ports differ). Below, <code>bb</code> = <code>node packages/scripts/dist/commands/run-cli.js</code> run from the worktree root.</li>
+    <li>Two scratch git repos: <code>mkdir -p /tmp/bb1711-a /tmp/bb1711-b</code>, then in each: <code>echo hi &gt; README.md &amp;&amp; git init -q &amp;&amp; git add . &amp;&amp; git commit -qm init</code>.</li>
+    <li>Host id: <code>bb machine list --json</code> → <code>host_tidkqprk2n</code>. Two projects (outputs: <a href="1711/repro/project-a.json">project-a.json</a>, <a href="1711/repro/project-b.json">project-b.json</a>):
+<pre>curl -s -X POST $BB_SERVER_URL/api/v1/projects -H 'content-type: application/json' \
+  -d '{"name":"repo-a","source":{"type":"local_path","path":"/tmp/bb1711-a","hostId":"host_tidkqprk2n"}}'
+# → {"id":"proj_smvrtcnbe4", …}
+curl -s -X POST $BB_SERVER_URL/api/v1/projects -H 'content-type: application/json' \
+  -d '{"name":"repo-b","source":{"type":"local_path","path":"/tmp/bb1711-b","hostId":"host_tidkqprk2n"}}'
+# → {"id":"proj_kd47iuy7n8", …}</pre></li>
+    <li>Parent thread in repo-a (<a href="1711/repro/parent-spawn.json">parent-spawn.json</a>):
+<pre>bb thread spawn --project proj_smvrtcnbe4 --provider claude-code --environment /tmp/bb1711-a --prompt "Reply only with ok." --json
+# → "id": "thr_3djzm7bexf", "projectId": "proj_smvrtcnbe4", "archivedAt": null, "deletedAt": null, "canSpawnChild": true</pre></li>
+    <li>Act as that thread (this is what <code>--parent-self</code> reads) and spawn a child in <b>repo-b</b> (<a href="1711/repro/child-spawn-cross-project.txt">child-spawn-cross-project.txt</a>):
+<pre>$ BB_THREAD_ID=thr_3djzm7bexf BB_PROJECT_ID=proj_smvrtcnbe4 \
+  bb thread spawn --project proj_kd47iuy7n8 --provider claude-code --environment /tmp/bb1711-b --parent-self --prompt "Reply only with ok."
+Error: Failed to create thread: HTTP 400: Parent thread is invalid
+exit=1</pre>
+    <b>Expected:</b> a thread in repo-b with <code>parentThreadId = thr_3djzm7bexf</code>. <b>Actual:</b> HTTP 400, no thread. The raw API shows the reason the CLI hides (<a href="1711/repro/child-spawn-cross-project-api.txt">child-spawn-cross-project-api.txt</a>):
+<pre>$ curl -s -i -X POST $BB_SERVER_URL/api/v1/threads -H 'content-type: application/json' -d '{"origin":"cli","projectId":"proj_kd47iuy7n8","providerId":"claude-code","input":[{"type":"text","text":"Reply only with ok."}],"environment":{"type":"host","hostId":"host_tidkqprk2n","workspace":{"type":"unmanaged","path":"/tmp/bb1711-b"}},"startedOnBehalfOf":null,"originKind":null,"parentThreadId":"thr_3djzm7bexf"}'
+HTTP/1.1 400 Bad Request
+content-type: application/json
+
+{"code":"parent_thread_invalid","message":"Parent thread is invalid","details":{"reason":"wrong_project","subject":"parent"}}</pre></li>
+    <li>Control: same command with <code>--project proj_smvrtcnbe4 --environment /tmp/bb1711-a</code> (same project as the parent) succeeds (<a href="1711/repro/child-spawn-same-project.txt">child-spawn-same-project.txt</a>):
+<pre>Thread spawned: thr_82cbrc7xgu
+You will be notified when this thread is done.
+  ID:       thr_82cbrc7xgu
+  Project:  proj_smvrtcnbe4
+exit=0</pre></li>
+  </ol>
+
+  <h3>C. Experiment: what happens if the guard is removed</h3>
+  <p>To learn whether the rest of the system tolerates a foreign parent, I deleted the three-line <code>wrong_project</code> check (<a href="1711/repro/experiment-allow-cross-project.diff">experiment-allow-cross-project.diff</a>), restarted the dev instance and re-ran step 5 verbatim (<a href="1711/repro/child-spawn-cross-project-PATCHED.txt">child-spawn-cross-project-PATCHED.txt</a>):</p>
+  <pre>Thread spawned: thr_97kkrjnm5i
+You will be notified when this thread is done.
+  ID:       thr_97kkrjnm5i
+  Project:  proj_kd47iuy7n8
+exit=0
+$ bb thread wait thr_97kkrjnm5i --timeout 90
+Thread thr_97kkrjnm5i reached status idle.
+$ bb thread show thr_97kkrjnm5i --json   # → parentThreadId: thr_3djzm7bexf, projectId: proj_kd47iuy7n8</pre>
+  <p>The parent's timeline (<a href="1711/repro/parent-timeline-after-patch.json">parent-timeline-after-patch.json</a>) received the child's completion, exactly like the same-project child; note the mention carries the child's foreign <code>projectId</code>:</p>
+  <pre>"text": "[bb system]\n\n@thread:thr_97kkrjnm5i completed:\n\nok",
+"mentions": [{ "resource": { "kind": "thread", "threadId": "thr_97kkrjnm5i", "projectId": "proj_kd47iuy7n8", … } }],
+"systemMessageKind": "child-completed"</pre>
+  <figure>
+    <img src="assets/1711-parent-notified-patched.png" alt="Parent thread timeline showing both child completions">
+    <figcaption>Guard removed: parent <code>thr_3djzm7bexf</code> (repo-a) shows "thr_82cbrc7xgu finished" (same-project child) and "thr_97kkrjnm5i finished" (cross-project child). Look at the sidebar on the left: under <em>repo-a</em> the same-project child is nested with an indent guide, but the cross-project child appears as a top-level row under <em>repo-b</em>, not under its parent.</figcaption>
+  </figure>
+  <figure>
+    <img src="assets/1711-child-cross-project-patched.png" alt="Cross-project child thread view">
+    <figcaption>Guard removed: the cross-project child open in repo-b. The header shows the "child" badge (so the app knows it has a parent) but there is no project indicator, and the sidebar does not nest it under the repo-a parent.</figcaption>
+  </figure>
+  <p>The patch was reverted afterwards (<code>git checkout apps/server/src/services/threads/thread-parent.ts</code>); the worktree contains only the repro test.</p>
+
+  <h2>Root cause</h2>
+  <p><b>Mechanism.</b> <code>POST /api/v1/threads</code> (and <code>bb thread spawn</code>, which builds that request in <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/cli/src/commands/thread/spawn.ts#L79-L100"><code>resolveSpawnParentThreadId</code></a>: <code>--parent-self</code> simply copies <code>BB_THREAD_ID</code> into <code>parentThreadId</code>) reaches <code>createThreadRequest</code>, which validates a hierarchy parent with <code>assertValidParentThread(deps, { parentThreadId, projectId: requestInput.projectId })</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/thread-create.ts#L646-L651">thread-create.ts#L646-L651</a>). The validator compares the parent's project with the <em>new thread's</em> project and throws:</p>
+  <pre>// apps/server/src/services/threads/thread-parent.ts#L151-L169
+export function assertValidParentThread(deps, args): Thread {
+  const parentThread = getThread(deps.db, args.parentThreadId);
+  if (parentThread === null) {
+    throwParentThreadInvalid("not_found");
+  }
+  const liveParentThread: Thread = parentThread;
+
+  if (liveParentThread.projectId !== args.projectId) {
+    throwParentThreadInvalid("wrong_project");      // ← #1711
+  }
+  if (liveParentThread.archivedAt !== null) { throwParentThreadInvalid("archived"); }
+  if (liveParentThread.deletedAt !== null)  { throwParentThreadInvalid("deleted"); }
+  …depth checks…</pre>
+  <p>Permalink: <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/thread-parent.ts#L151-L169">thread-parent.ts#L151-L169</a>. <code>throwParentThreadInvalid</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/lib/lifecycle-api-errors.ts#L178-L187">lifecycle-api-errors.ts#L178-L187</a>) produces the exact <code>400 parent_thread_invalid / "Parent thread is invalid"</code> body observed. The same validator is used by <code>PATCH /threads/:id</code> re-parenting (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/routes/threads/base.ts#L342-L349">base.ts#L342-L349</a>) and by fork/side-chat spawn allowance (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/thread-create.ts#L672-L678">thread-create.ts#L672-L678</a>), so re-parenting to a foreign thread fails identically.</p>
+  <p><b>Why the CLI message is uninformative.</b> The SDK's <code>BbHttpError</code> message is <code>HTTP 400: Parent thread is invalid</code>; the CLI's <code>prependErrorContext</code> (<code>apps/cli/src/commands/helpers.ts:139</code>) only prefixes it. The <code>details.reason</code> ("wrong_project") that the app maps to "Choose a parent thread from this project." (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/lib/lifecycle-errors.ts#L391-L395">lifecycle-errors.ts#L391-L395</a>) is never printed by the CLI, which is why the reporter perceived a "valid" parent being rejected for no reason.</p>
+  <p><b>Deliberate, not accidental.</b> The <code>wrong_project</code> reason was introduced in <code>b2cd3c445</code> ("add lifecycle-aware API error details", 2026-05-22) and is part of the public contract (<code>packages/server-contract/src/errors.ts:99</code>). <a href="https://github.com/get-bb/bb/pull/235">PR #235</a> removed the identical guard for <code>bb thread tell</code> sender attribution but wrote: "The create/fork hierarchy guard (<code>assertValidParentThread</code>) is intentionally left project-scoped — that governs parent/fork structure (sidebar grouping, depth caps), not peer-to-peer messaging." So the issue is a product decision to revisit, and the "expected result" is a feature request.</p>
+  <p><b>Deeper coupling a fix must respect.</b> The same-project assumption is duplicated in <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/thread-parent.ts#L67-L74"><code>isLiveParentThread</code></a> (<code>args.parentThread.projectId === args.projectId</code>). That predicate, via <code>isManagedChildThread</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/thread-default-policy.ts#L155-L163">thread-default-policy.ts#L155-L163</a>), decides whether a child (a) inherits its parent's execution permission mode and, more importantly, is <em>clamped to the parent's mode as a ceiling</em> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/thread-default-policy.ts#L344-L373">#L344-L373</a>, the fix for #1593), and (b) gets the implicit managed-worktree / personal-environment defaults (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/thread-default-policy.ts#L297-L330">#L297-L330</a>). Removing only the <code>assertValidParentThread</code> check (what my experiment did) would create a real regression: an <code>auto</code>-mode parent could spawn a <code>--permission-mode full</code> child in another project and the ceiling would not apply, because <code>isLiveParentThread</code> would say "not a managed child". Conversely, the personal-project branch that <em>reuses the parent's environment</em> must stay same-project, because environments are project-owned (<code>"Environment belongs to a different project"</code>, <code>thread-request-eligibility.ts:186</code>).</p>
+  <p>Everything else I traced is already project-agnostic: <code>listNonDeletedChildThreads</code>/<code>countNonDeletedAssignedChildThreads</code> filter by <code>parent_thread_id</code> only; child-completed / failed / blocked notifications (<code>child-thread-notifications.ts</code>, <code>internal/events.ts</code>, <code>interactive-requests.ts</code>) never look at <code>projectId</code>; the sidebar tolerates a parent missing from the project's list by promoting the child to a root (<code>projectThreadGroups.ts:309-311, 336-341</code>).</p>
+
+  <h2>Proposed fix (first principles)</h2>
+  <p>Confidence high on the mechanism; the product decision (allow cross-project parents) is the maintainers' call. If allowed:</p>
+  <ol>
+    <li><b>Server policy (<code>thread-parent.ts</code>).</b> Delete the <code>wrong_project</code> branch in <code>assertValidParentThread</code>. Split <code>isLiveParentThread</code> into a project-agnostic <code>isLiveParentThread</code> (non-null, not archived, not deleted) used for the permission ceiling, visibility inheritance and "managed child" semantics, and keep the project comparison only where the parent's <em>environment</em> is reused (the personal-project branch of <code>resolveCreateThreadEnvironment</code>) — reusing a foreign project's environment must remain impossible. Add a test in <code>thread-default-policy.test.ts</code> proving a cross-project child of an <code>auto</code> parent requesting <code>full</code> is clamped to <code>auto</code>.</li>
+    <li><b>Contract.</b> Remove <code>"wrong_project"</code> from <code>ParentThreadInvalidReason</code> in <code>packages/server-contract/src/errors.ts</code> and the app's <code>lifecycle-errors.ts</code> mapping (and the contract test), like #235 did for the sender variant. No <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump: nothing between server and daemon changes.</li>
+    <li><b>Depth/cycle checks</b> already walk by id, so they keep working across projects; keep them.</li>
+    <li><b>UI.</b> Nest cross-project children: <code>projectThreadGroups.ts</code> currently drops children whose parent is not in the same project list; either keep them as roots with a "from &lt;project&gt;" indicator, or fetch the parent lazily. The parent's child list/count in <code>ThreadDetailView.tsx</code> uses <code>useProjectThreadSubset({projectId, filters:{parentThreadId}})</code> and needs a project-agnostic children query. Also update the CLI/guide text ("Parent to the current thread") in <code>bb-guide-threads.md</code> and the bb-cli skill if cross-project is now supported.</li>
+    <li><b>Independent quick win.</b> Have the CLI print <code>details.reason</code> for <code>parent_thread_invalid</code> (e.g. "Parent thread is invalid (wrong_project): the parent must be in the same project") so users are not left guessing, whichever way the policy goes.</li>
+  </ol>
+  <p>Risk: (1) is where a mistake becomes a permission escalation; the test in step 1 is the guard. Depth cap now spans projects, which is the intended semantics of a hierarchy.</p>
+
+  <h2>Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/pull/235">PR #235</a> "Allow cross-project sender attribution for thread messages" (merged 2026-06-18) — the same guard for peer messaging was removed; the parent guard was explicitly kept. Direct precedent for the change.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1593">#1593</a> "Child threads can run with more permissions than their parent" (closed) — the ceiling it introduced is keyed on <code>isLiveParentThread</code>, which a cross-project fix must keep engaged.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1512">#1512</a> "Nest fork threads under their source in the default sidebar" — sidebar hierarchy work in the same area.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1768">#1768</a> child-thread notification discoverability — adjacent to the notification path exercised in experiment C.</li>
+  </ul>
+
+  <h2>Appendix</h2>
+  <h3>Files</h3>
+  <ul>
+    <li><a href="1711/repro/thread-parent-cross-project.repro.test.ts">repro test</a>, <a href="1711/repro/unit-test-output.clean.txt">its output</a></li>
+    <li><a href="1711/repro/child-spawn-cross-project.txt">CLI failure</a>, <a href="1711/repro/child-spawn-cross-project-api.txt">raw API failure</a>, <a href="1711/repro/child-spawn-same-project.txt">same-project control</a></li>
+    <li><a href="1711/repro/experiment-allow-cross-project.diff">experiment diff</a>, <a href="1711/repro/child-spawn-cross-project-PATCHED.txt">spawn with guard removed</a>, <a href="1711/repro/parent-timeline-after-patch.json">parent timeline after patch</a>, <a href="1711/repro/shot-child.js">dev-browser screenshot script</a></li>
+    <li>Logs: <a href="1711/build.log</a>, <a href="1711/install.log">install.log">build.log</a>, <a href="1711/dev-start.log">dev-start.log</a>, <a href="1711/dev-start2.log">dev-start2.log</a> (after patch), <a href="1711/dev-stop2.log">dev-stop2.log</a></li>
+  </ul>
+  <h3>Commands run (in order)</h3>
+  <pre>gh issue view 1711 --repo get-bb/bb --json title,body,labels,state,createdAt,author,comments,url
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+grep -rn "Parent thread is invalid" apps packages          # → lifecycle-api-errors.ts
+grep -rn "wrong_project" apps packages                      # → thread-parent.ts:162, errors.ts:99, lifecycle-errors.ts:391
+git log -S"wrong_project" --oneline                         # → b2cd3c445 (2026-05-22)
+git fetch origin main; git log 16ceb3a54..origin/main --oneline -- apps/server/src/services/threads/thread-parent.ts   # (empty → not fixed)
+(cd apps/server && pnpm exec vitest run test/threads/thread-parent-cross-project.repro.test.ts)   # FAILS on main
+scripts/bb-dev-app current                                   # app :14764 server :22764 daemon :30764
+git -C /tmp/bb1711-a init … ; git -C /tmp/bb1711-b init …
+node packages/scripts/dist/commands/run-cli.js machine list --json          # host_tidkqprk2n
+curl -s -X POST $BB_SERVER_URL/api/v1/projects … repo-a / repo-b
+node packages/scripts/dist/commands/run-cli.js thread spawn --project proj_smvrtcnbe4 --provider claude-code --environment /tmp/bb1711-a --prompt "Reply only with ok." --json
+BB_THREAD_ID=thr_3djzm7bexf … thread spawn --project proj_kd47iuy7n8 --environment /tmp/bb1711-b --parent-self …   # HTTP 400
+curl -s -i -X POST $BB_SERVER_URL/api/v1/threads … "parentThreadId":"thr_3djzm7bexf"                                # reason wrong_project
+BB_THREAD_ID=thr_3djzm7bexf … thread spawn --project proj_smvrtcnbe4 --parent-self …                                # OK (control)
+python3 (remove wrong_project branch) ; pnpm dev:stop ; scripts/bb-dev-app current
+BB_THREAD_ID=thr_3djzm7bexf … thread spawn --project proj_kd47iuy7n8 --parent-self …                                # OK with patch → thr_97kkrjnm5i
+node … thread wait thr_97kkrjnm5i --timeout 90 ; curl $BB_SERVER_URL/api/v1/threads/thr_3djzm7bexf/timeline
+dev-browser --browser bb1711 --headless run shot-child.js  (screenshots)
+git checkout apps/server/src/services/threads/thread-parent.ts ; pnpm dev:stop
+gh issue list / gh pr list searches for related items; gh pr view 235</pre>
+  <h3>Verbatim: same-project child accepted seconds earlier by the same parent</h3>
+  <pre>Thread spawned: thr_82cbrc7xgu
+You will be notified when this thread is done.
+
+  ID:       thr_82cbrc7xgu
+  Project:  proj_smvrtcnbe4
+  Status:   starting
+  Created:  8/18/2026, 7:18:01 AM
+  Updated:  8/18/2026, 7:18:01 AM
+
+exit=0</pre>
+</main></body></html>

@@ -1,0 +1,10 @@
+const page = await browser.getPage("bb1304");
+const logs = [];
+page.on("console", (m) => logs.push(m.type() + ": " + m.text().slice(0, 300)));
+page.on("pageerror", (e) => logs.push("pageerror: " + e.message));
+await page.reload({ waitUntil: "load" });
+await page.waitForTimeout(10000);
+console.log(JSON.stringify(await page.evaluate(() => window.__bbRenderCounts)));
+console.log(logs.slice(-40).join("\n"));
+const shot = await page.screenshot();
+console.log(await saveScreenshot(shot, "1304-second.png"));

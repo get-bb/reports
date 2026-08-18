@@ -1,0 +1,172 @@
+diff --git a/plugins/provider-claude-code/src/bridge/__tests__/bridge.test.ts b/plugins/provider-claude-code/src/bridge/__tests__/bridge.test.ts
+index 1517ecd67..0e61ba669 100644
+--- a/plugins/provider-claude-code/src/bridge/__tests__/bridge.test.ts
++++ b/plugins/provider-claude-code/src/bridge/__tests__/bridge.test.ts
+@@ -1887,6 +1887,82 @@ describe("bridge", () => {
+     }
+   });
+ 
++  // Regression for #1712: `/plan` sent on a LATER turn of a live session. The
++  // server puts `claudeCodePermissionMode: "plan"` in providerOptions on
++  // turn/start, but the bridge only ever applied the permission mode at
++  // session construction. The mention was stripped from the prompt and the
++  // prompt was pushed into a session still in the user's preset mode, so
++  // Claude never entered Plan mode and never called ExitPlanMode.
++  it("switches a live session into Plan mode when a later turn carries /plan", async () => {
++    const bridge = createBridgeJsonRpcTestHarness(handleLine);
++    const queries: ControlledClaudeQuery[] = [];
++    queryMock.mockImplementation(() => {
++      const query = createControlledClaudeQuery();
++      queries.push(query);
++      return query;
++    });
++
++    try {
++      const threadId = "thread-plan-mid-conversation";
++      // Turn 1: a normal accept-edits session (no plan mode).
++      await startBridgeThread({ bridge, threadId });
++      const query = queries[0];
++      const call = getLatestQueryCall();
++      if (!query) {
++        throw new Error("Expected live Claude query");
++      }
++      expect(call.options.permissionMode).toBe("acceptEdits");
++
++      // Turn 2: the user types "/plan ..." into the existing thread. The
++      // server strips nothing; it forwards the mention plus the plan knob.
++      bridge.sendRequest(
++        2,
++        "turn/start",
++        canonicalTurnParams({
++          threadId,
++          input: [
++            {
++              type: "text",
++              text: "/plan Create hello.txt containing hello world",
++              mentions: [
++                {
++                  start: 0,
++                  end: 5,
++                  resource: {
++                    kind: "command",
++                    trigger: "/",
++                    name: "plan",
++                    source: "command",
++                    origin: "builtin",
++                    label: "plan",
++                    argumentHint: null,
++                  },
++                },
++              ],
++            },
++          ],
++          providerOptions: { claudeCodePermissionMode: "plan" },
++        }),
++      );
++      await bridge.waitForResponse(2);
++      const prompt = await readNextPromptText(call);
++
++      // The `/plan` token is stripped (correct: the CLI would treat it as a
++      // second command) ...
++      expect(prompt).toBe("Create hello.txt containing hello world");
++      // ... so the ONLY thing that can put the session into Plan mode is the
++      // live permission-mode switch. On the base commit this is never called.
++      expect(query.setPermissionMode).toHaveBeenCalledWith("plan");
++      // No session rebuild either — the same query stays live.
++      expect(queries).toHaveLength(1);
++      expect(query.close).not.toHaveBeenCalled();
++
++      await stopBridgeThread({ bridge, queries, threadId });
++    } finally {
++      bridge.restore();
++    }
++  });
++
+   it("denies ExitPlanMode without prompting when the plan is missing", async () => {
+     const bridge = createBridgeJsonRpcTestHarness(handleLine);
+     const queries: ControlledClaudeQuery[] = [];
+diff --git a/plugins/provider-claude-code/src/bridge/bridge.ts b/plugins/provider-claude-code/src/bridge/bridge.ts
+index efdd25192..2bbb6a4dd 100644
+--- a/plugins/provider-claude-code/src/bridge/bridge.ts
++++ b/plugins/provider-claude-code/src/bridge/bridge.ts
+@@ -1701,6 +1701,29 @@ function createForwardUserQuestionRequest(
+     });
+ }
+ 
++/**
++ * `/plan` on a later turn of a live session. Session construction used to be
++ * the only place the permission mode was applied, so a mid-conversation
++ * `/plan` stripped the mention and pushed the prompt into a session that was
++ * still in the user's preset mode: no plan-mode reminder, no ExitPlanMode
++ * proposal. Switch the live SDK session into Plan mode before the prompt is
++ * pushed; the preset stays in `approvedPlanPermissionMode` for the approval
++ * to restore.
++ */
++async function enterPlanModeIfRequested(
++  threadSession: ThreadSession,
++  params: TurnStartParams | TurnSteerParams,
++): Promise<void> {
++  if (
++    params.claudeCodePermissionMode !== "plan" ||
++    threadSession.permissionMode === "plan"
++  ) {
++    return;
++  }
++  threadSession.permissionMode = "plan";
++  await threadSession.session.setPermissionMode("plan");
++}
++
+ /**
+  * Leave Plan mode once the user approves a plan.
+  *
+@@ -2281,6 +2304,7 @@ async function runTurnStart(
+       params.threadId,
+       withTurnLiveSessionSettings(threadSession.liveSettings, params),
+     );
++    await enterPlanModeIfRequested(threadSession, params);
+   } catch (error) {
+     const message = error instanceof Error ? error.message : String(error);
+     sendError(id, -32000, message);
+@@ -2346,6 +2370,7 @@ async function runTurnSteer(
+       params.threadId,
+       withTurnLiveSessionSettings(threadSession.liveSettings, params),
+     );
++    await enterPlanModeIfRequested(threadSession, params);
+   } catch (error) {
+     const message = error instanceof Error ? error.message : String(error);
+     sendError(id, -32000, message);
+diff --git a/plugins/provider-claude-code/src/bridge/commands.ts b/plugins/provider-claude-code/src/bridge/commands.ts
+index 4b9874c44..5e6efeab4 100644
+--- a/plugins/provider-claude-code/src/bridge/commands.ts
++++ b/plugins/provider-claude-code/src/bridge/commands.ts
+@@ -94,6 +94,9 @@ export const claudeTurnStartParamsSchema = z.object({
+   providerSubagentsEnabled: z.boolean().optional(),
+   config: z.record(z.string(), z.unknown()).optional(),
+   permissionEscalation: bridgePermissionEscalationSchema,
++  // `/plan` on a later turn: the live session must switch into Plan mode
++  // before the prompt is pushed. Undefined keeps the session's current mode.
++  claudeCodePermissionMode: z.literal("plan").optional(),
+ });
+ 
+ export const claudeTurnSteerParamsSchema = z.object({
+@@ -107,6 +110,7 @@ export const claudeTurnSteerParamsSchema = z.object({
+   memoryEnabled: z.boolean().optional(),
+   providerSubagentsEnabled: z.boolean().optional(),
+   permissionEscalation: bridgePermissionEscalationSchema,
++  claudeCodePermissionMode: z.literal("plan").optional(),
+ });
+ 
+ /** The canonical Provider Bridge Protocol params, per method. */
+diff --git a/plugins/provider-claude-code/src/session-params.ts b/plugins/provider-claude-code/src/session-params.ts
+index 97f935904..d781e63aa 100644
+--- a/plugins/provider-claude-code/src/session-params.ts
++++ b/plugins/provider-claude-code/src/session-params.ts
+@@ -328,5 +328,8 @@ export function buildClaudeTurnParams(
+     memoryEnabled: providerOptions.memoryEnabled,
+     providerSubagentsEnabled: providerOptions.providerSubagentsEnabled,
+     permissionEscalation: args.options.permissionEscalation,
++    ...(providerOptions.claudeCodePermissionMode !== undefined
++      ? { claudeCodePermissionMode: providerOptions.claudeCodePermissionMode }
++      : {}),
+   };
+ }

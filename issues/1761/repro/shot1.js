@@ -1,0 +1,10 @@
+const page = await browser.getPage("main");
+await page.setViewportSize({width: 1400, height: 900});
+await page.goto("http://localhost:13758/plugins/tasks/tasks", {waitUntil: "networkidle"});
+await new Promise(r=>setTimeout(r,3000));
+const link = page.getByRole("button", {name: "Open SC-1: OSS divergence audit"});
+await link.click({timeout: 5000});
+await new Promise(r=>setTimeout(r,3500));
+console.log(page.url());
+const p = await saveScreenshot(await page.screenshot(), "1761-detail.png");
+console.log(p);

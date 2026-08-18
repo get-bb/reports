@@ -1,0 +1,266 @@
+diff --git a/packages/agent-runtime/src/pi/bridge/tool-proxy.ts b/packages/agent-runtime/src/pi/bridge/tool-proxy.ts
+index 4ccacef05..6020e7482 100644
+--- a/packages/agent-runtime/src/pi/bridge/tool-proxy.ts
++++ b/packages/agent-runtime/src/pi/bridge/tool-proxy.ts
+@@ -10,7 +10,11 @@ export interface DynamicToolDefinition {
+ export type ToolCallForwarder = (
+   toolName: string,
+   args: Record<string, unknown>,
+-) => Promise<{ content: string; isError?: boolean }>;
++) => Promise<{
++  content: string;
++  images?: Array<{ data: string; mimeType: string }>;
++  isError?: boolean;
++}>;
+ 
+ /**
+  * Builds Pi-compatible ToolDefinition objects from dynamic tool definitions
+@@ -33,8 +37,20 @@ export function buildDynamicTools(
+         _signal: AbortSignal | undefined,
+       ) {
+         const result = await forwardToolCall(def.name, params);
++        const content: Array<
++          | { type: "text"; text: string }
++          | { type: "image"; data: string; mimeType: string }
++        > = [];
++        // Image-only results (browser_screenshot) must reach the model as
++        // image parts, not as the placeholder "OK" (get-bb/bb#1762).
++        if (result.content.length > 0 || !result.images?.length) {
++          content.push({ type: "text", text: result.content });
++        }
++        for (const image of result.images ?? []) {
++          content.push({ type: "image", data: image.data, mimeType: image.mimeType });
++        }
+         return {
+-          content: [{ type: "text" as const, text: result.content }],
++          content,
+           details: {},
+           ...(result.isError ? { isError: true } : {}),
+         };
+diff --git a/packages/plugin-sdk/src/provider-bridge.ts b/packages/plugin-sdk/src/provider-bridge.ts
+index 990c4e30a..fbb9ecda0 100644
+--- a/packages/plugin-sdk/src/provider-bridge.ts
++++ b/packages/plugin-sdk/src/provider-bridge.ts
+@@ -135,6 +135,8 @@ export type {
+   AcceptedUserMessageState,
+   BridgeJsonRpcResponse,
+   BridgeToolCallRequest,
++  BridgeToolCallResult,
++  BridgeToolResultImage,
+   BuildInteractiveResponseArgs,
+   DecodedInteractiveRequest,
+   EnsureProviderTurnStartedArgs,
+diff --git a/packages/provider-bridge-protocol/src/bridge-kit/bridge-session-registry.ts b/packages/provider-bridge-protocol/src/bridge-kit/bridge-session-registry.ts
+index 2dc932d44..f89f451d7 100644
+--- a/packages/provider-bridge-protocol/src/bridge-kit/bridge-session-registry.ts
++++ b/packages/provider-bridge-protocol/src/bridge-kit/bridge-session-registry.ts
+@@ -2,9 +2,14 @@ import {
+   decodeToolCallResponsePayload,
+   type BridgeJsonRpcResponse,
+   type BridgeToolCallRequest,
++  type BridgeToolResultImage,
+ } from "./bridge-tool-calls.js";
+ 
+-type ToolCallResult = { content: string; isError?: boolean };
++type ToolCallResult = {
++  content: string;
++  images?: BridgeToolResultImage[];
++  isError?: boolean;
++};
+ 
+ export interface PendingBridgeToolCall {
+   resolve: (value: ToolCallResult) => void;
+diff --git a/packages/provider-bridge-protocol/src/bridge-kit/bridge-tool-calls.ts b/packages/provider-bridge-protocol/src/bridge-kit/bridge-tool-calls.ts
+index 2283b436e..0dbd8d414 100644
+--- a/packages/provider-bridge-protocol/src/bridge-kit/bridge-tool-calls.ts
++++ b/packages/provider-bridge-protocol/src/bridge-kit/bridge-tool-calls.ts
+@@ -101,22 +101,51 @@ export function decodeBridgeJsonRpcResponse(
+ // Tool call response payload decoding
+ // ---------------------------------------------------------------------------
+ 
+-export function decodeToolCallResponsePayload(result: unknown): {
++/** An image a plugin tool returned, decoded from the wire's data: URL. */
++export interface BridgeToolResultImage {
++  data: string;
++  mimeType: string;
++}
++
++export interface BridgeToolCallResult {
+   content: string;
++  /** Image parts (e.g. browser_screenshot). Empty when the tool returned text only. */
++  images: BridgeToolResultImage[];
+   isError: boolean;
+-} {
++}
++
++const DATA_URL_RE = /^data:([^;,]+);base64,(.+)$/s;
++
++export function decodeToolCallResponsePayload(
++  result: unknown,
++): BridgeToolCallResult {
+   const parsed = providerToolCallResponseSchema.safeParse(result);
+   if (!parsed.success) {
+-    return { content: "OK", isError: false };
++    return { content: "OK", images: [], isError: false };
+   }
+ 
+-  const text = parsed.data.contentItems
+-    .filter((item) => item.type === "inputText")
+-    .map((item) => (item as { type: "inputText"; text: string }).text)
+-    .join("\n");
++  const texts: string[] = [];
++  const images: BridgeToolResultImage[] = [];
++  for (const item of parsed.data.contentItems) {
++    if (item.type === "inputText") {
++      texts.push(item.text);
++      continue;
++    }
++    const match = DATA_URL_RE.exec(item.imageUrl);
++    if (match) {
++      images.push({ mimeType: match[1]!, data: match[2]! });
++    } else {
++      // Non-data URLs cannot be inlined for the model; keep them visible.
++      texts.push(`[image: ${item.imageUrl}]`);
++    }
++  }
++  const text = texts.join("\n");
+ 
+   return {
+-    content: text || "OK",
++    // Text-only results keep the historical "OK" placeholder; an image-only
++    // result must not read as a bare "OK" (get-bb/bb#1762).
++    content: text || (images.length > 0 ? "" : "OK"),
++    images,
+     isError: !parsed.data.success,
+   };
+ }
+diff --git a/plugins/provider-acp/src/bridge/bridge.ts b/plugins/provider-acp/src/bridge/bridge.ts
+index 40d7638c8..467187e7a 100644
+--- a/plugins/provider-acp/src/bridge/bridge.ts
++++ b/plugins/provider-acp/src/bridge/bridge.ts
+@@ -349,7 +349,12 @@ async function forwardDynamicToolCall(args: {
+   threadId: string;
+   tool: string;
+ }): Promise<
+-  | { ok: true; content: string; isError?: boolean }
++  | {
++      ok: true;
++      content: string;
++      images?: Array<{ data: string; mimeType: string }>;
++      isError?: boolean;
++    }
+   | { ok: false; error: string }
+ > {
+   const session = sessionsByBbThreadId.get(args.threadId);
+diff --git a/plugins/provider-acp/src/bridge/tool-proxy-mcp.ts b/plugins/provider-acp/src/bridge/tool-proxy-mcp.ts
+index dc6629782..2b0970814 100644
+--- a/plugins/provider-acp/src/bridge/tool-proxy-mcp.ts
++++ b/plugins/provider-acp/src/bridge/tool-proxy-mcp.ts
+@@ -41,13 +41,21 @@ interface BridgeToolCallRequest {
+ }
+ 
+ type BridgeToolCallResponse =
+-  | { ok: true; content: string; isError?: boolean }
++  | {
++      ok: true;
++      content: string;
++      images?: Array<{ data: string; mimeType: string }>;
++      isError?: boolean;
++    }
+   | { ok: false; error: string };
+ 
+ const bridgeToolCallResponseSchema = z.union([
+   z.object({
+     ok: z.literal(true),
+     content: z.string(),
++    images: z
++      .array(z.object({ data: z.string(), mimeType: z.string() }))
++      .optional(),
+     isError: z.boolean().optional(),
+   }),
+   z.object({ ok: z.literal(false), error: z.string() }),
+@@ -230,8 +238,20 @@ async function handleRequest(
+           });
+           return;
+         }
++        // Image-only results (browser_screenshot) must reach the model as
++        // image parts, not as the placeholder "OK" (get-bb/bb#1762).
++        const content: Array<
++          | { type: "text"; text: string }
++          | { type: "image"; data: string; mimeType: string }
++        > = [];
++        if (result.content.length > 0 || !result.images?.length) {
++          content.push({ type: "text", text: result.content });
++        }
++        for (const image of result.images ?? []) {
++          content.push({ type: "image", data: image.data, mimeType: image.mimeType });
++        }
+         writeResult(message.id, {
+-          content: [{ type: "text", text: result.content }],
++          content,
+           ...(result.isError ? { isError: true } : {}),
+         });
+       } catch (error) {
+diff --git a/plugins/provider-claude-code/src/bridge/tool-proxy-mcp.ts b/plugins/provider-claude-code/src/bridge/tool-proxy-mcp.ts
+index 93300dd7d..ac88aff3b 100644
+--- a/plugins/provider-claude-code/src/bridge/tool-proxy-mcp.ts
++++ b/plugins/provider-claude-code/src/bridge/tool-proxy-mcp.ts
+@@ -1,4 +1,5 @@
+ import {
++  type BridgeToolResultImage,
+   type DynamicTool,
+ } from "@get-bb/plugin-sdk/provider-bridge";
+ import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
+@@ -15,7 +16,11 @@ export type DynamicToolDefinition = DynamicTool;
+ export type ToolCallForwarder = (
+   toolName: string,
+   args: Record<string, unknown>,
+-) => Promise<{ content: string; isError?: boolean }>;
++) => Promise<{
++  content: string;
++  images?: BridgeToolResultImage[];
++  isError?: boolean;
++}>;
+ 
+ export function buildBridgeMcpServer(
+   dynamicTools: DynamicToolDefinition[],
+@@ -56,13 +61,38 @@ export function buildBridgeMcpServer(
+       request.params.arguments ?? {},
+     );
+     return {
+-      content: [{ type: "text" as const, text: result.content }],
++      content: buildMcpContent(result),
+       ...(result.isError ? { isError: true } : {}),
+     };
+   });
+   return { type: "sdk", name: BRIDGE_MCP_SERVER_NAME, instance };
+ }
+ 
++/**
++ * Text first, then every image the plugin returned. An image-only result
++ * (browser_screenshot) must reach the model as an image part, not as the
++ * placeholder string "OK" (get-bb/bb#1762).
++ */
++function buildMcpContent(result: {
++  content: string;
++  images?: BridgeToolResultImage[];
++}): Array<
++  | { type: "text"; text: string }
++  | { type: "image"; data: string; mimeType: string }
++> {
++  const parts: Array<
++    | { type: "text"; text: string }
++    | { type: "image"; data: string; mimeType: string }
++  > = [];
++  if (result.content.length > 0 || !result.images?.length) {
++    parts.push({ type: "text", text: result.content });
++  }
++  for (const image of result.images ?? []) {
++    parts.push({ type: "image", data: image.data, mimeType: image.mimeType });
++  }
++  return parts;
++}
++
+ export function getAllowedToolNames(
+   dynamicTools: DynamicToolDefinition[],
+ ): string[] {

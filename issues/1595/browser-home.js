@@ -1,0 +1,10 @@
+const page = await browser.getPage("main");
+await page.setViewportSize({width: 1400, height: 900});
+await page.goto("http://localhost:14008/", {waitUntil: "networkidle"});
+await page.waitForTimeout(3000);
+console.log(page.url());
+console.log(await page.title());
+const p = await saveScreenshot(await page.screenshot(), "1595-home.png");
+console.log(p);
+const t = await page.evaluate(() => document.body.innerText.slice(0, 1500));
+console.log(t);

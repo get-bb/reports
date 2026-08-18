@@ -1,0 +1,1089 @@
+diff --git a/apps/desktop/src/local-view.ts b/apps/desktop/src/local-view.ts
+index 1937c575f8..a8b81889d8 100644
+--- a/apps/desktop/src/local-view.ts
++++ b/apps/desktop/src/local-view.ts
+@@ -1,5 +1,7 @@
+ import { stripVTControlCharacters } from "node:util";
+ import { escapeHtmlText } from "@bb/domain";
++import { BUILTIN_SERVER_NAME } from "./server-target.js";
++import type { StartupErrorAction } from "./startup-error-ipc.js";
+ 
+ export type LocalViewModel =
+   | InfoViewModel
+@@ -18,10 +20,18 @@ export interface InfoViewModel {
+   title: string;
+ }
+ 
++export interface StartupErrorRecovery {
++  actions: StartupErrorAction[];
++  /** One-time token that proves a click came from this view. */
++  token: string;
++}
++
+ export interface StartupErrorViewModel {
+   details: string;
+   kind: "error";
+   logText: string;
++  /** Null when the failure has no recovery action the app can take. */
++  recovery: StartupErrorRecovery | null;
+   title: string;
+ }
+ 
+@@ -52,6 +62,34 @@ function renderInfoView(viewModel: InfoViewModel): string {
+   `;
+ }
+ 
++// "Use This Mac" names the same target as the Server menu entry, so the label
++// follows that one constant.
++const STARTUP_ERROR_ACTION_LABELS: Record<StartupErrorAction, string> = {
++  retry: "Retry",
++  "use-this-mac": `Use ${BUILTIN_SERVER_NAME}`,
++};
++
++// The view carries no scripts of its own (CSP default-src 'none'). The window
++// preload finds these buttons by their data attribute, reads the token, and
++// sends both to the main process.
++function renderErrorActions(recovery: StartupErrorRecovery | null): string {
++  if (recovery === null || recovery.actions.length === 0) {
++    return "";
++  }
++  const token = escapeHtmlText(recovery.token);
++  const buttons = recovery.actions
++    .map(
++      (action) =>
++        `<button type="button" data-startup-error-action="${action}" data-startup-error-token="${token}">${escapeHtmlText(
++          STARTUP_ERROR_ACTION_LABELS[action],
++        )}</button>`,
++    )
++    .join("\n        ");
++  return `<div class="actions">
++        ${buttons}
++      </div>`;
++}
++
+ function renderErrorView(viewModel: StartupErrorViewModel): string {
+   const logText = formatPlainLogText(viewModel.logText);
+   const logs =
+@@ -60,6 +98,7 @@ function renderErrorView(viewModel: StartupErrorViewModel): string {
+     <main class="shell shell-error">
+       <h1>${escapeHtmlText(viewModel.title)}</h1>
+       <p>${escapeHtmlText(viewModel.details)}</p>
++      ${renderErrorActions(viewModel.recovery)}
+       ${logs}
+     </main>
+   `;
+@@ -147,6 +186,28 @@ function renderLocalView(viewModel: LocalViewModel): string {
+       margin: 0;
+     }
+ 
++    .actions {
++      display: flex;
++      flex-wrap: wrap;
++      gap: 8px;
++      margin: 18px 0 0;
++    }
++
++    button {
++      background: color-mix(in srgb, CanvasText 8%, Canvas);
++      border: 1px solid color-mix(in srgb, CanvasText 22%, transparent);
++      border-radius: 6px;
++      color: CanvasText;
++      font-size: 13px;
++      padding: 5px 14px;
++    }
++
++    button[data-startup-error-action="retry"] {
++      background: AccentColor;
++      border-color: AccentColor;
++      color: AccentColorText;
++    }
++
+     pre {
+       background: color-mix(in srgb, CanvasText 8%, transparent);
+       border-radius: 6px;
+diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
+index 889a9fc072..d24a75a734 100644
+--- a/apps/desktop/src/main.ts
++++ b/apps/desktop/src/main.ts
+@@ -53,6 +53,12 @@ import {
+   stopForeignRuntime,
+ } from "./foreign-runtime.js";
+ import { createLocalViewUrl } from "./local-view.js";
++import { loadRemoteServerPage } from "./remote-server-load.js";
++import {
++  acceptStartupErrorAction,
++  BB_DESKTOP_STARTUP_ERROR_ACTION_CHANNEL,
++  type StartupErrorAction,
++} from "./startup-error-ipc.js";
+ import { installApplicationMenu } from "./menu.js";
+ import {
+   DEFAULT_APPLICATION_MENU_ACCELERATORS,
+@@ -196,12 +202,15 @@ interface DesktopRuntime {
+ }
+ 
+ interface LoadStartupErrorArgs {
++  actions: StartupErrorAction[];
+   details: string;
+   logs: string;
+   title: string;
+ }
+ 
+ interface LoadWindowUrlArgs {
++  /** Token the loaded view accepts recovery clicks with, or null for none. */
++  startupErrorActionToken: string | null;
+   url: string;
+ }
+ 
+@@ -301,6 +310,8 @@ let desktopAutoUpdateService: DesktopAutoUpdateService | null = null;
+ let currentRuntime: DesktopRuntime | null = null;
+ let currentWindowUrl: string | null = null;
+ let logViewerIpcHandlersInstalled = false;
++let startupErrorIpcHandlersInstalled = false;
++let startupErrorActionToken: string | null = null;
+ let logViewerLineBuffer: LogLineBuffer | null = null;
+ let logViewerPreloadPath: string | null = null;
+ let logViewerTailer: LogTailer | null = null;
+@@ -1170,6 +1181,7 @@ async function applyServerTarget(): Promise<void> {
+     }
+     if (!attached) {
+       await loadStartupError({
++        actions: ["retry"],
+         details:
+           "Could not connect to the local bb server on this Mac. Check that the port is free or that a compatible bb server is running.",
+         logs: "",
+@@ -1204,9 +1216,10 @@ async function applyServerTarget(): Promise<void> {
+         `[desktop] Connect authentication failed (${result.code}): ${result.detail}`,
+       );
+       await loadStartupError({
++        actions: ["retry", "use-this-mac"],
+         details:
+           "The desktop app could not establish a session for this Connect server. " +
+-          `Try switching servers again. (${result.code}: ${result.detail})`,
++          `(${result.code}: ${result.detail})`,
+         logs: "",
+         title: "Could not authenticate with bb Connect",
+       });
+@@ -1217,19 +1230,31 @@ async function applyServerTarget(): Promise<void> {
+       expiresAt: result.expiresAt,
+       remoteServerUrl: target.server.url,
+     });
+-    bbAppLoaded = true;
+-    await loadWindowUrl({ url: target.server.url });
++    const loaded = await loadRemoteServerTarget(target.server.url);
+     if (!isCurrent()) {
+       return;
+     }
++    if (!loaded) {
++      // The app never reached this server, so stop refreshing its session.
++      connectSessionRenewal?.stop();
++      refreshApplicationMenu();
++      return;
++    }
++    // After the generation check, so an aborted older load cannot claim the
++    // workspace is open over a newer failure screen.
++    bbAppLoaded = true;
+     startRemoteSystemConfigSync(target.server.url);
+   } else {
+     // A custom server is a plain web load with no bb Connect involved.
+-    bbAppLoaded = true;
+-    await loadWindowUrl({ url: target.url });
++    const loaded = await loadRemoteServerTarget(target.url);
+     if (!isCurrent()) {
+       return;
+     }
++    if (!loaded) {
++      refreshApplicationMenu();
++      return;
++    }
++    bbAppLoaded = true;
+     startRemoteSystemConfigSync(target.url);
+   }
+   refreshApplicationMenu();
+@@ -1354,6 +1379,52 @@ function installLogViewerIpcHandlers(): void {
+   );
+ }
+ 
++async function handleStartupErrorAction(
++  action: StartupErrorAction,
++): Promise<void> {
++  await loadLoadingView();
++  if (action === "use-this-mac") {
++    await setActiveServerTarget("builtin");
++    return;
++  }
++  await applyServerTarget();
++}
++
++/**
++ * Wire the recovery buttons on the startup error screen.
++ *
++ * Only the window preload sends on this channel, because the app never exposes
++ * it on the main world. The token proves the click came from the error view the
++ * app itself rendered, and not from a page that copied the button markup.
++ */
++function installStartupErrorIpcHandlers(): void {
++  if (startupErrorIpcHandlersInstalled) {
++    return;
++  }
++  startupErrorIpcHandlersInstalled = true;
++  ipcMain.on(
++    BB_DESKTOP_STARTUP_ERROR_ACTION_CHANNEL,
++    (event, payload: unknown) => {
++      const action = acceptStartupErrorAction({
++        currentToken: startupErrorActionToken,
++        payload,
++        senderIsApplicationWindow: applicationWindowWebContentsIds.has(
++          event.sender.id,
++        ),
++      });
++      if (action === null) {
++        return;
++      }
++      // One use only: a repeated click, or a click that raced a load, does
++      // nothing.
++      startupErrorActionToken = null;
++      void handleStartupErrorAction(action).catch(
++        reportUnexpectedStartupFailure,
++      );
++    },
++  );
++}
++
+ async function loadLogViewerWindow(
+   args: LoadLogViewerWindowArgs,
+ ): Promise<void> {
+@@ -1440,6 +1511,9 @@ async function openServerDaemonLogs(): Promise<void> {
+ 
+ async function loadWindowUrl(args: LoadWindowUrlArgs): Promise<void> {
+   currentWindowUrl = args.url;
++  // Every load replaces what the window shows, so the token of the screen that
++  // is going away stops counting here, before the new page can send anything.
++  startupErrorActionToken = args.startupErrorActionToken;
+   if (desktopWindowFactory === null) {
+     return;
+   }
+@@ -1450,6 +1524,7 @@ async function loadWindowUrl(args: LoadWindowUrlArgs): Promise<void> {
+ async function loadLoadingView(): Promise<void> {
+   bbAppLoaded = false;
+   await loadWindowUrl({
++    startupErrorActionToken: null,
+     url: createLocalViewUrl({
+       viewModel: {
+         kind: "loading",
+@@ -1462,21 +1537,67 @@ async function loadLoadingView(): Promise<void> {
+ 
+ async function loadStartupError(args: LoadStartupErrorArgs): Promise<void> {
+   bbAppLoaded = false;
++  const recovery =
++    args.actions.length === 0
++      ? null
++      : { actions: args.actions, token: randomUUID() };
+   await loadWindowUrl({
++    startupErrorActionToken: recovery?.token ?? null,
+     url: createLocalViewUrl({
+       viewModel: {
+         details: `${args.details} Logs are under ${formatLogDirectory()}/.`,
+         kind: "error",
+         logText: args.logs,
++        recovery,
+         title: args.title,
+       },
+     }),
+   });
+ }
+ 
++/**
++ * Report a failure that has no better handler.
++ *
++ * The log gets the stack. The screen gets the message only, because an internal
++ * stack trace tells the user nothing they can act on.
++ */
++function reportUnexpectedStartupFailure(error: unknown): void {
++  process.stderr.write(
++    `${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
++  );
++  void loadStartupError({
++    actions: [],
++    details: error instanceof Error ? error.message : String(error),
++    logs: "",
++    title: "Could not open bb",
++  });
++}
++
++/**
++ * Load a remote target, or show the recoverable "cannot reach" screen.
++ *
++ * The caller owns `bbAppLoaded`, because only the caller knows whether its own
++ * switch is still the current one.
++ */
++async function loadRemoteServerTarget(serverUrl: string): Promise<boolean> {
++  return await loadRemoteServerPage({
++    loadStartupError,
++    async loadUrl(loadArgs) {
++      await loadWindowUrl({
++        startupErrorActionToken: null,
++        url: loadArgs.url,
++      });
++    },
++    logWarning(message) {
++      createDesktopLogger().warn(message);
++    },
++    serverUrl,
++  });
++}
++
+ async function loadBbApp(serverUrl: string): Promise<void> {
+   bbAppLoaded = true;
+-  await loadWindowUrl({ url: serverUrl });
++  await loadWindowUrl({ startupErrorActionToken: null, url: serverUrl });
+   if (shouldOpenDevTools()) {
+     desktopWindowFactory?.openDevTools();
+   }
+@@ -1728,6 +1849,7 @@ async function startOwnedRuntime(
+     }
+     setCurrentRuntime(null);
+     void loadStartupError({
++      actions: [],
+       details: `The Electron-owned bb-app process stopped with ${formatExitResult(
+         exit,
+       )}.`,
+@@ -1753,6 +1875,7 @@ async function startOwnedRuntime(
+ 
+   if (raceResult.kind === "process-exited") {
+     await loadStartupError({
++      actions: [],
+       details: `bb-app exited before the server was ready with ${formatExitResult(
+         raceResult.exit,
+       )}.`,
+@@ -1768,6 +1891,7 @@ async function startOwnedRuntime(
+   }
+ 
+   await loadStartupError({
++    actions: [],
+     details:
+       raceResult.result.kind === "incompatible"
+         ? `Port ${args.serverUrl} is responding, but it does not look like bb: ${raceResult.result.reason}.`
+@@ -1865,6 +1989,7 @@ async function decideOnExistingServer(
+   });
+   if (stopResult.kind === "unverified") {
+     await loadStartupError({
++      actions: [],
+       details:
+         `The bb at ${probe.serverUrl} records process ${String(stopResult.pid)}, but that ` +
+         "process no longer matches the record. bb did not stop it. Stop it yourself, then open bb again.",
+@@ -1875,6 +2000,7 @@ async function decideOnExistingServer(
+   }
+   if (stopResult.kind === "still-running") {
+     await loadStartupError({
++      actions: [],
+       details: `bb could not stop process ${String(stopResult.pid)}, even after SIGKILL.`,
+       logs: "",
+       title: "Could not stop the running bb",
+@@ -1883,6 +2009,7 @@ async function decideOnExistingServer(
+   }
+   if (stopResult.kind === "replaced") {
+     await loadStartupError({
++      actions: [],
+       details:
+         `Another bb started at ${probe.serverUrl} while the question was open, so bb stopped nothing. ` +
+         "Open bb again to see the copy that runs now.",
+@@ -1893,6 +2020,7 @@ async function decideOnExistingServer(
+   }
+   if (!(await waitForServerToStop(probe.serverUrl))) {
+     await loadStartupError({
++      actions: [],
+       details: `The bb at ${probe.serverUrl} stopped, but the address is still in use.`,
+       logs: "",
+       title: "Could not stop the running bb",
+@@ -1951,6 +2079,7 @@ async function initializeRuntime(args: InitializeRuntimeArgs): Promise<void> {
+ 
+   if (existingProbe.kind === "incompatible") {
+     await loadStartupError({
++      actions: [],
+       details: `Port ${args.serverUrl} is already in use, but it is not a compatible bb server: ${existingProbe.reason}.`,
+       logs: "",
+       title: "Port conflict",
+@@ -2268,6 +2397,7 @@ async function runDesktopApp(): Promise<void> {
+     userDataPath,
+   });
+   installLogViewerIpcHandlers();
++  installStartupErrorIpcHandlers();
+ 
+   refreshApplicationMenu();
+   await loadLoadingView();
+@@ -2289,13 +2419,4 @@ async function runDesktopApp(): Promise<void> {
+   }
+ }
+ 
+-void runDesktopApp().catch((error) => {
+-  const message =
+-    error instanceof Error ? (error.stack ?? error.message) : String(error);
+-  process.stderr.write(`${message}\n`);
+-  void loadStartupError({
+-    details: message,
+-    logs: "",
+-    title: "Could not open bb",
+-  });
+-});
++void runDesktopApp().catch(reportUnexpectedStartupFailure);
+diff --git a/apps/desktop/src/preload.ts b/apps/desktop/src/preload.ts
+index b730f2a2d8..ca760c3632 100644
+--- a/apps/desktop/src/preload.ts
++++ b/apps/desktop/src/preload.ts
+@@ -61,6 +61,10 @@ import {
+   type BbDesktopSpellcheckApi,
+ } from "./desktop-spellcheck-contract.js";
+ import { resolveBbDesktopPlatform } from "./desktop-platform.js";
++import {
++  BB_DESKTOP_STARTUP_ERROR_ACTION_CHANNEL,
++  STARTUP_ERROR_ACTIONS,
++} from "./startup-error-ipc.js";
+ 
+ function getDesktopVersion(version: string | undefined): string {
+   if (version === undefined || version.length === 0) {
+@@ -426,6 +430,29 @@ ipcRenderer.on(
+   },
+ );
+ 
++// The startup error view has no scripts of its own (CSP default-src 'none'), so
++// the preload wires its recovery buttons from the isolated world. This channel
++// stays off the main world on purpose: a loaded page must not switch servers.
++// This preload also runs on the loaded server page, which can carry the same
++// markup, so the click forwards the view's token and the main process checks it.
++window.addEventListener("DOMContentLoaded", () => {
++  for (const action of STARTUP_ERROR_ACTIONS) {
++    const button = document.querySelector<HTMLButtonElement>(
++      `button[data-startup-error-action="${action}"]`,
++    );
++    const token = button?.dataset.startupErrorToken;
++    if (button === null || button === undefined || token === undefined) {
++      continue;
++    }
++    button.addEventListener("click", () => {
++      ipcRenderer.send(BB_DESKTOP_STARTUP_ERROR_ACTION_CHANNEL, {
++        action,
++        token,
++      });
++    });
++  }
++});
++
+ void invokeDesktopInfo(BB_DESKTOP_GET_INFO_CHANNEL);
+ void invokeDesktopWindowState();
+ 
+diff --git a/apps/desktop/src/remote-server-load.ts b/apps/desktop/src/remote-server-load.ts
+new file mode 100644
+index 0000000000..8b0b985bdf
+--- /dev/null
++++ b/apps/desktop/src/remote-server-load.ts
+@@ -0,0 +1,109 @@
++import type { StartupErrorAction } from "./startup-error-ipc.js";
++
++const ELECTRON_LOAD_ERROR_CODE = /\bERR_[A-Z_]+ \(-?\d+\)/u;
++
++export interface RemoteServerStartupError {
++  actions: StartupErrorAction[];
++  details: string;
++  logs: string;
++  title: string;
++}
++
++export interface LoadRemoteServerPageArgs {
++  /** Shows the shared startup error screen. */
++  loadStartupError(args: RemoteServerStartupError): Promise<void>;
++  /** Loads a page into the application windows. */
++  loadUrl(args: { url: string }): Promise<void>;
++  logWarning(message: string): void;
++  serverUrl: string;
++}
++
++export interface DescribedServerUrl {
++  /** True when the saved URL carries a credential or a query value. */
++  hasSecret: boolean;
++  /** How to name this server on screen and in the log. */
++  label: string;
++}
++
++/**
++ * Name a saved target without repeating anything secret.
++ *
++ * `normalizeCustomServerUrl()` keeps user information and the query string, so a
++ * saved target can hold a password or a token. Neither belongs on a screen the
++ * user photographs for a bug report, or in a log they attach to one. The load
++ * request keeps the complete URL; only this text drops the secret parts.
++ */
++export function describeServerUrl(serverUrl: string): DescribedServerUrl {
++  let parsed: URL;
++  try {
++    parsed = new URL(serverUrl);
++  } catch {
++    // Not parseable, so nothing about it is known to be safe to print.
++    return { hasSecret: true, label: "the saved bb server" };
++  }
++  const hasSecret =
++    parsed.username.length > 0 ||
++    parsed.password.length > 0 ||
++    parsed.search.length > 0;
++  parsed.username = "";
++  parsed.password = "";
++  parsed.search = "";
++  parsed.hash = "";
++  return { hasSecret, label: `the server at ${parsed.toString()}` };
++}
++
++/**
++ * Describe a failed load for the log.
++ *
++ * The Electron message repeats the URL it tried, so when that URL holds a secret
++ * only the error code is safe to keep. Every other failure logs the full stack,
++ * which is where an Electron internal frame belongs.
++ */
++function formatLoadFailure(args: {
++  error: unknown;
++  hasSecret: boolean;
++}): string {
++  if (!args.hasSecret) {
++    return args.error instanceof Error
++      ? (args.error.stack ?? args.error.message)
++      : String(args.error);
++  }
++  const message =
++    args.error instanceof Error ? args.error.message : String(args.error);
++  return ELECTRON_LOAD_ERROR_CODE.exec(message)?.[0] ?? "the page load failed";
++}
++
++/**
++ * Load a remote bb server and keep an unreachable host recoverable.
++ *
++ * `BrowserWindow.loadURL` rejects with `ERR_FAILED` when the host sleeps, the
++ * tunnel is down, or no bb server listens there. That rejection used to unwind
++ * to the top-level startup handler, which printed the Electron stack on a
++ * screen with no controls. The detail stays in the log now, and the user gets
++ * the server name plus a way out.
++ */
++export async function loadRemoteServerPage(
++  args: LoadRemoteServerPageArgs,
++): Promise<boolean> {
++  try {
++    await args.loadUrl({ url: args.serverUrl });
++    return true;
++  } catch (error) {
++    const described = describeServerUrl(args.serverUrl);
++    args.logWarning(
++      `[desktop] could not load ${described.label}: ${formatLoadFailure({
++        error,
++        hasSecret: described.hasSecret,
++      })}`,
++    );
++    await args.loadStartupError({
++      actions: ["retry", "use-this-mac"],
++      details:
++        `bb could not reach ${described.label}. ` +
++        "The host is off the network, or it does not run a bb server.",
++      logs: "",
++      title: "Could not reach this bb server",
++    });
++    return false;
++  }
++}
+diff --git a/apps/desktop/src/startup-error-ipc.ts b/apps/desktop/src/startup-error-ipc.ts
+new file mode 100644
+index 0000000000..f6aee033c2
+--- /dev/null
++++ b/apps/desktop/src/startup-error-ipc.ts
+@@ -0,0 +1,52 @@
++import { z } from "zod";
++
++export const BB_DESKTOP_STARTUP_ERROR_ACTION_CHANNEL =
++  "bb-desktop:startup-error:action";
++
++/** Recovery buttons the startup error view can offer. */
++export const STARTUP_ERROR_ACTIONS = ["retry", "use-this-mac"] as const;
++
++export type StartupErrorAction = (typeof STARTUP_ERROR_ACTIONS)[number];
++
++export const startupErrorActionRequestSchema = z
++  .object({
++    action: z.enum(STARTUP_ERROR_ACTIONS),
++    /**
++     * The token the current error view rendered. The app window's preload also
++     * runs on the loaded server page, and that page can host the same button
++     * markup, so the main process trusts the token rather than the markup.
++     */
++    token: z.string().min(1),
++  })
++  .strict();
++export type StartupErrorActionRequest = z.infer<
++  typeof startupErrorActionRequestSchema
++>;
++
++export interface AcceptStartupErrorActionArgs {
++  /** Token the visible error view rendered, or null when no view offers one. */
++  currentToken: string | null;
++  payload: unknown;
++  /** Whether the message came from one of the app's own windows. */
++  senderIsApplicationWindow: boolean;
++}
++
++/**
++ * Decide whether a recovery click may act, and name the action it asks for.
++ *
++ * The window preload also runs on the loaded server page, and that page can host
++ * the same button markup, so markup alone proves nothing. Only the current error
++ * view carries the token, and every other load clears it.
++ */
++export function acceptStartupErrorAction(
++  args: AcceptStartupErrorActionArgs,
++): StartupErrorAction | null {
++  if (!args.senderIsApplicationWindow || args.currentToken === null) {
++    return null;
++  }
++  const parsed = startupErrorActionRequestSchema.safeParse(args.payload);
++  if (!parsed.success || parsed.data.token !== args.currentToken) {
++    return null;
++  }
++  return parsed.data.action;
++}
+diff --git a/apps/desktop/test/local-view.test.ts b/apps/desktop/test/local-view.test.ts
+index ce3475474a..cdc6e78d4e 100644
+--- a/apps/desktop/test/local-view.test.ts
++++ b/apps/desktop/test/local-view.test.ts
+@@ -27,6 +27,7 @@ const localViewTestCases: LocalViewTestCase[] = [
+       details: "The local service failed to start.",
+       kind: "error",
+       logText: "Failed to bind port",
++      recovery: null,
+       title: "Could not open bb",
+     },
+   },
+@@ -74,6 +75,7 @@ describe("local desktop views", () => {
+         kind: "error",
+         logText:
+           "\x1b[2K  \x1b[2m○\x1b[0m  Starting server\r\x1b[2K  \x1b[32m✓\x1b[0m  Server listening\nError: listen EADDRINUSE",
++        recovery: null,
+         title: "Could not open bb",
+       },
+     });
+@@ -85,4 +87,44 @@ describe("local desktop views", () => {
+     expect(html).not.toContain("\x1b[");
+     expect(html).not.toContain("\r");
+   });
++
++  // The window preload finds these buttons by this exact attribute. A rename
++  // here would leave an unreachable server on a screen with dead controls.
++  it("renders the recovery buttons the window preload wires up", () => {
++    const html = decodeLocalViewHtml({
++      viewModel: {
++        details: "bb could not reach the server at http://host.example:38886.",
++        kind: "error",
++        logText: "",
++        recovery: {
++          actions: ["retry", "use-this-mac"],
++          token: "token-abc",
++        },
++        title: "Could not reach this bb server",
++      },
++    });
++
++    expect(html).toContain(
++      '<button type="button" data-startup-error-action="retry" data-startup-error-token="token-abc">Retry</button>',
++    );
++    expect(html).toContain(
++      '<button type="button" data-startup-error-action="use-this-mac" data-startup-error-token="token-abc">Use This Mac</button>',
++    );
++    expect(html).toContain("http://host.example:38886");
++  });
++
++  it("renders no action row for a failure with no recovery action", () => {
++    const html = decodeLocalViewHtml({
++      viewModel: {
++        details: "Port 38886 is already in use.",
++        kind: "error",
++        logText: "",
++        recovery: null,
++        title: "Port conflict",
++      },
++    });
++
++    expect(html).not.toContain("<button");
++    expect(html).not.toContain('<div class="actions">');
++  });
+ });
+diff --git a/apps/desktop/test/preload-browser-api.test.ts b/apps/desktop/test/preload-browser-api.test.ts
+index a99b1a4958..7a10efd966 100644
+--- a/apps/desktop/test/preload-browser-api.test.ts
++++ b/apps/desktop/test/preload-browser-api.test.ts
+@@ -39,6 +39,11 @@ import {
+   BB_DESKTOP_WINDOW_STATE_CHANGED_CHANNEL,
+ } from "../src/desktop-window-command-ipc.js";
+ import { BB_DESKTOP_SPELLCHECK_GLOBAL_NAME } from "../src/desktop-spellcheck-contract.js";
++import {
++  BB_DESKTOP_STARTUP_ERROR_ACTION_CHANNEL,
++  STARTUP_ERROR_ACTIONS,
++  type StartupErrorAction,
++} from "../src/startup-error-ipc.js";
+ 
+ const electronMock = vi.hoisted(() => {
+   interface IpcRendererEvent {}
+@@ -158,9 +163,85 @@ interface EmitIpcPayloadArgs {
+   payload: unknown;
+ }
+ 
++/** Stands in for the token the error view renders into each button. */
++const VIEW_TOKEN = "view-token-1";
++
++interface PreloadDomStub {
++  /** Runs the click listener the preload attached to a rendered button. */
++  clickButton(action: StartupErrorAction): void;
++  /** Selectors the preload looked for, in the order it looked for them. */
++  querySelectors: string[];
++  /** Fires DOMContentLoaded, the point at which the page markup exists. */
++  ready(): void;
++}
++
++/**
++ * Give the preload the DOM globals an Electron renderer would provide.
++ *
++ * The preload wires the startup error buttons from the isolated world, so a
++ * plain Node test needs a `window` to listen on and a `document` to query.
++ */
++function installPreloadDomStub(): PreloadDomStub {
++  const clickListeners = new Map<string, () => void>();
++  const querySelectors: string[] = [];
++  const readyListeners: Array<() => void> = [];
++  const documentStub = {
++    querySelector(selector: string): unknown {
++      querySelectors.push(selector);
++      const action = STARTUP_ERROR_ACTIONS.find(
++        (candidate) =>
++          selector === `button[data-startup-error-action="${candidate}"]`,
++      );
++      if (action === undefined) {
++        return null;
++      }
++      return {
++        dataset: { startupErrorToken: VIEW_TOKEN },
++        addEventListener(_type: string, listener: () => void): void {
++          clickListeners.set(action, listener);
++        },
++      };
++    },
++  };
++  const windowStub = {
++    addEventListener(type: string, listener: () => void): void {
++      if (type === "DOMContentLoaded") {
++        readyListeners.push(listener);
++      }
++    },
++  };
++  Object.assign(globalThis, { document: documentStub, window: windowStub });
++
++  return {
++    clickButton(action: StartupErrorAction): void {
++      const listener = clickListeners.get(action);
++      if (listener === undefined) {
++        throw new Error(`Expected the preload to wire the ${action} button.`);
++      }
++      listener();
++    },
++    querySelectors,
++    ready(): void {
++      for (const listener of readyListeners) {
++        listener();
++      }
++    },
++  };
++}
++
++let preloadDom: PreloadDomStub | null = null;
++
++function requirePreloadDom(): PreloadDomStub {
++  if (preloadDom === null) {
++    throw new Error("Expected the preload DOM stub to be installed.");
++  }
++  return preloadDom;
++}
++
+ async function loadPreload(): Promise<BbDesktopApi> {
+   electronMock.reset();
+   vi.resetModules();
++  preloadDom = installPreloadDomStub();
+   process.env.BB_DESKTOP_VERSION = "0.0.0-test";
+   await import("../src/preload.js");
+   const api = electronMock.exposedApi;
+@@ -482,4 +563,36 @@ describe("desktop preload browser API", () => {
+       payload: false,
+     });
+   });
++
++  // The startup error screen is the only way out of an unreachable server, and
++  // its buttons carry no scripts. Without this wiring they are decoration.
++  it("forwards startup error recovery clicks to the main process", async () => {
++    await loadPreload();
++    const dom = requirePreloadDom();
++
++    dom.ready();
++
++    expect(dom.querySelectors).toEqual([
++      'button[data-startup-error-action="retry"]',
++      'button[data-startup-error-action="use-this-mac"]',
++    ]);
++
++    dom.clickButton("use-this-mac");
++    dom.clickButton("retry");
++
++    expect(
++      electronMock.sendCalls.filter(
++        (call) => call.channel === BB_DESKTOP_STARTUP_ERROR_ACTION_CHANNEL,
++      ),
++    ).toEqual([
++      {
++        channel: BB_DESKTOP_STARTUP_ERROR_ACTION_CHANNEL,
++        payload: { action: "use-this-mac", token: VIEW_TOKEN },
++      },
++      {
++        channel: BB_DESKTOP_STARTUP_ERROR_ACTION_CHANNEL,
++        payload: { action: "retry", token: VIEW_TOKEN },
++      },
++    ]);
++  });
+ });
+diff --git a/apps/desktop/test/remote-server-load.test.ts b/apps/desktop/test/remote-server-load.test.ts
+new file mode 100644
+index 0000000000..572b2fa1b9
+--- /dev/null
++++ b/apps/desktop/test/remote-server-load.test.ts
+@@ -0,0 +1,156 @@
++import { describe, expect, it } from "vitest";
++import {
++  loadRemoteServerPage,
++  type RemoteServerStartupError,
++} from "../src/remote-server-load.js";
++
++const SERVER_URL = "http://host.example:38886";
++
++interface RemoteServerLoadHarness {
++  errors: RemoteServerStartupError[];
++  loadedUrls: string[];
++  warnings: string[];
++}
++
++function createHarness(): RemoteServerLoadHarness {
++  return { errors: [], loadedUrls: [], warnings: [] };
++}
++
++function createElectronLoadFailure(): Error {
++  // Shape of the real rejection: an Electron internal frame the user must never
++  // see on the startup screen.
++  const error = new Error(`ERR_FAILED (-2) loading '${SERVER_URL}'`);
++  error.stack = `${error.message}\n    at rejectAndCleanup (node:electron/js2c/browser_init:2:89743)`;
++  return error;
++}
++
++describe("loading a remote bb server", () => {
++  it("reports a successful load", async () => {
++    const harness = createHarness();
++
++    const loaded = await loadRemoteServerPage({
++      async loadStartupError(args) {
++        harness.errors.push(args);
++      },
++      async loadUrl(args) {
++        harness.loadedUrls.push(args.url);
++      },
++      logWarning(message) {
++        harness.warnings.push(message);
++      },
++      serverUrl: SERVER_URL,
++    });
++
++    expect(loaded).toBe(true);
++    expect(harness.loadedUrls).toEqual([SERVER_URL]);
++    expect(harness.errors).toEqual([]);
++  });
++
++  it("turns an unreachable host into a recoverable screen", async () => {
++    const harness = createHarness();
++
++    const loaded = await loadRemoteServerPage({
++      async loadStartupError(args) {
++        harness.errors.push(args);
++      },
++      loadUrl() {
++        return Promise.reject(createElectronLoadFailure());
++      },
++      logWarning(message) {
++        harness.warnings.push(message);
++      },
++      serverUrl: SERVER_URL,
++    });
++
++    expect(loaded).toBe(false);
++    expect(harness.errors).toHaveLength(1);
++    const [startupError] = harness.errors;
++    expect(startupError?.actions).toEqual(["retry", "use-this-mac"]);
++    expect(startupError?.details).toContain(SERVER_URL);
++    // The Electron internals belong in the log, not on the screen.
++    expect(startupError?.details).not.toContain("ERR_FAILED");
++    expect(startupError?.details).not.toContain("js2c");
++    expect(startupError?.logs).toBe("");
++    expect(harness.warnings).toHaveLength(1);
++    expect(harness.warnings[0]).toContain("ERR_FAILED");
++    expect(harness.warnings[0]).toContain("js2c");
++  });
++
++  // A saved target keeps user information and the query string, so it can hold a
++  // password or a token. The user photographs this screen for a bug report and
++  // attaches the log to it.
++  it("keeps a credential and a query token out of the screen and the log", async () => {
++    const harness = createHarness();
++    const secretUrl = "https://alice:hunter2@bb.example:38886/?token=s3cret";
++
++    const loaded = await loadRemoteServerPage({
++      async loadStartupError(args) {
++        harness.errors.push(args);
++      },
++      loadUrl() {
++        return Promise.reject(
++          new Error(`ERR_CONNECTION_REFUSED (-102) loading '${secretUrl}'`),
++        );
++      },
++      logWarning(message) {
++        harness.warnings.push(message);
++      },
++      serverUrl: secretUrl,
++    });
++
++    expect(loaded).toBe(false);
++    const printed = [harness.errors[0]?.details ?? "", ...harness.warnings];
++    for (const text of printed) {
++      expect(text).not.toContain("hunter2");
++      expect(text).not.toContain("alice");
++      expect(text).not.toContain("s3cret");
++      expect(text).not.toContain("token=");
++    }
++    // Naming the host is the point of the screen, so that part survives.
++    expect(harness.errors[0]?.details).toContain("https://bb.example:38886/");
++    // The code is the part of the Electron message worth keeping.
++    expect(harness.warnings[0]).toContain("ERR_CONNECTION_REFUSED (-102)");
++  });
++
++  it("names no address when the saved target does not parse", async () => {
++    const harness = createHarness();
++
++    await loadRemoteServerPage({
++      async loadStartupError(args) {
++        harness.errors.push(args);
++      },
++      loadUrl() {
++        return Promise.reject(new Error("ERR_FAILED (-2) loading 'nonsense'"));
++      },
++      logWarning(message) {
++        harness.warnings.push(message);
++      },
++      serverUrl: "nonsense://it is not a url",
++    });
++
++    expect(harness.errors[0]?.details).toContain("the saved bb server");
++    expect(harness.errors[0]?.details).not.toContain("nonsense");
++    expect(harness.warnings[0]).not.toContain("nonsense");
++  });
++
++  it("still loads the complete URL, secret parts included", async () => {
++    const harness = createHarness();
++    const secretUrl = "https://alice:hunter2@bb.example:38886/?token=s3cret";
++
++    const loaded = await loadRemoteServerPage({
++      async loadStartupError(args) {
++        harness.errors.push(args);
++      },
++      async loadUrl(args) {
++        harness.loadedUrls.push(args.url);
++      },
++      logWarning(message) {
++        harness.warnings.push(message);
++      },
++      serverUrl: secretUrl,
++    });
++
++    expect(loaded).toBe(true);
++    expect(harness.loadedUrls).toEqual([secretUrl]);
++  });
++});
+diff --git a/apps/desktop/test/startup-error-ipc.test.ts b/apps/desktop/test/startup-error-ipc.test.ts
+new file mode 100644
+index 0000000000..e416ba809f
+--- /dev/null
++++ b/apps/desktop/test/startup-error-ipc.test.ts
+@@ -0,0 +1,71 @@
++import { describe, expect, it } from "vitest";
++import { acceptStartupErrorAction } from "../src/startup-error-ipc.js";
++
++const VIEW_TOKEN = "e0f1c2d3-4a5b-6c7d-8e9f-0a1b2c3d4e5f";
++
++// The window preload runs on the loaded server page too, so a hostile or
++// compromised bb server can host the same buttons and click them itself. Only
++// the token separates a real recovery click from that forgery.
++describe("accepting a startup error recovery click", () => {
++  it("accepts the action the visible error view offered", () => {
++    expect(
++      acceptStartupErrorAction({
++        currentToken: VIEW_TOKEN,
++        payload: { action: "use-this-mac", token: VIEW_TOKEN },
++        senderIsApplicationWindow: true,
++      }),
++    ).toBe("use-this-mac");
++  });
++
++  it("rejects a token the error view never rendered", () => {
++    expect(
++      acceptStartupErrorAction({
++        currentToken: VIEW_TOKEN,
++        payload: { action: "use-this-mac", token: "guessed" },
++        senderIsApplicationWindow: true,
++      }),
++    ).toBeNull();
++  });
++
++  it("rejects every click while no error view offers recovery", () => {
++    expect(
++      acceptStartupErrorAction({
++        currentToken: null,
++        payload: { action: "retry", token: VIEW_TOKEN },
++        senderIsApplicationWindow: true,
++      }),
++    ).toBeNull();
++  });
++
++  it("rejects a sender that is not an application window", () => {
++    expect(
++      acceptStartupErrorAction({
++        currentToken: VIEW_TOKEN,
++        payload: { action: "retry", token: VIEW_TOKEN },
++        senderIsApplicationWindow: false,
++      }),
++    ).toBeNull();
++  });
++
++  it.each([
++    {
++      label: "an unknown action",
++      payload: { action: "quit", token: VIEW_TOKEN },
++    },
++    { label: "no token", payload: { action: "retry" } },
++    { label: "an empty token", payload: { action: "retry", token: "" } },
++    {
++      label: "an extra field",
++      payload: { action: "retry", token: VIEW_TOKEN, url: "http://evil" },
++    },
++    { label: "no object", payload: "retry" },
++  ])("rejects a payload with $label", (testCase) => {
++    expect(
++      acceptStartupErrorAction({
++        currentToken: VIEW_TOKEN,
++        payload: testCase.payload,
++        senderIsApplicationWindow: true,
++      }),
++    ).toBeNull();
++  });
++});

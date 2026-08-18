@@ -1,0 +1,12 @@
+const page = await browser.getPage("main");
+await page.keyboard.press("Escape");
+await page.goto("http://localhost:15978/projects/proj_vs92eqyrud/threads/thr_h4dz2zcd52");
+await page.waitForTimeout(4000);
+const editor = page.locator('[contenteditable="true"]').first();
+await editor.click();
+await page.keyboard.type("/compact", {delay: 40});
+await page.waitForTimeout(1200);
+const p1 = await saveScreenshot(await page.screenshot(), "1721-typeahead.png");
+console.log(p1);
+const opts = await page.$$eval('[role="option"], [cmdk-item], [data-radix-collection-item]', ms => ms.map(m => m.textContent.trim().slice(0,60)));
+console.log(JSON.stringify(opts));

@@ -1,0 +1,599 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1758 github plugin latches needs-configuration on one transient gh auth failure</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.med { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .verdict { font-weight:600; }
+  .v-repro { color:var(--high); }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:14px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:4px; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1758 · github plugin latches needs-configuration on one transient gh auth failure and never re-probes</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill med">Medium</span> <span class="pill">Effort: Small</span>
+    <span class="pill">github</span>
+    <a href="https://github.com/get-bb/bb/issues/1758">open on GitHub</a>
+    <span>2026-08-18</span>
+    <span>base <code>16ceb3a540f81c1189efaffb27a39b1d9443abf5</code> (main)</span>
+  </p>
+  <p class="meta">
+    <span class="verdict v-repro">Verdict: REPRODUCED</span>
+    <span>· root-cause confidence: <b>high</b></span>
+    <span>· linked open PRs: none</span>
+  </p>
+
+  <h2>TL;DR</h2>
+  <p><b>Plain-language framing.</b> bb's optional <em>GitHub</em> plugin talks to GitHub through the <code>gh</code> command-line tool. When the plugin starts it runs <code>gh auth status</code> once to check that <code>gh</code> is logged in. <code>gh auth status</code> is not a local check: it calls the GitHub API, so it also fails when the network is down, when the macOS keychain holding the token is still locked, or when a slow machine makes it exceed the plugin's 10 s timeout. bb has a plugin state called <em>needs-configuration</em>, meant for "the user has to enter a setting"; a plugin in that state stays there until it is reloaded.</p>
+  <p><b>What the user sees.</b> After a bb start during which <code>gh auth status</code> failed once, <code>bb plugin list</code> shows <code>github … needs-configuration (GitHub CLI is not authenticated … run `gh auth login`, then `bb plugin reload github`)</code>, the <em>GitHub</em> entry disappears from the app sidebar, and nothing changes for hours even though <code>gh auth status</code> succeeds in every terminal. Running <code>gh auth login</code> as instructed does nothing; only <code>bb plugin reload github</code> (or saving the plugin's settings) helps.</p>
+  <p><b>What is actually wrong.</b> Verified end to end on <code>16ceb3a54</code>: <code>checkAuth()</code> in <code>plugins/github/server.ts</code> maps <em>every</em> failure of <code>gh auth status</code> to <code>NeedsConfigurationError</code>. That error is thrown from the load-time probe (which calls <code>bb.status.needsConfiguration</code>) and again from the first pass of the <code>sync</code> background service, which the plugin runtime treats as "stop this service and do not restart until reload". After that no code path runs <code>gh auth status</code> again: the runtime keeps needs-configuration until the next load, the plugin API has no way to clear it, and the app does not even load the frontend bundle of a non-running plugin, so the panel that could have shown the retained error (and its "Sync now" button) is unreachable. I reproduced it live (real <code>gh</code> behind a dead proxy for 10 s at server start, then healthy for 6.5 minutes: zero re-probes, still needs-configuration; <code>bb plugin reload github</code> → running) and with a vitest that fails on main.</p>
+
+  <h2>Claims vs findings</h2>
+  <table>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td><code>checkAuth()</code> runs at load and only again on reload; a one-off failure is latched permanently</td><td class="ok">Verified</td><td>Load-time probe <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/github/server.ts#L751-L758">server.ts#L751-L758</a>; the <code>sync</code> service's <code>syncAll()</code> also calls it <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/github/server.ts#L696-L697">server.ts#L696-L697</a> but its <code>NeedsConfigurationError</code> stops the service "until reload" <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/plugins/plugin-runtime.ts#L589-L598">plugin-runtime.ts#L589-L598</a>. Live: 3 gh calls at 07:23:54, none in the following 6.5 min (<a href="1758/repro/04-after-6min.txt">04-after-6min.txt</a>). Unit test fails on main.</td></tr>
+    <tr><td><code>bb plugin list</code> shows <code>needs-configuration</code> with the <code>gh auth login</code> hint while <code>gh auth status</code> succeeds</td><td class="ok">Verified</td><td><a href="1758/repro/04-after-6min.txt">04-after-6min.txt</a>: <code>gh auth status</code> ✓ and <code>github@0.2.1 needs-configuration (GitHub CLI is not authenticated. …)</code> in the same second.</td></tr>
+    <tr><td><code>bb plugin reload github</code> fixes it instantly</td><td class="ok">Verified</td><td><a href="1758/repro/05-reload.txt">05-reload.txt</a>: reload → <code>running</code>, <code>service sync: running</code>, three fresh gh calls.</td></tr>
+    <tr><td><code>gh auth status</code> makes a real API call (not local-only)</td><td class="ok">Verified</td><td>With <code>HTTPS_PROXY=http://127.0.0.1:9</code> (nothing listening) <code>gh auth status</code> exits 1 in 0.17 s printing "The token … is invalid"; normally 0.7 s here (Appendix). gh's own wording for a network failure is itself misleading.</td></tr>
+    <tr><td>Plausible one-off causes: locked keychain, network blip, slow start past the 10 s timeout, bb started before <code>gh auth login</code></td><td class="unv">Partly verified</td><td>Network failure: reproduced live. Slow host: reproduced by making the shim sleep 12 s (<a href="1758/repro/06-slow-gh-reload.txt">06-slow-gh-reload.txt</a>); the plugin then reports the same needs-configuration text while the retained inner error even says "GitHub CLI not found" (the 5 s <code>gh --version</code> probe timed out). Keychain: no macOS here, unverified, but any non-zero exit of <code>gh auth status</code> takes the identical path. bb-before-login: same path; that one is a genuine configuration case, but recovery still requires a reload.</td></tr>
+    <tr><td>The original <code>ghAuthError</code> is not recoverable after the fact; <code>bb plugin list</code> shows only the generic hint</td><td class="ok">Verified for the CLI, refined</td><td><code>bb plugin list</code> prints only the <code>statusDetail</code> string. The retained error <em>is</em> returned by the plugin's <code>status</code> RPC (<a href="1758/repro/03-rpc-status-after-gh-online.json">03-rpc-status…json</a>) but the only consumer, the plugin's own panel, is never mounted for a non-running plugin (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/lib/plugin-frontend.ts#L312-L314">plugin-frontend.ts#L312-L314</a>), so in practice it is invisible.</td></tr>
+    <tr><td>The hint names the wrong remedy (<code>gh auth login</code>)</td><td class="ok">Verified</td><td>The remedy is <code>bb plugin reload github</code> (or saving the plugin's settings, which the runtime answers with a reload: <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/plugins/plugin-service.ts#L1900-L1913">plugin-service.ts#L1900-L1913</a>). Neither is discoverable from the message except as the trailing "then …" clause.</td></tr>
+    <tr><td>Observed on bb 0.38.0 / macOS 26 / gh 2.95.0</td><td class="unv">Unverifiable</td><td>Reproduced on Linux with gh 2.96.0 at <code>16ceb3a54</code>; the code path is unchanged since <code>plugins/github</code> was created (git log -S checkAuth) and identical on <code>origin/main</code> today.</td></tr>
+  </table>
+
+  <h2>Environment</h2>
+  <ul>
+    <li>bb <code>16ceb3a54</code> (main, 2026-08-18); <code>git fetch origin main</code> shows no later commit touching <code>plugins/github</code> or the plugin runtime status handling.</li>
+    <li>Ubuntu 26.04, Linux 7.0.0-29-generic, node v24.18.0, gh 2.96.0 (authenticated as SawyerHood via <code>~/.config/gh/hosts.yml</code>).</li>
+    <li>Dev instance from worktree <code>/home/sawyer/projects/bb/.claude/worktrees/wf_242c3e11-a10-3</code>: app <code>:15580</code>, server <code>:23580</code>, host daemon <code>:31580</code>, data dir <code>/home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_242c3e11-a10-3-d733fd243d0c</code>. The github plugin is an "official" (not auto-installed) plugin: <code>bb plugin install builtin:github --yes</code>.</li>
+    <li>CLI wrapper: <a href="1758/repro/bb.sh">1758/repro/bb.sh</a> (sets <code>BB_SERVER_URL=http://localhost:23580</code> and runs <code>packages/scripts/dist/commands/run-cli.js</code>). Below, <code>bb</code> means this wrapper.</li>
+    <li>No agent turns were run; no provider usage.</li>
+  </ul>
+
+  <h2>Minimal reproduction</h2>
+  <h3>Live repro: gh unreachable for the first seconds of bb's life, then healthy</h3>
+  <p>The only trick is a transparent <code>gh</code> shim (<a href="1758/repro/fakebin/gh">1758/repro/fakebin/gh</a>) that runs the <b>real</b> <code>gh</code>, but while a flag file exists routes it through a dead proxy (<code>HTTPS_PROXY=http://127.0.0.1:9</code>) — a faithful "network is down" — and logs every invocation the server makes:</p>
+  <pre>#!/usr/bin/env bash
+# Repro shim for get-bb/bb#1758.
+# Transparent wrapper around the real `gh`. While the flag file exists it
+# forces every gh network call through a dead proxy (127.0.0.1:9), which is
+# how we simulate &quot;the network was down / gh could not reach api.github.com
+# for a moment when bb started&quot;. Remove the flag and gh works normally again.
+FLAG=&quot;/tmp/bb-reports/issues/1758/repro/gh-offline&quot;
+LOG=&quot;/tmp/bb-reports/issues/1758/repro/gh-calls.log&quot;
+REAL=&quot;/home/sawyer/.local/bin/gh&quot;
+SLOW=&quot;/tmp/bb-reports/issues/1758/repro/gh-slow&quot;
+mode=online
+[ -e &quot;$FLAG&quot; ] &amp;&amp; mode=OFFLINE
+[ -e &quot;$SLOW&quot; ] &amp;&amp; { mode=SLOW; sleep 12; }   # a starved host: gh takes &gt;10 s (plugin&#x27;s checkAuth timeout)
+printf &#x27;%s pid=%s ppid=%s mode=%s args=%s\n&#x27; &quot;$(date +%T)&quot; &quot;$$&quot; &quot;$PPID&quot; &quot;$mode&quot; &quot;$*&quot; &gt;&gt; &quot;$LOG&quot;
+if [ &quot;$mode&quot; = OFFLINE ]; then
+  exec env HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 &quot;$REAL&quot; &quot;$@&quot;
+fi
+exec &quot;$REAL&quot; &quot;$@&quot;
+</pre>
+  <ol>
+    <li>Build once: <code>pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build</code>.</li>
+    <li>Start the dev instance with the shim first on PATH and gh "offline" (<a href="1758/repro/start-dev-offline.sh">start-dev-offline.sh</a>; <code>scripts/bb-dev-app</code> prepends <code>BB_DEV_NODE_BIN_DIR</code> to the server's PATH ahead of <code>~/.local/bin</code>, where the real gh lives, so the shim dir also carries a <code>node</code> symlink):
+<pre>#!/usr/bin/env bash
+# Step 1 of the repro: start the bb dev instance while `gh` cannot reach GitHub.
+# scripts/bb-dev-app prepends BB_DEV_NODE_BIN_DIR to PATH before ~/.local/bin
+# (where the real gh lives), so pointing it at the shim dir (which also holds a
+# `node` symlink) makes the server&#x27;s `gh` calls hit the shim.
+set -euo pipefail
+WT=/home/sawyer/projects/bb/.claude/worktrees/wf_242c3e11-a10-3
+: &gt; /tmp/bb-reports/issues/1758/repro/gh-calls.log
+touch /tmp/bb-reports/issues/1758/repro/gh-offline          # gh is &quot;offline&quot; from now on
+export BB_DEV_NODE_BIN_DIR=/tmp/bb-reports/issues/1758/repro/fakebin
+cd &quot;$WT&quot;
+scripts/bb-dev-app current
+</pre>
+    If the github plugin is not installed yet: <code>bb plugin install builtin:github --yes</code> (I had installed it in a previous run of the same instance; the shim log below therefore starts with the plugin loading at server start).</li>
+    <li>Observe the latch (<a href="1758/repro/01-plugin-list-while-offline.txt">01-plugin-list-while-offline.txt</a>, shim log, dev.log):
+<pre>$ cat 1758/repro/gh-calls.log
+07:23:54 pid=2314480 ppid=2313311 mode=OFFLINE args=--version
+07:23:54 pid=2314493 ppid=2313311 mode=OFFLINE args=auth status      # load-time probe
+07:23:54 pid=2314513 ppid=2313311 mode=OFFLINE args=auth status      # sync service's first syncAll()
+$ grep github dev.log
+[07:23:54] INFO: [server] plugin github@0.2.1 loaded
+[07:23:54] INFO: [server] [plugin:github] service sync needs configuration; not restarting until reload
+$ bb plugin list | grep -A3 ^github
+github@0.2.1  needs-configuration  (GitHub CLI is not authenticated. Install the GitHub CLI (https://cli.github.com) and run `gh auth login`, then `bb plugin reload github`.)
+  source: builtin:github
+  service sync: stopped
+  command: bb github — Browse tracked GitHub repos, issues, and PRs
+</pre></li>
+    <li>Bring gh back (07:24:07): <code>rm 1758/repro/gh-offline</code>; <code>gh auth status</code> → ✓ Logged in.</li>
+    <li>Wait longer than the plugin's 5-minute sync interval and look again (<a href="1758/repro/wait-and-check.sh">wait-and-check.sh</a>, output <a href="1758/repro/04-after-6min.txt">04-after-6min.txt</a>):
+<pre>== 07:30:41 ==
+-- gh calls made by the server process since start (shim log):
+07:23:54 pid=2314480 ppid=2313311 mode=OFFLINE args=--version
+07:23:54 pid=2314493 ppid=2313311 mode=OFFLINE args=auth status
+07:23:54 pid=2314513 ppid=2313311 mode=OFFLINE args=auth status
+-- gh works right now:
+github.com
+  ✓ Logged in to github.com account SawyerHood (/home/sawyer/.config/gh/hosts.yml)
+-- bb plugin list:
+github@0.2.1  needs-configuration  (GitHub CLI is not authenticated. Install the GitHub CLI (https://cli.github.com) and run `gh auth login`, then `bb plugin reload github`.)
+  source: builtin:github
+  handlers: 2 calls / 6ms total / 6ms max, 1 errors
+  service sync: stopped
+-- plugin status RPC (what the panel banner would read):
+{&quot;ok&quot;:true,&quot;result&quot;:{&quot;ghOk&quot;:false,&quot;ghError&quot;:&quot;gh auth status failed: github.com\n  X Failed to log in to github.com account SawyerHood (/home/sawyer/.config/gh/hosts.yml)\n  - Active account: true\n  - The token in /home/sawyer/.config/gh/hosts.yml is invalid.\n  - To re-authenticate, run: gh auth refresh -h github.com\n  - To forget about this account, run: gh auth logout -h github.com -u SawyerHood&quot;,&quot;repos&quot;:[],&quot;lastSyncedAt&quot;:&quot;2026-08-18T07:23:16.057Z&quot;}}
+-- server log lines about github:
+54:@bb/server:dev: [07:23:53] INFO: [server] plugin github: rebuilding frontend bundle (plugin source is newer than dist/app.js)
+61:@bb/server:dev: [07:23:54] INFO: [server] plugin github@0.2.1 loaded
+63:@bb/server:dev: [07:23:54] INFO: [server] [plugin:github] service sync needs configuration; not restarting until reload
+75:@bb/server:dev: [07:25:07] WARN: [server] [plugin:github] rpc status failed: rpc input validation failed
+</pre>
+    <b>Expected</b> (issue): the plugin notices that <code>gh</code> works and comes back. <b>Actual</b>: 6 min 34 s after gh recovered the server has not run <code>gh</code> even once more, <code>bb plugin list</code> still says <code>needs-configuration (GitHub CLI is not authenticated … run `gh auth login` …)</code>, the sync service is <code>stopped</code>, and the retained error (only visible via the RPC) still describes the failure from 07:23:54.</li>
+    <li>The workaround from the issue (<a href="1758/repro/05-reload.txt">05-reload.txt</a>):
+<pre>$ bb plugin reload github
+github@0.2.1  running
+  source: builtin:github
+  handlers: 3 calls / 9ms total / 6ms max, 1 errors
+  service sync: running
+  command: bb github — Browse tracked GitHub repos, issues, and PRs
+--- gh calls:
+07:30:49 pid=2379402 ppid=2313311 mode=online args=--version
+07:30:49 pid=2379416 ppid=2313311 mode=online args=auth status
+07:30:50 pid=2379552 ppid=2313311 mode=online args=auth status
+</pre></li>
+  </ol>
+  <figure><img src="assets/1758-needs-config-detail.png" alt="Extensions › Installed plugins › GitHub while latched"><figcaption>Extensions › Installed plugins › GitHub while latched (gh already healthy again). The banner says "GitHub CLI is not authenticated … run gh auth login … Complete the Configuration section; bb reloads the plugin after you save", the sync service is Stopped. Note the plugin has no configuration that could fix this.</figcaption></figure>
+  <figure><img src="assets/1758-installed-list.png" alt="Installed plugins list while latched"><figcaption>Extensions › Installed plugins while latched: the GitHub row is enabled (toggle on) and only a small gear badge on its icon hints at the needs-configuration state; the list gives no reason.</figcaption></figure>
+  <figure><img src="assets/1758-sidebar-no-github.png" alt="Sidebar without GitHub entry while latched"><figcaption>App sidebar while latched: there is no <em>GitHub</em> entry at all (New thread / Extensions / Automations only). The app does not load the frontend bundle of a plugin whose status is not <code>running</code>, so the panel that would show the retained gh error and its "Sync now" button cannot be reached.</figcaption></figure>
+  <figure><img src="assets/1758-sidebar-after-reload.png" alt="Sidebar after bb plugin reload github"><figcaption>Same sidebar seconds after <code>bb plugin reload github</code>: <em>GitHub</em> is back. Nothing about gh changed between the two screenshots.</figcaption></figure>
+
+  <h3>Variant: slow host (gh takes &gt; 10 s)</h3>
+  <p>The shim can also sleep 12 s before running gh (flag <code>gh-slow</code>), the "load average 23" scenario. Reload the plugin under that condition (<a href="1758/repro/06-slow-gh-reload.txt">06-slow-gh-reload.txt</a>):</p>
+  <pre>$ touch 1758/repro/gh-slow; bb plugin reload github; rm 1758/repro/gh-slow
+github@0.2.1  needs-configuration  (GitHub CLI is not authenticated. Install the GitHub CLI (https://cli.github.com) and run `gh auth login`, then `bb plugin reload github`.)
+  source: builtin:github
+  handlers: 3 calls / 9ms total / 6ms max, 1 errors
+{&quot;ok&quot;:true,&quot;result&quot;:{&quot;ghOk&quot;:false,&quot;ghError&quot;:&quot;GitHub CLI not found. Install the GitHub CLI (https://cli.github.com) and run `gh auth login`, then `bb plugin reload github`.&quot;,&quot;repos&quot;:[],&quot;lastSyncedAt&quot;:&quot;2026-08-18T07:30:50.654Z&quot;}}</pre>
+  <p>Same latch, same "not authenticated" hint; the retained inner error is "GitHub CLI not found" because the 5 s <code>gh --version</code> probe in <code>resolveGh()</code> timed out first. Both messages are wrong for a machine that merely was busy.</p>
+
+  <h3>Unit-level repro (vitest, fails on main)</h3>
+  <p>File: <a href="1758/repro/server.auth-latch.test.ts">1758/repro/server.auth-latch.test.ts</a> — copy to <code>plugins/github/server.auth-latch.test.ts</code> and run <code>cd plugins/github &amp;&amp; pnpm exec vitest run server.auth-latch.test.ts</code>. It drives the real plugin entry (<code>plugins/github/server.ts</code>) through <code>createFakePluginHost</code> from <code>@get-bb/plugin-sdk/testing</code>, with a fake <code>gh</code> on PATH whose <code>auth status</code> fails while a flag file exists (with gh 2.96's verbatim offline wording) and succeeds afterwards; <code>auth token</code> (local-only) always succeeds because credentials are configured.</p>
+  <pre>// Repro for get-bb/bb#1758: the github plugin probes `gh auth status` once at
+// load, latches needs-configuration on any failure, and never re-probes.
+//
+// A fake `gh` on PATH fails (like a network blip / locked keychain / dead
+// proxy) while the plugin loads, then starts succeeding. The plugin should
+// notice that gh works again; on main it never does.
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from &quot;node:fs&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { afterEach, beforeEach, describe, expect, it } from &quot;vitest&quot;;
+import { createFakePluginHost } from &quot;@get-bb/plugin-sdk/testing&quot;;
+import plugin from &quot;./server&quot;;
+
+let binDir: string;
+let offlineFlag: string; // exists → `gh auth status` fails like a network outage
+let noTokenFlag: string; // exists → gh has no credentials at all
+let callLog: string;
+const originalPath = process.env.PATH;
+
+function ghCalls(): string[] {
+  if (!existsSync(callLog)) return [];
+  return readFileSync(callLog, &quot;utf8&quot;)
+    .trim()
+    .split(&quot;\n&quot;)
+    .filter((line: string) =&gt; line.length &gt; 0);
+}
+
+beforeEach(() =&gt; {
+  binDir = mkdtempSync(join(tmpdir(), &quot;bb-1758-gh-&quot;));
+  offlineFlag = join(binDir, &quot;gh-offline&quot;);
+  noTokenFlag = join(binDir, &quot;gh-no-token&quot;);
+  callLog = join(binDir, &quot;gh-calls.log&quot;);
+  // Mimics real `gh` (2.96) closely enough:
+  //  --version     always works, so the plugin&#x27;s resolveGh() finds it
+  //  auth token    local-only, no network: succeeds unless no credentials
+  //  auth status   network probe: fails with gh&#x27;s verbatim &quot;token is invalid&quot;
+  //                wording while offline (that IS what gh prints when it
+  //                cannot reach api.github.com), or &quot;You are not logged into
+  //                any GitHub hosts&quot; when there are no credentials.
+  writeFileSync(
+    join(binDir, &quot;gh&quot;),
+    `#!/usr/bin/env bash
+echo &quot;$*&quot; &gt;&gt; &quot;${callLog}&quot;
+case &quot;$1 $2&quot; in
+  &quot;--version &quot;) echo &quot;gh version 2.96.0 (fake)&quot;; exit 0;;
+  &quot;auth token&quot;)
+    if [ -e &quot;${noTokenFlag}&quot; ]; then echo &quot;no oauth token found for github.com&quot; &gt;&amp;2; exit 1; fi
+    echo &quot;gho_fake_token_is_configured_locally&quot;; exit 0;;
+  &quot;auth status&quot;)
+    if [ -e &quot;${noTokenFlag}&quot; ]; then
+      echo &quot;You are not logged into any GitHub hosts. To log in, run: gh auth login&quot; &gt;&amp;2; exit 1
+    fi
+    if [ -e &quot;${offlineFlag}&quot; ]; then
+      echo &quot;github.com&quot; &gt;&amp;2
+      echo &quot;  X Failed to log in to github.com account someone (keyring)&quot; &gt;&amp;2
+      echo &quot;  - The token in keyring is invalid.&quot; &gt;&amp;2
+      exit 1
+    fi
+    echo &quot;github.com&quot;; echo &quot;  ✓ Logged in to github.com account someone (keyring)&quot;; exit 0;;
+  *) echo &quot;[]&quot;; exit 0;;
+esac
+`,
+  );
+  chmodSync(join(binDir, &quot;gh&quot;), 0o755);
+  process.env.PATH = `${binDir}:${originalPath ?? &quot;&quot;}`;
+});
+
+afterEach(() =&gt; {
+  process.env.PATH = originalPath;
+  rmSync(binDir, { recursive: true, force: true });
+});
+
+async function loadWithSyncServiceOnce() {
+  const { bb, harness } = createFakePluginHost({ pluginId: &quot;github&quot; });
+  await plugin(bb);
+  // Run the sync service the way the host does at activation. On main its
+  // first syncAll() throws NeedsConfigurationError and it stops for good; a
+  // fixed plugin keeps looping, so abort it after its first pass.
+  const { controller, done } = harness.runService(&quot;sync&quot;);
+  await new Promise((resolve) =&gt; setTimeout(resolve, 150));
+  controller.abort();
+  await done;
+  return { bb, harness };
+}
+
+describe(&quot;github plugin gh auth probe (#1758)&quot;, () =&gt; {
+  it(&quot;re-probes gh after a transient auth-status failure instead of latching&quot;, async () =&gt; {
+    // 1. gh is &quot;offline&quot; while bb starts (credentials exist, API unreachable).
+    writeFileSync(offlineFlag, &quot;&quot;);
+    const { harness } = await loadWithSyncServiceOnce();
+    const before = (await harness.callRpc(&quot;status&quot;)) as { ghOk: boolean };
+    expect(before.ghOk).toBe(false); // probe failed at load, as expected
+    const callsWhileOffline = ghCalls().length;
+
+    // 2. gh recovers (network back / keychain unlocked). Nothing else changes.
+    rmSync(offlineFlag);
+
+    // 3. The plugin is asked for its status (panel banner / `bb github`).
+    //    A plugin that re-probes on demand or on its interval reports ghOk.
+    //    On main NOTHING re-runs `gh auth status`: ghOk stays false with the
+    //    stale error, and not a single further gh call is made.
+    const after = (await harness.callRpc(&quot;status&quot;)) as {
+      ghOk: boolean;
+      ghError: string | null;
+    };
+    expect(ghCalls().length).toBeGreaterThan(callsWhileOffline); // FAILS on main: no re-probe
+    expect(after.ghOk).toBe(true); // FAILS on main: latched
+  });
+
+  it(&quot;does not report needs-configuration (\&quot;run gh auth login\&quot;) for a transient probe failure&quot;, async () =&gt; {
+    writeFileSync(offlineFlag, &quot;&quot;);
+    const { harness } = await loadWithSyncServiceOnce();
+    // FAILS on main: both the load-time probe and the sync service latch
+    // needs-configuration with the `gh auth login` remedy, although gh holds
+    // valid credentials and only the network probe failed.
+    expect(harness.needsConfigurationMessages).toEqual([]);
+  });
+
+  it(&quot;still reports needs-configuration when gh has no credentials at all&quot;, async () =&gt; {
+    writeFileSync(noTokenFlag, &quot;&quot;);
+    const { harness } = await loadWithSyncServiceOnce();
+    expect(harness.needsConfigurationMessages.length).toBeGreaterThan(0);
+    expect(harness.needsConfigurationMessages[0]).toContain(&quot;gh auth login&quot;);
+  });
+
+  it(&quot;control: with gh working from the start the plugin never reports needs-configuration&quot;, async () =&gt; {
+    const { harness } = await loadWithSyncServiceOnce();
+    expect(harness.needsConfigurationMessages).toEqual([]);
+    const status = (await harness.callRpc(&quot;status&quot;)) as { ghOk: boolean };
+    expect(status.ghOk).toBe(true);
+  });
+});
+</pre>
+  <p>On main two of the four tests fail (<a href="1758/repro/vitest-main-clean.txt">vitest-main-clean.txt</a>): the first because after gh recovers the plugin makes no further gh call at all (<code>expected 3 to be greater than 3</code>) and <code>ghOk</code> stays false; the second because a purely transient failure produced two needs-configuration reports carrying the <code>gh auth login</code> remedy. The "no credentials at all" and the healthy control cases pass on main and must keep passing after a fix.</p>
+  <pre>
+ RUN  v4.1.1 /home/sawyer/projects/bb/.claude/worktrees/wf_242c3e11-a10-3/plugins/github
+
+ ❯  bb-plugin-github  server.auth-latch.test.ts (4 tests | 2 failed) 671ms
+     × re-probes gh after a transient auth-status failure instead of latching 176ms
+     × does not report needs-configuration (&quot;run gh auth login&quot;) for a transient probe failure 166ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL   bb-plugin-github  server.auth-latch.test.ts &gt; github plugin gh auth probe (#1758) &gt; re-probes gh after a transient auth-status failure instead of latching
+AssertionError: expected 3 to be greater than 3
+ ❯ server.auth-latch.test.ts:113:30
+    111|       ghError: string | null;
+    112|     };
+    113|     expect(ghCalls().length).toBeGreaterThan(callsWhileOffline); // FA…
+       |                              ^
+    114|     expect(after.ghOk).toBe(true); // FAILS on main: latched
+    115|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL   bb-plugin-github  server.auth-latch.test.ts &gt; github plugin gh auth probe (#1758) &gt; does not report needs-configuration (&quot;run gh auth login&quot;) for a transient probe failure
+AssertionError: expected [ …(2) ] to deeply equal []
+
+- Expected
++ Received
+
+- []
++ [
++   &quot;GitHub CLI is not authenticated. Install the GitHub CLI (https://cli.github.com) and run `gh auth login`, then `bb plugin reload github`.&quot;,
++   &quot;GitHub CLI is not authenticated. Install the GitHub CLI (https://cli.github.com) and run `gh auth login`, then `bb plugin reload github`.&quot;,
++ ]
+
+ ❯ server.auth-latch.test.ts:123:48
+    121|     // needs-configuration with the `gh auth login` remedy, although g…
+    122|     // valid credentials and only the network probe failed.
+    123|     expect(harness.needsConfigurationMessages).toEqual([]);
+       |                                                ^
+    124|   });
+    125|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  2 failed | 2 passed (4)
+   Start at  07:34:47
+   Duration  979ms (transform 115ms, setup 0ms, import 205ms, tests 671ms, environment 0ms)
+
+</pre>
+
+  <h2>Root cause</h2>
+  <p><b>1. Every <code>gh auth status</code> failure is classified as a configuration error.</b> <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/github/server.ts#L500-L508">server.ts#L500-L508</a>:</p>
+  <pre>async function checkAuth(): Promise&lt;void&gt; {
+  try {
+    await gh(["auth", "status"], 10_000);
+    ghAuthError = null;
+  } catch (error) {
+    ghAuthError = error instanceof Error ? error.message : String(error);
+    throw needsConfiguration(`GitHub CLI is not authenticated. ${GH_HINT}`);
+  }
+}</pre>
+  <p><code>gh auth status</code> hits the GitHub API, so network outage, locked keychain, dead proxy, or the 10 s <code>execFile</code> timeout on a starved host all land here. <code>resolveGh()</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/github/server.ts#L479-L492">server.ts#L479-L492</a>) has the same shape: a 5 s <code>gh --version</code> timeout is reported as "GitHub CLI not found". <code>GH_HINT</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/github/server.ts#L20-L22">server.ts#L20-L22</a>) always says <code>gh auth login</code>.</p>
+  <p><b>2. The error is thrown from the two places that latch.</b> At load, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/github/server.ts#L751-L758">server.ts#L751-L758</a> calls <code>bb.status.needsConfiguration(message)</code>. Immediately after, the <code>sync</code> service's first <code>syncAll()</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/github/server.ts#L696-L697">server.ts#L696-L697</a>, service at <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/github/server.ts#L728-L750">server.ts#L728-L750</a>) throws the same error out of <code>start()</code>. The runtime treats that as terminal: <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/plugins/plugin-runtime.ts#L589-L598">plugin-runtime.ts#L589-L598</a></p>
+  <pre>if (isNeedsConfigurationError(outcome.error)) {
+  service.state = "stopped";
+  reportNeedsConfiguration(id, outcome.error.message || `service ${name} needs configuration`);
+  logger.info(`[plugin:${id}] service ${name} needs configuration; not restarting until reload`);
+  return;
+}</pre>
+  <p>Ordinary crashes get exponential-backoff restarts (same function, a few lines down); NeedsConfigurationError deliberately does not. So the only periodic re-probe the plugin has (the 5-minute sync loop) is dead after one failure.</p>
+  <p><b>3. Nothing can clear the state except a reload.</b> The runtime keeps needs-configuration in a map that is only cleared "on the next load" (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/plugins/plugin-runtime.ts#L455-L457">plugin-runtime.ts#L455-L457</a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/plugins/plugin-runtime.ts#L1595">plugin-runtime.ts#L1595</a>); the plugin API exposes only <code>bb.status.needsConfiguration(message)</code>, no way back to running (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/plugins/plugin-api.ts#L1166-L1175">plugin-api.ts#L1166-L1175</a>). The one automatic reload is triggered by a settings save (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/plugins/plugin-service.ts#L1900-L1913">plugin-service.ts#L1900-L1913</a>), which the github plugin's message does not mention and which has nothing to do with gh.</p>
+  <p><b>4. The retained error and the manual re-probe are unreachable.</b> The plugin remembers <code>ghAuthError</code> and its <code>status</code> RPC returns it (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/github/server.ts#L909-L921">server.ts#L909-L921</a>); the panel would render it and offers a "Sync now" button whose <code>refresh</code> RPC would call <code>checkAuth()</code> again. But the app skips the frontend bundle of any plugin whose status is not <code>running</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/lib/plugin-frontend.ts#L312-L314">plugin-frontend.ts#L312-L314</a>), so the sidebar entry vanishes (screenshots above), the banner in <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/github/app.tsx#L2405-L2410">app.tsx#L2405-L2410</a> never mounts, and even that <code>refresh</code> could not have cleared the runtime status. <code>bb plugin list</code> prints only <code>statusDetail</code>, i.e. the generic hint.</p>
+  <p><b>Why the symptom follows.</b> One failed probe at startup → <code>needs-configuration</code> + sync service stopped → no further <code>gh</code> invocation from the server process, ever → <code>bb plugin list</code> keeps quoting a hint (<code>gh auth login</code>) that cannot change anything, the GitHub panel is gone, and only <code>bb plugin reload github</code> (or a settings save) re-runs the probe. Deeper issue: the plugin uses the runtime's <em>configuration</em> state for a <em>dependency availability</em> condition, and the runtime, correctly for real configuration errors, offers no self-healing for it.</p>
+
+  <h2>Proposed fix (first principles)</h2>
+  <p>Contained in the plugin; no server/daemon boundary change, no wire change, no <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump. Prototype diff: <a href="1758/repro/proposed-fix.diff">1758/repro/proposed-fix.diff</a> (applied in my worktree; makes all four tests in the repro file pass and keeps the existing <code>bb-plugin-github</code> typecheck and tests green: <a href="1758/repro/turbo-typecheck-test-with-fix.txt">turbo output</a>, <a href="1758/repro/vitest-with-fix-clean.txt">vitest output</a>).</p>
+  <ol>
+    <li><b>Classify probe failures.</b> In <code>checkAuth()</code>, throw <code>NeedsConfigurationError</code> only when gh is missing or holds no credentials at all. <code>gh auth token</code> is network-free (verified: it prints the token behind a dead proxy and fails with "no oauth token found for github.com" when there is no config, <a href="1758/repro/07-gh-token-probe.txt">07-gh-token-probe.txt</a>), so use it to tell "not logged in" from "logged in but the API probe failed". Everything else becomes a plain <code>Error</code> that carries gh's stderr.</li>
+    <li><b>Do not let the sync loop die on transient errors.</b> Catch non-configuration errors inside the <code>sync</code> service loop, log them, and retry with backoff (30 s doubling up to the 5-minute interval) instead of throwing out of <code>start()</code>. Rethrow only <code>NeedsConfigurationError</code>. Do not rely on the runtime's crash-restart for this: a throw during activation would mark the plugin <code>error</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/plugins/plugin-runtime.ts#L603-L611">plugin-runtime.ts#L603-L611</a>).</li>
+    <li><b>Re-probe on demand.</b> In the <code>status</code> RPC, if the last probe failed, run <code>checkAuth()</code> again before answering, so the panel banner (and any CLI/SDK caller) reflects the current state.</li>
+    <li><b>Load-time.</b> Only call <code>bb.status.needsConfiguration</code> for the two configuration cases; log transient failures as warnings.</li>
+  </ol>
+  <pre>diff --git a/plugins/github/server.ts b/plugins/github/server.ts
+index 2daeebe8d..bb4025007 100644
+--- a/plugins/github/server.ts
++++ b/plugins/github/server.ts
+@@ -12,6 +12,10 @@ import { defineRpcContract, type BbPluginApi } from &quot;@get-bb/plugin-sdk&quot;;
+ import { z } from &quot;zod&quot;;
+ 
+ const SYNC_INTERVAL_MS = 5 * 60_000;
++// Retry cadence while `gh auth status` fails for a reason that is not a
++// configuration problem (network blip, locked keychain, slow host): start at
++// 30 s and back off to the regular sync interval.
++const SYNC_RETRY_BASE_MS = 30_000;
+ const ISSUE_PAGE = 100;
+ const CLOSED_ISSUE_PAGE = 50;
+ const PR_PAGE = 50;
+@@ -310,6 +314,10 @@ function needsConfiguration(message: string): Error {
+   });
+ }
+ 
++function isNeedsConfigurationError(error: unknown): error is Error {
++  return error instanceof Error &amp;&amp; error.name === &quot;NeedsConfigurationError&quot;;
++}
++
+ /** owner/name from any GitHub remote URL (https, ssh, git@), else null. */
+ export function parseGithubRemote(url: string): string | null {
+   const match = url
+@@ -497,14 +505,37 @@ export default async function plugin(bb: BbPluginApi) {
+     return stdout;
+   }
+ 
++  // `gh auth status` is a network probe (it calls the GitHub API), so a
++  // failure does not by itself mean gh is unconfigured. Only two outcomes
++  // are configuration problems worth latching needs-configuration on:
++  // gh missing, and gh present but holding no credentials at all
++  // (`gh auth token` is local-only, so it answers that without the network).
++  // Anything else (network down, keychain locked, slow host, timeout) is
++  // reported as a plain error so callers retry instead of latching.
+   async function checkAuth(): Promise&lt;void&gt; {
+     try {
+       await gh([&quot;auth&quot;, &quot;status&quot;], 10_000);
+       ghAuthError = null;
++      return;
+     } catch (error) {
+       ghAuthError = error instanceof Error ? error.message : String(error);
++      if (isNeedsConfigurationError(error)) throw error; // gh not found
++    }
++    let hasToken = true;
++    try {
++      await gh([&quot;auth&quot;, &quot;token&quot;], 5_000);
++    } catch (error) {
++      // Only gh&#x27;s own &quot;no credentials&quot; answer is a configuration problem; a
++      // timeout or a crash of the local check is treated as transient too.
++      const message = error instanceof Error ? error.message : String(error);
++      hasToken = !/no oauth token|not logged in/i.test(message);
++    }
++    if (!hasToken) {
+       throw needsConfiguration(`GitHub CLI is not authenticated. ${GH_HINT}`);
+     }
++    throw new Error(
++      `gh auth status failed; gh has credentials, so this is probably transient and will be retried: ${ghAuthError}`,
++    );
+   }
+ 
+   // ------------------------------------------------------------------
+@@ -730,10 +761,27 @@ export default async function plugin(bb: BbPluginApi) {
+   // instead of crash-looping.
+   bb.background.service(&quot;sync&quot;, {
+     async start(signal) {
++      let failures = 0;
+       while (!signal.aborted) {
+-        await syncAll();
++        let delayMs = SYNC_INTERVAL_MS;
++        try {
++          await syncAll();
++          failures = 0;
++        } catch (error) {
++          if (isNeedsConfigurationError(error)) throw error;
++          failures += 1;
++          delayMs = Math.min(
++            SYNC_RETRY_BASE_MS * 2 ** (failures - 1),
++            SYNC_INTERVAL_MS,
++          );
++          bb.log.warn(
++            `sync failed (retry in ${Math.round(delayMs / 1000)}s): ${
++              error instanceof Error ? error.message : String(error)
++            }`,
++          );
++        }
+         await new Promise&lt;void&gt;((resolve) =&gt; {
+-          const timer = setTimeout(resolve, SYNC_INTERVAL_MS);
++          const timer = setTimeout(resolve, delayMs);
+           signal.addEventListener(
+             &quot;abort&quot;,
+             () =&gt; {
+@@ -752,9 +800,11 @@ export default async function plugin(bb: BbPluginApi) {
+   try {
+     await checkAuth();
+   } catch (error) {
+-    bb.status.needsConfiguration(
+-      error instanceof Error ? error.message : String(error),
+-    );
++    if (isNeedsConfigurationError(error)) {
++      bb.status.needsConfiguration(error.message);
++    } else {
++      bb.log.warn(error instanceof Error ? error.message : String(error));
++    }
+   }
+ 
+   // ------------------------------------------------------------------
+@@ -907,6 +957,15 @@ export default async function plugin(bb: BbPluginApi) {
+   bb.rpc.register(githubRpcContract, {
+     /** () → auth/sync status for the panel banner. */
+     async status() {
++      // Re-probe on demand after a failed probe so a recovered gh is noticed
++      // the next time the panel asks, not only on the next sync tick.
++      if (ghAuthError !== null) {
++        try {
++          await checkAuth();
++        } catch {
++          // ghAuthError already carries the failure
++        }
++      }
+       const cursor = await bb.storage.kv.get&lt;{
+         lastSyncedAt: string;
+         repos: number;
+</pre>
+  <p><b>What could go wrong / follow-ups.</b> (a) While gh is unreachable the plugin now shows <code>running</code>; the retained error is visible in the panel banner and dev log, but <code>bb plugin list</code> has no "degraded" detail. If a visible status is wanted the runtime would need a plugin-facing degraded/clear API (new public API ⇒ <code>experimental_</code> prefix and <code>docs/api_to_audit.md</code> per AGENTS.md); I would not block the fix on that. (b) The panel banner text in <code>app.tsx</code> still says "run gh auth login, then reload the plugin"; it should be reworded to show the actual error and offer "Sync now". (c) <code>resolveGh()</code> should distinguish ENOENT from a timeout so a slow host is not reported as "GitHub CLI not found" (in the prototype a timeout there is treated as transient only because it happens on the <code>auth status</code> path; a first-call timeout at <code>--version</code> still surfaces as NeedsConfiguration — worth tightening). (d) The genuinely-unauthenticated case still requires <code>bb plugin reload github</code> after <code>gh auth login</code>; that matches the runtime contract and the message is now correct for it. (e) <code>GH_TOKEN</code>-only setups: <code>gh auth token</code> returns the env token, so they are treated as configured; fine.</p>
+
+  <h2>PR review</h2>
+  <p>No open PRs are linked to this issue.</p>
+
+  <h2>Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/1267">#1267</a> (closed): GitHub plugin fails to load PRs when Issues are disabled — the other place where one gh failure took the whole sync down; fixed by per-repo tolerance in <code>fetchRepoItems</code>.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1543">#1543</a> (open): wake threads from native GitHub PR state changes — will lean on the same gh plumbing and sync loop.</li>
+    <li>No prior issue about needs-configuration latching or the plugin runtime's "not restarting until reload" policy was found (searched "needs-configuration", "gh auth", "github plugin").</li>
+  </ul>
+
+  <h2>Appendix</h2>
+  <h3>Commands run</h3>
+  <pre>git checkout 16ceb3a54 ; pnpm install --frozen-lockfile --prefer-offline ; pnpm exec turbo run build
+# shim self-test (real gh through a dead proxy fails; normal gh works)
+bash 1758/repro/shim-selftest.sh
+# first attempt (superseded, see 02-plugin-list-after-gh-online.txt): scripts/bb-dev-app current with the shim on PATH,
+#   bb plugin install builtin:github --yes  → the launcher puts ~/.local/bin (real gh) ahead of PATH; fixed by BB_DEV_NODE_BIN_DIR
+# clean run
+bash 1758/repro/start-dev-offline.sh                     # server starts 07:23:53 with gh offline
+bash 1758/repro/bb.sh plugin list | grep -A3 ^github     # 01-plugin-list-while-offline.txt
+rm 1758/repro/gh-offline                                 # 07:24:07 gh healthy again
+curl -s -X POST http://localhost:23580/api/v1/plugins/github/rpc/status -H 'content-type: application/json' -H 'origin: http://localhost:15580' -d null   # 03-rpc-status-after-gh-online.json
+bash 1758/repro/wait-and-check.sh 07:30:40 | tee 1758/repro/04-after-6min.txt
+bash 1758/repro/bb.sh plugin reload github               # 05-reload.txt
+touch 1758/repro/gh-slow; bash 1758/repro/bb.sh plugin reload github; rm 1758/repro/gh-slow   # 06-slow-gh-reload.txt
+dev-browser --browser bb1758 --headless run 1758/repro/shot-home.js ; … shot-extensions.js       # screenshots
+pnpm dev:stop
+bash 1758/repro/gh-token-probe.sh                        # 07-gh-token-probe.txt
+cp 1758/repro/server.auth-latch.test.ts plugins/github/ &amp;&amp; cd plugins/github &amp;&amp; pnpm exec vitest run server.auth-latch.test.ts   # fails on main
+git apply 1758/repro/proposed-fix.diff ; pnpm exec turbo run typecheck test --filter=bb-plugin-github --force        # all green</pre>
+  <h3>gh behaviour behind a dead proxy vs. normally</h3>
+  <pre>$ time gh auth status
+github.com
+  ✓ Logged in to github.com account SawyerHood (/home/sawyer/.config/gh/hosts.yml)
+real 0m0.708s
+$ time HTTPS_PROXY=http://127.0.0.1:9 gh auth status
+github.com
+  X Failed to log in to github.com account SawyerHood (/home/sawyer/.config/gh/hosts.yml)
+  - Active account: true
+  - The token in /home/sawyer/.config/gh/hosts.yml is invalid.
+  - To re-authenticate, run: gh auth refresh -h github.com
+real 0m0.174s   exit=1</pre>
+  <h3><code>gh auth token</code> as a network-free discriminator</h3>
+  <pre>== gh auth token, offline (dead proxy) ==
+gho_&lt;redacted&gt;
+exit=0
+== gh auth token, no config at all (empty GH_CONFIG_DIR) ==
+no oauth token found for github.com
+exit=1
+== gh auth status, no config at all ==
+You are not logged into any GitHub hosts. To log in, run: gh auth login
+exit=1
+</pre>
+  <h3>vitest with the prototype fix applied</h3>
+  <pre>
+ RUN  v4.1.1 /home/sawyer/projects/bb/.claude/worktrees/wf_242c3e11-a10-3/plugins/github
+
+
+ Test Files  1 passed (1)
+      Tests  4 passed (4)
+   Start at  07:35:57
+   Duration  998ms (transform 115ms, setup 0ms, import 200ms, tests 691ms, environment 0ms)
+
+</pre>
+  <h3>Files</h3>
+  <ul>
+    <li><a href="1758/repro/gh-calls.log">gh-calls.log</a> — every gh invocation the server made (clean run + reload + slow variant).</li>
+    <li><a href="1758/repro/dev.log">dev.log</a> — full dev-server log of the clean run.</li>
+    <li><a href="1758/repro/start-dev.log">start-dev.log</a>, <a href="1758/repro/dev-stop.log">dev-stop.log</a>.</li>
+  </ul>
+</main></body></html>

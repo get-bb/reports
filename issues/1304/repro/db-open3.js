@@ -1,0 +1,11 @@
+const page = await browser.getPage("bb1304b");
+const logs = [];
+page.on("console", (m) => logs.push(m.type() + ": " + m.text().slice(0, 300)));
+page.on("pageerror", (e) => logs.push("pageerror: " + e.message));
+await page.setViewportSize({ width: 1280, height: 900 });
+await page.goto("http://localhost:16550/projects/proj_rgsz9s6cf9/threads/thr_7pjwqvvat2", { waitUntil: "load" });
+await page.waitForTimeout(12000);
+console.log(JSON.stringify(await page.evaluate(() => ({ counts: window.__bbRenderCounts, rows: document.querySelectorAll("[data-timeline-row-id]").length, bodyLen: document.body.innerHTML.length }))));
+console.log(logs.slice(-40).join("\n"));
+const shot = await page.screenshot();
+console.log(await saveScreenshot(shot, "1304-third.png"));

@@ -1,0 +1,725 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1131 synchronous SQLite on the event loop</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.medium { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1131 · Synchronous SQLite on the event loop: one cold query froze all clients for 11s on a 1.7GB bb.db</h1>
+  <p class="meta">
+    <span class="pill">Bug / perf</span> <span class="pill medium">Medium</span>
+    <span class="pill">perf</span> <span class="pill">host</span>
+    <a href="https://github.com/get-bb/bb/issues/1131">open on GitHub</a>
+    <span>2026-08-18</span>
+    <span>base <code>16ceb3a540f81c1189efaffb27a39b1d9443abf5</code> (main)</span>
+  </p>
+  <p class="meta">
+    <span class="verdict v-partial">Verdict: PARTIALLY REPRODUCED</span>
+    <span>· root-cause confidence: <b>high</b> (mechanism) / <b>medium</b> (that the two scans named below are what dominated the reporter's 3.4 s)</span>
+    <span>· linked open PRs: none</span>
+  </p>
+
+  <h2>TL;DR</h2>
+  <p><b>Plain-language framing.</b> bb's server keeps everything in one SQLite file (<code>bb.db</code>) and reads it with <code>better-sqlite3</code>, which is <em>synchronous</em>: while a query runs, the single Node event loop that serves every HTTP request, every WebSocket and every host-daemon message does nothing else. So a slow read for one client is a freeze for all clients. The issue has two halves: (1) an 11.2 s freeze on a cold <code>bb thread list</code>, and (2) a later comment (0.37.0) reporting a 3.4 s freeze when opening the <em>latest page</em> of a 44k-event thread. Both are the same structural fact (sync reads on the loop) plus a specific query that reads far more of the file than the response needs.</p>
+  <p><b>Half 1 is already fixed.</b> The 11.2 s thread-list stall was traced in <a href="https://github.com/get-bb/bb/pull/1204">#1204</a> (merged 2026-08-08, shipped in 0.36) to <code>listLatestGoalEventRowsByThreadIds</code> walking every event row of every listed thread; a partial index and an <code>INDEXED BY</code> pin cut cold reads from 444,010 to 357. On the base commit, a cold <code>GET /api/v1/threads</code> over 3,287 visible threads in a 1.57 GB seeded database takes 52 ms. The reporter confirmed this on 0.36.1-nightly.</p>
+  <p><b>Half 2 is real on the base commit and I reproduced its mechanism.</b> I built a 1.57 GB <code>bb.db</code> (704k events, 1.03 GiB event JSON, one 44k-event / 70 MB thread) with the repo's own perf-fixture seeder, restarted the server, evicted the OS page cache and requested the thread's latest timeline page. The build ran <b>320–460 ms</b> on the loop (event-query stage 260–384 ms) and a concurrent <code>GET /health</code> probe stalled for <b>293 ms</b>, i.e. the whole build. The server read <b>99.7 MB</b> from disk (918 major page faults) to return a <b>1.7 MiB</b> page of 1,599 rows. Per-statement attribution shows the bytes come from two helpers the latest page always runs and that are <em>not bounded by the page window</em>: <code>listTodoSnapshotEventRowsForThread</code> (fetches the payload of every tool-call event in the thread to evaluate <code>json_extract($.item.tool)</code>; 73 MB) and <code>listStoredEventRowsByParentToolCallIds</code> called with <code>sequenceBounds: null</code> (walks every event of the thread through <code>events_thread_sequence_idx</code> evaluating <code>json_extract($.parentToolCallId)</code>; 20 MB cold, and 64 ms of pure CPU even warm). Their cost scales with the size of the whole thread, not the page — exactly the shape the reporter measured (1,212 rows / 1.74 MiB returned, 3.4 s in the event query). On my local NVMe with 16 cores the absolute time is ~10x smaller than the reporter's Hetzner VM; the read volume and fault count are the transferable numbers.</p>
+  <p><b>Retention claims.</b> The 32 KB truncation threshold is verified (<code>COMPLETED_EVENT_OUTPUT_TRUNCATION_THRESHOLD_CHARS = 32 * 1024</code>) and on my production-shaped seed 0 of 56,166 command outputs exceed it while 91% exceed 4 KB, so "the sweep reclaims ~0" is credible. The "250/hour" batch claim is <b>refuted</b>: the sweep runs every 10 s (job <code>cadenceMs: 0</code>, <code>setInterval(…, 10_000)</code>) and scans 250 candidate rows per output path per tick (up to ~90k rows/hour/path); it advanced through 6 weeks of my fixture in 15 minutes. It is a scan batch, not a truncation quota, so batch size is not what limits reclamation — the threshold is.</p>
+
+  <h2>Claims vs findings</h2>
+  <table>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Cold <code>bb thread list --json</code> stalled the loop 11.2 s (0.35.1, 1.7 GB db)</td><td class="ok">Verified historically, fixed</td><td>#1204 rebuilt a 1.45 GB db and measured 10.5 s cold in <code>listLatestGoalEventRowsByThreadIds</code>; fixed by <code>events_goal_thread_sequence_idx</code> + <code>INDEXED BY</code> (migration 0088). Base commit: cold <code>GET /api/v1/threads</code>, 3,287 threads → 52 ms (<a href="1131/repro/1131-cold-thread-list.out">out</a>). Reporter confirmed on 0.36.1-nightly.</td></tr>
+    <tr><td>While stalled, static <code>/</code> TTFB went 2 ms → 7.3 s: one sync query freezes every route</td><td class="ok">Verified (mechanism)</td><td><code>buildThreadTimeline</code> runs inside <code>runEventLoopWorkSync</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/timeline.ts#L1809-L1821">timeline.ts#L1809-L1821</a>); during a 320 ms cold build my <code>/health</code> probe (100 ms cadence) measured 293 ms TTFB. In the packaged app the same server serves <code>index.html</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/server.ts#L623-L623">server.ts#L623-L623</a>).</td></tr>
+    <tr><td>better-sqlite3 is synchronous on the serving loop; stall scales with cache misses</td><td class="ok">Verified</td><td>All reads use <code>better-sqlite3</code> via Drizzle on the main thread; no worker (#1198 was closed). Cold vs warm for the same page: 354 ms / 99.9 MB read vs 171 ms / 0 bytes (<a href="1131/repro/1131-profile-base-cold.out">cold</a>, <a href="1131/repro/1131-profile-base-warm.out">warm</a>). Connection uses <code>mmap_size = 1 GiB</code>, so cold pages are major faults with kernel readahead (~108 KB per fault observed).</td></tr>
+    <tr><td>Stalls up to 22 s under memory pressure / leak to 4.2 G</td><td class="unv">Unverifiable</td><td>No data; not investigated.</td></tr>
+    <tr><td><code>events</code> = 1,447 MB of 1.7 GB; item/completed = 913 MB, 815 MB of it <code>commandExecution.aggregatedOutput</code></td><td class="unv">Their data; plausible</td><td>My seed at the same scale: 1.57 GB file, 1.03 GiB event JSON, 831 MB in commandExecution item/completed rows.</td></tr>
+    <tr><td>Truncation threshold 32 KB; real payload median 5–10 KB, so the sweep reclaims ~0</td><td class="ok">Threshold verified; effect plausible</td><td><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/db/src/data/sweeps.ts#L22-L27">sweeps.ts#L22-L27</a>. Seed: 0 of 56,166 outputs &gt; 32 KB, 51,453 (91%) &gt; 4 KB, 0 rows truncated after 15 min of sweeps although the cursor advanced through ~6 weeks of rows.</td></tr>
+    <tr><td>Batch 250/hour is below the generation rate; a threshold fix could never work down a backlog</td><td class="no">Refuted</td><td>Job <code>completed-event-output-truncation</code> has <code>cadenceMs: 0</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/system/periodic-sweeps.ts#L528-L533">periodic-sweeps.ts#L528-L533</a>) and the sweep interval is 10 s (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/start-server.ts#L254-L257">start-server.ts#L254-L257</a>); 250 is a per-tick, per-output-path <em>scan</em> limit (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/db/src/data/sweeps.ts#L160-L180">sweeps.ts#L160-L180</a>) → up to 90k rows/hour/path. Same at 0.35.1 (checked <code>desktop-v0.35.1</code>).</td></tr>
+    <tr><td><code>automation_runs</code> retention is unbounded</td><td class="ok">Verified</td><td>Only <code>DELETE FROM automation_runs WHERE automation_id = ?</code> on automation delete (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/automations/src/data.ts#L495-L498">data.ts#L495-L498</a>); no age/size prune.</td></tr>
+    <tr><td>0.37.0: latest timeline page, 44,246 events / 131.7 MiB thread: total 3,578 ms, event-query 3,462 ms for 1,212 rows / 1.74 MiB</td><td class="ok">Verified (mechanism, smaller magnitude)</td><td>Base commit, 44k-event / 70 MB thread, cold: build 313–459 ms, event-query 260–384 ms, 1,599 rows / 1.69 MiB, 99.7 MB disk reads, 918 major faults; two whole-thread scans account for the bytes (below). #1716 (merged Aug 17, in base, <em>not</em> in 0.37.0/0.38.0) fixed two other timeline queries but not these.</td></tr>
+    <tr><td>Suggestion: worker thread / async driver for heavy reads</td><td class="unv">Design opinion</td><td>Would bound blast radius but not cost; the two scans below are fixable at the query level first (see Proposed fix). #1207 tracks the worker option.</td></tr>
+  </table>
+
+  <h2>Environment</h2>
+  <ul>
+    <li>bb <code>16ceb3a54</code> (main, 2026-08-18) in worktree <code>/home/sawyer/projects/bb/.claude/worktrees/wf_242c3e11-a10-26</code>; dev instance app <code>:13609</code>, server <code>:21609</code>, host daemon <code>:29609</code>, data dir <code>/home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_242c3e11-a10-26-5256c67149d9</code>.</li>
+    <li>Linux 7.0.0-29-generic, 16 cores, 57 GB RAM, local NVMe (CT1000E100SSD8); node v24.18.0; better-sqlite3 12.10.0 (SQLite 3.53.1); sqlite3 CLI 3.46.1. The reporter runs a Hetzner 4 vCPU / 8 GB VM — cold I/O there is much slower than here, so compare read bytes / fault counts, not milliseconds.</li>
+    <li>Database: seeded with the repo's <code>pnpm seed:perf</code> plus two env knobs I added to the fixture (<a href="1131/repro/1131-seed-fixture.diff">diff</a>): 4,000 threads, 704,206 events, 1.57 GB file after <code>wal_checkpoint(TRUNCATE)</code>; giant thread <code>thr_v67duphyr7</code> = 44,004 events / 70.7 MB (3,673 commandExecution completions = 54.7 MB, 2,524 toolCall rows = 1.5 MB, 520 of them TodoWrite/Task*). No providers were run; nothing about this repro needs a real agent.</li>
+  </ul>
+
+  <h2>Minimal reproduction</h2>
+  <p>All scripts live in <a href="1131/repro/">1131/repro/</a> and take <code>BB_REPO=&lt;abs path to your bb worktree&gt;</code>; they derive the server URL and data dir from <code>scripts/bb-dev-app env|status</code>. <code>python3</code>, <code>curl</code>, <code>sqlite3</code> on PATH.</p>
+  <ol>
+    <li>Build and start once, then stop: <code>pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build &amp;&amp; scripts/bb-dev-app current &amp;&amp; pnpm dev:stop</code>.</li>
+    <li>Seed the database at scale (≈30 s): <code>BB_REPO=$PWD 1131/repro/1131-seed.sh</code> (<a href="1131/repro/1131-seed.sh">script</a>). It prints the giant thread id.</li>
+    <li>Start the dev instance again: <code>scripts/bb-dev-app current</code>.</li>
+    <li>Run the cold-timeline experiment: <code>BB_REPO=$PWD 1131/repro/1131-cold-timeline.sh &lt;giant thread id&gt;</code> (<a href="1131/repro/1131-cold-timeline.sh">script</a>). It <code>kill -9</code>s the server (the dev supervisor restarts it, so its in-memory timeline cache and SQLite page cache are empty), evicts the OS page cache for <code>bb.db*</code> with <code>posix_fadvise(DONTNEED)</code>, starts a <code>GET /health</code> probe every 100 ms, then requests the latest timeline page while counting the server's <code>/proc/&lt;pid&gt;/io read_bytes</code>.</li>
+  </ol>
+  <p><b>Expected:</b> a page of ~1.7 MiB costs on the order of its own size in I/O and does not delay unrelated requests noticeably. <b>Actual</b> (<a href="1131/repro/1131-cold-timeline-run1.out">1131-cold-timeline-run1.out</a>):</p>
+  <pre>--- server=http://localhost:21609 db=/home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_242c3e11-a10-26-5256c67149d9/bb.db thread=thr_v67duphyr7
+--- kill -9 server pid 2571342
+--- server back
+evicted /home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_242c3e11-a10-26-5256c67149d9/bb.db 1565413376
+evicted /home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_242c3e11-a10-26-5256c67149d9/bb.db-wal 210152
+evicted /home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_242c3e11-a10-26-5256c67149d9/bb.db-shm 32768
+--- 07:50:57.241 GET /api/v1/threads/thr_v67duphyr7/timeline (cold)
+timeline: http=200 ttfb=0.319727s size=329482
+--- server /proc/2581879/io before: rchar: 44876202 syscr: 12671 read_bytes: 0 
+--- server /proc/2581879/io after:  rchar: 44922097 syscr: 12764 read_bytes: 99708928 
+--- 07:50:57.573 second request (warm, cached)
+timeline: http=200 ttfb=0.002934s size=329482
+--- /health probe, slowest 5:
+07:50:57.269 health ttfb=0.292943s
+07:51:03.143 health ttfb=0.123661s
+07:50:56.924 health ttfb=0.001531s
+07:50:57.042 health ttfb=0.001301s
+07:50:57.676 health ttfb=0.001227s
+--- /health probe, all samples &gt; 0.05s:
+07:50:57.269 health ttfb=0.292943s
+07:51:03.143 health ttfb=0.123661s
+--- server log lines:
+@bb/server:dev: [07:48:06] INFO: [server] Thread timeline build blocked the event loop {"threadId":"thr_v67duphyr7","totalDurationMs":165.8,"thresholdMs":150,"suppressedSinceLastLog":0,"selectionStrategy":"standard-window","pageKind":"latest","segmentLimit":20,"eventRowCount":1599,"eventDataBytes":1693701,"decodedEventCount":159 …
+@bb/server:dev: [07:49:49] INFO: [server] Thread timeline build blocked the event loop {"threadId":"thr_v67duphyr7","totalDurationMs":459.3,"thresholdMs":150,"suppressedSinceLastLog":0,"selectionStrategy":"standard-window","pageKind":"latest","segmentLimit":20,"eventRowCount":1599,"eventDataBytes":1693701,"decodedEventCount":159 …
+@bb/server:dev: [07:50:57] INFO: [server] Thread timeline build blocked the event loop {"threadId":"thr_v67duphyr7","totalDurationMs":313.2,"thresholdMs":150,"suppressedSinceLastLog":0,"selectionStrategy":"standard-window","pageKind":"latest","segmentLimit":20,"eventRowCount":1599,"eventDataBytes":1693701,"decodedEventCount":159 …</pre>
+  <p>Read it as: the cold build took 313 ms of loop time (server log line, <code>event-query</code> 260 ms of it), the server read 99,708,928 bytes from disk for a 329 KB response (1.69 MiB of event rows before projection), and the <code>/health</code> request issued 28 ms after the timeline request waited 293 ms — it was queued behind the synchronous build. The second, cached request answered in 3 ms. The earlier line at 07:49:49 is the first run of the same script (459 ms build, 384 ms event-query) before I checkpointed the 563 MB WAL the seeder had left behind.</p>
+
+  <h3>Where the bytes go: per-statement attribution</h3>
+  <p><a href="1131/repro/1131-profile.sh">1131-profile.sh</a> copies <a href="1131/repro/issue-1131-profile.ts">issue-1131-profile.ts</a> into <code>apps/server/</code> and runs the real <code>buildThreadTimelineWithProfile</code> against the same file with every prepared statement wrapped to record time and <code>read_bytes</code>/major-fault deltas. Run with the dev server stopped (<code>pnpm dev:stop</code>; a running server keeps the file mmapped, which defeats page-cache eviction): <code>BB_REPO=$PWD 1131/repro/1131-profile.sh &lt;data dir&gt;/bb.db &lt;thread id&gt; /tmp/out</code>. Cold (<a href="1131/repro/1131-profile-base-cold.out">full</a>):</p>
+  <pre>{
+  "threadId": "thr_v67duphyr7",
+  "maxSeq": 44004,
+  "totalMs": 354,
+  "diskReadBytes": 99966976,
+  "majorPageFaults": 918,
+…
+
+10 statement executions, 10 distinct statements. Top by disk bytes:
+    73004 KiB    135 ms  x  1  select "created_at", "data", "id", "item_id", "item_kind", "provider_thread_id", "scope_kind", "sequence", "thread_id", "turn_id", "type" from "events" where ("events"." …
+    20256 KiB    110 ms  x  1  select "created_at", CASE WHEN length("data") &lt;= ? THEN "data" ELSE json_replace("data", CASE WHEN json_type("events"."data", ?) = 'text' AND length(json_extract("events …
+     2268 KiB      4 ms  x  1  select "thread_id" || ':user-seed:' || "sequence", "sequence" from "events" where ("events"."thread_id" = ? and "events"."type" = ? and ( COALESCE(json_extract("events". …</pre>
+  <p>Warm, same page (<a href="1131/repro/1131-profile-base-warm.out">full</a>) — the second statement is CPU-bound and stays at ~64 ms with everything in RAM, because it still visits all 44k rows:</p>
+  <pre>Top by time:
+     64 ms        0 KiB  x  1  select "created_at", CASE WHEN length("data") &lt;= ? THEN "data" ELSE json_replace("data", CASE WHEN json_type("events"."data", ?) = 'text' AND length(json_extract("events …
+     10 ms        0 KiB  x  1  select "created_at", CASE WHEN length("data") &lt;= ? THEN "data" ELSE json_replace("data", CASE WHEN json_type("events"."data", ?) = 'text' AND length(json_extract("events …
+      7 ms        0 KiB  x  1  select "created_at", "data", "id", "item_id", "item_kind", "provider_thread_id", "scope_kind", "sequence", "thread_id", "turn_id", "type" from "events" where ("events"." …</pre>
+  <p>Statement 1 is <code>listTodoSnapshotEventRowsForThread</code>; statement 2 is <code>listStoredEventRowsByParentToolCallIds</code> (unbounded). Their identity is confirmed by the SQL text and by the unit test below.</p>
+
+  <h3>Control: the original thread-list path is fast on base</h3>
+  <pre>--- kill -9 server pid 2665941, wait for supervisor restart
+evicted /home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_242c3e11-a10-26-5256c67149d9/bb.db 1565413376
+evicted /home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_242c3e11-a10-26-5256c67149d9/bb.db-wal 844632
+evicted /home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_242c3e11-a10-26-5256c67149d9/bb.db-shm 32768
+--- 07:58:49.150 GET /api/v1/threads (cold, first after restart)
+threads: http=200 ttfb=0.051862s size=3170093
+--- server io before: read_bytes: 0 / after: read_bytes: 8192
+thread rows returned: 3287
+--- 07:58:49.259 second GET /api/v1/threads (warm)
+threads: http=200 ttfb=0.045422s
+--- bb thread list --json (warm) via CLI
+• turbo 2.8.3
+• Packages in scope: @bb/cli, @bb/scripts
+• Running build in 2 packages
+• Remote caching disabled, using shared worktree cache
+
+ Tasks:    2 successful, 2 total
+Cached:    2 cached, 2 total
+  Time:    188ms &gt;&gt;&gt; FULL TURBO
+
+
+real	0m1.846s
+user	0m1.886s
+sys	0m0.871s
+</pre>
+
+  <h3>Unit-level repro (query plans and scaling)</h3>
+  <p>File: <a href="1131/repro/issue-1131-timeline-full-thread-scans.test.ts">issue-1131-timeline-full-thread-scans.test.ts</a> (copy to <code>packages/db/test/</code>; run <code>cd packages/db &amp;&amp; pnpm exec vitest run test/issue-1131-timeline-full-thread-scans.test.ts --disableConsoleIntercept</code>). It <b>passes on main</b>: it pins the current plans (thread-wide index walks with <code>json_extract</code> per row) and shows the parent-tool-call scan taking ~28x longer on a 10k-event thread than on a 200-event thread for the same empty result. Output (<a href="1131/repro/1131-vitest.out">1131-vitest.out</a>):</p>
+  <pre>
+ RUN  v4.1.1 /home/sawyer/projects/bb/.claude/worktrees/wf_242c3e11-a10-26/packages/db
+
+ ✓  @bb/db  test/issue-1131-timeline-full-thread-scans.test.ts &gt; issue #1131: latest-page timeline helpers scan the whole thread &gt; listTodoSnapshotEventRowsForThread visits every tool-call row (and its payload) of the thread 87ms
+ ✓  @bb/db  test/issue-1131-timeline-full-thread-scans.test.ts &gt; issue #1131: latest-page timeline helpers scan the whole thread &gt; listStoredEventRowsByParentToolCallIds without sequence bounds is a full-thread scan with json_extract per row 74ms
+issue-1131 parent-tool-call scan: 0.49 ms (200 events) vs 13.91 ms (10k events), ratio 28.4x
+ ✓  @bb/db  test/issue-1131-timeline-full-thread-scans.test.ts &gt; issue #1131: latest-page timeline helpers scan the whole thread &gt; the unbounded parent-tool-call scan cost grows with thread size, not page size 431ms
+
+ Test Files  1 passed (1)
+      Tests  3 passed (3)
+   Start at  08:01:00
+   Duration  1.28s (transform 257ms, setup 0ms, import 610ms, tests 593ms, environment 0ms)
+
+</pre>
+  <pre>import { describe, expect, it } from "vitest";
+import { turnScope } from "@bb/domain";
+import { createConnection, type DbConnection } from "../src/connection.js";
+import { migrate } from "../src/migrate.js";
+import { noopNotifier } from "../src/notifier.js";
+import {
+  insertEvents,
+  listStoredEventRowsByParentToolCallIds,
+  listTodoSnapshotEventRowsForThread,
+} from "../src/data/events.js";
+import { upsertHost } from "../src/data/hosts.js";
+import { createProject } from "../src/data/projects.js";
+import { createThread } from "../src/data/threads.js";
+
+// Issue #1131 (timeline follow-up, 0.37.0 comment): the *latest page* of a
+// large thread blocks the event loop for seconds on a cold cache. Two of the
+// helpers the latest-page build always runs are not bounded by the page
+// window at all: they walk every event (or every tool-call event) of the
+// thread and evaluate json_extract() on the payload of each visited row, so
+// their cost is proportional to the whole thread's stored bytes rather than to
+// the page that is returned. This test pins the shape of the SQL plans and
+// shows the row-visit scaling with an in-memory database.
+//
+// It PASSES on main: it documents the current plans. Once either helper is
+// bounded (partial/expression index, or persisted state), the plan assertions
+// here must be updated deliberately.
+
+type SqliteParameter = string | number | bigint | Buffer | null;
+
+interface QueryPlanRow {
+  detail: string;
+}
+
+interface CapturedStatement {
+  params: SqliteParameter[];
+  sql: string;
+}
+
+function captureStatements(
+  db: DbConnection,
+  run: () =&gt; void,
+): CapturedStatement[] {
+  const captured: CapturedStatement[] = [];
+  const raw = db.$client;
+  const originalPrepare = raw.prepare.bind(raw);
+  Object.defineProperty(raw, "prepare", {
+    configurable: true,
+    writable: true,
+    value: (source: string) =&gt; {
+      const statement = originalPrepare(source);
+      const originalAll = statement.all.bind(statement);
+      statement.all = (...params: unknown[]) =&gt; {
+        captured.push({ params: params as SqliteParameter[], sql: source });
+        return originalAll(...params);
+      };
+      return statement;
+    },
+  });
+  try {
+    run();
+  } finally {
+    Object.defineProperty(raw, "prepare", {
+      configurable: true,
+      writable: true,
+      value: originalPrepare,
+    });
+  }
+  return captured;
+}
+
+function queryPlan(db: DbConnection, statement: CapturedStatement): string {
+  return db.$client
+    .prepare&lt;SqliteParameter[], QueryPlanRow&gt;(
+      `EXPLAIN QUERY PLAN ${statement.sql}`,
+    )
+    .all(...statement.params)
+    .map((row) =&gt; row.detail)
+    .join("\n");
+}
+
+function setup() {
+  const db = createConnection(":memory:");
+  migrate(db);
+  const host = upsertHost(db, noopNotifier, {
+    name: "issue-1131-host",
+    type: "persistent",
+  });
+  const { project } = createProject(db, noopNotifier, {
+    name: "issue-1131",
+    source: { type: "local_path", hostId: host.id, path: "/tmp/issue-1131" },
+  });
+  const thread = createThread(db, noopNotifier, {
+    projectId: project.id,
+    providerId: "claude-code",
+  });
+  return { db, thread };
+}
+
+/**
+ * A thread made of `toolCallPairs` Read tool calls (item/started +
+ * item/completed with a `resultText` of `payloadChars`) followed by one
+ * TodoWrite. This is the shape of a long claude-code session: thousands of
+ * tool calls, each carrying a multi-KB result, and a handful of todo writes.
+ */
+function seedToolCallThread(
+  db: DbConnection,
+  threadId: string,
+  toolCallPairs: number,
+  payloadChars: number,
+): number {
+  const payload = "x".repeat(payloadChars);
+  let sequence = 0;
+  const batch: Parameters&lt;typeof insertEvents&gt;[2] = [];
+  for (let index = 0; index &lt; toolCallPairs; index += 1) {
+    const itemId = `call_${index}`;
+    batch.push({
+      data: JSON.stringify({
+        item: { id: itemId, type: "toolCall", tool: "Read", status: "inProgress" },
+      }),
+      itemId,
+      itemKind: "toolCall",
+      scope: turnScope("turn_1131"),
+      sequence: ++sequence,
+      threadId,
+      type: "item/started",
+    });
+    batch.push({
+      data: JSON.stringify({
+        item: {
+          id: itemId,
+          type: "toolCall",
+          tool: "Read",
+          status: "completed",
+          resultText: payload,
+        },
+      }),
+      itemId,
+      itemKind: "toolCall",
+      scope: turnScope("turn_1131"),
+      sequence: ++sequence,
+      threadId,
+      type: "item/completed",
+    });
+  }
+  batch.push({
+    data: JSON.stringify({
+      item: {
+        id: "call_todo",
+        type: "toolCall",
+        tool: "TodoWrite",
+        status: "completed",
+        args: { todos: [{ content: "ship", status: "pending" }] },
+      },
+    }),
+    itemId: "call_todo",
+    itemKind: "toolCall",
+    scope: turnScope("turn_1131"),
+    sequence: ++sequence,
+    threadId,
+    type: "item/completed",
+  });
+  db.transaction((tx) =&gt; {
+    insertEvents(tx, noopNotifier, batch);
+  });
+  return sequence;
+}
+
+describe("issue #1131: latest-page timeline helpers scan the whole thread", () =&gt; {
+  it("listTodoSnapshotEventRowsForThread visits every tool-call row (and its payload) of the thread", () =&gt; {
+    const { db, thread } = setup();
+    seedToolCallThread(db, thread.id, 200, 2_000);
+
+    const captured = captureStatements(db, () =&gt; {
+      const rows = listTodoSnapshotEventRowsForThread(db, {
+        threadId: thread.id,
+      });
+      // Only the single TodoWrite row is wanted ...
+      expect(rows).toHaveLength(1);
+    });
+    const statement = captured.find((entry) =&gt;
+      entry.sql.includes("'TodoWrite'"),
+    );
+    if (!statement) {
+      throw new Error("expected the todo snapshot SQL");
+    }
+    // ... but the plan can only narrow to (thread_id, type, item_kind): the
+    // json_extract($.item.tool) filter is applied per row after fetching the
+    // event payload, so every tool-call row of the thread is read from disk.
+    // On the reporter's 44k-event thread that is thousands of multi-KB rows
+    // scattered across a 1.6 GiB file (73 MiB of reads on the seeded copy).
+    const plan = queryPlan(db, statement);
+    expect(plan).toMatch(
+      /SEARCH events USING INDEX events_thread_type_item_kind_sequence_idx \(thread_id=\? AND type=\? AND item_kind=\?\)/u,
+    );
+    expect(plan).not.toContain("COVERING INDEX");
+    db.$client.close();
+  });
+
+  it("listStoredEventRowsByParentToolCallIds without sequence bounds is a full-thread scan with json_extract per row", () =&gt; {
+    const { db, thread } = setup();
+    seedToolCallThread(db, thread.id, 200, 2_000);
+
+    const captured = captureStatements(db, () =&gt; {
+      // This is how ensureTimelineWindowParentedRows calls it for the latest
+      // page (sequenceBounds === null): no sequenceStart / beforeSequence.
+      const rows = listStoredEventRowsByParentToolCallIds(db, {
+        excludedTypes: ["item/agentMessage/delta"],
+        maxInlineOutputChars: 4_000,
+        parentToolCallIds: ["call_7", "call_9"],
+        threadId: thread.id,
+      });
+      expect(rows).toHaveLength(0);
+    });
+    const statement = captured.find((entry) =&gt;
+      entry.sql.includes("'$.parentToolCallId'"),
+    );
+    if (!statement) {
+      throw new Error("expected the parent-tool-call SQL");
+    }
+    const plan = queryPlan(db, statement);
+    // (thread_id=?) only: SQLite walks every event of the thread through the
+    // thread/sequence index and evaluates json_extract on each payload.
+    expect(plan).toMatch(
+      /SEARCH events USING INDEX events_thread_sequence_idx \(thread_id=\?\)/u,
+    );
+    db.$client.close();
+  });
+
+  it("the unbounded parent-tool-call scan cost grows with thread size, not page size", () =&gt; {
+    const { db, thread } = setup();
+    const small = createThread(db, noopNotifier, {
+      projectId: thread.projectId,
+      providerId: "claude-code",
+    });
+    seedToolCallThread(db, small.id, 100, 4_000);
+    seedToolCallThread(db, thread.id, 5_000, 4_000);
+
+    const time = (threadId: string): number =&gt; {
+      const start = performance.now();
+      for (let index = 0; index &lt; 5; index += 1) {
+        listStoredEventRowsByParentToolCallIds(db, {
+          excludedTypes: ["item/agentMessage/delta"],
+          maxInlineOutputChars: 4_000,
+          parentToolCallIds: ["call_1"],
+          threadId,
+        });
+      }
+      return (performance.now() - start) / 5;
+    };
+    const smallMs = time(small.id);
+    const largeMs = time(thread.id);
+    // Same page (zero matching rows either way), 50x the thread: the query
+    // time follows the thread. Printed rather than asserted on an exact ratio
+    // to keep the test stable on slow CI; the ratio is ~30-50x locally.
+    console.log(
+      `issue-1131 parent-tool-call scan: ${smallMs.toFixed(2)} ms (200 events) vs ${largeMs.toFixed(2)} ms (10k events), ratio ${(largeMs / smallMs).toFixed(1)}x`,
+    );
+    expect(largeMs).toBeGreaterThan(smallMs * 5);
+    db.$client.close();
+  });
+});
+</pre>
+
+  <h2>Root cause</h2>
+  <p><b>1. Structural: reads are synchronous on the only event loop.</b> <code>GET /threads/:id/timeline</code> calls <code>buildThreadTimelineWithProfile</code> inside <code>runEventLoopWorkSync</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/timeline.ts#L1809-L1846">timeline.ts#L1809-L1846</a>); every SQLite call underneath is a blocking <code>better-sqlite3</code> call on the main thread (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/db/src/connection.ts#L164-L191">connection.ts#L164-L191</a>). The server itself documents the consequence: a slow build "directly stalls agent work on every thread on the host" (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/timeline-build-log.ts#L4-L17">timeline-build-log.ts#L4-L17</a>) and logs "Thread timeline build blocked the event loop" above 150 ms, and "Event loop stalled" above 500 ms (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/system/event-loop-stall-monitor.ts#L13-L15">event-loop-stall-monitor.ts#L13-L15</a>). Nothing has changed here since the issue was filed; #1198 (worker thread) was closed in favour of query-level fixes (#1207).</p>
+  <p><b>2. The thread-list stall (the issue's headline) was <code>listLatestGoalEventRowsByThreadIds</code>, fixed by #1204.</b> Not re-derived here; #1204's writeup and the reporter's follow-up confirm it, and my cold thread list over 3,287 threads is 52 ms.</p>
+  <p><b>3. The timeline stall (0.37.0 comment) comes from two window-independent, whole-thread reads inside the "event-query" stage.</b> <code>selectStandardTimelineEventRows</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/timeline.ts#L1380-L1500">timeline.ts#L1380-L1500</a>) correctly bounds the <em>window</em> rows by segment anchors and an event budget, but then backfills state with helpers that ignore the window:</p>
+  <ul>
+    <li><code>ensureLatestTimelineHeadStateRows</code> → <code>listTodoSnapshotEventRowsForThread</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/timeline.ts#L1011-L1017">timeline.ts#L1011-L1017</a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/db/src/data/events.ts#L1911-L1940">events.ts#L1911-L1940</a>). SQL: <code>thread_id = ? AND type IN (?,?) AND item_kind = ? AND json_extract(data,'$.item.tool') IN ('TodoWrite',…)</code>. Plan: <code>SEARCH events USING INDEX events_thread_type_item_kind_sequence_idx (thread_id=? AND type=? AND item_kind=?)</code> — the index narrows to <em>all</em> tool-call rows of the thread, and the <code>json_extract</code> filter forces a table fetch of each row's <code>data</code> payload. The doc comment assumes "tens of rows per thread"; the row count it actually visits is the thread's tool-call count (2,524 here; a long claude-code session has thousands, each with a multi-KB result). Cold: 73 MB / 135 ms on NVMe.</li>
+    <li><code>ensureTimelineWindowParentedRows</code> → <code>listStoredEventRowsByParentToolCallIds</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/timeline.ts#L463-L517">timeline.ts#L463-L517</a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/db/src/data/events.ts#L1325-L1370">events.ts#L1325-L1370</a>). For the latest page <code>sequenceBounds</code> is <code>null</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/timeline.ts#L1450-L1458">timeline.ts#L1450-L1458</a>), so the SQL is <code>thread_id = ? AND (json_extract(data,'$.parentToolCallId') IN (…) OR json_extract(data,'$.item.parentToolCallId') IN (…)) AND type NOT IN (…) ORDER BY sequence</code>. Plan: <code>SEARCH events USING INDEX events_thread_sequence_idx (thread_id=?)</code> — every event of the thread is visited and its payload parsed. Cold: 20 MB / 110 ms; warm: 64 ms CPU. Both queries touch overlapping pages, so whichever runs first pays most of the I/O; together they read essentially every page holding this thread's rows (~100 MB with mmap readahead), which is why the total did not drop when I indexed only the todo lookup (see the experiment below).</li>
+  </ul>
+  <p><b>Why the symptom follows.</b> A 44k-event thread's rows are interleaved with 700k other rows across a 1.6 GB file. Visiting all of them (or all tool-call rows) means thousands of scattered page faults; on a cloud volume each is a synchronous ~ms read plus ~100 MB of throughput, and every one of those milliseconds is loop time. That yields the reporter's profile shape exactly: event-query ≫ decode + projection, 1.2k rows / 1.7 MiB returned. It also explains why warm requests still cost 270–330 ms for them (the full-thread <code>json_extract</code> walk is CPU, not I/O). #1716's index for <code>hasParentedEventCrossingSequence</code> and the background-task aggregation are different queries and do not touch these two.</p>
+  <p><b>Deeper issue.</b> Several timeline backfills query "the whole thread" for state that is conceptually per-thread (current todo list, open background tasks, parent/child links) but is stored only as events with the discriminator inside JSON. Any such lookup is O(thread) unless there is a partial/expression index whose predicate the query spells out literally, and the planner needs an <code>INDEXED BY</code> pin because <code>bb.db</code> never runs <code>ANALYZE</code> (#1204 hit both points). Adding a worker thread would stop one client's page from freezing everyone, but the read amplification would remain.</p>
+
+  <h2>Proposed fix (first principles)</h2>
+  <ol>
+    <li><b>Bound the parent/child backfill on the latest page.</b> Children of a tool call are always appended after the parent's <code>item/started</code>, and every visible tool call is inside the window (rows ≥ <code>sequenceStart</code>). Pass <code>sequenceStart: window.sequenceStart</code> (no upper bound) instead of <code>null</code> at <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/timeline.ts#L1450-L1458">timeline.ts#L1450-L1458</a>, and add a partial index that lets the parented lookup avoid the payload walk, e.g. <code>events (thread_id, sequence) WHERE COALESCE(json_extract(data,'$.item.parentToolCallId'), json_extract(data,'$.parentToolCallId')) IS NOT NULL</code> spelled identically in the query. Risk: a page that opens mid-turn with a parent tool call started before <code>sequenceStart</code> — that case is already covered by the "missing parent context" path (<code>listStoredToolCallRowsByItemIds</code>) and by <code>ensureTimelineWindowTurnStartedRows</code>; add a test for a nested subagent whose parent is on an older page.</li>
+    <li><b>Make the todo-snapshot lookup index-only.</b> Add a partial expression index <code>events (thread_id, sequence) WHERE item_kind='toolCall' AND type IN ('item/started','item/completed') AND json_extract(data,'$.item.tool') IN ('TodoWrite','TaskCreate','TaskUpdate','TaskList','TaskGet')</code> (Drizzle schema + generated migration, like #1204/#1716), rewrite <code>listTodoSnapshotEventRowsForThread</code> with literal type/item_kind values and <code>INDEXED BY</code>, and add a query-plan regression to <code>packages/db/test/query-plans.test.ts</code>. I verified on the seeded db that the pinned plan becomes <code>SEARCH events USING INDEX events_todo_snapshot_idx (thread_id=?)</code> visiting 520 rows instead of 2,524, and that without the pin the stats-less planner keeps the old plan (<a href="1131/repro/1131-todo-index-experiment.out">experiment</a>, <a href="1131/repro/1131-todo-index-experiment.sql">sql</a>, <a href="1131/repro/1131-todo-index-experiment.diff">code diff</a>). Alternatively persist the current todo list as thread state at append time so the timeline never re-derives it.</li>
+    <li><b>Then re-measure</b> with the profiler script cold; if the event-query stage is still dominated by scattered payload reads, that is the moment for the shared read-isolation seam #1207 discusses (one worker owned by the DB layer, serving thread-list and timeline).</li>
+    <li><b>Retention (separate, smaller):</b> lower <code>COMPLETED_EVENT_OUTPUT_TRUNCATION_THRESHOLD_CHARS</code> toward 4–8 KB (or make it a settings knob) — the batch size is not the constraint. Note that truncation only shrinks the constant; the fixes above remove the O(thread) factor.</li>
+  </ol>
+  <pre>Run Time: real 0.000 user 0.000266 sys 0.000266
+--- plan with literals (as the query would have to be written for SQLite to prove the partial-index predicate):
+QUERY PLAN
+`--SEARCH events USING INDEX events_thread_type_item_kind_sequence_idx (thread_id=? AND type=? AND item_kind=?)
+Run Time: real 0.000 user 0.000018 sys 0.000018
+--- plan with the current bound parameters for type/item_kind (partial index NOT usable):
+QUERY PLAN
+`--SEARCH events USING INDEX events_thread_type_item_kind_sequence_idx (thread_id=? AND type=? AND item_kind=?)
+Run Time: real 0.000 user 0.000017 sys 0.000017
+--- rows in the partial index (whole database):
+7656
+Run Time: real 0.001 user 0.000341 sys 0.000000
+--- plan when pinned with INDEXED BY (what a fix would emit, cf. #1204):
+QUERY PLAN
+`--SEARCH events USING INDEX events_todo_snapshot_idx (thread_id=?)
+Run Time: real 0.000 user 0.000020 sys 0.000000
+520
+Run Time: real 0.000 user 0.000034 sys 0.000000
+</pre>
+  <p>Cold profile after applying the todo-index experiment (index created manually, helper pinned): the todo statement drops to 28 MB but the unbounded parent scan absorbs the pages it no longer pre-faulted (65 MB); total stays ~100 MB — evidence that fix 1 is required, not optional (<a href="1131/repro/1131-profile-todo-index-fix-cold.out">full</a>):</p>
+  <pre>
+10 statement executions, 10 distinct statements. Top by disk bytes:
+    64896 KiB    191 ms  x  1  select "created_at", CASE WHEN length("data") &lt;= ? THEN "data" ELSE json_replace("data", CASE WHEN json_type("events"."data", ?) = 'text' AND length(json_extract("events …
+    28356 KiB     45 ms  x  1  SELECT "events"."created_at" AS "createdAt", "events"."data" AS "data", "events"."id" AS "id", "events"."item_id" AS "itemId", "events"."item_kind" AS "itemKind", "event …</pre>
+
+  <h2>PR review</h2>
+  <p>No open PRs are linked to this issue. Historical: <a href="https://github.com/get-bb/bb/pull/1204">#1204</a> (merged) fixed the thread-list half; <a href="https://github.com/get-bb/bb/pull/1198">#1198</a> (closed) proposed the worker thread; <a href="https://github.com/get-bb/bb/pull/1716">#1716</a> (merged, in base, not in 0.37/0.38) optimized two other timeline queries.</p>
+
+  <h2>Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/1207">#1207</a>: thread-list reads still synchronous after #1204 — the "revisit condition" the reporter says is now met by the timeline path.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1205">#1205</a> / <a href="https://github.com/get-bb/bb/pull/1209">#1209</a>: SQLite variable-limit failure on the same route.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1334">#1334</a>: co-located workload starving the bb server (same single-loop sensitivity).</li>
+    <li><a href="https://github.com/get-bb/bb/pull/882">#882</a>: introduced the event-budgeted window and <code>listTodoSnapshotEventRowsForThread</code>; <a href="https://github.com/get-bb/bb/pull/1199">#1199</a>: introduced <code>sequenceBounds</code> for byte-paged turns (left <code>null</code> for the latest page).</li>
+  </ul>
+
+  <h2>Appendix</h2>
+  <h3>Commands run</h3>
+  <pre>cd /home/sawyer/projects/bb/.claude/worktrees/wf_242c3e11-a10-26 &amp;&amp; git checkout 16ceb3a54
+pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build
+scripts/bb-dev-app current            # app :13609 server :21609 daemon :29609; creates data dir + host-id
+pnpm dev:stop
+git apply 1131/repro/1131-seed-fixture.diff &amp;&amp; pnpm exec turbo run build --filter=@bb/scripts
+BB_SEED_GIANT_THREAD_EVENTS=44000 BB_SEED_OUTPUT_LINE_SCALE=6 pnpm seed:perf -- --reset --threads 4000 --events 650000
+sqlite3 &lt;data dir&gt;/bb.db "PRAGMA wal_checkpoint(TRUNCATE);"
+scripts/bb-dev-app current
+export BB_REPO=$PWD
+1131/repro/1131-cold-timeline.sh thr_v67duphyr7        # -&gt; 1131-cold-timeline-run1.out
+1131/repro/1131-cold-thread-list.sh                    # -&gt; 1131-cold-thread-list.out
+pnpm dev:stop                                          # so page-cache eviction is effective for the profiler
+1131/repro/1131-profile.sh &lt;data dir&gt;/bb.db thr_v67duphyr7 1131/repro/1131-profile-base
+cp 1131/repro/issue-1131-timeline-full-thread-scans.test.ts packages/db/test/ &amp;&amp; cd packages/db &amp;&amp; pnpm exec vitest run test/issue-1131-timeline-full-thread-scans.test.ts --disableConsoleIntercept
+sqlite3 &lt;data dir&gt;/bb.db &lt; 1131/repro/1131-todo-index-experiment.sql
+git apply 1131/repro/1131-todo-index-experiment.diff &amp;&amp; 1131/repro/1131-profile.sh &lt;data dir&gt;/bb.db thr_v67duphyr7 1131/repro/1131-profile-todo-index-fix
+git checkout packages/db/src/data/events.ts; sqlite3 &lt;data dir&gt;/bb.db "DROP INDEX events_todo_snapshot_idx;"
+pnpm dev:stop</pre>
+  <h3>Seed fixture patch</h3>
+  <pre>diff --git a/packages/scripts/src/lib/seed-perf-fixture.ts b/packages/scripts/src/lib/seed-perf-fixture.ts
+index 3d882a4eb..a2c5e7966 100644
+--- a/packages/scripts/src/lib/seed-perf-fixture.ts
++++ b/packages/scripts/src/lib/seed-perf-fixture.ts
+@@ -528,7 +528,11 @@ function buildThreadEvents(args: ThreadEventBuildArgs): void {
+               cwd: "",
+               status: "completed",
+               approvalStatus: null,
+-              aggregatedOutput: makeOutput(rng, rng.int(10, 120)),
++              aggregatedOutput: makeOutput(
++                rng,
++                rng.int(10, 120) *
++                  (Number(process.env.BB_SEED_OUTPUT_LINE_SCALE ?? 1) || 1),
++              ),
+             },
+           },
+         });
+@@ -872,6 +876,11 @@ export function seedPerfFixture(
+     options.threadCount,
+     options.eventCount,
+   );
++  // Issue #1131 repro: allow one giant thread (reporter: 44,246 events).
++  const giantThreadEvents = Number(process.env.BB_SEED_GIANT_THREAD_EVENTS ?? 0);
++  if (Number.isInteger(giantThreadEvents) &amp;&amp; giantThreadEvents &gt; 0) {
++    eventTargets[0] = giantThreadEvents;
++  }
+ 
+   interface SeededThread {
+     row: ThreadInsert;
+</pre>
+  <h3>Profiler source (issue-1131-profile.ts)</h3>
+  <pre>// Issue #1131 profiling harness: run one timeline "latest page" build for a
+// thread against a real bb.db, exactly as the route does, and attribute the
+// event-loop-blocking time and disk reads to individual SQL statements.
+//
+// Usage (from apps/server, with the dev server STOPPED or the DB copied):
+//   node --conditions=source --import tsx issue-1131-profile.ts &lt;bb.db&gt; &lt;thread id&gt; [cold]
+//
+// "cold" evicts the OS page cache for the db files first (posix_fadvise via
+// python3 is not needed: we use fs + a tiny fadvise shim through `dd`-free
+// approach: node has no fadvise, so pass "cold" only after running the
+// eviction yourself; the script prints /proc/self/io read_bytes deltas so
+// you can see whether reads hit disk).
+import { readFileSync } from "node:fs";
+import { performance } from "node:perf_hooks";
+import { createConnection, getThread } from "@bb/db";
+import { buildThreadTimelineWithProfile } from "./src/services/threads/timeline.js";
+import { DEFAULT_MAX_INLINE_OUTPUT_CHARS } from "./src/services/threads/timeline-output-truncation.js";
+
+const [dbPath, threadId] = process.argv.slice(2);
+if (!dbPath || !threadId) {
+  console.error("usage: issue-1131-profile.ts &lt;bb.db&gt; &lt;thread id&gt;");
+  process.exit(2);
+}
+
+function readBytes(): number {
+  const io = readFileSync("/proc/self/io", "utf8");
+  const m = /^read_bytes: (\d+)/mu.exec(io);
+  return m ? Number(m[1]) : 0;
+}
+
+/** Major page faults so far: with SQLite mmap each cold page is one fault. */
+function majorFaults(): number {
+  const stat = readFileSync("/proc/self/stat", "utf8");
+  // field 12 (1-indexed) after the comm field; comm may contain spaces.
+  const rest = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+  return Number(rest[9]);
+}
+
+interface StmtSample {
+  sql: string;
+  ms: number;
+  bytes: number;
+  op: string;
+  args: number;
+}
+const samples: StmtSample[] = [];
+
+const db = createConnection(dbPath, {
+  slowQueryThresholdMs: 0,
+  slowQueryLogger: {
+    info() {
+      /* replaced by the wrapper below */
+    },
+  },
+});
+
+// Wrap prepare again so each statement execution records read_bytes deltas.
+const sqlite = db.$client;
+const originalPrepare = sqlite.prepare.bind(sqlite);
+Object.defineProperty(sqlite, "prepare", {
+  configurable: true,
+  writable: true,
+  value: (source: string) =&gt; {
+    const stmt = originalPrepare(source);
+    for (const op of ["all", "get", "run"] as const) {
+      const original = stmt[op].bind(stmt);
+      (stmt as unknown as Record&lt;string, unknown&gt;)[op] = (
+        ...params: unknown[]
+      ) =&gt; {
+        const b0 = readBytes();
+        const t0 = performance.now();
+        try {
+          return original(...params);
+        } finally {
+          samples.push({
+            sql: source.replace(/\s+/gu, " ").trim().slice(0, 1200),
+            ms: performance.now() - t0,
+            bytes: readBytes() - b0,
+            op,
+            args: params.length,
+          });
+        }
+      };
+    }
+    return stmt;
+  },
+});
+
+const thread = getThread(db, threadId);
+if (!thread) {
+  console.error(`thread ${threadId} not found`);
+  process.exit(1);
+}
+const maxSeq = (
+  db.$client
+    .prepare("select max(sequence) as s from events where thread_id = ?")
+    .get(threadId) as { s: number }
+).s;
+samples.length = 0;
+
+const bytesBefore = readBytes();
+const faultsBefore = majorFaults();
+const t0 = performance.now();
+const { profile } = buildThreadTimelineWithProfile(db, thread, {
+  eventBudget: 1500,
+  includeProviderUnhandledOperations: false,
+  includeNestedRows: false,
+  maxInlineOutputChars: DEFAULT_MAX_INLINE_OUTPUT_CHARS,
+  maxSeq,
+  page: { kind: "latest", segmentLimit: 20 },
+  providerDisplayName: "Codex",
+  planCommand: null,
+  summaryOnly: false,
+});
+const totalMs = performance.now() - t0;
+const bytesAfter = readBytes();
+const faultsAfter = majorFaults();
+
+console.log(
+  JSON.stringify(
+    {
+      threadId,
+      maxSeq,
+      totalMs: Math.round(totalMs),
+      diskReadBytes: bytesAfter - bytesBefore,
+      majorPageFaults: faultsAfter - faultsBefore,
+      profile: {
+        ...profile,
+        stageTimings: profile.stageTimings.map((s) =&gt; ({
+          stage: s.stage,
+          ms: Math.round(s.durationMs * 10) / 10,
+        })),
+      },
+    },
+    null,
+    2,
+  ),
+);
+
+// Aggregate by SQL text.
+const agg = new Map&lt;
+  string,
+  { n: number; ms: number; bytes: number; op: string }
+&gt;();
+for (const s of samples) {
+  const key = s.sql;
+  const cur = agg.get(key) ?? { n: 0, ms: 0, bytes: 0, op: s.op };
+  cur.n += 1;
+  cur.ms += s.ms;
+  cur.bytes += s.bytes;
+  agg.set(key, cur);
+}
+const rows = [...agg.entries()].sort((a, b) =&gt; b[1].bytes - a[1].bytes);
+console.log(
+  `\n${samples.length} statement executions, ${agg.size} distinct statements. Top by disk bytes:`,
+);
+for (const [sql, v] of rows.slice(0, 12)) {
+  console.log(
+    `  ${String(Math.round(v.bytes / 1024)).padStart(7)} KiB  ${String(Math.round(v.ms)).padStart(5)} ms  x${String(v.n).padStart(3)}  ${sql}`,
+  );
+}
+const byMs = [...agg.entries()].sort((a, b) =&gt; b[1].ms - a[1].ms);
+console.log(`\nTop by time:`);
+for (const [sql, v] of byMs.slice(0, 8)) {
+  console.log(
+    `  ${String(Math.round(v.ms)).padStart(5)} ms  ${String(Math.round(v.bytes / 1024)).padStart(7)} KiB  x${String(v.n).padStart(3)}  ${sql}`,
+  );
+}
+</pre>
+  <h3>Sweep cursor evidence (15 min after start; fixture rows span ~90 days)</h3>
+  <pre>sqlite&gt; select id, datetime(last_created_at/1000,'unixepoch'), datetime(updated_at/1000,'unixepoch') from maintenance_scan_cursors;
+completed_event_output_truncation:v1:commandExecution:aggregatedOutput|2026-06-04 17:41:18|2026-08-18 08:01:25
+completed_event_output_truncation:v1:toolCall:result|2026-07-15 08:14:49|2026-08-18 08:01:25
+sqlite&gt; select count(*), sum(length(json_extract(data,'$.item.aggregatedOutput'))&gt;32768), sum(length(json_extract(data,'$.item.aggregatedOutput'))&gt;4096)
+   ...&gt; from events where type='item/completed' and item_kind='commandExecution';
+56166|0|51453
+sqlite&gt; select count(*) from events where type='item/completed' and item_kind='commandExecution' and json_type(data,'$.item.truncation.aggregatedOutput') is not null;
+0</pre>
+  <h3>Query plans on the seeded db (base code)</h3>
+  <pre>sqlite&gt; explain query plan select id from events where thread_id='thr_v67duphyr7' and (json_extract(data,'$.parentToolCallId') in ('a','b') or json_extract(data,'$.item.parentToolCallId') in ('a','b')) and type not in ('x','y') order by sequence;
+`--SEARCH events USING INDEX events_thread_sequence_idx (thread_id=?)
+sqlite&gt; explain query plan select id from events where thread_id='thr_v67duphyr7' and type in ('item/started','item/completed') and item_kind='toolCall' and json_extract(data,'$.item.tool') in ('TodoWrite','TaskCreate','TaskUpdate','TaskList','TaskGet');
+`--SEARCH events USING INDEX events_thread_type_item_kind_sequence_idx (thread_id=? AND type=? AND item_kind=?)
+sqlite&gt; select type, count(*), sum(length(data)) from events where thread_id='thr_v67duphyr7' and item_kind='toolCall' group by type;
+item/completed|1262|1268995
+item/started|1262|279417</pre>
+</main></body></html>

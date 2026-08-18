@@ -1,0 +1,10 @@
+const page = await browser.getPage("main");
+await page.setViewportSize({ width: 1400, height: 900 });
+const link = page.getByRole("link", { name: /this link/ }).last();
+console.log("href attr:", await link.getAttribute("href"));
+await link.click();
+await page.waitForTimeout(3000);
+await saveScreenshot(await page.screenshot(), "1182-after-click.png");
+const body = await page.evaluate(() => document.body.innerText);
+const idx = body.indexOf("~/");
+console.log("body around ~/:", JSON.stringify(body.slice(Math.max(0, idx - 300), idx + 400)));

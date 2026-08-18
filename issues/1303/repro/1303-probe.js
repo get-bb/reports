@@ -1,0 +1,12 @@
+const APP = "http://localhost:12873";
+const page = await browser.getPage("probe");
+await page.setViewportSize({ width: 390, height: 844 });
+page.on("console", (m) => { if (m.type() === "error" || m.type() === "warning") console.log("console." + m.type() + ": " + m.text().slice(0, 300)); });
+page.on("pageerror", (e) => console.log("pageerror: " + e.message));
+const reqs = [];
+page.on("request", (r) => { if (r.url().includes("/api/")) reqs.push(r.method() + " " + r.url().replace(APP, "")); });
+await page.goto(APP + "/projects/proj_4r7awx3ed2/threads/thr_thnzrmgehr", { waitUntil: "load" });
+await new Promise((r) => setTimeout(r, 6000));
+console.log(reqs.join("\n"));
+await saveScreenshot(await page.screenshot(), "1303-probe.png");
+console.log(await page.evaluate(() => document.body.innerText.slice(0, 500)));

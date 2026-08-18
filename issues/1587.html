@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1587 Transcription often fails with HTTP 403 due to cloudflare when using codex subscription</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.medium { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .verdict { font-weight:600; }
+  .v-repro { color:var(--ok); }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1587 · Transcription often fails with HTTP 403 due to cloudflare when using codex subscription</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill medium">Medium</span> <span class="pill">Effort: unset</span>
+    <span class="pill">providers</span> <span class="pill">provider-codex</span>
+    <a href="https://github.com/get-bb/bb/issues/1587">open on GitHub</a>
+    <span>2026-08-18</span>
+    <span>base <code>16ceb3a540f81c1189efaffb27a39b1d9443abf5</code> (main)</span>
+  </p>
+  <p class="meta">
+    <span class="verdict v-repro">Verdict: REPRODUCED</span>
+    <span>· root-cause confidence: <b>high</b> (mechanism) / <b>medium</b> (why the reporter's network is challenged more often than mine)</span>
+    <span>· linked open PRs: none</span>
+  </p>
+
+  <h2>TL;DR</h2>
+  <p><b>Plain-language framing.</b> When bb is configured with the default transcription model <code>codex/gpt-transcribe</code> and the local Codex CLI is logged in with a ChatGPT subscription (<code>~/.codex/auth.json</code> has <code>auth_mode: "chatgpt"</code>), voice input (<code>bb voice transcribe file.mp3</code> or the microphone button in the prompt box) is executed by the <em>host daemon</em>, which POSTs the audio to <code>https://chatgpt.com/backend-api/transcribe</code> with the subscription's bearer token. That URL is not a Codex endpoint: it is the ChatGPT <em>web app's</em> transcription endpoint, and it sits behind Cloudflare bot management (a web application firewall, WAF, rule that issues a "managed challenge"). The Codex endpoint the daemon uses for the other helper calls, <code>https://chatgpt.com/backend-api/codex/responses</code>, is not behind that challenge.</p>
+  <p>When Cloudflare decides to challenge a request it answers <code>HTTP 403</code> with the header <code>cf-mitigated: challenge</code> and a "Just a moment…" HTML page that only a JavaScript-running browser can solve. The daemon already knows about this: it re-sends the request once with the Cloudflare cookies from the challenge response. If the retry is challenged too, the daemon gives up with the generic, <em>permanent</em> error code <code>codex_request_failed</code> whose message embeds the first 400 characters of the challenge page. The server treats that code as non-transient (no second attempt, no fallback), so the user sees <code>Error: HTTP 502: Codex transcription request failed with HTTP 403: &lt;html&gt; &lt;head&gt; &lt;meta name="viewport" …</code>.</p>
+  <p>Whether a given request is challenged is decided by Cloudflare per IP / TLS fingerprint / headers and fluctuates. On my network the daemon's exact header set (<code>Authorization</code> + <code>chatgpt-account-id</code> + <code>originator: bb</code> + <code>User-Agent: bb-host-daemon</code>) passed 10/10 times, while the same request with only <code>Authorization</code> was challenged 7/10 times, and unauthenticated probes were challenged 10/10 for every User-Agent tried (all of them pass the <code>/backend-api/codex/responses</code> path). The reporters ("usually fails on my machine", "same here") are presumably on networks where the same daemon request is scored badly (inferred, not observed: Cloudflare's per-IP/fingerprint scoring is opaque and the issue does not say). I therefore could not trigger a real challenge with the real headers from here; I reproduced the failure end to end by feeding the daemon the real captured challenge response through a Node preload, and I verified the mechanism live with curl. The issue's guess that an API key would avoid it is correct: <code>auth_mode: "apikey"</code> (or <code>BB_TRANSCRIPTION=openai/…</code> + <code>OPENAI_API_KEY</code>) goes to <code>api.openai.com/v1/audio/transcriptions</code>, which is not behind that WAF rule. Note that the issue body does not quote an error string (it only says "fails with HTTP 403 due to cloudflare"); the exact wording shown below is what the code produces on a challenged network, reproduced here by simulation.</p>
+
+  <h2>Claims vs findings</h2>
+  <table>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Transcription fails with HTTP 403 from Cloudflare when using a Codex subscription</td><td class="ok">Verified (mechanism)</td><td><code>https://chatgpt.com/backend-api/transcribe</code> is behind Cloudflare managed challenge (<code>HTTP 403</code>, <code>cf-mitigated: challenge</code>, HTML body; captured in <a href="1587/repro/cf-challenge-headers.txt">cf-challenge-headers.txt</a>). The daemon's transcription code path is the only bb code that hits it, and only for <code>auth_mode: "chatgpt"</code>. End-to-end repro below shows exactly the reported error text.</td></tr>
+    <tr><td>"seems to usually fail on my machine"</td><td class="unv">Unverifiable here; plausible</td><td>Cloudflare's decision is per-network and fluctuates: with the daemon's headers I got 0/18 challenges (8 real daemon calls + 10 curl); with <code>Authorization</code> only, 7/10; unauthenticated, 10/10 with every UA. A network with a worse bot score sees the same fuzziness with the full headers. See <a href="1587/waf-sample.log">waf-sample.log</a>.</td></tr>
+    <tr><td>"it hits a chatgpt.com endpoint meant for internal use vs an actual official api endpoint"</td><td class="ok">Verified</td><td><code>CHATGPT_TRANSCRIBE_URL = "https://chatgpt.com/backend-api/transcribe"</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/codex-chatgpt-client.ts#L28">codex-chatgpt-client.ts#L28</a>). The installed <code>codex-cli 0.147.0</code> binary contains no reference to <code>/backend-api/transcribe</code> (its voice input uses <code>realtime/calls</code>); the string only exists in the ChatGPT web client. Probing <code>/backend-api/codex/transcribe</code> and two other codex-prefixed variants returns 404 (<a href="1587/waf-probe-codex-path.log">log</a>), so there is no un-challenged Codex-scoped equivalent.</td></tr>
+    <tr><td>"I suspect an API key would fix it"</td><td class="ok">Verified by code path (not run: no API key here)</td><td><code>fetchTranscription</code> routes <code>auth.type === "apiKey"</code> to <code>https://api.openai.com/v1/audio/transcriptions</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/codex-chatgpt-client.ts#L905-L934">L905-L934</a>); the server-side <code>openai/*</code> route does the same. Neither goes through chatgpt.com.</td></tr>
+    <tr><td>Comment "same here" (jandornig)</td><td class="unv">No details</td><td>Second independent report; no version, OS or network info.</td></tr>
+  </table>
+
+  <h2>Environment</h2>
+  <ul>
+    <li>bb worktree <code>/home/sawyer/projects/bb/.claude/worktrees/wf_242c3e11-a10-20</code>. The worktree HEAD was <code>a108fa7ef</code> (5 commits after the base <code>16ceb3a54</code>); <code>git diff 16ceb3a54 HEAD</code> is empty for every file involved (<code>codex-chatgpt-client.ts</code>, <code>chatgpt-cloudflare-cookies.ts</code>, <code>voice-transcription.ts</code>, <code>inference.ts</code>), and permalinks below point at the base commit. <code>git log 16ceb3a54..origin/main</code> touches none of them either: not fixed on main.</li>
+    <li>Linux 7.0.0-29-generic (Ubuntu), node v24.18.0, pnpm 9.15.0, codex-cli 0.147.0 with <code>~/.codex/auth.json</code> <code>auth_mode: "chatgpt"</code> (subscription). Default <code>BB_TRANSCRIPTION=codex/gpt-transcribe</code>.</li>
+    <li>Dev instance (original run): app <code>:16862</code>, server <code>:24862</code>, host daemon <code>:32862</code>, data dir <code>/home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_242c3e11-a10-20-905936e6568b</code>. Revision re-run (step D output below): worktree <code>wf_6b6686dc-4c2-26</code> (same HEAD <code>a108fa7ef</code>), server <code>:25796</code>, host daemon <code>:33796</code>, data dir <code>/home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_6b6686dc-4c2-26-1b40c9cc9b2f</code>. Both started with <code>NODE_OPTIONS="--import /tmp/bb-reports/issues/1587/repro/cf-challenge-preload.mjs"</code> so the daemon can be switched between the real network and a simulated Cloudflare challenge without a restart (see repro).</li>
+    <li>Test audio: <a href="1587/repro/tone.mp3">tone.mp3</a> (1 s 440 Hz sine, generated with ffmpeg; the real endpoint transcribes it as <code>"..."</code>).</li>
+  </ul>
+
+  <h2>Minimal reproduction</h2>
+  <p>Three layers, from "prove the endpoint is behind a Cloudflare challenge" to "the CLI error the code produces on a challenged network" (the issue itself does not quote the error text). No secrets are printed by any script; the auth probes read <code>~/.codex/auth.json</code> in-process.</p>
+
+  <h3>A. The endpoint is behind Cloudflare managed challenge; the Codex endpoint is not (live, no bb involved)</h3>
+  <p>Script: <a href="1587/repro/waf-probe.sh">waf-probe.sh</a>. Unauthenticated POSTs to both URLs with five User-Agents. A request that passes the WAF (Cloudflare's web application firewall) reaches the app and gets <code>401</code>; a challenged one gets <code>403</code> + <code>cf-mitigated: challenge</code> and never reaches the app.</p>
+  <pre>$ bash /tmp/bb-reports/issues/1587/repro/waf-probe.sh
+UA=bb-host-daemon                       https://chatgpt.com/backend-api/transcribe       HTTP/2 403  cf-mitigated: challenge server: cloudflare
+UA=bb-host-daemon                       https://chatgpt.com/backend-api/codex/responses  HTTP/2 401  server: cloudflare
+UA=codex_cli_rs/0.147.0 (Linux …)       https://chatgpt.com/backend-api/transcribe       HTTP/2 403  cf-mitigated: challenge server: cloudflare
+UA=codex_cli_rs/0.147.0 (Linux …)       https://chatgpt.com/backend-api/codex/responses  HTTP/2 401  server: cloudflare
+UA=curl/8.5.0                           https://chatgpt.com/backend-api/transcribe       HTTP/2 403  cf-mitigated: challenge server: cloudflare
+UA=curl/8.5.0                           https://chatgpt.com/backend-api/codex/responses  HTTP/2 401  server: cloudflare
+UA=python-requests/2.31                 https://chatgpt.com/backend-api/transcribe       HTTP/2 403  cf-mitigated: challenge server: cloudflare
+UA=python-requests/2.31                 https://chatgpt.com/backend-api/codex/responses  HTTP/2 401  server: cloudflare
+UA=Mozilla/5.0 (… Chrome/128.0 …)       https://chatgpt.com/backend-api/transcribe       HTTP/2 403  cf-mitigated: challenge server: cloudflare
+UA=Mozilla/5.0 (… Chrome/128.0 …)       https://chatgpt.com/backend-api/codex/responses  HTTP/2 401  server: cloudflare</pre>
+  <p>Ran twice, 10 min apart, identical result (<a href="1587/waf-probe.log">run 1</a>, <a href="1587/waf-probe-2.log">run 2</a>). The full challenge response is saved: <a href="1587/repro/cf-challenge-headers.txt">headers</a>, <a href="1587/repro/cf-challenge-body.html">10,492-byte HTML body</a> ("Just a moment…", loads <code>/cdn-cgi/challenge-platform/…</code>).</p>
+
+  <h3>B. Which headers matter, and how "often" it fails (live)</h3>
+  <p>Scripts: <a href="1587/repro/waf-probe-headers.py">waf-probe-headers.py</a> (one request per header combination) and <a href="1587/repro/waf-sample.py">waf-sample.py</a> (10 interleaved pairs). Both send the daemon's multipart body and User-Agent.</p>
+  <pre>$ python3 /tmp/bb-reports/issues/1587/repro/waf-probe-headers.py
+auth+account+originator        HTTP/2 200                           body={"text":"...","asset_pointer":"sediment://file_…
+auth+account                   HTTP/2 200                           body={"text":"...", …
+auth+originator=bb             HTTP/2 200                           body={"text":"...", …
+auth+originator=codex_cli_rs   HTTP/2 200                           body={"text":"...", …
+auth only                      HTTP/2 403 cf-mitigated: challenge   body=&lt;html&gt;   &lt;head&gt;     &lt;meta name="viewport" …
+account only (no auth)         HTTP/2 401                           body={"detail":"Unauthorized"}
+originator only (no auth)      HTTP/2 401                           body={"detail":"Unauthorized"}
+nothing                        HTTP/2 403 cf-mitigated: challenge   body=&lt;html&gt;   &lt;head&gt; …
+
+$ python3 /tmp/bb-reports/issues/1587/repro/waf-sample.py | tail -1
+tally: {"full-daemon-headers": {"200": 10}, "authorization-only": {"403": 7, "200": 3}}</pre>
+  <p>Read: on <em>this</em> network the presence of <code>chatgpt-account-id</code> or <code>originator</code> (which the daemon does send) is enough to pass, and without them the outcome is a coin flip weighted toward the challenge (7/10). That coin flip is what "often fails" looks like; the reporters' networks are scored so that it applies even with the full header set. Re-sending the challenge's own cookies is what the daemon's single retry does; with curl and a cookie jar (<a href="1587/repro/waf-cookie-retry.sh">waf-cookie-retry.sh</a>) my first run went <code>403, 403, 401</code> and a second run a minute later <code>401 ×8</code> (<a href="1587/waf-cookie-retry.log">log of the second run</a>): the retry can help, but only sometimes, and never deterministically.</p>
+
+  <h3>C. The daemon path against the real endpoint (live, this network): passes</h3>
+  <p><a href="1587/repro/live-probe-1587.ts">live-probe-1587.ts</a> calls the real <code>transcribeCodexVoice()</code> from <code>apps/host-daemon/src/codex-chatgpt-client.ts</code> with the local subscription auth. Copy it into <code>apps/host-daemon/</code> and run <code>pnpm exec tsx live-probe-1587.ts /tmp/bb-reports/issues/1587/repro/tone.mp3 8</code>:</p>
+  <pre>#1 OK 580ms text="..."
+#2 OK 896ms text="..."
+#3 OK 521ms text="..."
+#4 OK 524ms text="..."
+#5 OK 587ms text="..."
+#6 OK 500ms text="..."
+#7 OK 655ms text="..."
+#8 OK 1602ms text="..."</pre>
+  <p>So the live failure is network-dependent and did not occur from here with the daemon's headers. Steps D and E reproduce what happens on a network where it does.</p>
+
+  <h3>D. End to end: <code>bb voice transcribe</code> on a challenged network (deterministic simulation)</h3>
+  <p><a href="1587/repro/cf-challenge-preload.mjs">cf-challenge-preload.mjs</a> is a Node <code>--import</code> preload that wraps <code>globalThis.fetch</code>: while the flag file <code>FORCE_CF_CHALLENGE</code> exists, any POST to <code>https://chatgpt.com/backend-api/transcribe</code> gets the <em>real</em> captured Cloudflare response from step A (403, <code>cf-mitigated: challenge</code>, the HTML body, a <code>__cf_bm</code> set-cookie); everything else goes to the network. It logs each intercepted call, which lets us count the daemon's attempts. Both scripts are configured through the environment: the preload reads <code>CF_PRELOAD_DIR</code> (flag file + log location, default <code>/tmp/bb-1587-preload</code>) and finds <code>cf-challenge-body.html</code> next to itself; the wrapper <a href="1587/repro/run-cli-transcribe.sh">run-cli-transcribe.sh</a> reads <code>WORKTREE</code> (default <code>$PWD</code>), <code>BB_SERVER_URL</code> (required) and the same <code>CF_PRELOAD_DIR</code>. Nothing needs editing.</p>
+  <ol>
+    <li>In your built bb worktree, start your dev instance with the preload: <code>export NODE_OPTIONS="--import /tmp/bb-reports/issues/1587/repro/cf-challenge-preload.mjs" &amp;&amp; scripts/bb-dev-app current</code> (the launcher passes the environment to the server and daemon). Then <code>unset NODE_OPTIONS; eval "$(scripts/bb-dev-app env)"; export WORKTREE=$PWD</code> and confirm <code>curl -s $BB_SERVER_URL/api/v1/system/config</code> shows <code>"voiceTranscriptionEnabled":true</code> (give it ~30 s to boot).</li>
+    <li>Baseline (real network): <code>bash /tmp/bb-reports/issues/1587/repro/run-cli-transcribe.sh baseline</code>. Expected and actual: the CLI prints <code>...</code> (the transcript of the 1 s tone, printed as plain text because the wrapper does not pass <code>--json</code>) and <code>exit=0</code>:</li>
+    <li>Challenged: <code>bash /tmp/bb-reports/issues/1587/repro/run-cli-transcribe.sh challenge</code>.</li>
+  </ol>
+  <pre>$ bash /tmp/bb-reports/issues/1587/repro/run-cli-transcribe.sh baseline
+$ bb voice transcribe tone.mp3 --type audio/mpeg   # mode=baseline server=http://localhost:25796
+...
+exit=0
+
+$ bash /tmp/bb-reports/issues/1587/repro/run-cli-transcribe.sh challenge
+$ bb voice transcribe tone.mp3 --type audio/mpeg   # mode=challenge server=http://localhost:25796
+Error: HTTP 502: Codex transcription request failed with HTTP 403: &lt;html&gt; &lt;head&gt; &lt;meta name="viewport" content="width=device-width, initial-scale=1" /&gt; &lt;style global&gt;body{font-family:Arial,Helvetica,sans-serif}.container{align-items:center;display:flex;flex-direction:column;gap:2rem;height:100%;justify-content:center;width:100%}@keyframes enlarge-appear{0%{opacity:0;transform:scale(75%) rotate(-90deg)}to{opacity:1;transform:scale(100%) rotate(0deg)}}.lo...
+exit=1
+--- daemon fetch calls intercepted by the preload during this run (/tmp/bb-1587-preload/cf-challenge-preload.log):
+2026-08-18T14:27:13.470Z pid=3478951 intercepted POST https://chatgpt.com/backend-api/transcribe cookie="__cf_bm=6DH8…; __cflb=04dT…; _cfuvid=zv0y…" ua=bb-host-daemon
+2026-08-18T14:27:13.471Z pid=3478951 intercepted POST https://chatgpt.com/backend-api/transcribe cookie="__cf_bm=SIMULATED.CHALLENGE.COOKIE-1787038601; __cflb=04dT…; _cfuvid=zv0y…" ua=bb-host-daemon</pre>
+  <p><b>Expected:</b> a transcript, or at least a retry/fallback and a human-readable error. <b>Actual:</b> exit 1 with the error the code produces for a challenged request (HTTP 502 wrapping "HTTP 403" and the challenge page's CSS). The preload log shows the daemon's two fetches (original + one cookie retry, the second carrying the <code>__cf_bm</code> from the challenge). The server log for the same second shows a single attempt out of two allowed and the daemon's error code:</p>
+  <pre>@bb/host-daemon:dev: [14:27:13] DEBUG: [host-daemon] Online host RPC {"serverUrl":"http://127.0.0.1:25796","commandType":"codex.voice.transcribe","errorCode":"codex_request_failed","handlerMs":1.9,"ok":false}
+@bb/server:dev:      [14:27:13] WARN: [server] Voice transcription failed {"attempts":1,"durationMs":7,"maxAttempts":2,"model":"codex/gpt-transcribe","reason":"failed"}</pre>
+  <p>Full CLI output: <a href="1587/cli-challenge-run.log">cli-challenge-run.log</a>. Running <code>run-cli-transcribe.sh baseline</code> again (which removes the flag file <code>/tmp/bb-1587-preload/FORCE_CF_CHALLENGE</code>) makes the same instance transcribe again (<code>...</code>, <code>exit=0</code>). Preload log of the run: <a href="1587/repro/cf-challenge-preload.log">cf-challenge-preload.log</a>.</p>
+
+  <h3>E. Unit-level repro test (fails on main)</h3>
+  <p><a href="1587/repro/codex-chatgpt-client-1587.test.ts">codex-chatgpt-client-1587.test.ts</a>: drop it at <code>apps/host-daemon/src/codex-chatgpt-client-1587.test.ts</code> and run <code>cd apps/host-daemon &amp;&amp; pnpm exec vitest run src/codex-chatgpt-client-1587.test.ts</code>. It stubs <code>fetch</code> with the challenge response (real HTML head) and calls the real <code>transcribeCodexVoice()</code> against a temp <code>CODEX_HOME</code> with a ChatGPT-mode <code>auth.json</code>. Test 1 documents today's behavior and passes; test 2 asserts the behavior the server needs and fails:</p>
+  <pre>✓ documents current behavior: one cookie retry, then a permanent codex_request_failed carrying raw HTML
+× EXPECTED (fails on main): a Cloudflare challenge is transient and must not leak the challenge HTML
+  → expected 'codex_request_failed' to be 'codex_service_unavailable' // Object.is equality
+    ❯ src/codex-chatgpt-client-1587.test.ts:130:26
+ Test Files  1 failed (1)   Tests  1 failed | 1 passed (2)</pre>
+  <p>Which assertion fails and why: <code>expect(failure.code).toBe("codex_service_unavailable")</code> at line 130 receives <code>codex_request_failed</code> because <code>codexRequestErrorCode(403)</code> falls through to the generic code; the following assertion (<code>message</code> must not contain <code>&lt;html&gt;</code>) would fail too. Full log: <a href="1587/vitest-1587.log">vitest-1587.log</a>. The test file inline:</p>
+  <pre>// Repro for get-bb/bb#1587 (excerpt; full file linked above)
+function cloudflareChallengeResponse(): Response {
+  return new Response(CF_CHALLENGE_HTML, {
+    status: 403,
+    headers: {
+      "content-type": "text/html; charset=UTF-8",
+      "cf-mitigated": "challenge",
+      server: "cloudflare",
+      "set-cookie": "__cf_bm=cloudflare-cookie; HttpOnly; SameSite=None; Secure; Path=/; Domain=chatgpt.com",
+    },
+  });
+}
+
+it("documents current behavior: one cookie retry, then a permanent codex_request_failed carrying raw HTML", async () =&gt; {
+  await writeChatGptAuth();
+  const fetchMock = vi.fn&lt;typeof fetch&gt;();
+  fetchMock.mockImplementation(async () =&gt; cloudflareChallengeResponse());
+  vi.stubGlobal("fetch", fetchMock);
+
+  const failure = await runTranscribe();
+
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  const retryHeaders = new Headers(fetchMock.mock.calls[1]?.[1]?.headers);
+  expect(retryHeaders.get("cookie")).toBe("__cf_bm=cloudflare-cookie");
+  expect(failure.code).toBe("codex_request_failed");
+  expect(failure.message).toContain(
+    "Codex transcription request failed with HTTP 403: &lt;html&gt; &lt;head&gt; &lt;meta name=\"viewport\"",
+  );
+});
+
+it("EXPECTED (fails on main): a Cloudflare challenge is transient and must not leak the challenge HTML", async () =&gt; {
+  await writeChatGptAuth();
+  const fetchMock = vi.fn&lt;typeof fetch&gt;();
+  fetchMock.mockImplementation(async () =&gt; cloudflareChallengeResponse());
+  vi.stubGlobal("fetch", fetchMock);
+
+  const failure = await runTranscribe();
+
+  expect(failure.code).toBe("codex_service_unavailable"); // &lt;-- FAILS on main: "codex_request_failed"
+  expect(failure.message).not.toContain("&lt;html&gt;");        // &lt;-- FAILS on main
+});</pre>
+
+  <h2>Root cause</h2>
+  <p><b>1. The subscription transcription path uses a ChatGPT web-app endpoint that is behind Cloudflare bot management.</b> <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/codex-chatgpt-client.ts#L27-L30">codex-chatgpt-client.ts#L27-L30</a>:</p>
+  <pre>const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
+const CHATGPT_TRANSCRIBE_URL = "https://chatgpt.com/backend-api/transcribe";
+const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
+const OPENAI_TRANSCRIBE_URL = "https://api.openai.com/v1/audio/transcriptions";</pre>
+  <p><code>fetchTranscription</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/codex-chatgpt-client.ts#L920-L934">L920-L934</a>) picks <code>CHATGPT_TRANSCRIBE_URL</code> whenever <code>readCodexAuthCredentials()</code> returns <code>type: "chatgpt"</code>. Step A shows that Cloudflare applies a managed challenge to <code>/backend-api/transcribe</code> and not to <code>/backend-api/codex/responses</code>; the challenge requires executing JavaScript from <code>/cdn-cgi/challenge-platform/</code>, which a Node <code>fetch</code> client cannot do. Codex CLI itself never calls this URL (its binary has no such string), so OpenAI has no reason to exempt non-browser clients on it. The headers bb sends (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/codex-chatgpt-client.ts#L183-L193">createChatGptHeaders</a>: bearer, <code>chatgpt-account-id</code>, <code>originator: bb</code>, <code>User-Agent: bb-host-daemon</code>) lower the challenge rate here to 0/18 but the decision is made by Cloudflare per client and per network; the reporters' clients get challenged "usually".</p>
+  <p><b>2. The daemon's mitigation is a single blind retry.</b> <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/codex-chatgpt-client.ts#L176-L181">isCloudflareChallenge</a> detects the header, and <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/codex-chatgpt-client.ts#L352-L370">fetchChatGpt</a> re-sends once with whatever Cloudflare service cookies were stored (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/chatgpt-cloudflare-cookies.ts">chatgpt-cloudflare-cookies.ts</a>, in-memory, process-global):</p>
+  <pre>  const response = await fetchOnce();
+  if (!isCloudflareChallenge(response)) {
+    return response;
+  }
+  return fetchOnce();</pre>
+  <p>A challenge response only sets <code>__cf_bm</code>; <code>cf_clearance</code> (the cookie that actually clears a challenge) is issued only after the JS challenge is solved. So the retry works only if Cloudflare's score happens to flip (step B: <code>403, 403, 401</code>), and the second 403 is then treated like any other HTTP error.</p>
+  <p><b>3. The 403 is classified as a permanent failure, so the server neither retries nor falls back, and the raw HTML is put in the message.</b> <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/codex-chatgpt-client.ts#L384-L396">codexRequestErrorCode</a> maps 401, 429 and 5xx; 403 falls to <code>codex_request_failed</code>. <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/codex-chatgpt-client.ts#L459-L474">createCodexHttpError</a> then appends <code>extractProviderErrorMessage(readErrorText(...))</code>, which for a <code>text/html</code> body is the whitespace-collapsed HTML truncated to 400 chars. On the server, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/ai/inference.ts#L129-L138">isTransientInferenceError</a> only recognises <code>codex_rate_limited</code>, <code>codex_service_unavailable</code>, <code>codex_request_timeout</code>, <code>command_timeout</code>; <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/ai/inference.ts#L208-L232">inferenceCompleteWithFallback</a> therefore stops after attempt 1 of <code>maxAttempts: 2</code> (server log: <code>"attempts":1,"maxAttempts":2</code>), and <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/ai/voice-transcription.ts#L154-L174">transcribeWithCodexHostDaemon</a> re-throws the daemon error as-is: <code>HTTP 502: Codex transcription request failed with HTTP 403: &lt;html&gt; …</code>. Note also that the transcription "fallback" is the same model (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/ai/voice-transcription.ts#L148-L151">fallbackModel: transcriptionModel</a>), so even a transient classification would only buy one more try of the same challenged endpoint after 250 ms, not a switch to <code>api.openai.com</code>.</p>
+  <p><b>Deeper issue.</b> bb depends on an undocumented ChatGPT web endpoint whose bot protection is outside its control; a Cloudflare rule change can break subscription-mode voice for everyone at once. There is no Codex-scoped transcription endpoint to move to (step A/<a href="1587/waf-probe-codex-path.log">codex-path probe</a> = 404). The realistic goals are: don't make a challenge look like a bb bug, retry/fallback sensibly, and tell the user what to configure.</p>
+
+  <h2>Proposed fix (first principles)</h2>
+  <ol>
+    <li><b>Daemon (host-local primitive: classify the provider response).</b> In <code>transcribeCodexVoice</code>/<code>createCodexHttpError</code>, when <code>isCloudflareChallenge(response)</code> is still true after the retry, throw a dedicated <code>ExpectedCommandDispatchError</code> — either <code>codex_service_unavailable</code> with a clean message such as <em>"ChatGPT transcription endpoint returned a Cloudflare challenge (HTTP 403); this network is being bot-filtered. Try again, or configure OPENAI_API_KEY / an API-key Codex login for transcription."</em> — or a new code (<code>codex_cloudflare_challenge</code>) that the server adds to <code>isTransientInferenceError</code>. Also stop leaking HTML in general: in <code>createCodexHttpError</code>, if the response <code>content-type</code> is <code>text/html</code>, do not append the body. Test 2 of the repro file is the regression test. Since only the error <em>code/message</em> content changes and both are already free-form strings on the wire, no <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump is strictly needed for the first variant; a new code that the server switches on is a wire-meaning change and should bump it.</li>
+    <li><b>Server (product policy).</b> In <code>transcribeWithCodexHostDaemon</code>, make the fallback meaningful: if <code>deps.config.openAiApiKey</code> is set, use <code>openai/&lt;same model id&gt;</code> (the existing <code>transcribeWithOpenAi</code> path against <code>api.openai.com</code>) as the fallback attempt after a transient/challenge failure instead of <code>fallbackModel: transcriptionModel</code>; otherwise keep the one delayed retry (a real retry does sometimes pass, step B). Map the final challenge failure to the existing <code>buildTranscriptionUnavailableError()</code> (503 <code>transcription_unavailable</code>) so the CLI/app show a sentence, not CSS. Document in <code>docs/configuration.md</code> that subscription-mode voice can be blocked by Cloudflare and that <code>BB_TRANSCRIPTION=openai/gpt-4o-transcribe</code> + <code>OPENAI_API_KEY</code> avoids chatgpt.com.</li>
+    <li><b>Optional hardening (daemon).</b> Persist the Cloudflare cookies across daemon restarts (they are already scoped and allow-listed) and consider mirroring what a browser sends more closely (e.g. <code>Accept</code>, <code>Origin: https://chatgpt.com</code>, <code>Referer</code>), measured against real challenge rates. I did not verify that this changes Cloudflare's score; step B suggests <code>originator</code>/<code>chatgpt-account-id</code> already carry most of the weight here.</li>
+  </ol>
+  <p><b>What could go wrong:</b> classifying every 403 as transient would hide real permission errors; key the change on <code>cf-mitigated: challenge</code> only. Falling back to <code>api.openai.com</code> spends API credit for users who thought they were on a subscription; gate it on an explicit configured key and log it. <b>What would settle the "why their network" question:</b> a reporter running <a href="1587/repro/waf-sample.py">waf-sample.py</a> from their machine (it prints only status codes) and pasting the tally.</p>
+
+  <h2>Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/pull/1330">#1330</a> "Fix transient thread title inference failures" — introduced the transient/fallback policy (<code>isTransientInferenceError</code>, <code>inferenceCompleteWithFallback</code>) that this fix should plug into.</li>
+    <li>Commit <code>adea82e1d</code> (2026-06-08) "retry Codex voice transcription on transient failures" and <code>f17e8e4b6</code> (2026-05-18) which added the Cloudflare cookie retry — the existing, insufficient mitigations.</li>
+    <li>No other open issue or PR mentions transcription/Cloudflare (searched <code>transcri OR cloudflare OR voice</code>).</li>
+  </ul>
+
+  <h2>Appendix</h2>
+  <h3>Files</h3>
+  <ul>
+    <li><a href="1587/repro/">1587/repro/</a>: <code>tone.mp3</code>, <code>waf-probe.sh</code>, <code>waf-probe-auth.sh</code>, <code>waf-probe-headers.py</code>, <code>waf-sample.py</code>, <code>waf-cookie-retry.sh</code>, <code>waf-probe-codex-path.py</code>, <code>cf-challenge-headers.txt</code>, <code>cf-challenge-body.html</code>, <code>cf-challenge-preload.mjs</code>, <code>run-cli-transcribe.sh</code>, <code>live-probe-1587.ts</code>, <code>codex-chatgpt-client-1587.test.ts</code>.</li>
+    <li>Logs: <a href="1587/waf-probe.log">waf-probe.log</a>, <a href="1587/waf-probe-2.log">waf-probe-2.log</a>, <a href="1587/waf-probe-auth.log">waf-probe-auth.log</a>, <a href="1587/waf-probe-headers.log">waf-probe-headers.log</a>, <a href="1587/waf-sample.log">waf-sample.log</a>, <a href="1587/waf-cookie-retry.log">waf-cookie-retry.log</a>, <a href="1587/waf-probe-codex-path.log">waf-probe-codex-path.log</a>, <a href="1587/cli-challenge-run.log">cli-challenge-run.log</a>, <a href="1587/vitest-1587.log">vitest-1587.log</a>, <a href="1587/codex-strings.txt">codex-strings.txt</a> (strings of the codex 0.147.0 binary, used to check it never calls <code>/backend-api/transcribe</code>).</li>
+  </ul>
+  <h3>Captured challenge response headers (step A)</h3>
+  <pre>HTTP/2 403
+date: Tue, 18 Aug 2026 07:36:41 GMT
+content-type: text/html; charset=UTF-8
+content-length: 10492
+cf-mitigated: challenge
+server: cloudflare
+server-timing: chlray;desc="a2cf3fb8fc1c64b6"
+set-cookie: __cf_bm=…; HttpOnly; SameSite=None; Secure; Path=/; Domain=chatgpt.com; Expires=Tue, 18 Aug 2026 08:06:41 GMT
+cf-ray: a2cf3fb8fc1c64b6-SJC</pre>
+  <h3>Codex-prefixed transcription paths do not exist</h3>
+  <pre>$ python3 /tmp/bb-reports/issues/1587/repro/waf-probe-codex-path.py
+https://chatgpt.com/backend-api/codex/transcribe               HTTP/2 404   body={"detail":"Not Found"}
+https://chatgpt.com/backend-api/codex/audio/transcriptions     HTTP/2 404   body={"detail":"Not Found"}
+https://chatgpt.com/backend-api/codex/v1/audio/transcriptions  HTTP/2 404   body={"detail":"Not Found"}
+https://chatgpt.com/backend-api/transcribe                     HTTP/2 200   body={"text":"...","asset_pointer":"sediment://file_…</pre>
+  <h3>Codex CLI binary does not reference the endpoint</h3>
+  <pre>$ strings -n 6 ~/.codex/packages/standalone/current/bin/codex &gt; codex-strings.txt
+$ grep -oE ".{0,60}(backend-api/transcribe|/transcribe|audio/transcriptions).{0,60}" codex-strings.txt | sort -u
+(no output)
+$ grep -oE ".{0,40}realtime/calls.{0,40}" codex-strings.txt | head -1
+…sdpsession/backend-apirealtime/callscodex-realtime-call-boundaryContent-Dispositio…</pre>
+  <h3>Commands run (in order)</h3>
+  <pre>gh issue view 1587 --comments
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+git fetch origin main; git log 16ceb3a54..origin/main --oneline -- apps/host-daemon/src/codex-chatgpt-client.ts apps/host-daemon/src/chatgpt-cloudflare-cookies.ts apps/host-daemon/src/codex-auth.ts apps/server/src/services/ai
+codex --version; strings -n 6 ~/.codex/packages/standalone/current/bin/codex &gt; /tmp/bb-reports/issues/1587/codex-strings.txt
+ffmpeg -f lavfi -i "sine=frequency=440:duration=1" -ac 1 -ar 16000 -c:a libmp3lame -q:a 6 tone.mp3
+cd apps/host-daemon &amp;&amp; pnpm exec tsx live-probe-1587.ts /tmp/bb-reports/issues/1587/repro/tone.mp3 8
+bash repro/waf-probe.sh; bash repro/waf-probe-auth.sh; python3 repro/waf-probe-headers.py; bash repro/waf-cookie-retry.sh (x2); python3 repro/waf-probe-codex-path.py; python3 repro/waf-sample.py
+curl -s -o repro/cf-challenge-body.html -D repro/cf-challenge-headers.txt -X POST -A bb-host-daemon https://chatgpt.com/backend-api/transcribe -F file=@repro/tone.mp3 -F model=gpt-transcribe
+export NODE_OPTIONS="--import /tmp/bb-reports/issues/1587/repro/cf-challenge-preload.mjs" &amp;&amp; scripts/bb-dev-app current
+unset NODE_OPTIONS; eval "$(scripts/bb-dev-app env)"; export WORKTREE=$PWD
+curl -s $BB_SERVER_URL/api/v1/system/config   # voiceTranscriptionEnabled: true
+bash /tmp/bb-reports/issues/1587/repro/run-cli-transcribe.sh baseline    # "..." exit=0
+bash /tmp/bb-reports/issues/1587/repro/run-cli-transcribe.sh challenge   # HTTP 502 ... HTTP 403 ... exit=1
+bash /tmp/bb-reports/issues/1587/repro/run-cli-transcribe.sh baseline    # "..." exit=0 again
+grep -a "Voice transcription failed\|codex.voice.transcribe" ~/.bb-dev/launchers/projects-bb-.claude-worktrees-wf_6b6686dc-4c2-26/dev.log
+cd apps/host-daemon &amp;&amp; pnpm exec vitest run src/codex-chatgpt-client-1587.test.ts
+pnpm dev:stop</pre>
+  <h2>Verification</h2>
+  <p>An independent verifier followed all five layers (A–E) in a separate worktree at the same HEAD and confirmed every result: waf-probe.sh gave the identical 403/<code>cf-mitigated: challenge</code> vs 401 table; waf-probe-headers.py gave the identical header-combination table and waf-sample.py tallied full-daemon-headers 10/10 200 vs authorization-only 9/10 challenged (7/10 in the original run: the "coin flip"); live-probe-1587.ts 8/8 OK; the dev-instance run reproduced the exact <code>HTTP 502: Codex transcription request failed with HTTP 403: &lt;html&gt;…</code> output with two intercepted daemon fetches, <code>codex_request_failed</code> in the daemon log and <code>attempts:1,maxAttempts:2</code> in the server log; vitest 1 passed / 1 failed at the <code>codex_service_unavailable</code> assertion. All root-cause code excerpts were confirmed at <code>16ceb3a54</code>, and <code>git log 16ceb3a54..origin/main</code> touches none of the files.</p>
+  <p><b>Changed in this revision.</b> (1) The verifier's one major finding: <code>run-cli-transcribe.sh</code> and <code>cf-challenge-preload.mjs</code> were hardcoded to the original worktree path, ports and flag/log paths (and the wrapper deleted the preload-log artifact on every run). Both were rewritten to take <code>WORKTREE</code>, <code>BB_SERVER_URL</code> and <code>CF_PRELOAD_DIR</code> from the environment (defaults: <code>$PWD</code>, required, <code>/tmp/bb-1587-preload</code>), the preload locates <code>cf-challenge-body.html</code> relative to itself, and the wrapper only prints the log lines appended during its own run. Step D was then re-run from scratch in a third worktree (<code>wf_6b6686dc-4c2-26</code>, ports 25796/33796) with the new scripts and no manual edits; the baseline / challenge / baseline outputs and log lines shown in step D and <a href="1587/cli-challenge-run.log">cli-challenge-run.log</a> are from that re-run. (2) Minor: step D's baseline expectation now says the CLI prints <code>...</code> (no <code>--json</code>). (3) Minor: "the reporter's error" is now phrased as the error the code produces on a challenged network, with a note that the issue does not quote an error string. (4) Minor: WAF is expanded once, and the per-network bot-score explanation is marked as inferred in the TL;DR.</p>
+</main></body>
+</html>

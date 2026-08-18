@@ -1,0 +1,12 @@
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const { chromium } = require(`${process.env.HOME}/.nvm/versions/node/v24.18.0/lib/node_modules/dev-browser/node_modules/playwright`);
+const APP=process.env.APP, PROJECT=process.env.PROJECT;
+const browser = await chromium.launch({ headless: true });
+const context = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
+const page = await context.newPage();
+const t0=Date.now();
+page.on("request", r => { if (r.url().includes("/api/v1/")) console.log(`+${Date.now()-t0}ms ${r.method()} ${r.url().replace(APP,"")}`); });
+await page.goto(`${APP}/projects/${PROJECT}`, { waitUntil: "load", timeout: 60000 });
+await new Promise(r=>setTimeout(r,20000));
+await browser.close();

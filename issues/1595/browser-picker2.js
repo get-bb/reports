@@ -1,0 +1,13 @@
+const page = await browser.getPage("main");
+await page.setViewportSize({width: 1400, height: 900});
+await page.goto("http://localhost:14008/projects/proj_mcn754hcb8", {waitUntil: "networkidle"});
+await page.waitForTimeout(2500);
+await saveScreenshot(await page.screenshot(), "1595-before.png");
+const trigger = page.locator('button', { hasText: 'Work locally' }).first();
+console.log("trigger count", await page.locator('button', { hasText: 'Work locally' }).count());
+await trigger.click();
+await page.waitForTimeout(1200);
+console.log(await page.evaluate(() => document.body.innerText.slice(0, 1500)));
+await saveScreenshot(await page.screenshot(), "1595-picker-open.png");
+const items = await page.evaluate(() => [...document.querySelectorAll('[role="menuitem"],[role="menuitemradio"],[role="option"]')].map(e => ({text: e.innerText.trim().replace(/\n/g,' | '), disabled: e.getAttribute('aria-disabled') ?? e.getAttribute('data-disabled')})));
+console.log(JSON.stringify(items, null, 1));

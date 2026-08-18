@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1721 pi /compact on a small session puts the thread in error state</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.medium { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .verdict { font-weight:600; }
+  .v-repro { color:var(--high); }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:6px; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1721 · pi <code>/compact</code> on a small session surfaces as a failed turn and puts the thread in error state</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill medium">Medium</span> <span class="pill">Effort: Low</span>
+    <span class="pill">providers</span> <span class="pill">provider-pi</span>
+    <a href="https://github.com/get-bb/bb/issues/1721">open on GitHub</a>
+    <span>2026-08-18</span>
+    <span>base <code>16ceb3a540f81c1189efaffb27a39b1d9443abf5</code> (main)</span>
+  </p>
+  <p class="meta">
+    <span class="verdict v-repro">Verdict: REPRODUCED</span>
+    <span>· root-cause confidence: <b>high</b></span>
+    <span>· linked open PRs: none</span>
+    <span>· not fixed on origin/main as of a108fa7ef</span>
+  </p>
+
+  <h2>TL;DR</h2>
+  <p><b>Plain-language framing.</b> bb threads backed by the <code>pi</code> provider have a "compact context" action (type <code>/compact</code> in the composer and pick the built-in <em>compact</em> command, or <code>POST /api/v1/threads/:id/compact</code>). bb turns it into a special "maintenance turn" and asks pi's SDK to summarise old messages. Pi has a floor: it keeps the most recent ~20k tokens (<code>keepRecentTokens</code>, default 20000) and only compacts what lies before that. On a small session there is nothing before the floor, so pi refuses with <code>Compaction failed: Nothing to compact (session too small)</code>.</p>
+  <p><b>What the user sees.</b> The refusal is rendered as a red <em>Context compaction failed</em> row, the turn ends with <code>turn/completed status=failed</code>, and the thread's status flips to <code>error</code> ("Retry by sending a follow-up message" placeholder in the composer). <code>bb thread tell &lt;id&gt; "…"</code> (default steer mode) is then rejected with <code>HTTP 409: Thread is not active</code>, because steer mode only accepts <code>active</code> or <code>idle</code> threads. Nothing is broken in the session: a normal <em>start</em>-mode send (the composer, or <code>POST /threads/:id/send</code> with <code>mode:"start"</code>) recovers the thread and pi answers normally.</p>
+  <p><b>What is actually wrong.</b> Pi reports every manual-compaction outcome via one event, <code>compaction_end</code>; a "nothing to do" refusal and a genuine failure (e.g. summarisation request failed) both arrive as <code>errorMessage</code>. bb's pi event translator (<code>packages/agent-runtime/src/pi/event-translation.ts</code>) maps any manual <code>compaction_end</code> with an <code>errorMessage</code> to <code>turn/completed status=failed</code>, and the server maps a failed root turn to the lifecycle event <code>run.failed</code>, whose only transition from <code>active</code> is to <code>error</code>. There is no distinction between "pi declined because there is nothing to compact" and "pi tried and failed", and this behaviour is even pinned by an existing unit test (<code>event-translation.test.ts:432-465</code>, "manual compaction does not report success"), so it is a design gap rather than a regression.</p>
+
+  <h2>Claims vs findings</h2>
+  <table>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Pi refuses <code>/compact</code> below its <code>keepRecentTokens</code> floor (20k default) with "Compaction failed: Nothing to compact (session too small)"</td><td class="ok">Verified</td><td>pi-coding-agent 0.84.0 <code>dist/core/agent-session.js:1376-1385</code> throws <code>Nothing to compact (session too small)</code> when <code>prepareCompaction()</code> returns undefined; <code>dist/core/settings-manager.js:521</code> defaults <code>keepRecentTokens</code> to 20000. Live: seq 20 of the repro thread carries exactly that message at 6,453 used tokens.</td></tr>
+    <tr><td>bb surfaces it as <code>turn/completed status=failed</code></td><td class="ok">Verified</td><td>Event dump <a href="1721/repro/02-events-after-compact.json">02-events-after-compact.json</a>, seq 20: <code>{"status":"failed","error":{"message":"Compaction failed: Nothing to compact (session too small)"}}</code>. Translator branch at <code>event-translation.ts:751-767</code>.</td></tr>
+    <tr><td>Thread goes to <code>error</code> state</td><td class="ok">Verified</td><td><code>bb thread wait … --status error</code> succeeded; <code>bb thread show</code> prints <code>Status: error</code> (<a href="1721/repro/06-thread-show-after-ui-compact.txt">06-thread-show-after-ui-compact.txt</a>). Screenshot below.</td></tr>
+    <tr><td><code>bb thread tell</code> then rejects with a 409</td><td class="ok">Verified (steer mode)</td><td><code>Error: HTTP 409: Thread is not active</code> (<a href="1721/repro/03-tell-steer.txt">03-tell-steer.txt</a>). Cause: <code>resolveSendMode</code> in <code>thread-send.ts:174-199</code> maps steer on a non-active, non-idle thread to <code>throwThreadNotWritable</code>. A start-mode send (<code>POST /threads/:id/send</code> with <code>mode:"start"</code>, what the composer does) is accepted with 200 and recovers the thread (<a href="1721/repro/05-send-start-recovers.txt">05-send-start-recovers.txt</a>).</td></tr>
+    <tr><td>Observed at 4.8k and 22.4k tokens too</td><td class="unv">Unverified, plausible</td><td>Reproduced at 6.4k. 22.4k is plausible: <code>findCutPoint</code> walks back until it has accumulated ≥20k tokens and then cuts at the nearest valid cut point <em>at or after</em> that entry, so a session barely over the floor can leave zero messages to summarise and still hit <code>Nothing to compact</code>. Not measured.</td></tr>
+    <tr><td>Above the floor (34.7k) <code>/compact</code> works: <code>item/started{contextCompaction}</code> + <code>thread/compacted</code> + <code>turn/completed</code></td><td class="unv">Not re-run</td><td>Consistent with the translator's success branch (<code>event-translation.ts:730-736</code>) and existing test "manual compaction owns a complete maintenance turn". Not re-run to save provider usage; the mechanism is not in question.</td></tr>
+    <tr><td>Where to look: <code>bridge.ts</code> <code>/compact</code> interception and how a compaction failure maps to turn status</td><td class="ok">Verified, refined</td><td>Interception is in <code>bridge.ts:872-877</code> → <code>startPiCompaction</code> (<code>bridge.ts:812-829</code>). The status mapping is <em>not</em> in the bridge's settle report; it is in the translator's <code>compaction_end</code> case (<code>event-translation.ts:721-769</code>). <code>PiSdkSession.compact()</code> deliberately swallows the rejection once <code>compaction_end</code> was emitted (<code>sdk-session.ts:343-365</code>), so the settle report says "completed" while the translator already closed the turn as failed.</td></tr>
+  </table>
+
+  <h2>Environment</h2>
+  <ul>
+    <li>bb <code>16ceb3a54</code> (main, 2026-08-18), worktree <code>/home/sawyer/projects/bb/.claude/worktrees/wf_242c3e11-a10-6</code>. Dev instance via <code>scripts/bb-dev-app current</code>: app <code>:15978</code>, server <code>:23978</code>, host daemon <code>:31978</code>, data dir <code>/home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_242c3e11-a10-6-d11596b233f0</code>.</li>
+    <li>Linux 7.0.0-29-generic (Ubuntu), node v24.18.0, <code>@earendil-works/pi-coding-agent</code> 0.84.0 (bb's pinned pi SDK), pi model <code>openai-codex/gpt-5.4-mini</code>, reasoning low, permission mode full.</li>
+    <li>Project <code>proj_vs92eqyrud</code> (local path <code>/tmp/bb-1721-repo</code>, host <code>host_ypd3mt86gh</code>); thread <code>thr_h4dz2zcd52</code>.</li>
+    <li>Checked <code>origin/main</code> (a108fa7ef, 5 commits past base): <code>event-translation.ts</code> <code>compaction_end</code> branch unchanged; not fixed.</li>
+  </ul>
+
+  <h2>Minimal reproduction</h2>
+  <ol>
+    <li>Build and start a dev instance: <code>pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build &amp;&amp; scripts/bb-dev-app current</code>. Export the printed values: <code>export BB_SERVER_URL=http://localhost:23978 BB_HOST_DAEMON_PORT=31978</code>. Below, <code>bb</code> means <code>node packages/scripts/dist/commands/run-cli.js</code> run from the worktree root (or <code>pnpm bb:dev</code>).</li>
+    <li>Create a scratch repo and project:
+<pre>mkdir -p /tmp/bb-1721-repo &amp;&amp; git -C /tmp/bb-1721-repo init -q &amp;&amp; echo hi &gt; /tmp/bb-1721-repo/README.md \
+  &amp;&amp; git -C /tmp/bb-1721-repo add -A &amp;&amp; git -C /tmp/bb-1721-repo -c user.email=a@b -c user.name=a commit -qm init
+bb machine list            # note the host id
+curl -s -X POST $BB_SERVER_URL/api/v1/projects -H 'content-type: application/json' \
+  -d '{"name":"qa","source":{"type":"local_path","path":"/tmp/bb-1721-repo","hostId":"host_ypd3mt86gh"}}'
+# → {"id":"proj_vs92eqyrud", ...}</pre></li>
+    <li>Spawn a tiny pi thread and wait for it to go idle (session is ~6k tokens, far below pi's 20k floor):
+<pre>bb thread spawn --project proj_vs92eqyrud --provider pi --model openai-codex/gpt-5.4-mini \
+   --reasoning-level low --permission-mode full --prompt "Reply only with ok." --json | grep '"id"'
+# "id": "thr_h4dz2zcd52"
+bb thread wait thr_h4dz2zcd52 --timeout 180
+# Thread thr_h4dz2zcd52 reached status idle.</pre></li>
+    <li>Ask bb to compact the thread. Either the API (what the composer's <em>compact</em> command sends) …
+<pre>curl -s -o /dev/null -w "%{http_code}\n" -X POST $BB_SERVER_URL/api/v1/threads/thr_h4dz2zcd52/compact \
+  -H 'content-type: application/json' -d '{}'
+# 200</pre>
+    … or in the app: open the thread, type <code>/compact</code> in the composer, pick the built-in <em>compact</em> command from the typeahead, press Enter.</li>
+    <li>Observe the outcome:
+<pre>$ bb thread wait thr_h4dz2zcd52 --status error --timeout 60
+Thread thr_h4dz2zcd52 reached status error.
+$ bb thread show thr_h4dz2zcd52 | head -2
+Thread: thr_h4dz2zcd52
+  Status: error
+$ bb thread log thr_h4dz2zcd52 | tail -6
+── User ────────────────────────────────────────────────────
+/compact
+
+── Context compaction failed ───────────────────────────────
+  Compaction failed: Nothing to compact (session too small)
+$ bb thread tell thr_h4dz2zcd52 "Reply only with ok."
+Error: HTTP 409: Thread is not active</pre>
+    <b>Expected</b>: a benign "nothing to compact" notice, thread stays <code>idle</code>, <code>bb thread tell</code> works. <b>Actual</b>: failed turn, thread <code>error</code>, steer-mode tell 409s.</li>
+    <li>Raw events for the compaction turn (<code>curl "$BB_SERVER_URL/api/v1/threads/thr_h4dz2zcd52/events?limit=200"</code>, full dump <a href="1721/repro/02-events-after-compact.json">02-events-after-compact.json</a>):
+<pre>16 client/turn/requested  input=[{"type":"text","text":"/compact","mentions":[{"start":0,"end":8,"resource":{"kind":"command","trigger":"/","name":"compact","source":"command","origin":"builtin",...}}]}]
+17 turn/started
+18 turn/input/accepted     clientRequestId=creq_8uhhrmixvw
+19 item/started            item.type=contextCompaction id=pi-compaction-btea2e3f0e-1-2
+20 turn/completed          {"status":"failed","error":{"message":"Compaction failed: Nothing to compact (session too small)"}}
+21 thread/contextWindowUsage/updated  usedTokens=6453 modelContextWindow=272000</pre>
+    Note there is no <code>thread/compacted</code>, no <code>item/completed</code> and no <code>provider/error</code>; the only terminal signal is the failed <code>turn/completed</code>.</li>
+    <li>Recovery (proves the session is fine and this is purely a surfacing problem):
+<pre>$ curl -s -X POST $BB_SERVER_URL/api/v1/threads/thr_h4dz2zcd52/send -H 'content-type: application/json' \
+    -d '{"input":[{"type":"text","text":"Reply only with ok.","mentions":[]}],"mode":"start"}'
+{"ok":true}
+$ bb thread wait thr_h4dz2zcd52 --timeout 120
+Thread thr_h4dz2zcd52 reached status idle.</pre></li>
+  </ol>
+
+  <h3>Screenshots (app path)</h3>
+  <figure>
+    <img src="assets/1721-before.png" alt="Thread before the UI-triggered compact">
+    <figcaption>Before: the pi thread <code>thr_h4dz2zcd52</code> is idle after the recovery turn (the earlier red "Context compaction failed error" row is from the API-triggered repro in step 4). Composer placeholder is the normal "Ask for a follow-up".</figcaption>
+  </figure>
+  <figure>
+    <img src="assets/1721-typeahead.png" alt="Typing /compact shows the built-in compact command">
+    <figcaption>Triggering it: typing <code>/compact</code> in the composer opens the Commands typeahead with the built-in <em>compact — Compact context</em> entry. Enter selects it, Enter again sends.</figcaption>
+  </figure>
+  <figure>
+    <img src="assets/1721-after.png" alt="After: Context compaction failed, thread in error state">
+    <figcaption>The bug: ~6 s after sending, a <em>compact</em> user bubble, then a red <em>Context compaction failed · error</em> row expanded to <code>Compaction failed: Nothing to compact (session too small)</code>. The composer placeholder switched to "Retry by sending a follow-up message" and the send button is disabled-grey, i.e. the thread is in <code>error</code> state.</figcaption>
+  </figure>
+
+  <h3>Unit-level repro (fails on 16ceb3a54)</h3>
+  <p>File: <a href="1721/repro/issue-1721-compact-too-small.test.ts">1721/repro/issue-1721-compact-too-small.test.ts</a> (place at <code>packages/agent-runtime/src/pi/issue-1721-compact-too-small.test.ts</code>; run <code>pnpm exec vitest run src/pi/issue-1721-compact-too-small.test.ts</code> from <code>packages/agent-runtime</code>). It drives the pi event translator with the exact two SDK events pi emits for this case and asserts the desired outcome (turn not failed). Output: <a href="1721/repro/vitest-output.txt">vitest-output.txt</a>.</p>
+<pre>import { describe, expect, it } from "vitest";
+import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import { createPiEventTranslator } from "./event-translation.js";
+
+describe("issue #1721: pi manual /compact on a too-small session", () =&gt; {
+  it("does not fail the turn when pi has nothing to compact", () =&gt; {
+    const translator = createPiEventTranslator({ providerId: "pi" });
+    const context = { threadId: "bb-thread-1" };
+
+    translator.translatePiEvent(
+      { type: "compaction_start", reason: "manual" } satisfies AgentSessionEvent,
+      context,
+    );
+    const completed = translator.translatePiEvent(
+      {
+        type: "compaction_end",
+        reason: "manual",
+        result: undefined,
+        willRetry: false,
+        aborted: false,
+        errorMessage: "Compaction failed: Nothing to compact (session too small)",
+      } satisfies AgentSessionEvent,
+      context,
+    );
+
+    const turnCompleted = completed.find((event) =&gt; event.type === "turn/completed");
+    expect(turnCompleted).toBeDefined();
+    // Actual on 16ceb3a54: status === "failed" with the pi error message,
+    // which the server maps to run.failed -&gt; thread status "error".
+    expect(turnCompleted).toMatchObject({ status: "completed" });
+  });
+});</pre>
+<pre> FAIL  @bb/agent-runtime  src/pi/issue-1721-compact-too-small.test.ts &gt; issue #1721: pi manual /compact on a too-small session &gt; does not fail the turn when pi has nothing to compact
+AssertionError: expected { type: 'turn/completed', …(5) } to match object { status: 'completed' }
+- Expected
++ Received
+  {
+-   "status": "completed",
++   "status": "failed",
+  }</pre>
+  <p>Note the pre-existing test <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/pi/event-translation.test.ts#L432-L465">event-translation.test.ts#L432-L465</a> asserts the <em>opposite</em> for this exact message ("failed manual compaction does not report success"), so a fix must update that case too.</p>
+
+  <h2>Root cause</h2>
+  <p><b>1. Pi signals "nothing to do" through the same channel as a real failure.</b> <code>AgentSession.compact()</code> in pi-coding-agent 0.84.0 (<code>dist/core/agent-session.js:1366-1385</code>, vendored, no repo permalink) emits <code>compaction_start{reason:"manual"}</code>, then computes <code>prepareCompaction(pathEntries, settings)</code>. With <code>keepRecentTokens = 20000</code> (<code>settings-manager.js:521</code>) and a 6k-token session, <code>findCutPoint</code> never accumulates the budget, the cut lands at the first message, <code>messagesToSummarize</code> is empty and <code>prepareCompaction</code> returns <code>undefined</code>. The session then throws <code>Nothing to compact (session too small)</code> (or <code>Already compacted</code>), and its <code>catch</code> emits <code>compaction_end{reason:"manual", aborted:false, errorMessage:"Compaction failed: …"}</code> before re-throwing:</p>
+<pre>const preparation = prepareCompaction(pathEntries, settings);
+if (!preparation) {
+    const lastEntry = pathEntries[pathEntries.length - 1];
+    if (lastEntry?.type === "compaction") throw new Error("Already compacted");
+    throw new Error("Nothing to compact (session too small)");
+}
+…
+catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const aborted = message === "Compaction cancelled" || …;
+    this._emit({ type: "compaction_end", reason: "manual", result: undefined, aborted, willRetry: false,
+                 errorMessage: aborted ? undefined : `Compaction failed: ${message}` });
+    throw error;
+}</pre>
+  <p><b>2. bb's bridge routes the request straight to that SDK call.</b> The server's compact route (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/routes/threads/actions.ts#L130-L157">routes/threads/actions.ts#L130-L157</a>) sends a start-mode turn whose only input is the standalone built-in <code>/compact</code> mention. The pi bridge intercepts it (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/pi/bridge/bridge.ts#L872-L877">bridge.ts#L872-L877</a>) and calls <code>startPiCompaction</code> → <code>PiSdkSession.compact()</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/pi/bridge/bridge.ts#L804-L829">bridge.ts#L804-L829</a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/pi/bridge/sdk-session.ts#L343-L365">sdk-session.ts#L343-L365</a>). Nothing pre-checks whether there is anything to compact.</p>
+  <p><b>3. The translator treats every manual <code>compaction_end</code> with an <code>errorMessage</code> as a failed turn.</b> <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/pi/event-translation.ts#L721-L769">event-translation.ts#L721-L769</a>:</p>
+<pre>if (!parsed.data.aborted &amp;&amp; !parsed.data.errorMessage) {
+  events.push({ type: "thread/compacted", … });
+} else if (parsed.data.reason !== "manual") {
+  events.push({ type: "provider/error", … });          // automatic compaction only
+}
+if (parsed.data.reason === "manual" &amp;&amp; state.currentTurnId === turnId) {
+  events.push({
+    type: "turn/completed", …,
+    status: parsed.data.aborted ? "interrupted" : parsed.data.errorMessage ? "failed" : "completed",
+    ...(parsed.data.errorMessage ? { error: { message: parsed.data.errorMessage } } : {}),
+  });
+  turnState.finishTurn({ state, threadId: stateKey });
+}</pre>
+  <p>So the pi refusal becomes seq 20 <code>turn/completed status=failed error.message="Compaction failed: Nothing to compact (session too small)"</code>. The <code>contextCompaction</code> item opened at <code>compaction_start</code> is never completed; the thread-view infers "Context compaction failed" from the failed turn (<code>packages/thread-view/src/build-event-projection.ts:533-555</code> → <code>finalizeOpenCompactionsForTurn</code>).</p>
+  <p><b>4. The server maps a failed root turn to <code>run.failed</code>, and <code>run.failed</code> from <code>active</code> is <code>error</code>.</b> <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/internal/turn-completed-events.ts#L21-L31">turn-completed-events.ts#L21-L31</a> (<code>lifecycleEventForTurnCompletion</code>) and <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/domain/src/thread-lifecycle.ts#L90-L93">thread-lifecycle.ts#L90-L93</a> (<code>active: { "run.failed": "error" }</code>). The compaction turn is a root turn (it was requested through the normal client-turn path), so the thread lands in <code>error</code>.</p>
+  <p><b>5. Why <code>bb thread tell</code> 409s.</b> <code>tell</code> defaults to steer mode; <code>resolveSendMode</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/thread-send.ts#L174-L199">thread-send.ts#L174-L199</a>) accepts steer only on <code>active</code> (steer) or <code>idle</code> (start) threads and throws <code>Thread is not active</code> for <code>error</code>. That is generic behaviour for any errored thread, not compaction-specific; it is the reason the benign refusal blocks agent-driven follow-ups. A start-mode send is accepted from <code>error</code> (<code>thread-send.ts:582-590</code>), which is why the composer recovers.</p>
+  <p><b>Deeper issue.</b> The bridge protocol has no notion of a "no-op" terminal outcome for a maintenance turn: <code>turn/completed</code> is <code>completed | interrupted | failed</code>, and a completed compaction is only ever announced by <code>thread/compacted</code>. Any provider that can decline a manual compaction will hit the same choice between lying (<code>completed</code> + no <code>thread/compacted</code>, which also leaves the UI's <code>contextCompaction</code> item pending) and erroring the thread. Pi's messages are also unstructured strings, so any classification in bb has to match text.</p>
+
+  <h2>Proposed fix (first principles)</h2>
+  <ol>
+    <li><b>Classify pi's refusals in the translator</b> (<code>packages/agent-runtime/src/pi/event-translation.ts</code>, <code>compaction_end</code> manual branch). Pi 0.84.0 has exactly two "declined before doing anything" messages: <code>Compaction failed: Nothing to compact (session too small)</code> and <code>Compaction failed: Already compacted</code>. When <code>reason === "manual"</code>, <code>!aborted</code> and the message matches one of these, emit <code>turn/completed status:"completed"</code> (no <code>error</code>) instead of <code>failed</code>, so the server applies <code>run.succeeded</code> → <code>idle</code>. Keep <code>failed</code> for everything else (e.g. <code>Summarization failed: …</code>, no model selected), which are real failures.</li>
+    <li><b>Close the open compaction row with a truthful message.</b> A <code>completed</code> turn without <code>thread/compacted</code> leaves the <code>contextCompaction</code> item pending in the timeline (<code>operation-projection.ts:openCompactionsByKey</code>). Options, cheapest first: (a) emit <code>provider/error{message:"Context compaction skipped", detail:&lt;pi message&gt;}</code> alongside the completed turn — the server does not change lifecycle on <code>provider/error</code>, and <code>getCompactionTurnFinalization</code> already turns it into a closed row (title today reads "Context compaction failed"; retitle in <code>packages/thread-view/src/operation-projection.ts:finalizeOpenCompactionsForTurn</code> when the turn itself completed); or (b) add a <code>skipped</code>/<code>detail</code> field to the <code>contextCompaction</code> item and emit <code>item/completed</code> — cleaner, but it is a domain contract change (<code>packages/domain/src/provider-event.ts</code>) and, since items travel daemon → server, requires a <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump.</li>
+    <li><b>Update the pinned test</b> <code>event-translation.test.ts:432-465</code>: the "failed" row currently uses the "Nothing to compact" message as its example of a failure; change that row to a genuine failure message and add a row asserting the no-op outcome (the repro test above can be folded in).</li>
+    <li>Optional server-side pre-empt: the compact route already knows <code>contextWindowUsage.usedTokens</code>; it could refuse with a friendly 409 when usage is far below any plausible floor. Not recommended as the primary fix: <code>keepRecentTokens</code> is a pi-side setting the server does not know, and it would not help the "Already compacted" case.</li>
+  </ol>
+  <p>Risks: text matching against pi's messages is brittle across pi upgrades (pin the strings next to the pi version and cover them with the unit test); making the turn <code>completed</code> without <code>thread/compacted</code> must not trigger post-turn side effects that assume compaction happened (none found: <code>thread/compacted</code> is the only signal consumers key off). No wire-shape change for option 2(a).</p>
+
+  <h2>PR review</h2>
+  <p>No open PRs are linked to this issue.</p>
+
+  <h2>Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/1103">#1103</a> (closed): pi provider had no manual compaction; the <code>/compact</code> maintenance-turn path this report exercises was added for it in PR #1152 (commit 12acc8e5f); the settle fallback in <code>startPiCompaction</code> came with #1432 (7c3d1ab76).</li>
+    <li><a href="https://github.com/get-bb/bb/issues/448">#448</a> (closed): original request for a way to compact threads.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1431">#1431</a> (closed): claude-code <code>/clear</code> turn never settles — the sibling problem of a maintenance turn's terminal event being wrong.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1640">#1640</a>: provider bridge protocol; this bug was found during its final gate.</li>
+  </ul>
+
+  <h2>Appendix</h2>
+  <h3>Commands run</h3>
+<pre>gh api repos/get-bb/bb/issues/1721 --jq .body
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+git fetch origin main; git log 16ceb3a54..origin/main --oneline -- packages/agent-runtime/src/pi apps/server/src/internal
+git checkout 16ceb3a54            # worktree had been at a108fa7ef; repro done against base
+scripts/bb-dev-app current         # app :15978 server :23978 daemon :31978
+export BB_SERVER_URL=http://localhost:23978 BB_HOST_DAEMON_PORT=31978
+node packages/scripts/dist/commands/run-cli.js machine list
+curl -s -X POST $BB_SERVER_URL/api/v1/projects … (see step 2)
+node packages/scripts/dist/commands/run-cli.js thread spawn --project proj_vs92eqyrud --provider pi --model openai-codex/gpt-5.4-mini --reasoning-level low --permission-mode full --prompt "Reply only with ok." --json
+node packages/scripts/dist/commands/run-cli.js thread wait thr_h4dz2zcd52 --timeout 180
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BB_SERVER_URL/api/v1/threads/thr_h4dz2zcd52/compact -H 'content-type: application/json' -d '{}'
+node packages/scripts/dist/commands/run-cli.js thread wait thr_h4dz2zcd52 --status error --timeout 60
+node packages/scripts/dist/commands/run-cli.js thread show thr_h4dz2zcd52 --json
+node packages/scripts/dist/commands/run-cli.js thread log thr_h4dz2zcd52
+curl -s "$BB_SERVER_URL/api/v1/threads/thr_h4dz2zcd52/events?limit=200" &gt; 1721/repro/02-events-after-compact.json
+node packages/scripts/dist/commands/run-cli.js thread tell thr_h4dz2zcd52 "Reply only with ok."            # HTTP 409: Thread is not active
+node packages/scripts/dist/commands/run-cli.js thread tell thr_h4dz2zcd52 "Reply only with ok." --mode queue  # HTTP 400: Sender thread is invalid (unrelated: queue mode needs a sender thread)
+curl -s -X POST $BB_SERVER_URL/api/v1/threads/thr_h4dz2zcd52/send -H 'content-type: application/json' -d '{"input":[{"type":"text","text":"Reply only with ok.","mentions":[]}],"mode":"start"}'   # {"ok":true}, recovers
+dev-browser --browser bb1721 --headless … (scripts: 1721/repro/browser-compact.js, browser-compact-send.js)
+node packages/scripts/dist/commands/run-cli.js thread show thr_h4dz2zcd52   # Status: error (after UI compact)
+cd packages/agent-runtime &amp;&amp; pnpm exec vitest run src/pi/issue-1721-compact-too-small.test.ts
+pnpm dev:stop</pre>
+
+  <h3>Artifacts</h3>
+  <ul>
+    <li><a href="1721/repro/01-spawn.json">01-spawn.json</a> — spawn response</li>
+    <li><a href="1721/repro/02-events-after-compact.json">02-events-after-compact.json</a> — full event list after the first (API) compact</li>
+    <li><a href="1721/repro/03-tell-steer.txt">03-tell-steer.txt</a>, <a href="1721/repro/04-tell-queue.txt">04-tell-queue.txt</a> — CLI tell outputs on the errored thread</li>
+    <li><a href="1721/repro/05-send-start-recovers.txt">05-send-start-recovers.txt</a> — start-mode send accepted</li>
+    <li><a href="1721/repro/06-thread-show-after-ui-compact.txt">06-thread-show-after-ui-compact.txt</a> — status after the UI-triggered compact + tell 409</li>
+    <li><a href="1721/repro/browser-compact.js">browser-compact.js</a>, <a href="1721/repro/browser-compact-send.js">browser-compact-send.js</a>, <a href="1721/repro/browser-menu.js">browser-menu.js</a> — dev-browser scripts used for the screenshots</li>
+    <li><a href="1721/repro/issue-1721-compact-too-small.test.ts">issue-1721-compact-too-small.test.ts</a>, <a href="1721/repro/vitest-output.txt">vitest-output.txt</a> — unit repro</li>
+    <li><a href="1721/repro/07-server-log-excerpt.txt">07-server-log-excerpt.txt</a> — the only lifecycle log line for the thread (an unrelated benign "no transition for run.started from status active" during spawn); neither server nor daemon logs mention the compaction refusal, so the event stream is the only trace.</li>
+  </ul>
+
+  <h3>Pi SDK excerpts (node_modules/@earendil-works/pi-coding-agent@0.84.0)</h3>
+<pre>// dist/core/settings-manager.js:521
+return this.settings.compaction?.keepRecentTokens ?? 20000;
+
+// dist/core/compaction/compaction.js:492-540 (prepareCompaction)
+const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
+…
+if (messagesToSummarize.length === 0 &amp;&amp; turnPrefixMessages.length === 0) {
+    return undefined;
+}</pre>
+</main></body>
+</html>

@@ -1,0 +1,567 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1654 claude login doesn't apply to existing thread and requires restart</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.medium { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  details summary { cursor:pointer; color:var(--accent); }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1654 · claude login doesn't apply to existing thread and requires restart</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill medium">Medium</span> <span class="pill">Effort: n/a</span>
+    <span class="pill">providers</span> <span class="pill">provider-claude-code</span>
+    <a href="https://github.com/get-bb/bb/issues/1654">open on GitHub</a>
+    <span>2026-08-18</span>
+    <span>base <code>16ceb3a540f81c1189efaffb27a39b1d9443abf5</code> (main)</span>
+  </p>
+  <p class="meta">
+    <span class="verdict v-partial">Verdict: PARTIALLY REPRODUCED</span>
+    <span>· root-cause confidence: <b>medium</b></span>
+    <span>· linked open PRs: none</span>
+  </p>
+
+  <h2>TL;DR</h2>
+  <p><b>Plain-language framing.</b> bb does not talk to Anthropic itself for Claude threads. For every Claude thread the <em>provider-claude-code</em> plugin (running inside the host daemon) spawns one <code>claude</code> CLI process through the Claude Agent SDK and keeps that process alive for the whole life of the thread: every follow-up message is pushed into the same process's stdin (streaming input). The process is only killed when the thread is stopped/archived or when the bb server (host daemon) restarts. The CLI, not bb, decides which OAuth token goes on each API request; it reads the token from <code>~/.claude/.credentials.json</code> (Linux) or the macOS Keychain, and <code>claude login</code> writes there. bb's usage page, by contrast, re-reads that store on every refresh.</p>
+  <p>What the reporter sees: a thread hits a Claude usage limit, they <code>claude login</code> into a different subscription in a terminal, the bb usage page switches to the new account, but retrying in the existing thread still fails with the rate limit until the bb server is restarted. What is actually going on: the retry goes to the <em>same long-lived</em> <code>claude</code> process, and that process memoizes the OAuth token it loaded at startup. The CLI only drops that memo before a request when it notices a change of the <b>mtime of <code>&lt;config dir&gt;/.credentials.json</code></b>, or (if that file does not exist, i.e. macOS Keychain users) by re-reading the Keychain through a 30&nbsp;s cache that also keeps serving the old token whenever the <code>security</code> re-read fails or times out. A 429 does not invalidate anything. So whenever the credential store changes in a way this probe does not see, the live process is pinned to the old account for as long as it lives; only a fresh process (server restart, or stopping the idle thread) loads the new login.</p>
+  <p>On this Linux machine with Claude Code 2.1.233 and 2.1.234 the plain scenario does <b>not</b> reproduce: <code>claude login</code> rewrites the file, the mtime changes, and the very next turn on the live process uses the new token (repro log <a href="1654/repro/run-default-2.1.234.log">run-default-2.1.234.log</a>). The mechanism, however, reproduces deterministically as soon as the store changes without an mtime change (<a href="1654/repro/run-preserve-mtime-2.1.234.log">run-preserve-mtime-2.1.234.log</a>): the live process keeps sending the old token, a new process sends the new one — exactly the reported symptom. On macOS (the reporter's likely platform) the same pinning happens if a leftover <code>~/.claude/.credentials.json</code> sits next to the Keychain entry that <code>claude login</code> actually updates, or whenever the CLI's Keychain re-read fails within its 2&nbsp;s timeout. I could not run macOS here, so that last step is inferred from the shipped darwin binary's code (excerpts in <a href="1654/repro/claude-cli-credential-cache-excerpts.txt">claude-cli-credential-cache-excerpts.txt</a>), hence <em>medium</em> confidence. bb-side, the fact that survives all of this: bb never recycles the provider process after a terminal rate-limit/auth failure and therefore depends entirely on the CLI's in-process credential refresh, which has these known holes.</p>
+
+  <h2>Claims vs findings</h2>
+  <table>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Hitting a Claude rate limit in a thread leaves the thread's provider process in place</td><td class="ok">Verified</td><td>bb keeps one <code>claude</code> process per thread across turns and idle periods (same pid 2422530 before and after a second turn; <a href="1654/repro/bb-e2e-pid-persistence.txt">bb-e2e-pid-persistence.txt</a>). The 429 turn returns <code>result is_error=true</code> and the process stays alive and accepts the next turn (repro logs, Step 1 → Step 3). Nothing in the bridge or server tears the session down on a rate-limit result (<code>bridge.ts</code> replaces a session only when its SDK stream ended, <code>getWritableThreadSession</code>).</td></tr>
+    <tr><td><code>claude login</code> in the terminal (different subscription) succeeds and the bb usage page updates</td><td class="ok">Verified by code</td><td>The host daemon's usage fetch reads the credential store on every call — Keychain first, then <code>~/.claude/.credentials.json</code>, no caching (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/provider-usage.ts#L299-L356">provider-usage.ts#L299-L356</a>). So the usage page always shows the account that is currently in the store, independent of what live <code>claude</code> processes hold in memory.</td></tr>
+    <tr><td>Retries on the thread still hit the rate limit</td><td class="unv">Partially reproduced</td><td>Not reproduced on Linux with the plain flow (file mtime changes → CLI reloads the token on the next request, both 2.1.233 and 2.1.234). Reproduced deterministically when the store changes without an mtime change (Linux analog of the macOS Keychain case): the live process keeps sending token&nbsp;A after the file holds token&nbsp;B (<a href="1654/repro/run-preserve-mtime-2.1.234.log">log</a>).</td></tr>
+    <tr><td>Restarting the bb server fixes it</td><td class="ok">Verified</td><td>A restart kills the host daemon's bridge subprocesses and their <code>claude</code> children; the next turn resumes the thread in a fresh process that reads the store at startup (repro Step 4: new process → token&nbsp;B). Also verified in bb: <code>bb thread stop</code> on the idle thread releases the runtime and the next message spawns a new pid (2452544) — a lighter workaround than a server restart.</td></tr>
+    <tr><td>(implicit) bb is what caches the old login</td><td class="no">Refuted</td><td>bb passes no token: the session env is the daemon's env plus <code>CLAUDE_CODE_ENTRYPOINT=cli</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/provider-claude-code/src/bridge/bridge.ts#L1366-L1376">bridge.ts#L1366-L1376</a>); no <code>CLAUDE_CODE_OAUTH_TOKEN</code>/<code>ANTHROPIC_API_KEY</code> handling anywhere in the repo. The memo lives inside the <code>claude</code> process (excerpts below).</td></tr>
+  </table>
+
+  <h2>Environment</h2>
+  <ul>
+    <li>bb <code>16ceb3a54</code> (main, 2026-08-18), worktree <code>/home/sawyer/projects/bb/.claude/worktrees/wf_242c3e11-a10-14</code>. <code>git log 16ceb3a54..origin/main</code> (5 commits, up to <code>a108fa7ef</code>) touches nothing related; not fixed on main.</li>
+    <li>Linux 7.0.0-29-generic, node v24.18.0. Claude Code CLI on PATH: <code>~/.local/bin/claude → ~/.local/share/claude/versions/2.1.234</code> (also ran 2.1.233 and 2.1.232 binaries from the same directory). <code>@anthropic-ai/claude-agent-sdk</code> 0.3.197 (the version bb's plugin depends on).</li>
+    <li>Dev instance for the e2e check: App <code>:14796</code>, Server <code>:22796</code>, Host daemon <code>:30796</code>, data dir <code>/home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_242c3e11-a10-14-36521054d605</code>; project <code>proj_gatbfz5kej</code> (local path <code>/tmp/bb1654-scratch</code>), thread <code>thr_bdragpqzef</code>, host <code>host_pygkamp3h8</code>.</li>
+    <li>macOS was not available; the darwin-arm64 2.1.233/2.1.234 binaries were downloaded from <code>https://downloads.claude.ai/claude-code-releases/&lt;ver&gt;/darwin-arm64/claude</code> and only their embedded JS was inspected.</li>
+  </ul>
+
+  <h2>Minimal reproduction</h2>
+  <p>The repro drives the Claude Agent SDK exactly the way bb's <code>SdkSession</code> does (streaming-input <code>query()</code>, one process, several turns) against a local mock of the Anthropic API that logs the <code>Authorization</code> header and answers 429 for token&nbsp;A and a normal SSE reply for token&nbsp;B. Credentials live in a throwaway <code>CLAUDE_CONFIG_DIR</code>, so nothing touches your real login. No bb instance and no real usage needed.</p>
+  <ol>
+    <li>Build the worktree once: <code>pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build</code>.</li>
+    <li>Copy the script next to the plugin's <code>node_modules</code> (it imports the SDK from there): <code>cp /tmp/bb-reports/issues/1654/repro/stale-oauth-repro.mjs plugins/provider-claude-code/repro-1654.mjs</code>.</li>
+    <li>Plain flow (login rewrites the credentials file): <code>node plugins/provider-claude-code/repro-1654.mjs</code>. <b>Expected</b> (and observed): turn 2 on the live process already uses token&nbsp;B → exit&nbsp;0, "NOT reproduced".</li>
+    <li>Store changes without an mtime change (analog of a Keychain login next to a leftover file): <code>REPRO_MODE=preserve-mtime node plugins/provider-claude-code/repro-1654.mjs</code>. <b>Expected</b> if the CLI re-read credentials per request: token&nbsp;B on turn 2. <b>Actual</b>: turn 2 still sends token&nbsp;A and is rate-limited again; only the fresh process (turn 3) sends token&nbsp;B → exit&nbsp;1, "BUG REPRODUCED".</li>
+    <li>Optional: <code>REPRO_CLAUDE_BIN=~/.local/share/claude/versions/2.1.233 REPRO_MODE=preserve-mtime node …</code> to run against another CLI version (2.1.233 retries a 429 ten times with backoff, so it takes several minutes).</li>
+  </ol>
+  <h3>Output of step 4 (the pinned-token case), Claude Code 2.1.234</h3>
+  <pre>$ REPRO_MODE=preserve-mtime node repro-1654.mjs
+(exit=1)
+
+[repro] wrote /tmp/bb1654-claude-config-tmbJlb/.credentials.json with sk-ant-oat01-ACCOUNT-A-rate-limited
+
+=== Step 1: session P1 starts with token A (account A), first turn -&gt; rate limited ===
+[mock-api] HEAD / authorization=(none)
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[repro] turn 1 result: subtype=success is_error=true
+[repro] turn 1: /v1/messages calls=1 tokens used=[&quot;sk-ant-oat01-ACCOUNT-A-rate-limited&quot;]
+
+=== Step 2: user runs `claude login` on account B (credentials file rewritten with token B) ===
+[repro] (preserve-mtime) mtimeNs before=1787038782487032623 after=1787038782487032623 (unchanged)
+[repro] wrote /tmp/bb1654-claude-config-tmbJlb/.credentials.json with sk-ant-oat01-ACCOUNT-B-fresh-login
+
+=== Step 3: retry on the SAME live process P1 (what bb does when you resend in the thread) ===
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[repro] turn 2 result: subtype=success is_error=true
+[repro] turn 2 (same process, after login): /v1/messages calls=1 tokens used=[&quot;sk-ant-oat01-ACCOUNT-A-rate-limited&quot;]
+
+=== Step 4: fresh process P2 (what a bb server restart gives you) ===
+[mock-api] HEAD / authorization=(none)
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-B-fresh-login
+[repro] turn 3 result: subtype=success is_error=false
+[repro] turn 3 (new process): /v1/messages calls=1 tokens used=[&quot;sk-ant-oat01-ACCOUNT-B-fresh-login&quot;]
+
+=== SUMMARY ===
+{
+  &quot;turn1&quot;: [
+    &quot;sk-ant-oat01-ACCOUNT-A-rate-limited&quot;
+  ],
+  &quot;turn2&quot;: [
+    &quot;sk-ant-oat01-ACCOUNT-A-rate-limited&quot;
+  ],
+  &quot;turn3&quot;: [
+    &quot;sk-ant-oat01-ACCOUNT-B-fresh-login&quot;
+  ]
+}
+BUG REPRODUCED: the live claude process kept sending token A after the credentials file changed to token B; only a new process picked up token B.
+</pre>
+  <h3>Output of step 3 (plain file rewrite, not reproduced), Claude Code 2.1.234</h3>
+  <pre>$  node repro-1654.mjs
+(exit=0)
+
+[repro] wrote /tmp/bb1654-claude-config-6ccVzo/.credentials.json with sk-ant-oat01-ACCOUNT-A-rate-limited
+
+=== Step 1: session P1 starts with token A (account A), first turn -&gt; rate limited ===
+[mock-api] HEAD / authorization=(none)
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[repro] turn 1 result: subtype=success is_error=true
+[repro] turn 1: /v1/messages calls=1 tokens used=[&quot;sk-ant-oat01-ACCOUNT-A-rate-limited&quot;]
+
+=== Step 2: user runs `claude login` on account B (credentials file rewritten with token B) ===
+[repro] wrote /tmp/bb1654-claude-config-6ccVzo/.credentials.json with sk-ant-oat01-ACCOUNT-B-fresh-login
+
+=== Step 3: retry on the SAME live process P1 (what bb does when you resend in the thread) ===
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-B-fresh-login
+[repro] turn 2 result: subtype=success is_error=false
+[repro] turn 2 (same process, after login): /v1/messages calls=1 tokens used=[&quot;sk-ant-oat01-ACCOUNT-B-fresh-login&quot;]
+
+=== Step 4: fresh process P2 (what a bb server restart gives you) ===
+[mock-api] HEAD / authorization=(none)
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-B-fresh-login
+[repro] turn 3 result: subtype=success is_error=false
+[repro] turn 3 (new process): /v1/messages calls=1 tokens used=[&quot;sk-ant-oat01-ACCOUNT-B-fresh-login&quot;]
+
+=== SUMMARY ===
+{
+  &quot;turn1&quot;: [
+    &quot;sk-ant-oat01-ACCOUNT-A-rate-limited&quot;
+  ],
+  &quot;turn2&quot;: [
+    &quot;sk-ant-oat01-ACCOUNT-B-fresh-login&quot;
+  ],
+  &quot;turn3&quot;: [
+    &quot;sk-ant-oat01-ACCOUNT-B-fresh-login&quot;
+  ]
+}
+NOT reproduced: the live process picked up the new token.
+</pre>
+  <h3>The repro script (<a href="1654/repro/stale-oauth-repro.mjs">1654/repro/stale-oauth-repro.mjs</a>)</h3>
+  <pre>// Repro for get-bb/bb#1654: a long-lived Claude Code process (the way bb&#x27;s
+// provider-claude-code bridge keeps one `claude` process per thread) keeps
+// using the OAuth access token it loaded at startup, even after
+// ~/.claude/.credentials.json (here: $CLAUDE_CONFIG_DIR/.credentials.json) is
+// rewritten by `claude login`.
+//
+// Run from plugins/provider-claude-code (needs @anthropic-ai/claude-agent-sdk):
+//   node /tmp/bb-reports/issues/1654/repro/stale-oauth-repro.mjs
+import { query } from &quot;@anthropic-ai/claude-agent-sdk&quot;;
+import { createServer } from &quot;node:http&quot;;
+import { mkdtempSync, writeFileSync, statSync } from &quot;node:fs&quot;;
+import { execFileSync } from &quot;node:child_process&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+
+const TOKEN_A = &quot;sk-ant-oat01-ACCOUNT-A-rate-limited&quot;;
+const TOKEN_B = &quot;sk-ant-oat01-ACCOUNT-B-fresh-login&quot;;
+
+// ---- mock Anthropic API: token A is &quot;rate limited&quot;, token B works ---------
+const seen = [];
+const server = createServer((req, res) =&gt; {
+  let body = &quot;&quot;;
+  req.on(&quot;data&quot;, (c) =&gt; (body += c));
+  req.on(&quot;end&quot;, () =&gt; {
+    const auth = req.headers.authorization ?? &quot;(none)&quot;;
+    const token = auth.replace(/^Bearer /, &quot;&quot;);
+    seen.push({ path: req.url, token });
+    console.log(`[mock-api] ${req.method} ${req.url} authorization=${auth}`);
+    if (!req.url.startsWith(&quot;/v1/messages&quot;)) {
+      res.writeHead(404).end();
+      return;
+    }
+    if (token === TOKEN_A &amp;&amp; process.env.REPRO_MODE !== &quot;success-first&quot;) {
+      res.writeHead(429, {
+        &quot;content-type&quot;: &quot;application/json&quot;,
+        &quot;anthropic-ratelimit-unified-status&quot;: &quot;rejected&quot;,
+        &quot;anthropic-ratelimit-unified-reset&quot;: String(Math.floor(Date.now() / 1000) + 3600),
+      });
+      res.end(JSON.stringify({ type: &quot;error&quot;, error: { type: &quot;rate_limit_error&quot;, message: &quot;You have hit your usage limit (mock)&quot; } }));
+      return;
+    }
+    res.writeHead(200, { &quot;content-type&quot;: &quot;text/event-stream&quot; });
+    const ev = (t, d) =&gt; res.write(`event: ${t}\ndata: ${JSON.stringify({ type: t, ...d })}\n\n`);
+    ev(&quot;message_start&quot;, { message: { id: &quot;msg_1&quot;, type: &quot;message&quot;, role: &quot;assistant&quot;, model: &quot;claude-sonnet-4-5&quot;, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } });
+    ev(&quot;content_block_start&quot;, { index: 0, content_block: { type: &quot;text&quot;, text: &quot;&quot; } });
+    ev(&quot;content_block_delta&quot;, { index: 0, delta: { type: &quot;text_delta&quot;, text: &quot;ok&quot; } });
+    ev(&quot;content_block_stop&quot;, { index: 0 });
+    ev(&quot;message_delta&quot;, { delta: { stop_reason: &quot;end_turn&quot;, stop_sequence: null }, usage: { output_tokens: 1 } });
+    ev(&quot;message_stop&quot;, {});
+    res.end();
+  });
+});
+await new Promise((r) =&gt; server.listen(0, &quot;127.0.0.1&quot;, r));
+const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+// ---- fake CLAUDE_CONFIG_DIR with OAuth credentials -----------------------
+const configDir = mkdtempSync(join(tmpdir(), &quot;bb1654-claude-config-&quot;));
+function writeCredentials(accessToken) {
+  const credPath = join(configDir, &quot;.credentials.json&quot;);
+  let previous = null;
+  try { previous = statSync(credPath, { bigint: true }); } catch {}
+  writeFileSync(credPath, JSON.stringify({
+    claudeAiOauth: {
+      accessToken,
+      refreshToken: &quot;sk-ant-ort01-unused&quot;,
+      expiresAt: Date.now() + 24 * 3600 * 1000,
+      scopes: [&quot;user:inference&quot;, &quot;user:profile&quot;],
+      subscriptionType: &quot;max&quot;,
+    },
+  }));
+  if (previous &amp;&amp; process.env.REPRO_MODE === &quot;preserve-mtime&quot;) {
+    // Emulate a credential store change that the CLI&#x27;s mtime probe cannot see
+    // (macOS: a leftover ~/.claude/.credentials.json next to a keychain entry).
+    // node&#x27;s utimes only has ms precision; use python os.utime(ns=...) to restore the exact nanosecond mtime
+    execFileSync(&quot;python3&quot;, [&quot;-c&quot;, &quot;import os,sys;os.utime(sys.argv[1], ns=(int(sys.argv[2]), int(sys.argv[3])))&quot;, credPath, String(previous.atimeNs), String(previous.mtimeNs)]);
+    const now = statSync(credPath, { bigint: true });
+    console.log(`[repro] (preserve-mtime) mtimeNs before=${previous.mtimeNs} after=${now.mtimeNs} (${now.mtimeNs === previous.mtimeNs ? &quot;unchanged&quot; : &quot;CHANGED&quot;})`);
+  }
+  console.log(`[repro] wrote ${configDir}/.credentials.json with ${accessToken}`);
+}
+writeCredentials(TOKEN_A);
+
+const env = {
+  ...process.env,
+  CLAUDE_CONFIG_DIR: configDir,
+  ANTHROPIC_BASE_URL: baseUrl,
+  CLAUDE_CODE_ENTRYPOINT: &quot;cli&quot;,
+  DISABLE_TELEMETRY: &quot;1&quot;,
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: &quot;1&quot;,
+  NO_PROXY: &quot;127.0.0.1,localhost&quot;,
+};
+for (const k of [&quot;ANTHROPIC_API_KEY&quot;, &quot;ANTHROPIC_AUTH_TOKEN&quot;, &quot;CLAUDECODE&quot;, &quot;CLAUDE_CODE_SESSION_ID&quot;, &quot;CLAUDE_AGENT_SDK_CLIENT_APP&quot;, &quot;CLAUDE_CODE_MESSAGING_SOCKET&quot;, &quot;CLAUDE_CODE_MESSAGING_TOKEN&quot;, &quot;CLAUDE_CODE_CHILD_SESSION&quot;, &quot;CLAUDE_PID&quot;, &quot;CLAUDE_CODE_EXECPATH&quot;, &quot;ANTHROPIC_MODEL&quot;]) delete env[k];
+
+// ---- a streaming-input SDK session, exactly like bb&#x27;s SdkSession.start() --
+function openSession(label) {
+  let resolveNext = null;
+  const queue = [];
+  const prompt = { [Symbol.asyncIterator]() { return { next() {
+    if (queue.length) return Promise.resolve({ value: queue.shift(), done: false });
+    return new Promise((r) =&gt; (resolveNext = r));
+  } }; } };
+  const q = query({ prompt, options: {
+    cwd: process.cwd(), env, model: &quot;claude-sonnet-4-5&quot;, ...(process.env.REPRO_CLAUDE_BIN ? { pathToClaudeCodeExecutable: process.env.REPRO_CLAUDE_BIN } : {}),
+    systemPrompt: &quot;Reply with ok.&quot;, permissionMode: &quot;default&quot;,
+    settingSources: [], persistSession: false, includePartialMessages: false,
+    tools: [], allowedTools: [],
+    stderr: (d) =&gt; process.stderr.write(`[claude stderr ${label}] ${d}`),
+  } });
+  const results = [];
+  let onResult = null;
+  (async () =&gt; { for await (const m of q) {
+    if (m.type === &quot;result&quot;) { results.push(m); onResult?.(m); }
+  } })().catch((e) =&gt; console.log(`[${label}] stream error: ${e.message}`));
+  return {
+    turn(text) {
+      const msg = { type: &quot;user&quot;, message: { role: &quot;user&quot;, content: text }, parent_tool_use_id: null, session_id: &quot;&quot; };
+      const done = new Promise((r) =&gt; (onResult = r));
+      if (resolveNext) { const r = resolveNext; resolveNext = null; r({ value: msg, done: false }); } else queue.push(msg);
+      return done;
+    },
+    close() { q.close(); },
+  };
+}
+
+function report(step, before) {
+  const calls = seen.slice(before).filter((s) =&gt; s.path.startsWith(&quot;/v1/messages&quot;));
+  const tokens = [...new Set(calls.map((c) =&gt; c.token))];
+  console.log(`[repro] ${step}: /v1/messages calls=${calls.length} tokens used=${JSON.stringify(tokens)}`);
+  return tokens;
+}
+
+const summary = {};
+console.log(&quot;\n=== Step 1: session P1 starts with token A (account A), first turn -&gt; rate limited ===&quot;);
+const p1 = openSession(&quot;P1&quot;);
+let mark = seen.length;
+let r = await p1.turn(&quot;Reply only with ok.&quot;);
+console.log(`[repro] turn 1 result: subtype=${r.subtype} is_error=${r.is_error}`);
+summary.turn1 = report(&quot;turn 1&quot;, mark);
+
+console.log(&quot;\n=== Step 2: user runs `claude login` on account B (credentials file rewritten with token B) ===&quot;);
+writeCredentials(TOKEN_B);
+
+console.log(&quot;\n=== Step 3: retry on the SAME live process P1 (what bb does when you resend in the thread) ===&quot;);
+mark = seen.length;
+r = await p1.turn(&quot;Reply only with ok.&quot;);
+console.log(`[repro] turn 2 result: subtype=${r.subtype} is_error=${r.is_error}`);
+summary.turn2 = report(&quot;turn 2 (same process, after login)&quot;, mark);
+p1.close();
+
+console.log(&quot;\n=== Step 4: fresh process P2 (what a bb server restart gives you) ===&quot;);
+const p2 = openSession(&quot;P2&quot;);
+mark = seen.length;
+r = await p2.turn(&quot;Reply only with ok.&quot;);
+console.log(`[repro] turn 3 result: subtype=${r.subtype} is_error=${r.is_error}`);
+summary.turn3 = report(&quot;turn 3 (new process)&quot;, mark);
+p2.close();
+
+server.close();
+console.log(&quot;\n=== SUMMARY ===&quot;);
+console.log(JSON.stringify(summary, null, 2));
+const bug = summary.turn2.includes(TOKEN_A) &amp;&amp; !summary.turn2.includes(TOKEN_B) &amp;&amp; summary.turn3.includes(TOKEN_B);
+console.log(bug
+  ? &quot;BUG REPRODUCED: the live claude process kept sending token A after the credentials file changed to token B; only a new process picked up token B.&quot;
+  : &quot;NOT reproduced: the live process picked up the new token.&quot;);
+process.exit(bug ? 1 : 0);
+</pre>
+
+  <h3>bb end-to-end: the provider process really is long-lived</h3>
+  <p>On a dev instance at <code>16ceb3a54</code> I spawned a real claude-code thread, sent a second message, and looked at the process tree under the host daemon each time (<a href="1654/repro/bb-e2e-pid-persistence.txt">bb-e2e-pid-persistence.txt</a>). The same <code>claude</code> pid served both turns and stayed alive while idle. Stopping the idle thread (<code>bb thread stop</code>) released it and the next message started a new pid — the workaround that does not need a server restart. On the user's own bb instance on this machine (observed with <code>ps</code> only) a bridge-spawned <code>claude</code> had been alive for ~14.8&nbsp;h.</p>
+  <pre># bb e2e check: one long-lived `claude` process per thread, kept alive across turns
+# dev instance: worktree 16ceb3a54, App http://localhost:14796, Server http://localhost:22796, Host daemon http://127.0.0.1:30796
+# data dir: /home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_242c3e11-a10-14-36521054d605
+# host daemon pid: 2414254 (found via `ss -ltnp | grep :30796`)
+
+$ pnpm bb:dev thread spawn --project proj_gatbfz5kej --provider claude-code --permission-mode accept-edits --title &quot;1654 pid check&quot; --prompt &quot;Reply only with ok.&quot; --json
+  -&gt; thread thr_bdragpqzef  (turn 1 completed, status idle at 07:35)
+
+$ pstree -p -T 2414254 | grep -v esbuild
+                    |-MainThread(2422114)---claude(2422530)
+
+$ ps -o pid,ppid,etimes,lstart,args -p 2422114,2422530
+    PID    PPID ELAPSED                  STARTED COMMAND
+2422114 2414254      32 Tue Aug 18 07:34:55 2026 node ... apps/host-daemon/dist/bb-claude-code-bridge.mjs   (provider-claude-code bridge)
+2422530 2422114      31 Tue Aug 18 07:34:56 2026 /home/sawyer/.local/bin/claude --output-format stream-json --verbose --input-format stream-json --thinking adaptive --thinking-display summarized --effort medium --model ... --permission-prompt-tool stdio
+$ date
+Tue Aug 18 07:35:29 AM UTC 2026
+# thread status at this point:
+$ curl -s $BB_SERVER_URL/api/v1/threads/thr_bdragpqzef | python3 -c &quot;import json,sys;d=json.load(sys.stdin);print(d[&#x27;status&#x27;],d[&#x27;runtime&#x27;])&quot;
+idle {&#x27;displayStatus&#x27;: &#x27;idle&#x27;, &#x27;hostReconnectGraceExpiresAt&#x27;: None}
+
+# --- second turn on the same thread ---
+$ pnpm bb:dev thread tell thr_bdragpqzef &quot;Reply only with ok.&quot; --json
+{ &quot;threadId&quot;: &quot;thr_bdragpqzef&quot;, &quot;ok&quot;: true, &quot;mode&quot;: &quot;steer&quot; }
+$ pnpm bb:dev thread wait thr_bdragpqzef --json
+  &quot;matched&quot;: true, &quot;target&quot;: { &quot;kind&quot;: &quot;status&quot;, &quot;status&quot;: &quot;idle&quot; }
+
+$ pstree -p -T 2414254 | grep claude
+                    |-MainThread(2422114)---claude(2422530)
+$ ps -o pid,ppid,etimes,lstart -p 2422530
+    PID    PPID ELAPSED                  STARTED
+2422530 2422114      60 Tue Aug 18 07:34:56 2026
+
+# =&gt; the SAME claude process (pid 2422530, started 07:34:56) served both turns and stays alive while the thread is idle.
+# It only goes away on an explicit stop/release/archive of the thread or when the host daemon (bb server) restarts.
+#
+# For comparison, on the user&#x27;s real bb instance on this machine (not touched, only observed with ps) a bridge-spawned
+# `claude --output-format stream-json ... --permission-prompt-tool stdio` process had been alive for 53313 s (~14.8 h).
+
+# --- workaround check: releasing the idle runtime spawns a fresh claude process on the next send ---
+$ pnpm bb:dev thread stop thr_bdragpqzef --json
+{ &quot;ok&quot;: true, &quot;threadId&quot;: &quot;thr_bdragpqzef&quot; }
+$ pstree -p -T 2414254 | grep -c claude
+0
+$ pnpm bb:dev thread tell thr_bdragpqzef &quot;Reply only with ok.&quot; --json ; pnpm bb:dev thread wait thr_bdragpqzef --json
+  ok / matched status idle
+$ pstree -p -T 2414254 | grep claude
+                    |-MainThread(2422114)---claude(2452544)      &lt;- NEW pid (was 2422530); this process reads credentials fresh at startup
+$ date
+Tue Aug 18 07:38:25 AM UTC 2026
+</pre>
+
+  <h2>Root cause</h2>
+  <p><b>1. bb keeps one <code>claude</code> process per thread for the thread's whole life.</b> <code>SdkSession.start()</code> opens a streaming-input SDK query with <code>persistSession: true</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/provider-claude-code/src/bridge/sdk-session.ts#L211-L285">sdk-session.ts#L211-L285</a>); each new turn is <code>pushInput()</code> into that same query (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/provider-claude-code/src/bridge/sdk-session.ts#L287-L324">sdk-session.ts#L287-L324</a>, called from <code>runTurnStart</code> → <code>queuePromptInputs</code> in <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/provider-claude-code/src/bridge/bridge.ts#L2257-L2299">bridge.ts#L2257-L2296</a>). The bridge only rebuilds a session when its SDK stream ended (<code>getWritableThreadSession</code> → <code>replaceEndedThreadSession</code>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/provider-claude-code/src/bridge/bridge.ts#L1199-L1243">bridge.ts#L1199-L1244</a>); a 429 result does not end the stream. The server releases an idle runtime only on an explicit stop (<code>stopThreadForCurrentState</code> → <code>releaseIdleThreadRuntime</code>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/thread-lifecycle.ts#L1479-L1553">thread-lifecycle.ts#L1479-L1553</a>). Nothing recycles the process after a rate-limit or auth failure. bb passes no credentials of its own (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/provider-claude-code/src/bridge/bridge.ts#L1366-L1376">buildSessionEnv</a>), so which account a thread bills is decided entirely inside that long-lived CLI process.</p>
+  <p><b>2. The Claude Code CLI memoizes the OAuth token and invalidates it only on narrow triggers.</b> From the shipped binaries (minified names, see <a href="1654/repro/claude-cli-credential-cache-excerpts.txt">excerpts</a>): <code>getClaudeAIOAuthTokens</code> (<code>ua = iu(() =&gt; … al().read()?.claudeAiOauth …)</code>) and its async twin are memoized. Before each API request the client runs the "refresh if needed" step, whose first action is:</p>
+  <pre>async function A8_(){
+  try{ let{mtimeMs:e}=await stat(join(configDir,".credentials.json")); if(e!==lastMtime) lastMtime=e, clearTokenCaches() }
+  catch{ /* file missing (Keychain users) */ ua.cache.clear(); s5.cache.clear(); let t=(await s5())?.accessToken??null; … }
+}</pre>
+  <p>So on Linux a real <code>claude login</code> is picked up (mtime changes) — which is why the plain flow does not reproduce here — but any change the mtime probe cannot see leaves the memo in place for the life of the process (the <code>preserve-mtime</code> run). On macOS the store is the Keychain: if <code>~/.claude/.credentials.json</code> is absent the CLI re-reads the Keychain through its own 30&nbsp;s cache (<code>$2o=30000</code>), and on any failed/timed-out <code>security find-generic-password</code> re-read (2&nbsp;s timeout, versus 10&nbsp;s for the startup prefetch) it re-caches the <em>old</em> token for another 30&nbsp;s ("<code>[keychain] read failed; serving stale cache</code>"); if the file <em>is</em> present (plaintext fallback leftover — the CLI only deletes it when a Keychain write succeeds while the Keychain held nothing before) the mtime path wins and the Keychain change is never noticed. A 429 invalidates nothing; only a 401 triggers "recovered from disk/keychain" recovery. Either way the visible symptom is the reported one: usage page (fresh read) shows account&nbsp;B, the thread's process keeps billing account&nbsp;A, restart fixes it.</p>
+  <p><b>Deeper issue.</b> Even when the CLI does reload, bb offers the user no way short of a server restart to "make this thread use my current login": the rate-limit recovery path (<code>continueThreadAfterProviderRateLimit</code>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/provider-rate-limit-recovery.ts#L299-L330">provider-rate-limit-recovery.ts#L302-L330</a>) and a manual resend both push into the existing process. The thread's provider identity (<code>providerThreadId</code>) is persisted, so a fresh process could resume the same conversation at no cost — the bridge already does exactly that when a stream ends.</p>
+
+  <h2>Proposed fix (first principles)</h2>
+  <ul>
+    <li><b>Recycle the provider process after a terminal rate-limit/auth failure (plugin, daemon side).</b> In <code>plugins/provider-claude-code/src/bridge/bridge.ts</code>, when the SDK <code>result</code> for a turn carries <code>is_error</code> classified as <code>rate-limit</code>/<code>unauthorized</code>/<code>billing</code> (the categories already computed by <code>buildClaudeProviderErrorInfo</code>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/provider-claude-code/src/error-info.ts#L16-L60">error-info.ts#L16-L60</a>), mark the <code>ThreadSession</code> as <em>recycle-on-next-input</em>. In <code>getWritableThreadSession</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/provider-claude-code/src/bridge/bridge.ts#L1234-L1243">bridge.ts#L1234-L1244</a>) treat that flag like <code>streamEnded</code>: settle, <code>emitSessionReplacement</code>, and <code>start(providerThreadId)</code> a fresh SDK session (the existing <code>replaceEndedThreadSession</code> path). The new <code>claude</code> process reads the store at startup, so a login done in between takes effect on the retry; the SDK <code>resume</code> keeps the conversation. Cost: one process spawn per failed turn (only after failures, so negligible), and the replacement notification already exists (#1268 semantics), so nothing is silent. Wire shapes do not change (no <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump needed). Risk to check: a resume of a session whose last turn failed must not re-emit that failure; the existing stream-ended replacement path handles the same case.</li>
+    <li><b>Optionally, release idle Claude runtimes on rate-limit failure at the server</b> (policy layer): after <code>turn/completed status=failed</code> with a terminal <code>rate-limit</code> provider error, call the existing <code>releaseIdleThreadRuntime</code> so the next send cold-starts. Simpler, but provider-agnostic and coarser (Codex/Pi do not have this problem), so the plugin-level fix is the better layer per AGENTS.md ("daemon owns runtime/session management").</li>
+    <li><b>Documentation/UX:</b> until then, tell users that stopping the idle thread (<code>bb thread stop &lt;id&gt;</code> or the Stop action) makes the next message run in a fresh process with the current login — verified above.</li>
+    <li>What would settle the macOS specifics: on the reporter's machine, <code>ls -la ~/.claude/.credentials.json</code> (leftover plaintext file → mtime path pins the token) and the CLI debug log of a bb-spawned session after login (<code>[keychain] read failed; serving stale cache</code> or the 30&nbsp;s TTL). If neither applies, the CLI's cache is not the cause and the next thing to look at is whether the retry took longer than 30&nbsp;s after login.</li>
+  </ul>
+
+  <h2>PR review</h2>
+  <p>No open PRs are linked to this issue.</p>
+
+  <h2>Related issues</h2>
+  <ul>
+    <li>bb: <code>provider/rateLimits/updated</code> handling and the rate-limit recovery flow (<code>provider-rate-limit-recovery.ts</code>, plugin <code>provider-retry</code>) — they resend into the same process and would benefit from the recycle-on-failure fix.</li>
+    <li>Claude Code changelog 2.1.178: "Fixed model requests continuing to fail with auth errors after credentials were refreshed outside the session, due to a stale cached request configuration" — same class of in-process credential staleness, fixed only for the 401 path.</li>
+    <li>Claude Code changelog 2.1.234: usage-limit 429s are no longer retried in-process (1 call vs 11 in 2.1.233), and "continue automatically at usage limit" was added; neither invalidates the token cache.</li>
+  </ul>
+
+  <h2>Appendix</h2>
+  <h3>Commands run</h3>
+  <pre>gh issue view 1654 --repo get-bb/bb --json ...            # no comments on the issue
+git checkout 16ceb3a54 &amp;&amp; pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build
+grep -rn "claudeAiOauth|credentials.json|oauth" apps plugins packages   # bb reads the store only in apps/host-daemon/src/provider-usage.ts
+grep -rn "CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY" apps plugins packages docs   # only a bb-app env test; bb never sets a token
+cp /tmp/bb-reports/issues/1654/repro/stale-oauth-repro.mjs plugins/provider-claude-code/repro-1654.mjs
+node plugins/provider-claude-code/repro-1654.mjs                                    # -> run-default-2.1.234.log
+REPRO_MODE=success-first node plugins/provider-claude-code/repro-1654.mjs           # 200 on turn 1: still reloads on turn 2 (Linux)
+REPRO_MODE=preserve-mtime node plugins/provider-claude-code/repro-1654.mjs          # -> run-preserve-mtime-2.1.234.log (BUG REPRODUCED)
+REPRO_CLAUDE_BIN=~/.local/share/claude/versions/2.1.233 node plugins/provider-claude-code/repro-1654.mjs   # 11 calls per 429 turn, reloads on turn 2
+REPRO_MODE=preserve-mtime REPRO_CLAUDE_BIN=~/.local/share/claude/versions/2.1.233 node …                # -> run-preserve-mtime-2.1.233.log
+strings -n 8 ~/.local/share/claude/versions/2.1.234 &gt; /tmp/strings.txt   # then python substring search for
+#   getClaudeAIOAuthTokens / ".credentials.json")) / mtimeMs / name:"keychain" / tengu_oauth_401_recovered_from_*
+curl -fsSL -o /tmp/bb1654-mac/claude-darwin-arm64 https://downloads.claude.ai/claude-code-releases/2.1.234/darwin-arm64/claude  (and 2.1.233)
+scripts/bb-dev-app current ; eval "$(scripts/bb-dev-app env)"
+curl -s -X POST $BB_SERVER_URL/api/v1/projects -H 'content-type: application/json' -d '{"name":"qa","source":{"type":"local_path","path":"/tmp/bb1654-scratch","hostId":"host_pygkamp3h8"}}'
+pnpm bb:dev thread spawn --project proj_gatbfz5kej --provider claude-code --permission-mode accept-edits --title "1654 pid check" --prompt "Reply only with ok." --json
+ss -ltnp | grep :30796 ; pstree -p -T &lt;host daemon pid&gt; ; ps -o pid,ppid,etimes,lstart,args -p &lt;bridge&gt;,&lt;claude&gt;
+pnpm bb:dev thread tell thr_bdragpqzef "Reply only with ok." --json ; pnpm bb:dev thread wait thr_bdragpqzef --json ; pstree again
+pnpm bb:dev thread stop thr_bdragpqzef --json ; tell again ; pstree again   # new claude pid
+git fetch origin main ; git log --oneline 16ceb3a54..origin/main            # nothing relevant
+pnpm dev:stop</pre>
+  <h3>Claude Code CLI credential-cache excerpts (2.1.234 linux, 2.1.234/2.1.233 darwin)</h3>
+  <pre>Excerpts of the Claude Code CLI&#x27;s OAuth credential handling, recovered from the
+embedded (minified) JS source in the shipped binaries. Identifiers are minified;
+readable names are given in comments. Extracted with `strings -n 8 &lt;binary&gt;` and
+python substring search (see the report&#x27;s Appendix for the exact commands).
+
+Binaries:
+  linux-x64  2.1.234  ~/.local/share/claude/versions/2.1.234           (what bb spawns on this machine)
+  darwin-arm64 2.1.234 and 2.1.233  https://downloads.claude.ai/claude-code-releases/&lt;ver&gt;/darwin-arm64/claude
+
+--------------------------------------------------------------------------------
+1) getClaudeAIOAuthTokens (sync, `ua`) and getClaudeAIOAuthTokensAsync (`s5`/`az`) are MEMOIZED
+   (`iu(...)` = lodash-style memoize with `.cache`; `B0r/FCr(...)` = promise memoize). linux 2.1.234:
+
+ua=iu(()=&gt;{
+  if(pg())return null;                                        // CLAUDE_CODE_SIMPLE / --bare
+  if(V.CLAUDE_CODE_OAUTH_TOKEN)return{accessToken:V.CLAUDE_CODE_OAUTH_TOKEN, ...};
+  let e=nye(),t=(r)=&gt;({accessToken:r, ...});                  // fd token
+  if(e&amp;&amp;(!x6t()||IH()))return t(e);
+  if(IH())return null;
+  try{let o=al().read()?.claudeAiOauth;if(o?.accessToken)return o}catch(r){ke(r)}   // &lt;- read from secure storage ONCE, then cached
+  if(e)return t(e);
+  return null});
+s5=B0r(async()=&gt;{ ... try{let n=(await al().readAsync())?.claudeAiOauth;if(n?.accessToken)return n}catch(t){ke(t)} ... });
+
+--------------------------------------------------------------------------------
+2) The only pre-request cache invalidation: `A8_` (linux) / `OG_` (darwin 2.1.234) / `bM_` (darwin 2.1.233),
+   called first thing from the &quot;refresh OAuth token if needed&quot; step (`q6s`/`JWs`, wrapped by `Nb`/`Fb`)
+   which the API client runs before creating each request (&quot;[API:request] Creating client ... await Fb(); let m=ua()&quot;).
+
+async function A8_(){
+  try{
+    let{mtimeMs:e}=await g7t.stat(ERr.join(tee(),&quot;.credentials.json&quot;));   // &lt;config dir&gt;/.credentials.json
+    if(e!==Bmd)Bmd=e,OV()                                                   // mtime changed -&gt; clear ua/s5 memo caches (OV = s8s + ...)
+  }catch{
+    // file missing (macOS keychain users): clear memo caches and re-read via the storage backend
+    ua.cache?.clear?.(),s5.cache?.clear?.();
+    let t=(await s5())?.accessToken??null;
+    if(t!==Fmd)Fmd=t,rye(),QRe()
+  }
+}
+function s8s(){ua.cache?.clear?.(),s5.cache?.clear?.(),oye()}
+function OV(){s8s(),rye(),QRe()}
+
+  =&gt; If &lt;config dir&gt;/.credentials.json EXISTS and its mtime is unchanged, nothing is invalidated and the process
+     keeps the token it loaded at startup (this is what the preserve-mtime repro exercises on Linux).
+  =&gt; Other invalidation points are only: successful token refresh/save, /login inside the same process,
+     401 recovery (&quot;tengu_oauth_401_recovered_from_disk&quot; / &quot;..._from_keychain&quot;), structured-IO env update.
+     A 429 (usage limit) does NOT invalidate anything.
+
+--------------------------------------------------------------------------------
+3) Storage backend `al()`.
+   linux:  function al(){if(TJu)return TJu;return q4s}          // q4s = {name:&quot;plaintext&quot;, read(){ readFileSync(&lt;cfg&gt;/.credentials.json) } ...}  (keychain code compiled out)
+   darwin: function al(){if(MXu)return MXu;return _Xu(G3s,j2o)} // keychain-with-plaintext-fallback
+
+   darwin keychain backend (2.1.234; identical in 2.1.233 with other minified names) has its OWN 30 s cache and
+   serves STALE data when `security` fails/times out (2 s timeout on re-reads vs 10 s for the startup prefetch):
+
+G3s={name:&quot;keychain&quot;,
+  read(){let e=AR.cache;if(Date.now()-e.cachedAt&lt;$2o)return e.data;          // $2o = 30000 ms
+    let t=AR.lastReadFailure;if(t!==null&amp;&amp;Date.now()-t&lt;z3s)return e.data;      // z3s = 1000 ms
+    try{ ... o=Oat(`security find-generic-password -a &quot;${n}&quot; -w -s &quot;${r}&quot;`,{timeout:qxr}) ... }catch(r){}   // qxr = 2000 ms
+    if(e.data!==null)return T(&quot;[keychain] read failed; serving stale cache&quot;,{level:&quot;warn&quot;}),AR.cache={data:e.data,cachedAt:Date.now()},e.data;
+    return AR.cache={data:null,cachedAt:Date.now()},null},
+  async readAsync(){let e=AR.cache;if(Date.now()-e.cachedAt&lt;$2o)return e.data; ...
+    n=SXu().then((o)=&gt;{ ... if(o===MI){ T(&quot;[keychain] readAsync failed; not caching a null&quot;); AR.lastReadFailure=Date.now();
+                          if(e.data!==null)AR.cache={data:e.data,cachedAt:Date.now()}; return e.data }   // failure =&gt; stale token re-cached for another 30 s
+    ... })},
+  invalidateCache(){iee()}, ...}
+function iee(){AR.cache={data:null,cachedAt:0},AR.generation++,AR.readInFlight=null,AR.lastReadFailure=null}
+var MVe=&quot;-credentials&quot;,$2o=30000,z3s=1000;   qxr=2000 (security timeout for re-reads); SF_=1e4 (startup prefetch timeout)
+
+   The plaintext fallback file on darwin is only deleted when a keychain write succeeds AND the keychain previously
+   held no entry (`_Xu.update`: `if(i===null)await t.delete(o)`), so a leftover ~/.claude/.credentials.json can
+   coexist with the keychain entry that `claude login` actually updates.
+
+--------------------------------------------------------------------------------
+4) Behavioural difference seen in the repro: 2.1.233 retries a usage-limit 429 (10 retries with backoff, 11 calls per
+   turn); 2.1.234 makes a single call and returns `result is_error=true` immediately (new &quot;continue automatically at
+   usage limit&quot; behaviour). Neither version invalidates the token cache on 429.
+</pre>
+  <h3>2.1.233 preserve-mtime run (same result: 11 retried calls per 429 turn, live process pinned to token A, new process uses token B)</h3>
+  <pre>[repro] wrote /tmp/bb1654-claude-config-rjUK0R/.credentials.json with sk-ant-oat01-ACCOUNT-A-rate-limited
+
+=== Step 1: session P1 starts with token A (account A), first turn -&gt; rate limited ===
+[mock-api] HEAD /api/hello authorization=(none)
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[repro] turn 1 result: subtype=success is_error=true
+[repro] turn 1: /v1/messages calls=11 tokens used=[&quot;sk-ant-oat01-ACCOUNT-A-rate-limited&quot;]
+
+=== Step 2: user runs `claude login` on account B (credentials file rewritten with token B) ===
+[repro] (preserve-mtime) mtimeNs before=1787039073264976866 after=1787039073264976866 (unchanged)
+[repro] wrote /tmp/bb1654-claude-config-rjUK0R/.credentials.json with sk-ant-oat01-ACCOUNT-B-fresh-login
+
+=== Step 3: retry on the SAME live process P1 (what bb does when you resend in the thread) ===
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-A-rate-limited
+[repro] turn 2 result: subtype=success is_error=true
+[repro] turn 2 (same process, after login): /v1/messages calls=11 tokens used=[&quot;sk-ant-oat01-ACCOUNT-A-rate-limited&quot;]
+
+=== Step 4: fresh process P2 (what a bb server restart gives you) ===
+[mock-api] HEAD /api/hello authorization=(none)
+[mock-api] POST /v1/messages?beta=true authorization=Bearer sk-ant-oat01-ACCOUNT-B-fresh-login
+[repro] turn 3 result: subtype=success is_error=false
+[repro] turn 3 (new process): /v1/messages calls=1 tokens used=[&quot;sk-ant-oat01-ACCOUNT-B-fresh-login&quot;]
+
+=== SUMMARY ===
+{
+  &quot;turn1&quot;: [
+    &quot;sk-ant-oat01-ACCOUNT-A-rate-limited&quot;
+  ],
+  &quot;turn2&quot;: [
+    &quot;sk-ant-oat01-ACCOUNT-A-rate-limited&quot;
+  ],
+  &quot;turn3&quot;: [
+    &quot;sk-ant-oat01-ACCOUNT-B-fresh-login&quot;
+  ]
+}
+BUG REPRODUCED: the live claude process kept sending token A after the credentials file changed to token B; only a new process picked up token B.
+</pre>
+</main></body></html>

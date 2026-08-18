@@ -1,0 +1,12 @@
+const page = await browser.getPage("main");
+const errors = [];
+page.on("console", (m) => { if (m.type() === "error") errors.push(m.text().slice(0, 300)); });
+page.on("pageerror", (e) => errors.push("PAGEERROR " + String(e).slice(0, 300)));
+await page.setViewportSize({ width: 1400, height: 900 });
+await page.goto("http://localhost:17374/projects/proj_xfhduummc3/threads/thr_em7hmw2zzh", { waitUntil: "load" });
+await page.waitForTimeout(8000);
+console.log(await page.url());
+console.log("errors:", JSON.stringify(errors.slice(0, 10), null, 1));
+const body = await page.evaluate(() => document.body.innerText.slice(0, 1500));
+console.log(body);
+await saveScreenshot(await page.screenshot(), "1182-thread-before.png");

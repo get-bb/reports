@@ -1,0 +1,199 @@
+Report · #1615 unbounded list rendering (CSV preview creates ~50k cells)
+← reports
+#1615 · Unbounded list rendering in 11 components: full arrays mapped into scroll surfaces (CSV preview can create ~50k cells)
+Perf Medium Effort: unset
+perf
+open on GitHub
+2026-08-18
+base 16ceb3a540f81c1189efaffb27a39b1d9443abf5 (main)
+Verdict: PARTIALLY REPRODUCED
+· root-cause confidence: high (for the surfaces that reproduce)
+· linked open PRs: none
+TL;DR
+Plain-language framing. Several React components in the bb web app take an array (CSV cells, directory entries, changed files, …) and call array.map(…) to create one DOM row per element, inside a small scrollable box. The box hides most rows visually, but the browser still has to build, style, and lay out every one of them. On a phone (the issue is filed against iOS Safari) that costs memory and blocks touch scrolling; on a desktop it costs a multi-second freeze.
+This is an automated-audit issue that lists 11 files. I spot-checked every one against the base commit. Three surfaces really do render an unbounded (or very large) number of rows and I reproduced them in a real browser: (1) the CSV file preview creates exactly 50,000 <td> (plus one <span> each, 101k elements in the table) for a panel that shows about 50 cells, blocking the main thread for 2.3–2.9 s on this desktop and 8–14 s under 4× CPU throttling; (2) the "Untracked · N files" prompt banner (WorkspaceChangesList without limit) mounts one row per changed file — 5,000 rows / 20,000 elements for a 128 px box — and, worse than the issue says, they are in the DOM even while the banner is collapsed, and the workspace-status payload that feeds it is itself unbounded (425 KB, 5,000 files); (3) the "Add project" folder browser (RemotePathBrowser) renders every directory entry (5,000 <li> for a 224 px box) because the host daemon's readdir listing has no cap.
+The remaining eight entries are either bounded upstream (branch picker: server default limit=50), tiny in practice (model list, plugin marketplace, machines list, todo list, child threads), a container primitive that maps nothing and has no consumers (CommandList), or an outright misread: resource-pagination.tsx:306-309 is the items.slice(0, visibleCount) that implements a bounded window. The claim "no client limit bounds the row count" is also wrong for the CSV path — it is capped at 500×100 — the problem is that the cap is 50k cells and all of them are mounted at once. I could not test on iOS Safari (no device); the numbers below are headless Chromium.
+Claims vs findings
+ClaimStatusEvidence
+CSV path in FilePreview.tsx "can create about 50,000 cells"Verified (exactly)500 body rows × 100 columns → 50,000 <td> + 601 <th>, 101,306 elements in the table; browser run step4.out, jsdom test issue-1615-unbounded-lists.test.tsx. Main thread blocked 2.3 s (prod build, 1×), 8.1 s (prod build, 4× CPU throttle); DOM Nodes 46k → 183k; JS heap +29 MB.
+"No client limit bounds the row count"Refuted for CSV; verified for othersCSV is bounded to CSV_PREVIEW_MAX_ROWS = 500 × CSV_PREVIEW_MAX_COLUMNS = 100 since #520 (2026-07-07). WorkspaceChangesList (banner call site) and RemotePathBrowser have no client or server bound: 5,000 rows each in the repro.
+RemotePathBrowser.tsx:242,387 unboundedVerified5,000 <li> in the h-56 box (step6.out). Host daemon host-files.ts lists the whole directory with fs.readdir and no cap.
+BranchPicker.tsx:570,1044 unboundedRefuted in practiceRows are mapped without a client cap, but the data is server-limited: PROJECT_SOURCE_BRANCHES_LIMIT = 50 (app), BRANCH_LIST_LIMIT_DEFAULT = 50, max 1,000 (server), limitBranchList in the daemon. Local + remote ⇒ ≤ 100 rows.
+ModelReasoningPicker.tsx:971-996 unboundedTechnically true, small dataMaps navRows; the model list per provider is tens of entries and already has a "More models" fold. Lines 971-996 are actually the provider tabs / search input; the map is at ~1016.
+BrowsePluginsTab.tsx:276 unboundedTechnically true, small dataMarketplace entries (dozens). Not a realistic memory problem.
+ThreadPromptContextBanner.tsx:404-405 (child threads) unboundedTechnically trueChildThreadsBody maps all active child threads into max-h-40. Could matter for large fleets; not measured.
+ThreadTodoCard.tsx:104-109 unboundedTechnically true, small dataAgent todo lists are tens of items.
+UpdatesSettingsSection.tsx:896-920 unboundedTechnically true, small dataOne row group per enrolled machine.
+WorkspaceChangesList.tsx:111-119 unboundedVerified, worse than statedComponent has a bounded TruncatedList mode when limit is passed (metadata panel uses it: "Show 4995 more"), but the prompt banner passes no limit: 5,000 rows / 20,000 elements mounted, and mounted while collapsed (AnimatedBody only animates grid-rows). Upstream, WorkspaceStatus.workingTree.files is unbounded on the wire (425 KB for 5,000 files).
+packages/shared-ui/.../command.tsx:61 unboundedRefutedCommandList is a max-h-[300px] container wrapper; it maps nothing, and no file in apps/app imports it.
+resource-pagination.tsx:306-309 unboundedRefuted (misread)Those lines are items.slice(0, visibleCount) in useResourceInfiniteItems, i.e. the bounded window itself (grows by pageSize on loadMore).
+iOS Safari slows down / reloads the tabUnverifiable hereNo iOS device or simulator on this host. Chromium at 4× CPU throttle blocks 8–14 s on the CSV preview, which is consistent with the mechanism.
+Environment
+bb 16ceb3a54 (main, 2026-08-18), worktree /home/sawyer/projects/bb/.claude/worktrees/wf_242c3e11-a10-17. Nothing on origin/main after the base touches these components except fe230cd3d (background-agent banner, unrelated) — not fixed.
+Linux 7.0.0-29-generic, node v24.18.0, codex-cli 0.147.0 (one "Reply only with ok." turn to provision the thread's workspace).
+Dev instance: app :15271 (Vite dev), server :23271, host daemon :31271, data dir /home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_242c3e11-a10-17-dae163ef21fd. Production build served with vite preview on :15272 proxying /api and /ws to :23271 (vite.preview-1615.config.ts).
+Browser: HeadlessChrome/145.0.7632.6 via dev-browser (Playwright), viewport 1400×900. Project proj_drg6kwky3m → /tmp/1615-qa, thread thr_5e4dmaajwp, environment env_hd3zgfggci.
+Minimal reproduction
+Fixture: a scratch git repo with a 600×120 CSV (committed) and 5,000 untracked files.
+mkdir -p /tmp/1615-qa && cd /tmp/1615-qa && git init -q
+python3 - <<'EOF'
+import os, csv
+os.makedirs("data", exist_ok=True)
+with open("data/big.csv","w",newline="") as f:
+w=csv.writer(f)
+w.writerow([f"col_{c}" for c in range(120)])
+for r in range(600):
+w.writerow([f"r{r}c{c}" for c in range(120)])
+os.makedirs("manyfiles", exist_ok=True)
+for i in range(5000):
+open(f"manyfiles/file_{i:05d}.txt","w").write("x")
+EOF
+git add data && git -c user.email=qa@example.com -c user.name=qa commit -qm init
+pnpm install --frozen-lockfile --prefer-offline && pnpm exec turbo run build && scripts/bb-dev-app current (note App/Server ports and host id from curl -s $BB_SERVER_URL/api/v1/hosts).
+Create the project and a thread (one tiny codex turn provisions the local workspace):
+curl -s -X POST http://localhost:23271/api/v1/projects -H 'content-type: application/json' \
+-d '{"name":"qa","source":{"type":"local_path","path":"/tmp/1615-qa","hostId":"host_uhq5uwxsbj"}}'   # → proj_drg6kwky3m
+BB_SERVER_URL=http://localhost:23271 pnpm bb:dev thread spawn --project proj_drg6kwky3m --provider codex \
+--permission-mode accept-edits --title "1615 qa" --prompt "Reply only with ok." --json                # → thr_5e4dmaajwp
+Edit the URL/ids at the top of the scripts in 1615/repro/ and run them with dev-browser --browser bb1615 --headless --timeout 120 run <script>.
+A. CSV preview: 50,000 cells for ~50 visible
+Script step4-open-csv.js: opens the thread, shows the right panel, "+" new tab, types big.csv in "Search files", Enter, then counts table cells. Output (step4.out):
+before opening csv: {"nodes":20529,"tds":0}
+csv preview: {"totalNodes":121845,"tableNodes":101306,"td":50000,"th":601,"bodyRows":500,"columns":100,
+"scrollBox":{"w":507,"h":744},"scrollSize":{"w":28848,"h":14529},
+"note":"Showing the first 500 rows and 100 columns."}
+ms from Enter to table in DOM: 3643
+Expected: a 507×744 px scroll box that shows ~25 rows × 2 columns holds on the order of a few hundred cells (virtualized or windowed). Actual: all 50,000 <td> (each wrapping a <span>) are mounted; the table is 28,848×14,529 px.
+Triggering it: the secondary panel "New tab" file search with big.csv typed, before pressing Enter.
+The moment the bug shows: the visible preview is ~25 rows × 2 columns ("Showing the first 500 rows and 100 columns." at the bottom), but the DOM behind it holds 50,000 cells.
+Cost, measured with the Long Tasks API and CDP Performance.getMetrics (step5-measure-csv.js against the Vite dev build, step5b-measure-csv-prod.js against the production build; outputs step5.out, step5b.out):
+# dev build (React dev mode)
+cpuThrottle=1x {"longTasksMs":[2914,227,1644],"longTaskTotalMs":4785,"maxLongTaskMs":2914,"td":50000}
+cpuThrottle=4x {"longTasksMs":[13721,905,215,69,75,9002,233],"longTaskTotalMs":24220,"maxLongTaskMs":13721,"td":50000}
+# production build (vite preview :15272 → server :23271)
+cpuThrottle=1x {"longTasksMs":[519,149,2344],"longTaskTotalMs":3012,"maxLongTaskMs":2344,"td":50000}
+cpuThrottle=4x {"longTasksMs":[1092,2605,70,627,8080,89,190],"longTaskTotalMs":12753,"maxLongTaskMs":8080,"td":50000}
+CDP metrics before: {"Nodes":46037,"LayoutCount":0,"RecalcStyleCount":1,"JSHeapUsedSize":60445508}
+after: {"Nodes":182615,"LayoutCount":4,"RecalcStyleCount":19,"JSHeapUsedSize":90912052}  heap delta MB: 29
+Opening one 570 KB CSV in the production build blocks the main thread for 2.3 s on this desktop and 8.1 s in a single task at 4× throttle (a rough phone stand-in), adds 136k DOM nodes and 29 MB of JS heap. (The 46k "before" node count is the 5,000-file banner from experiment B already being mounted.)
+B. Prompt banner "Untracked · 5000 files": 5,000 rows in a 128 px box, mounted even when collapsed
+Script step2-changed-files-banner.js. Output (step2.out):
+DOM nodes before expanding banner: 20584
+after expand: {"totalNodes":20584,"listRows":5000,"listClass":"space-y-1 overflow-auto max-h-32 px-3 pb-2 pt-1",
+"listBox":{"h":128,"w":726},"scrollHeight":120008,"listNodes":20000}
+Expected: a collapsed banner holds no rows; an expanded 128 px box holds a handful (the metadata panel version of the same list shows 5 + "Show 4995 more"). Actual: element count is identical before and after expanding (20,584) — the 5,000 <li> / 20,000 elements are always mounted on the thread page; the list is 120,008 px tall inside a 128 px box. Also 5,000 buttons named "Open manyfiles/file_NNNNN.txt" are in the accessibility tree while collapsed. The status payload feeding it: GET /api/v1/environments/env_hd3zgfggci/status → 425,343 bytes, workingTree.files.length = 5000 (env-status.json).
+Before: banner collapsed. The DOM already contains 20,000 elements for the list.
+After clicking the banner: five rows visible, 5,000 mounted.
+C. "Add project" folder browser: 5,000 rows in a 224 px box
+Script step6-path-browser.js (sidebar "New project" → pencil "Edit path" → type /tmp/1615-qa/manyfiles → Enter). Output (step6.out):
+path browser: {"nodesBefore":122048,"totalNodes":141896,"rows":5000,"boxH":224,"scrollH":132821,"boxNodes":20001} ms: 2089
+The Add-project dialog showing 8 of the 5,000 entries; all 5,000 <li> are mounted (list is 132,821 px tall).
+Unit-level repro (jsdom)
+File: 1615/repro/issue-1615-unbounded-lists.test.tsx (copy to apps/app/src/components/secondary-panel/). It passes on main and documents the current DOM footprint; a fix should turn the two count assertions red and they should then be rewritten to the bounded numbers.
+// @vitest-environment jsdom
+import { cleanup, render } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { FilePreview } from "./FilePreview";
+import { WorkspaceChangesList } from "@/components/thread/WorkspaceChangesList";
+import type { WorkspaceChangedFile } from "@/components/thread/WorkspaceChangesList";
+vi.mock("@pierre/diffs/react", () => ({ File: () => null, useWorkerPoolStats: () => ({}) }));
+afterEach(() => cleanup());
+function csv(rows: number, cols: number): string {
+const header = Array.from({ length: cols }, (_, c) => `col_${c}`).join(",");
+const body = Array.from({ length: rows }, (_, r) =>
+Array.from({ length: cols }, (_, c) => `r${r}c${c}`).join(","));
+return [header, ...body].join("\n");
+}
+describe("issue #1615: unbounded list rendering", () => {
+it("CSV preview mounts every cell of the 500x100 window (50,000 <td>)", () => {
+const { container } = render(
+<FilePreview path="data/big.csv"
+state={{ kind: "ready", file: { name: "big.csv", contents: csv(600, 120) },
+lineRange: null, textPreviewKind: "csv" }} />);
+const table = container.querySelector("table[aria-label$='CSV preview']");
+expect(table!.querySelectorAll("tbody tr")).toHaveLength(500);
+expect(table!.querySelectorAll("thead th")).toHaveLength(101);
+expect(table!.querySelectorAll("td")).toHaveLength(50_000);
+expect(table!.querySelectorAll("td > span")).toHaveLength(50_000);
+expect(table!.querySelectorAll("*").length).toBeGreaterThan(100_000);
+});
+it("WorkspaceChangesList without `limit` mounts one row per changed file", () => {
+const files: WorkspaceChangedFile[] = Array.from({ length: 5000 }, (_, i) => ({
+path: `manyfiles/file_${String(i).padStart(5, "0")}.txt`, status: "??", insertions: null, deletions: null }));
+const { container } = render(<WorkspaceChangesList files={files} className="max-h-32" />);
+expect(container.querySelectorAll("li")).toHaveLength(5000);
+});
+});
+$ cd apps/app && pnpm exec vitest run --config vitest.config.ts src/components/secondary-panel/issue-1615-unbounded-lists.test.tsx
+Test Files  1 passed (1)
+Tests  2 passed (2)
+Duration  5.63s (tests 2.75s)
+Root cause
+A. CSV preview. CsvFilePreview maps bodyRows × columns straight into <tr><td><span> (FilePreview.tsx#L971-L995). The only bound is the parse cap CSV_PREVIEW_MAX_ROWS = 500 / CSV_PREVIEW_MAX_COLUMNS = 100 (L209-L210), which was chosen so parseCsvRows stops scanning multi-megabyte files, not to bound the DOM. 500×100 = 50,000 cells, each with a wrapping <span class="block max-w-full truncate"> and a title, all rendered synchronously in one React commit into a single overflow-auto box.
+{bodyRows.map((row, rowIndex) => (
+<tr key={rowIndex}>
+<th scope="row" …>{rowIndex + 2}</th>
+{columns.map((column) => {
+const cell = row[column.index] ?? "";
+return (
+<td key={column.index} className="w-72 max-w-72 overflow-hidden …" title={cell}>
+<span className="block max-w-full truncate">{cell}</span>
+</td>);
+})}
+</tr>))}
+B. Prompt banner changed-files list. WorkspaceChangesList has two modes (WorkspaceChangesList.tsx#L98-L119): with limit it renders a TruncatedList ("Show N more"), without it a plain ul.overflow-auto that maps every file. ThreadPromptContextBanner uses the second mode with className="max-h-32 …" and no limit (ThreadPromptContextBanner.tsx#L1148-L1163), and wraps it in AnimatedBody, which keeps children mounted and only toggles grid-rows-[0fr]/opacity-0/aria-hidden (L660-L687) — hence 20,000 elements on every thread page whose workspace is dirty, whether or not the user opens the banner. Upstream, Workspace.getStatus runs git status --porcelain=v1 --untracked-files=all and maps every entry into files with no cap (workspace.ts#L744-L820); the diff-files route has WORKSPACE_DIFF_MAX_FILES = 500 but the status route has nothing equivalent, so the 5,000-file list also travels the daemon → server → app path (425 KB) on every status refresh.
+C. RemotePathBrowser. Maps data.entries into <li>/<button> inside an h-56 overflow-y-auto div (RemotePathBrowser.tsx#L240-L262, #L385-L390). The daemon handler readdirs the whole directory (host-files.ts#L150-L183) with no limit; only dotfiles and a skip-list are dropped.
+Why the symptom follows. A scroll box with overflow:auto clips painting, not DOM. Every mounted row is styled, laid out (the CSV table is 28,848×14,529 px, table layout over 50k cells with sticky header/row-number cells) and kept in memory. React must also diff all rows on each re-render (the banner list re-renders on every workspace-status update). On WebKit/iOS the same work runs on a slower CPU with a tight per-tab memory budget, which is where "slow down or reload" comes from; on Chromium here it is a 2–14 s freeze.
+Not root causes. BranchPicker is bounded by the server (limit=50, branch-list-query.ts#L4, project-queries.ts#L62). useResourceInfiniteItems (resource-pagination.tsx#L306-L309) is the windowing helper. CommandList (command.tsx#L54-L64) is an unused container.
+Proposed fix (first principles)
+CSV preview: virtualize rows. @tanstack/react-virtual is already a dependency and already used with the same pattern in DiffFilesPanel.tsx. Keep the sticky <thead>, virtualize <tbody> rows over the existing scroll container (fixed row height = leading-5 + padding, so estimateSize is exact), and optionally virtualize columns the same way (100 columns × 18 rem = 28k px wide). Fewer than ~40 rows × visible columns stay mounted; keyboard/selection ("Add to chat" via SecondaryPanelSelectionActions) needs a check because text selection across unmounted rows would break — bound the selection to mounted rows or fall back to the source view. Cheapest interim: add content-visibility:auto; contain-intrinsic-size: auto 20px on <tr>; that skips style/layout for offscreen rows but still allocates 50k elements, so it does not fix memory. Update issue-1615-unbounded-lists.test.tsx to assert the bounded count.
+Prompt banner: don't mount what's collapsed, and bound the list. In ThreadPromptContextBanner render the git body only when isGitExpanded (or after first expand), and pass limit to WorkspaceChangesList (the metadata panel already does) or virtualize the max-h-32 list. Separately, cap workingTree.files at the boundary: add a maxFiles/truncated pair to the status command mirroring WORKSPACE_DIFF_MAX_FILES. That changes the daemon → server contract (WorkspaceStatus shape), so it needs a HOST_DAEMON_PROTOCOL_VERSION bump and the "N files" summary should keep the exact count (from porcelain entry count) while the list is truncated.
+RemotePathBrowser: cap the listing. Add limit to the daemon's directory-list command (like limitBranchList) with a truncated flag, default e.g. 500, and show "N more entries; type the path" in the dialog. Also a protocol-version bump. Client-side, virtualize the h-56 list if the cap stays high.
+Leave the small-data surfaces (models, plugins, machines, todos) alone; child threads in the banner could take the same limit/"Show more" treatment if fleets get large. Close the command.tsx and resource-pagination.tsx entries as false positives.
+What could go wrong: virtualized tables and sticky headers interact badly if row heights vary (CSV cells are single-line truncate, so they don't); the CSV "Copy CSV" / selection actions must operate on the data, not the DOM; truncating status files must not change hasUncommittedChanges/state semantics used by commit/PR flows in routes/environments.ts.
+PR review
+No open PRs are linked to this issue.
+Related issues
+#1616: tracking issue for the 20-finding iOS Safari audit (this is finding 2).
+#1301: thread timeline never unmounts history (22k DOM nodes) — same pattern in the timeline, explicitly out of scope here.
+#1261 (closed): large active thread lists kept all sidebar rows mounted — precedent for windowing/virtualizing.
+#1749: timeline event budget assumes 0.06 ms/event; measured 0.479 ms — related mis-sized budget on a slow host.
+Appendix
+Commands run
+git checkout 16ceb3a54
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+scripts/bb-dev-app current                                   # app :15271, server :23271, daemon :31271
+# fixture repo: see "Minimal reproduction"
+curl -s http://localhost:23271/api/v1/hosts                  # host_uhq5uwxsbj
+curl -s -X POST http://localhost:23271/api/v1/projects -H 'content-type: application/json' \
+-d '{"name":"qa","source":{"type":"local_path","path":"/tmp/1615-qa","hostId":"host_uhq5uwxsbj"}}'
+BB_SERVER_URL=http://localhost:23271 pnpm bb:dev thread spawn --project proj_drg6kwky3m --provider codex \
+--permission-mode accept-edits --title "1615 qa" --prompt "Reply only with ok." --json
+dev-browser --browser bb1615 --headless --timeout 90  run 1615/repro/step1-open-thread.js
+dev-browser --browser bb1615 --headless --timeout 90  run 1615/repro/step2-changed-files-banner.js   > step2.out
+dev-browser --browser bb1615 --headless --timeout 90  run 1615/repro/step3-open-panel.js
+dev-browser --browser bb1615 --headless --timeout 120 run 1615/repro/step4-open-csv.js              > step4.out
+dev-browser --browser bb1615 --headless --timeout 240 run 1615/repro/step5-measure-csv.js           > step5.out   # dev build, 1x then 4x
+cp 1615/repro/vite.preview-1615.config.ts apps/app/ && (cd apps/app && pnpm exec vite preview --config vite.preview-1615.config.ts &)   # :15272
+dev-browser --browser bb1615 --headless --timeout 300 run 1615/repro/step5b-measure-csv-prod.js     > step5b.out  # prod build, 1x then 4x + CDP metrics
+dev-browser --browser bb1615 --headless --timeout 120 run 1615/repro/step6-path-browser.js          > step6.out
+curl -s http://localhost:23271/api/v1/environments/env_hd3zgfggci/status -o 1615/repro/env-status.json -w "%{http_code} %{size_download}\n"   # 200 425343
+cp 1615/repro/issue-1615-unbounded-lists.test.tsx apps/app/src/components/secondary-panel/ && cd apps/app && \
+pnpm exec vitest run --config vitest.config.ts src/components/secondary-panel/issue-1615-unbounded-lists.test.tsx
+pnpm dev:stop
+Bounds found while spot-checking (all at 16ceb3a54)
+apps/app/src/components/secondary-panel/FilePreview.tsx:209   CSV_PREVIEW_MAX_COLUMNS = 100
+apps/app/src/components/secondary-panel/FilePreview.tsx:210   CSV_PREVIEW_MAX_ROWS = 500          (since 72f3c4f6f, 2026-07-07, #520)
+apps/app/src/hooks/queries/project-queries.ts:62               PROJECT_SOURCE_BRANCHES_LIMIT = 50
+apps/server/src/routes/branch-list-query.ts:4                  BRANCH_LIST_LIMIT_DEFAULT = 50
+packages/domain/src/host-list-limits.ts:4                      BRANCH_LIST_LIMIT_MAX = 1_000
+apps/server/src/constants.ts:32                                WORKSPACE_DIFF_MAX_FILES = 500      (diff files only; status files unbounded)
+apps/server/src/constants.ts:23                                WORKSPACE_STATUS_MAX_UNTRACKED_LINE_STAT_FILES = 50 (line stats only)
+apps/host-daemon/src/command-handlers/host-files.ts:150        fs.readdir(directory) — no limit
+packages/host-workspace/src/workspace.ts:806                   files = entries.map(...) — no limit
+apps/app/package.json                                          "@tanstack/react-virtual": "^3.14.2" (used by DiffFilesPanel.tsx)
+Accessibility-tree evidence that the collapsed banner is fully mounted
+// page.evaluate: names of the first 60 buttons on the thread page with the banner COLLAPSED
+[..., "Changed files: Untracked, 5000 files", "Open manyfiles/file_00000.txt", "Open manyfiles/file_00001.txt",
+"Open manyfiles/file_00002.txt", ... "Open manyfiles/file_00024.txt"]   // continues to file_04999
