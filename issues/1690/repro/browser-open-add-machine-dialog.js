@@ -1,0 +1,11 @@
+const page = await browser.getPage("main");
+await page.setViewportSize({width: 1280, height: 900});
+await page.goto("http://localhost:12022/settings/machines", {waitUntil: "networkidle"});
+await new Promise(r=>setTimeout(r,1500));
+await page.getByRole("button", {name: "Add a machine"}).click();
+await new Promise(r=>setTimeout(r,3000));
+console.log(await saveScreenshot(await page.screenshot(), "1690-e.png"));
+const pre = await page.$$eval("pre", els => els.map(e=>e.textContent));
+console.log(JSON.stringify(pre, null, 2));
+const dlg = await page.$eval("[role=dialog]", e => e.innerText);
+console.log(dlg);

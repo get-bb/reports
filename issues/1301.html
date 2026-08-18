@@ -1,0 +1,698 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1301 thread timeline never unmounts history</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#1a7f37; --warn:#9a6700; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 8px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.ok { background:var(--ok); color:#fff; border-color:var(--ok); }
+  .pill.warn { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .verdict { font-weight:600; }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; background:#fff; }
+  figcaption { font-size:13px; color:var(--muted); margin-top:6px; }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; max-height:520px; }
+  a { color:var(--accent); }
+  .grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px; } @media (max-width:700px){ .grid{grid-template-columns:1fr;} }
+  .v-ok { color:var(--ok); font-weight:600; } .v-bad { color:var(--high); font-weight:600; } .v-unk { color:var(--warn); font-weight:600; }
+  details summary { cursor:pointer; color:var(--accent); }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1301 · Thread timeline never unmounts history: 22k DOM nodes and 250-600ms long tasks after scrolling a large thread</h1>
+  <p class="meta">
+    <span class="pill">Type: Bug (perf)</span> <span class="pill warn">Priority: not set on issue</span> <span class="pill">Effort: not set on issue</span>
+    <span class="pill">perf</span>
+    <a href="https://github.com/get-bb/bb/issues/1301">open on GitHub</a>
+    <span>investigated 2026-08-18</span>
+    <span>base commit <code>16ceb3a54</code> (main)</span>
+  </p>
+  <p class="verdict">Verdict: <span class="pill high">REPRODUCED</span> &nbsp; Root-cause confidence: <span class="pill ok">high</span></p>
+
+  <h2>TL;DR</h2>
+  <p>On a big thread the web app pages history in from the server just fine (anchor-based <code>timeline?beforeAnchorSeq=…</code>, ~10 pages of ~35–55 ms / 75–170 KB each on this machine). But every page the user scrolls into is <em>prepended</em> to a single in-memory array (<code>loadedTimeline.rows</code>) and <code>ThreadTimelineRows</code> renders that entire array as real React components and real DOM. Nothing is windowed, virtualised, or collapsed, so the DOM grows monotonically: on the seeded 9,001-event thread at a 390×844 viewport I measured 2,403 → 21,082 DOM nodes and 6,552 → 68,302 px of scroll height after reaching the top, exactly the shape the issue describes. Each prepended page costs one synchronous long task of ~280–470 ms (dev build, desktop CPU) made of mounting ~150 rows (~4,000 nodes) plus forced layout of the ever-larger document (<code>readOverflowMeasurement</code> in a <code>useLayoutEffect</code> is the largest attributed JS frame). The same accumulation happens at desktop widths (measured 21,182 nodes, long tasks up to 589 ms). Open PR <a href="https://github.com/get-bb/bb/pull/1384">#1384</a> (not linked to the issue) adds an in-flow windowed list for compact viewports and, with main merged in, bounds the DOM to ~1.7–2.2k nodes and long tasks to ~60–170 ms on the same repro; it does not touch desktop and has a real remount-on-threshold defect (details below).</p>
+
+  <h2>Claims vs findings</h2>
+  <table>
+    <tr><th>Claim (issue)</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Opening the 9,001-event seeded thread starts at ~2.3k DOM nodes; initial page ~109 KB / ~50 ms</td><td class="v-ok">Verified</td><td>2,403 nodes, 84 rows mounted at load; <code>GET /timeline</code> = 109,302 bytes in 58 ms (curl), 92 rows.</td></tr>
+    <tr><td>Scrolling to the top grows the DOM monotonically to ~22k nodes and ~75k px scroll height; nothing is unmounted</td><td class="v-ok">Verified</td><td>21,082 nodes / 820 mounted rows / 68,302 px after reaching the top; count never decreases across samples (browser-02, browser-03 logs). Numbers differ slightly from the issue because the seed fixture on this run is 8 threads / 34,536 events, not the 400k base + jumbo append.</td></tr>
+    <tr><td>Every older-page render is a 250–600 ms synchronous long task (desktop speed, dev build)</td><td class="v-ok">Verified</td><td>PerformanceObserver <code>longtask</code>: 10 long tasks, min 279 ms, median 343 ms, max 472 ms, total 3581 ms across the 10 older pages at 390 px width; 15 long tasks, min 59 ms, median 353 ms, max 589 ms, total 5213 ms at 1280 px width. Dev build (Vite, React dev runtime), Chromium headless.</td></tr>
+    <tr><td>Server-side pagination is already good (~10 KB / ~40 ms per page); the problem is purely client accumulation</td><td class="v-ok">Verified (sizes larger than claimed)</td><td>Walking all cursors: 11 pages, 943 rows, 6–54 ms each, but 72–167 KB per page (not ~10 KB) — the seeded assistant messages carry code blocks. Total 1.24 MB for the whole thread. Client accumulation is the mechanism (root cause below).</td></tr>
+    <tr><td>Multiply ~4× for phone CPUs</td><td class="v-unk">Unverified</td><td>No phone hardware in this environment; a 4× CPU slowdown would put the measured 280–470 ms tasks in the 1–2 s range, plausible but not measured.</td></tr>
+    <tr><td>Comment: a 44,246-event / 131.7 MiB production conversation; latest-page projection reads 1.7–2.1 MiB and blocks the server 270–3,578 ms</td><td class="v-unk">Unverified / out of scope</td><td>Server-side read cost is tracked in #1131 / #1207 per the comment; on this fixture the latest page is 109 KB / 58 ms so nothing here contradicts or confirms the production numbers.</td></tr>
+    <tr><td>Suggested approach: window the list keyed on stable anchor ids; paging protocol needs no changes</td><td class="v-ok">Consistent with code</td><td>Row ids are stable (<code>thr_…:user-seed:8182</code> style anchors) and PR #1384 windows without protocol changes.</td></tr>
+  </table>
+
+  <h2>Environment</h2>
+  <table>
+    <tr><th>Item</th><th>Value</th></tr>
+    <tr><td>bb commit</td><td><code>16ceb3a540f81c1189efaffb27a39b1d9443abf5</code> (main, "Revert 'Stop clipping two-digit ordered list markers'")</td></tr>
+    <tr><td>OS / Node</td><td>Linux 7.0.0-29-generic (Ubuntu), Node v24.18.0, pnpm workspace</td></tr>
+    <tr><td>Browser</td><td>Playwright Chromium (headless, via <code>dev-browser</code> CLI), viewport 390×844 (mobile) and 1280×900 (desktop). Vite dev build (React development runtime, so absolute times are inflated vs. production; the shape of the problem is unchanged).</td></tr>
+    <tr><td>Dev instance</td><td><code>scripts/bb-dev-app current</code>: App <code>http://localhost:13028</code>, Server <code>http://localhost:21028</code>, host daemon <code>127.0.0.1:29028</code>, data dir <code>~/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-19-286d462cc7e4</code></td></tr>
+    <tr><td>Fixture</td><td><code>pnpm seed:perf -- --projects 1 --threads 8 --events 60000 --seed 42</code> → project <code>proj_mgvp7iamvh</code>, largest thread <code>thr_wfjb5qctw4</code> with 9,001 event rows (same size as the issue's thread)</td></tr>
+    <tr><td>Providers</td><td>Not exercised; the seeded thread is archived and static, no agent turns were run.</td></tr>
+  </table>
+
+  <h2>Minimal reproduction</h2>
+  <ol>
+    <li>Start the dev instance once so the seed can attach to the local host, stop it, seed, and restart:
+<pre>scripts/bb-dev-app current          # prints App/Server URLs + data dir
+pnpm dev:stop
+pnpm seed:perf -- --projects 1 --threads 8 --events 60000 --seed 42
+scripts/bb-dev-app current</pre>
+      Seed output:
+<pre>●  data dir /home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-19-286d462cc7e4
+  ●  host host_r6ri2fc2bi
+  ○  prepared 1 projects, 4 environments, 8 threads
+  ○  inserted 34536 event rows
+  ○  inserted 1083 search segments and 835 prompt history rows
+[2K  ✓  seeded 1 projects, 8 threads, 34536 events in 1.0s
+  ●  search segments: 1083, prompt history: 835</pre>
+      Find the largest thread and its project:
+<pre>sqlite3 &lt;data dir&gt;/bb.db &quot;select thread_id, count(*) c from events group by thread_id order by c desc limit 1;&quot;
+# thr_wfjb5qctw4|9001
+sqlite3 &lt;data dir&gt;/bb.db &quot;select project_id from threads where id=&#x27;thr_wfjb5qctw4&#x27;;&quot;
+# proj_mgvp7iamvh</pre>
+    </li>
+    <li>(Optional, proves the server side is fine.) Walk every timeline page with <a href="1301/repro/1301-walk-pages.mjs">1301-walk-pages.mjs</a> — <b>Expected and actual</b>: 11 pages, all under 60 ms:
+<pre>page 1 rows=92 bytes=108920 ms=39 olderCursor={&quot;anchorSeq&quot;:8182,&quot;anchorId&quot;:&quot;thr_wfjb5qctw4:user-seed:8182&quot;}
+page 2 rows=85 bytes=106780 ms=6 olderCursor={&quot;anchorSeq&quot;:7346,&quot;anchorId&quot;:&quot;thr_wfjb5qctw4:user-seed:7346&quot;}
+page 3 rows=111 bytes=167317 ms=44 olderCursor={&quot;anchorSeq&quot;:6474,&quot;anchorId&quot;:&quot;thr_wfjb5qctw4:user-seed:6474&quot;}
+page 4 rows=73 bytes=81160 ms=54 olderCursor={&quot;anchorSeq&quot;:5704,&quot;anchorId&quot;:&quot;thr_wfjb5qctw4:user-seed:5704&quot;}
+page 5 rows=76 bytes=76485 ms=34 olderCursor={&quot;anchorSeq&quot;:4927,&quot;anchorId&quot;:&quot;thr_wfjb5qctw4:user-seed:4927&quot;}
+page 6 rows=78 bytes=91581 ms=39 olderCursor={&quot;anchorSeq&quot;:4146,&quot;anchorId&quot;:&quot;thr_wfjb5qctw4:user-seed:4146&quot;}
+page 7 rows=97 bytes=147632 ms=41 olderCursor={&quot;anchorSeq&quot;:3208,&quot;anchorId&quot;:&quot;thr_wfjb5qctw4:user-seed:3208&quot;}
+page 8 rows=92 bytes=136841 ms=43 olderCursor={&quot;anchorSeq&quot;:2328,&quot;anchorId&quot;:&quot;thr_wfjb5qctw4:user-seed:2328&quot;}
+page 9 rows=97 bytes=144864 ms=41 olderCursor={&quot;anchorSeq&quot;:1438,&quot;anchorId&quot;:&quot;thr_wfjb5qctw4:user-seed:1438&quot;}
+page 10 rows=85 bytes=107873 ms=36 olderCursor={&quot;anchorSeq&quot;:609,&quot;anchorId&quot;:&quot;thr_wfjb5qctw4:user-seed:609&quot;}
+page 11 rows=57 bytes=72615 ms=35 olderCursor=null
+TOTAL pages=11 rows=943 bytes=1242068
+</pre>
+    </li>
+    <li>Open <code>http://localhost:13028/projects/proj_mgvp7iamvh/threads/thr_wfjb5qctw4</code> at a 390×844 viewport (script <a href="1301/repro/browser-01-open.js">browser-01-open.js</a>). <b>Expected/actual</b>: 84 rows, 2,403 DOM nodes, scroll height 6,552 px.
+      <figure><img src="assets/1301-initial.png" alt="Thread just opened at mobile width" width="390"><figcaption>Before: the thread just after load, scrolled to the bottom (2,403 DOM nodes, 84 timeline rows mounted).</figcaption></figure>
+    </li>
+    <li>Hold scroll-up until the first message while sampling DOM size and long tasks (script <a href="1301/repro/browser-03-wheel-scroll.js">browser-03-wheel-scroll.js</a>; a variant that sets <code>scrollTop = 0</code> step by step is <a href="1301/repro/browser-02-scroll-history.js">browser-02-scroll-history.js</a>).
+      <br><b>Expected</b>: mounted DOM stays roughly constant (only what is near the viewport), scrolling stays under 50 ms per frame.
+      <br><b>Actual</b> (verbatim, wheel variant):
+<pre>{&quot;label&quot;:&quot;before&quot;,&quot;nodes&quot;:2403,&quot;rows&quot;:84,&quot;scrollHeight&quot;:6552,&quot;scrollTop&quot;:5756,&quot;longTasks&quot;:0}
+{&quot;label&quot;:&quot;burst-1&quot;,&quot;nodes&quot;:21082,&quot;rows&quot;:820,&quot;scrollHeight&quot;:68302,&quot;scrollTop&quot;:0,&quot;longTasks&quot;:10}
+/home/sawyer/.dev-browser/tmp/1301-mid-scroll.png
+{&quot;label&quot;:&quot;burst-2&quot;,&quot;nodes&quot;:21082,&quot;rows&quot;:820,&quot;scrollHeight&quot;:68302,&quot;scrollTop&quot;:0,&quot;longTasks&quot;:10}
+{&quot;label&quot;:&quot;burst-3&quot;,&quot;nodes&quot;:21082,&quot;rows&quot;:820,&quot;scrollHeight&quot;:68302,&quot;scrollTop&quot;:0,&quot;longTasks&quot;:10}
+LONGTASKS [{&quot;start&quot;:11017,&quot;dur&quot;:296},{&quot;start&quot;:11332,&quot;dur&quot;:286},{&quot;start&quot;:11834,&quot;dur&quot;:312},{&quot;start&quot;:12173,&quot;dur&quot;:343},{&quot;start&quot;:12735,&quot;dur&quot;:279},{&quot;start&quot;:13306,&quot;dur&quot;:400},{&quot;start&quot;:13736,&quot;dur&quot;:313},{&quot;start&quot;:14293,&quot;dur&quot;:462},{&quot;start&quot;:14993,&quot;dur&quot;:472},{&quot;start&quot;:15755,&quot;dur&quot;:418}]
+/home/sawyer/.dev-browser/tmp/1301-top-of-history.png
+</pre>
+      Step-wise variant (one <code>scrollTop=0</code> then 1.5 s wait per sample) shows the monotonic growth per page:
+<pre>{&quot;label&quot;:&quot;before&quot;,&quot;t&quot;:56526,&quot;nodes&quot;:2403,&quot;rows&quot;:84,&quot;scrollHeight&quot;:6552,&quot;scrollTop&quot;:5756,&quot;longTasks&quot;:6,&quot;loadOlderVisible&quot;:false}
+{&quot;label&quot;:&quot;page-1&quot;,&quot;t&quot;:58030,&quot;nodes&quot;:6525,&quot;rows&quot;:251,&quot;scrollHeight&quot;:20043,&quot;scrollTop&quot;:19247,&quot;longTasks&quot;:8,&quot;loadOlderVisible&quot;:false}
+{&quot;label&quot;:&quot;page-2&quot;,&quot;t&quot;:59535,&quot;nodes&quot;:10047,&quot;rows&quot;:388,&quot;scrollHeight&quot;:31410,&quot;scrollTop&quot;:30614,&quot;longTasks&quot;:10,&quot;loadOlderVisible&quot;:false}
+{&quot;label&quot;:&quot;page-3&quot;,&quot;t&quot;:61041,&quot;nodes&quot;:13794,&quot;rows&quot;:538,&quot;scrollHeight&quot;:44265,&quot;scrollTop&quot;:43469,&quot;longTasks&quot;:12,&quot;loadOlderVisible&quot;:false}
+{&quot;label&quot;:&quot;page-4&quot;,&quot;t&quot;:62547,&quot;nodes&quot;:17881,&quot;rows&quot;:694,&quot;scrollHeight&quot;:57184,&quot;scrollTop&quot;:56388,&quot;longTasks&quot;:14,&quot;loadOlderVisible&quot;:false}
+{&quot;label&quot;:&quot;page-5&quot;,&quot;t&quot;:64055,&quot;nodes&quot;:21082,&quot;rows&quot;:820,&quot;scrollHeight&quot;:68303,&quot;scrollTop&quot;:67507,&quot;longTasks&quot;:16,&quot;loadOlderVisible&quot;:false}
+{&quot;label&quot;:&quot;page-6&quot;,&quot;t&quot;:65562,&quot;nodes&quot;:21082,&quot;rows&quot;:820,&quot;scrollHeight&quot;:68303,&quot;scrollTop&quot;:0,&quot;longTasks&quot;:16,&quot;loadOlderVisible&quot;:false}
+{&quot;label&quot;:&quot;page-7&quot;,&quot;t&quot;:67070,&quot;nodes&quot;:21082,&quot;rows&quot;:820,&quot;scrollHeight&quot;:68303,&quot;scrollTop&quot;:0,&quot;longTasks&quot;:16,&quot;loadOlderVisible&quot;:false}
+{&quot;label&quot;:&quot;page-8&quot;,&quot;t&quot;:68576,&quot;nodes&quot;:21082,&quot;rows&quot;:820,&quot;scrollHeight&quot;:68303,&quot;scrollTop&quot;:0,&quot;longTasks&quot;:16,&quot;loadOlderVisible&quot;:false}
+LONGTASKS [{&quot;start&quot;:8005,&quot;dur&quot;:150},{&quot;start&quot;:8159,&quot;dur&quot;:94},{&quot;start&quot;:9485,&quot;dur&quot;:65},{&quot;start&quot;:20294,&quot;dur&quot;:173},{&quot;start&quot;:20524,&quot;dur&quot;:74},{&quot;start&quot;:20599,&quot;dur&quot;:59},{&quot;start&quot;:56564,&quot;dur&quot;:329},{&quot;start&quot;:56907,&quot;dur&quot;:205},{&quot;start&quot;:58062,&quot;dur&quot;:338},{&quot;start&quot;:58418,&quot;dur&quot;:243},{&quot;start&quot;:59561,&quot;dur&quot;:422},{&quot;start&quot;:60015,&quot;dur&quot;:313},{&quot;start&quot;:61084,&quot;dur&quot;:420},{&quot;start&quot;:61536,&quot;dur&quot;:314},{&quot;start&quot;:62582,&quot;dur&quot;:476},{&quot;start&quot;:63095,&quot;dur&quot;:385}]
+/home/sawyer/.dev-browser/tmp/1301-after-scroll-top.png
+</pre>
+      <div class="grid">
+        <figure><img src="assets/1301-mid-scroll.png" alt="Mid scroll" width="390"><figcaption>The moment the bug shows: mid-history after several pages have been prepended. Visually fine, but the whole history below is still mounted.</figcaption></figure>
+        <figure><img src="assets/1301-top-of-history.png" alt="Top of history" width="390"><figcaption>Top of history reached: 820 rows / 21,082 nodes / 68,302 px all mounted.</figcaption></figure>
+        <figure><img src="assets/1301-after-scroll-top.png" alt="After scrollTop=0 variant" width="390"><figcaption>Step-wise variant end state (same numbers).</figcaption></figure>
+      </div>
+    </li>
+    <li>CPU-profile one prepend via CDP (script <a href="1301/repro/browser-04-profile.js">browser-04-profile.js</a>; raw <code>.cpuprofile</code> files in <a href="1301/repro/">1301/repro/</a>). Top self-time frames for the first two older pages:
+<pre>=== page1: rows 84 -&gt; 251, sampled 1712ms ===
+665.0ms  (program) @ :-1
+435.7ms  (idle) @ :-1
+99.9ms  readOverflowMeasurement @ conversation-message-overflow.tsx:8
+90.8ms  (garbage collector) @ :-1
+68.5ms  exports.jsxDEV @ react_jsx-dev-runtime.js:190
+44.2ms  exports.jsx @ react_jsx-runtime.js:190
+21.2ms  run @ :-1
+13.0ms  exports.createElement @ react.js:590
+9.8ms  addObjectToProperties @ react-dom_client.js:2332
+9.8ms  getMaxScrollOffset @ bottom-anchored-scroll-body.tsx:48
+8.6ms  react_stack_bottom_frame @ react-dom_client.js:12863
+8.2ms  ReactElement @ react_jsx-dev-runtime.js:103
+6.9ms  addValueToProperties @ react-dom_client.js:2335
+6.9ms  ReactElement @ react_jsx-runtime.js:103
+6.2ms  addObjectDiffToProperties @ react-dom_client.js:2408
+5.7ms  setAttribute @ :-1
+5.4ms  now @ :-1
+5.4ms  createTask @ :-1
+5.0ms  ReactStrictModeWarnings.recordLegacyContextWarning @ react-dom_client.js:12834
+4.7ms  runWithFiberInDEV @ react-dom_client.js:846
+4.4ms  propagateParentContextChanges @ react-dom_client.js:3162
+3.8ms  ReactElement @ react.js:131
+3.8ms  syntaxExtension @ blank-line-CbzQQYtI.js:188
+3.6ms  logComponentRender @ react-dom_client.js:2460
+3.1ms  createElementNS @ :-1
+2.9ms  mergeProps @ @radix-ui_react-slot.js:56
+2.9ms  splice @ blank-line-CbzQQYtI.js:106
+2.9ms  validateProperty @ react-dom_client.js:1874
+2.9ms  getComponentNameFromType @ react_jsx-dev-runtime.js:14
+2.9ms  jsxDEVImpl @ react_jsx-dev-runtime.js:147
+--- by script ---
+665.0ms  (program))
+435.7ms  (idle))
+123.6ms  react-dom_client.js
+100.5ms  conversation-message-overflow.tsx
+90.8ms  (garbage collector))
+83.6ms  react_jsx-dev-runtime.js
+54.1ms  react_jsx-runtime.js
+21.2ms  run)
+20.9ms  react.js
+16.2ms  react-markdown.js
+10.5ms  bottom-anchored-scroll-body.tsx
+7.7ms  blank-line-CbzQQYtI.js
+5.7ms  setAttribute)
+5.4ms  now)
+5.4ms  createTask)
+=== page2: rows 251 -&gt; 388, sampled 1408ms ===
+422.3ms  (program) @ :-1
+422.3ms  (idle) @ :-1
+156.8ms  readOverflowMeasurement @ conversation-message-overflow.tsx:8
+69.6ms  exports.jsxDEV @ react_jsx-dev-runtime.js:190
+39.8ms  run @ :-1
+38.6ms  exports.jsx @ react_jsx-runtime.js:190
+19.8ms  (garbage collector) @ :-1
+13.8ms  addValueToProperties @ react-dom_client.js:2335
+10.2ms  addObjectToProperties @ react-dom_client.js:2332
+10.1ms  propagateParentContextChanges @ react-dom_client.js:3162
+10.0ms  exports.createElement @ react.js:590
+8.5ms  getMaxScrollOffset @ bottom-anchored-scroll-body.tsx:48
+7.8ms  addObjectDiffToProperties @ react-dom_client.js:2408
+7.6ms  now @ :-1
+7.2ms  ReactElement @ react_jsx-runtime.js:103
+6.4ms  createTask @ :-1
+5.9ms  setAttribute @ :-1
+5.5ms  react_stack_bottom_frame @ react-dom_client.js:12863
+4.6ms  ReactElement @ react_jsx-dev-runtime.js:103
+3.4ms  logComponentRender @ react-dom_client.js:2460
+3.3ms  runWithFiberInDEV @ react-dom_client.js:846
+3.3ms  ReactElement @ react.js:131
+3.1ms  visitParents @ lib-CvsIybF7.js:385
+2.9ms  reconcileChildFibersImpl @ react-dom_client.js:3776
+2.6ms  measure @ :-1
+2.5ms  ReactStrictModeWarnings.recordLegacyContextWarning @ react-dom_client.js:12834
+2.4ms  validatePropertiesInDevelopment @ react-dom_client.js:9493
+2.4ms  validateProperty @ react-dom_client.js:1874
+2.3ms  completeWork @ react-dom_client.js:6275
+1.8ms  jsxDEVImpl @ react_jsx-dev-runtime.js:147
+--- by script ---
+422.3ms  (program))
+422.3ms  (idle))
+157.5ms  conversation-message-overflow.tsx
+111.2ms  react-dom_client.js
+79.8ms  react_jsx-dev-runtime.js
+48.4ms  react_jsx-runtime.js
+39.8ms  run)
+19.8ms  (garbage collector))
+15.9ms  react.js
+11.7ms  react-markdown.js
+9.7ms  bottom-anchored-scroll-body.tsx
+7.6ms  now)
+6.4ms  createTask)
+5.9ms  setAttribute)
+4.4ms  blank-line-CbzQQYtI.js
+</pre>
+      <p><code>(program)</code> is native work the JS profiler cannot attribute (style/layout/paint of the growing tree). <code>readOverflowMeasurement</code> is a <code>scrollHeight</code>/<code>clientHeight</code> read inside a <code>useLayoutEffect</code>, so its "self time" is a forced synchronous layout of the whole document. The rest is React mounting ~150 rows' worth of components (jsx runtime + react-dom) and markdown parsing.</p>
+    </li>
+    <li>Unit-level repro that fails on main (<a href="1301/repro/ThreadTimelineRows.issue-1301.test.tsx">ThreadTimelineRows.issue-1301.test.tsx</a>, drop it into <code>apps/app/src/components/thread/timeline/</code> and run <code>pnpm exec vitest run src/components/thread/timeline/ThreadTimelineRows.issue-1301.test.tsx</code> from <code>apps/app</code>). The failing assertion is <code>expect(withContent.length).toBeLessThan(200)</code>: all 800 rows are mounted with real content.
+<pre>// @vitest-environment jsdom
+//
+// Repro for issue #1301: ThreadTimelineRows mounts every loaded row with its
+// full content. There is no windowing, so mounted DOM grows linearly with the
+// number of pages the user has scrolled through. This test FAILS on main
+// (16ceb3a54): all 800 rows are mounted with real content.
+
+import { cleanup, render } from &amp;quot;@testing-library/react&amp;quot;;
+import { afterEach, describe, expect, it } from &amp;quot;vitest&amp;quot;;
+import { MemoryRouter } from &amp;quot;react-router-dom&amp;quot;;
+import { CompactViewportOverrideProvider } from &amp;quot;@bb/shared-ui/hooks/use-compact-viewport&amp;quot;;
+import { conversationRow } from &amp;quot;@/test/fixtures/thread-timeline-rows&amp;quot;;
+import { ThreadTimelineRows } from &amp;quot;./ThreadTimelineRows&amp;quot;;
+
+afterEach(() =&amp;gt; cleanup());
+
+describe(&amp;quot;issue #1301: timeline history is never unmounted&amp;quot;, () =&amp;gt; {
+  it(&amp;quot;bounds the number of rows mounted with real content on a compact viewport&amp;quot;, () =&amp;gt; {
+    const rows = Array.from({ length: 800 }, (_, index) =&amp;gt;
+      conversationRow({
+        id: `message_${index}`,
+        role: index % 2 === 0 ? &amp;quot;user&amp;quot; : &amp;quot;assistant&amp;quot;,
+        text: `Timeline message ${index}`,
+        sourceSeqStart: index + 1,
+        sourceSeqEnd: index + 1,
+        threadId: &amp;quot;thr_1301&amp;quot;,
+      }),
+    );
+    const { container } = render(
+      &amp;lt;MemoryRouter&amp;gt;
+        &amp;lt;CompactViewportOverrideProvider isCompactViewport&amp;gt;
+          &amp;lt;ThreadTimelineRows
+            threadId=&amp;quot;thr_1301&amp;quot;
+            timelineRows={rows}
+            threadRuntimeDisplayStatus=&amp;quot;idle&amp;quot;
+            workspaceRootPath={undefined}
+          /&amp;gt;
+        &amp;lt;/CompactViewportOverrideProvider&amp;gt;
+      &amp;lt;/MemoryRouter&amp;gt;,
+    );
+    const wrappers = container.querySelectorAll(&amp;quot;[data-timeline-row-id]&amp;quot;);
+    const withContent = Array.from(wrappers).filter(
+      (wrapper) =&amp;gt; wrapper.textContent !== null &amp;amp;&amp;amp; wrapper.textContent.length &amp;gt; 0,
+    );
+    // Every row wrapper is present (that is fine) ...
+    expect(wrappers.length).toBe(800);
+    // ... but a windowed list would realize only rows near the viewport.
+    // On main every one of the 800 rows carries its full rendered content.
+    expect(withContent.length).toBeLessThan(200);
+  });
+});
+</pre>
+      Output on main:
+<pre> RUN  v4.1.1 /home/sawyer/projects/bb/.claude/worktrees/wf_debcf606-e4a-19/apps/app
+ ❯ src/components/thread/timeline/ThreadTimelineRows.issue-1301.test.tsx (1 test | 1 failed) 1179ms
+     × bounds the number of rows mounted with real content on a compact viewport 1178ms
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+ FAIL  src/components/thread/timeline/ThreadTimelineRows.issue-1301.test.tsx &gt; issue #1301: timeline history is never unmounted &gt; bounds the number of rows mounted with real content on a compact viewport
+AssertionError: expected 800 to be less than 200
+ ❯ src/components/thread/timeline/ThreadTimelineRows.issue-1301.test.tsx:49:32
+     47|     // ... but a windowed list would realize only rows near the viewpo…
+     48|     // On main every one of the 800 rows carries its full rendered con…
+     49|     expect(withContent.length).toBeLessThan(200);
+       |                                ^
+     50|   });
+     51| });
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+ Test Files  1 failed (1)
+      Tests  1 failed (1)
+   Start at  05:18:29
+   Duration  4.14s (transform 1.10s, setup 19ms, import 2.46s, tests 1.18s, environment 398ms)
+</pre>
+    </li>
+  </ol>
+
+  <h2>Root cause</h2>
+  <p>Two pieces of client code combine to produce the symptom; neither has a bug in the "wrong output" sense — the design simply has no upper bound.</p>
+  <h3>1. Older pages are accumulated into one array</h3>
+  <p><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/components/thread/timeline/useThreadTimelineController.ts#L227-L236"><code>apps/app/src/components/thread/timeline/useThreadTimelineController.ts#L227-L236</code></a> — <code>prependOlderTimelineRows</code> concatenates every fetched page in front of what is already loaded, and <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/components/thread/timeline/useThreadTimelineController.ts#L496-L515"><code>apps/app/src/components/thread/timeline/useThreadTimelineController.ts#L496-L515</code></a> stores the result in <code>loadedTimeline.rows</code>. There is no eviction, cap, or "distance from viewport" notion anywhere in the controller. Rows are only dropped when the latest window becomes non-contiguous (<code>isLatestTimelineWindowContiguous</code>) or the surface key changes.</p>
+<pre>export function prependOlderTimelineRows({ loadedRows, olderRows }) {
+  const rows: TimelineRow[] = [];
+  appendTimelineRowsPreservingOrder(rows, olderRows);
+  appendTimelineRowsPreservingOrder(rows, loadedRows);
+  return rows;
+}</pre>
+  <p>Auto-loading makes this fast to trigger: <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/components/thread/timeline/useAutoLoadOlderRows.ts#L9-L9"><code>apps/app/src/components/thread/timeline/useAutoLoadOlderRows.ts#L9-L9</code></a> prefetches the next page whenever the sentinel is within 600 px of the viewport, so a flick to the top fetches page after page.</p>
+  <h3>2. Every loaded row is rendered as real DOM</h3>
+  <p><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/components/thread/timeline/ThreadTimelineRows.tsx#L1906-L1928"><code>apps/app/src/components/thread/timeline/ThreadTimelineRows.tsx#L1906-L1928</code></a> — <code>TimelineRowsList</code> maps <em>all</em> items to <code>&lt;div data-timeline-row-id&gt;&lt;MemoizedTimelineRowView …/&gt;&lt;/div&gt;</code>. Memoisation (and identity preservation in the controller) keeps already-mounted rows from re-rendering, so React work per page is roughly O(page), but the browser's style/layout cost is against the whole subtree, and DOM/heap memory is O(everything ever loaded). Each conversation row is a full markdown render (~25 nodes per row on this fixture) plus a message action bar, so 820 rows ≈ 21k nodes.</p>
+  <h3>Why the per-page long task is 250–600 ms</h3>
+  <ul>
+    <li>Mounting ~85–110 rows (~4k nodes) of markdown/JSX in one commit (React dev runtime in the dev build roughly doubles this).</li>
+    <li><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/components/thread/timeline/conversation-message-overflow.tsx#L135-L135"><code>apps/app/src/components/thread/timeline/conversation-message-overflow.tsx#L135-L135</code></a> — every newly mounted conversation row measures <code>scrollHeight</code>/<code>clientHeight</code> in a <code>useLayoutEffect</code>. The first read forces layout of the whole (now larger) document inside the same task; the profile attributes 100–157 ms of self time to it per page.</li>
+    <li><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/components/ui/height-transition.tsx#L299-L299"><code>apps/app/src/components/ui/height-transition.tsx#L299-L299</code></a> — the list is wrapped in <code>AutoHeightContainer</code>, which reads <code>inner.offsetHeight</code> and animates the wrapper height on every content change, adding another layout read on prepend.</li>
+    <li>The bottom-anchored scroll body captures/restores <code>scrollHeight</code> around the prepend (more layout reads).</li>
+  </ul>
+  <p>Because layout cost scales with total mounted DOM, later pages are slower than earlier ones (296 ms for the first page vs. 418–472 ms for the last ones in the wheel run) even though pages have similar row counts. This is why the issue calls it "a series of visible freezes": each is a single sync task with no yielding.</p>
+  <h3>Deeper / adjacent issues</h3>
+  <ul>
+    <li>The accumulation is not mobile-specific. At 1280 px width the same run reaches 21,182 nodes and long tasks up to 589 ms. #1304 (composer keystroke cost scales with mounted timeline size) is the same root cause seen from the composer.</li>
+    <li>Memory: the loaded rows array also grows without bound (1.24 MB of JSON for this thread; the comment's 131 MiB production thread would be far worse) and is retained per surface for the lifetime of the thread view.</li>
+  </ul>
+
+  <h2>Proposed fix (first principles)</h2>
+  <p>Confidence is high on the mechanism, so a fix direction is reasonable to state. Two independent layers, both client-only (the paging protocol is fine):</p>
+  <ol>
+    <li><b>Bound what is rendered</b> — window the top-level <code>TimelineRowsList</code> so only rows near the viewport (± ~1 viewport of margin) mount real content; rows outside keep a fixed-height in-flow placeholder sized from their last measured height (estimate before first measurement). Keying on the existing stable row ids means realised rows keep identity across streaming updates. This is exactly what PR #1384 does; the essential requirements it should meet are: no absolute positioning (so native scroll anchoring and existing bottom-anchoring keep working), height placeholders in normal flow, realisation on IntersectionObserver, and pinning rows the user has interacted with (expanded tool calls, selections). It should apply at all viewport widths, not only <code>&lt; 768px</code>, and must not swap wrapper component types when it turns on/off (see PR review).</li>
+    <li><b>Bound what is loaded</b> (optional, memory) — cap <code>loadedTimeline.rows</code> at N pages and drop pages far from the viewport, keeping both cursors, so scrolling back down re-fetches. This is more invasive (the controller currently assumes the loaded rows are a contiguous prefix ending at the live window) and windowing alone removes the user-visible freezes, so it can be a follow-up.</li>
+    <li><b>Reduce per-page commit cost</b> regardless: batch the overflow measurement so a page of new rows does one layout read (e.g. via the shared ResizeObserver only, dropping the synchronous first read, or measuring in one <code>requestAnimationFrame</code>), and skip <code>AutoHeightContainer</code>'s height animation for prepends. These shave the constant factor but do not fix the unbounded growth.</li>
+  </ol>
+  <p>Risks: windowing breaks find-in-page and screen-reader linear reading for derealised rows, needs care with scroll restoration on prepend (placeholder estimate vs real height), and interacts with the streaming path (active turn rows must never derealise). All are addressed, with varying complexity, in #1384.</p>
+
+  <h2>PR review — #1384 "Window large mobile timelines" (open, not linked to #1301)</h2>
+  <p><a href="https://github.com/get-bb/bb/pull/1384">PR #1384</a> by SawyerHood (agent-generated, GPT-5.6 + Claude), branch <code>bb/mobile-timeline-virtualization</code>, 8 commits, +1,887/−37 across <code>ThreadTimelineRows.tsx</code>, <code>ThreadTimelineRows.actions.test.tsx</code>, <code>useScrollToSearchedMessage.ts</code>. Full diff saved at <a href="1301/repro/pr1384.diff">pr1384.diff</a>. It is not linked from the issue but is the only open work that addresses it, so it is reviewed here.</p>
+  <h3>What it changes</h3>
+  <ul>
+    <li>When <code>spacing === "top-level" &amp;&amp; isCompactViewport (&lt;768px) &amp;&amp; bottomAnchor &amp;&amp; IntersectionObserver &amp;&amp; items.length &gt;= 40</code>, each row is wrapped in <code>TimelineWindowedListItem</code>: an in-flow <code>div</code> that renders children only while "realized" and otherwise a fixed-height, <code>aria-hidden</code> placeholder (estimate 120 px conversation / 40 px other, replaced by measured height on derealise).</li>
+    <li>An IntersectionObserver with 1,000 px root margin realises/derealises. While the scroll body reports an active scroll (<code>data-scrollbar-scrolling</code>), above-viewport realisations are compensated by shrinking earlier placeholders ("donor" scheme, two <code>flushSync</code> commits in one task) so no <code>scrollTop</code> write kills WebKit momentum; otherwise a capture/<code>flushSync</code>/restore of the first visible row's top is used. An idle pass (300 ms) mounts insolvent realisations and re-budgets never-measured estimates to the running average.</li>
+    <li>Interaction pins (click/focus capture, cap 24) keep touched rows mounted; terminal auto-expanded row ids are accumulated so evicted rows re-expand on remount; search targets and the unread divider are always realised; <code>useScrollToSearchedMessage</code> waits for the target to be realised.</li>
+    <li>Moves <code>AutoHeightContainer</code> inside <code>TimelineRowsList</code> for the non-windowed path only (windowed path has no height animation wrapper).</li>
+  </ul>
+  <h3>Does it address the root cause?</h3>
+  <p>Yes for compact viewports: it bounds mounted content (layer 1 above). It does not bound the loaded rows array (layer 2, acceptable) and does nothing for widths ≥768 px.</p>
+  <h3>Tests I ran</h3>
+  <ul>
+    <li>Merged <code>main@16ceb3a54</code> into the PR branch. One conflict in <code>ThreadTimelineRows.tsx</code>: main added <code>snapRevision={heightSnapRevision}</code> to <code>AutoHeightContainer</code> (#1568) while the PR moved that container into <code>TimelineRowsList</code>. Resolved by threading a <code>heightSnapRevision</code> prop. The PR needs this rebase before it can merge.</li>
+    <li><code>pnpm exec turbo run typecheck --filter=@bb/app</code>: pass. <code>vitest run src/components/thread/timeline/ src/components/ui/bottom-anchored-scroll-body</code>: 22 files / 204 tests pass; the PR's 3 windowing tests pass.</li>
+    <li>Same browser repro on the merged branch at 390×844 (<a href="1301/repro/browser-05-pr1384-wheel-scroll.js">browser-05</a>):
+<pre>{&quot;label&quot;:&quot;before&quot;,&quot;nodes&quot;:996,&quot;rows&quot;:84,&quot;realized&quot;:20,&quot;windowed&quot;:true,&quot;scrollHeight&quot;:7265,&quot;scrollTop&quot;:6469,&quot;longTasks&quot;:0}
+{&quot;label&quot;:&quot;burst-1&quot;,&quot;nodes&quot;:1683,&quot;rows&quot;:617,&quot;realized&quot;:33,&quot;windowed&quot;:true,&quot;scrollHeight&quot;:51204,&quot;scrollTop&quot;:3244,&quot;longTasks&quot;:17}
+/home/sawyer/.dev-browser/tmp/1301-pr1384-mid-scroll.png
+{&quot;label&quot;:&quot;burst-2&quot;,&quot;nodes&quot;:1675,&quot;rows&quot;:820,&quot;realized&quot;:16,&quot;windowed&quot;:true,&quot;scrollHeight&quot;:69374,&quot;scrollTop&quot;:0,&quot;longTasks&quot;:26}
+{&quot;label&quot;:&quot;burst-3&quot;,&quot;nodes&quot;:1675,&quot;rows&quot;:820,&quot;realized&quot;:16,&quot;windowed&quot;:true,&quot;scrollHeight&quot;:69374,&quot;scrollTop&quot;:0,&quot;longTasks&quot;:26}
+{&quot;label&quot;:&quot;burst-4&quot;,&quot;nodes&quot;:1675,&quot;rows&quot;:820,&quot;realized&quot;:16,&quot;windowed&quot;:true,&quot;scrollHeight&quot;:69374,&quot;scrollTop&quot;:0,&quot;longTasks&quot;:26}
+LONGTASKS [{&quot;start&quot;:5616,&quot;dur&quot;:112},{&quot;start&quot;:5747,&quot;dur&quot;:90},{&quot;start&quot;:5891,&quot;dur&quot;:83},{&quot;start&quot;:6575,&quot;dur&quot;:105},{&quot;start&quot;:6709,&quot;dur&quot;:81},{&quot;start&quot;:6825,&quot;dur&quot;:83},{&quot;start&quot;:6959,&quot;dur&quot;:78},{&quot;start&quot;:7237,&quot;dur&quot;:64},{&quot;start&quot;:7618,&quot;dur&quot;:107},{&quot;start&quot;:7793,&quot;dur&quot;:113},{&quot;start&quot;:7944,&quot;dur&quot;:81},{&quot;start&quot;:8054,&quot;dur&quot;:52},{&quot;start&quot;:8615,&quot;dur&quot;:113},{&quot;start&quot;:8776,&quot;dur&quot;:106},{&quot;start&quot;:8924,&quot;dur&quot;:92},{&quot;start&quot;:9028,&quot;dur&quot;:83},{&quot;start&quot;:9226,&quot;dur&quot;:120},{&quot;start&quot;:10410,&quot;dur&quot;:72},{&quot;start&quot;:10525,&quot;dur&quot;:97},{&quot;start&quot;:10648,&quot;dur&quot;:168},{&quot;start&quot;:11194,&quot;dur&quot;:117},{&quot;start&quot;:11442,&quot;dur&quot;:74},{&quot;start&quot;:11559,&quot;dur&quot;:80},{&quot;start&quot;:11676,&quot;dur&quot;:57},{&quot;start&quot;:11858,&quot;dur&quot;:122},{&quot;start&quot;:12007,&quot;dur&quot;:60}]
+/home/sawyer/.dev-browser/tmp/1301-pr1384-top-of-history.png
+</pre>
+      DOM bounded at ~1.7k nodes (was 21k), 16–33 realised rows, 26 long tasks, min 52 ms, median 90 ms, max 168 ms, total 2410 ms (was 10 long tasks, min 279 ms, median 343 ms, max 472 ms, total 3581 ms). Remaining long tasks are the per-page prepend of ~90 placeholder wrappers plus realisation of rows entering the window.</li>
+    <li>Scroll back down from the top in bursts, checking after 600 ms idle for placeholders intersecting the viewport (<a href="1301/repro/browser-06-pr1384-scroll-down.js">browser-06</a>): 17 samples, <code>blankVisible</code> = 0 in every sample, DOM 1.7–2.2k nodes. Scroll height fluctuates by ~1.7k px as estimates are corrected but I did not observe visible position jumps in Chromium (WebKit momentum behaviour, which the PR is mostly about, cannot be checked here).</li>
+    <li>Desktop width on the merged branch (<a href="1301/repro/browser-07-pr1384-desktop.js">browser-07</a>): unchanged from main — <code>windowed:false</code>, 21,182 nodes, 15 long tasks, min 59 ms, median 353 ms, max 589 ms, total 5213 ms.
+<pre>{&quot;label&quot;:&quot;before&quot;,&quot;nodes&quot;:2503,&quot;rows&quot;:84,&quot;realized&quot;:84,&quot;windowed&quot;:false,&quot;scrollHeight&quot;:5306,&quot;scrollTop&quot;:4454,&quot;longTasks&quot;:0}
+{&quot;label&quot;:&quot;burst-1&quot;,&quot;nodes&quot;:21182,&quot;rows&quot;:820,&quot;realized&quot;:820,&quot;windowed&quot;:false,&quot;scrollHeight&quot;:54994,&quot;scrollTop&quot;:0,&quot;longTasks&quot;:15}
+/home/sawyer/.dev-browser/tmp/1301-pr1384-desktop-mid.png
+{&quot;label&quot;:&quot;burst-2&quot;,&quot;nodes&quot;:21182,&quot;rows&quot;:820,&quot;realized&quot;:820,&quot;windowed&quot;:false,&quot;scrollHeight&quot;:54994,&quot;scrollTop&quot;:0,&quot;longTasks&quot;:15}
+{&quot;label&quot;:&quot;burst-3&quot;,&quot;nodes&quot;:21182,&quot;rows&quot;:820,&quot;realized&quot;:820,&quot;windowed&quot;:false,&quot;scrollHeight&quot;:54994,&quot;scrollTop&quot;:0,&quot;longTasks&quot;:15}
+LONGTASKS [{&quot;start&quot;:5755,&quot;dur&quot;:353},{&quot;start&quot;:6125,&quot;dur&quot;:248},{&quot;start&quot;:6624,&quot;dur&quot;:365},{&quot;start&quot;:7151,&quot;dur&quot;:285},{&quot;start&quot;:7472,&quot;dur&quot;:141},{&quot;start&quot;:7614,&quot;dur&quot;:493},{&quot;start&quot;:8314,&quot;dur&quot;:421},{&quot;start&quot;:8771,&quot;dur&quot;:244},{&quot;start&quot;:9041,&quot;dur&quot;:523},{&quot;start&quot;:9726,&quot;dur&quot;:507},{&quot;start&quot;:10447,&quot;dur&quot;:59},{&quot;start&quot;:10535,&quot;dur&quot;:547},{&quot;start&quot;:11156,&quot;dur&quot;:234},{&quot;start&quot;:11417,&quot;dur&quot;:589},{&quot;start&quot;:12353,&quot;dur&quot;:204}]
+/home/sawyer/.dev-browser/tmp/1301-pr1384-desktop-top.png
+</pre>
+    </li>
+    <li>Hostile unit test (<a href="1301/repro/ThreadTimelineRows.pr1384-threshold.test.tsx">ThreadTimelineRows.pr1384-threshold.test.tsx</a>): render 39 rows on a compact viewport, then re-render with 40 rows. <b>Fails</b>: the wrapper for <code>message_0</code> is a different DOM node after the 40th row lands (the whole list is unmounted and remounted). Assertion: <code>expect(after).toBe(before)</code>.</li>
+  </ul>
+  <div class="grid">
+    <figure><img src="assets/1301-pr1384-mid-scroll.png" alt="PR 1384 mid scroll" width="390"><figcaption>PR #1384 (main merged), mid history: only ~30 rows realised, rest are placeholders; nothing blank in view.</figcaption></figure>
+    <figure><img src="assets/1301-pr1384-top-of-history.png" alt="PR 1384 top of history" width="390"><figcaption>PR #1384 at the top of history: 820 wrappers, 16 realised, 1,675 DOM nodes.</figcaption></figure>
+  </div>
+  <h3>Findings</h3>
+  <table>
+    <tr><th>#</th><th>Where</th><th>Severity</th><th>Finding</th></tr>
+    <tr><td>1</td><td><code>ThreadTimelineRows.tsx</code> <code>shouldWindow</code> (PR diff ~L2184-2190) and the two return branches of <code>TimelineRowsList</code></td><td class="v-bad">High</td><td>Windowing toggles by swapping the per-row wrapper element type (<code>&lt;div&gt;</code> ↔ <code>&lt;TimelineWindowedListItem&gt;</code>) under the same key. When <code>items.length</code> crosses 40 (every mobile thread does this mid-conversation as messages stream in), or the viewport crosses 768 px (tablet rotate, desktop resize, split view), React unmounts and remounts <em>every</em> row: expanded tool-call/turn state, in-progress text selection, "show more" reveals and scroll geometry are lost, and the remount is itself a large sync task at the worst moment. Repro test above fails. Fix: always render the same wrapper component and make it a no-op passthrough (always realised) when windowing is off, or key the list on <code>shouldWindow</code> deliberately and document the reset.</td></tr>
+    <tr><td>2</td><td><code>shouldWindow</code> requires <code>useIsCompactViewport()</code></td><td class="v-bad">Medium</td><td>Only <code>&lt;768px</code> is windowed. The unbounded growth (and #1304's composer cost) is identical at desktop widths — measured 21k nodes / 589 ms tasks on the PR branch at 1280 px. The PR title scopes to mobile, but the WebKit-momentum machinery is the hard part; enabling the window on desktop is mostly removing the guard, and shipping it mobile-only leaves the issue open.</td></tr>
+    <tr><td>3</td><td>Base drift; <code>AutoHeightContainer</code></td><td class="v-unk">Medium (mergeability)</td><td>Branch is 151 commits behind main and conflicts with #1568's <code>snapRevision</code>. The PR also removes <code>AutoHeightContainer</code> from the windowed path entirely, so the height-snap-on-turn-completion behaviour from #1568 does not apply on mobile once windowed. Whether that is acceptable needs a deliberate call; my merge only threads the prop through the non-windowed path.</td></tr>
+    <tr><td>4</td><td><code>TimelineRowsList</code> hooks: <code>useIsCompactViewport</code>, <code>useBottomAnchoredScroll</code>, <code>useStore</code>, <code>useLocation</code>, several <code>useMemo</code>s</td><td>Low</td><td><code>TimelineRowsList</code> is also rendered recursively for nested (turn/delegation) lists where <code>shouldWindow</code> is always false, so every nested list now subscribes to the media query and router and computes search/unread/anchor indices it never uses. Cheap individually, but the file is now ~3,150 lines with the windowing state machine inline; extracting <code>useTimelineWindow</code> to its own module would keep the nested path free of it.</td></tr>
+    <tr><td>5</td><td><code>estimateTimelineListItemHeight</code> (120 / 40 px), <code>TIMELINE_WINDOW_REBUDGET_*</code></td><td>Low</td><td>Static estimates seed placeholders; on this fixture assistant messages are 300–900 px, so <code>scrollHeight</code> swings by ~1.7 kpx during a scroll (69,374 → 68,302 → 70,073 in my runs) as estimates are replaced. In Chromium this was invisible; on WebKit the PR's donor scheme is designed for it. Worth keeping the iOS drift check from the PR description as an automated Playwright/WebKit test rather than a one-off measurement.</td></tr>
+    <tr><td>6</td><td>Placeholders are <code>aria-hidden</code> with empty content</td><td>Low (inherent)</td><td>Find-in-page and assistive tech cannot reach derealised rows; the in-app search deep link is handled. Acceptable trade-off for a virtualised list but should be stated in the PR.</td></tr>
+    <tr><td>7</td><td>Type/contract hygiene</td><td>Low</td><td>No <code>as any</code>/<code>unknown</code> smuggling found; only a <code>{ top, bottom } as DOMRect</code> in tests. No server/daemon boundary or protocol changes (client only), so no <code>HOST_DAEMON_PROTOCOL_VERSION</code> concern.</td></tr>
+  </table>
+  <h3>Verdict</h3>
+  <p><b>REQUEST CHANGES.</b> The approach is right and it demonstrably fixes the measured problem on compact viewports (21k → 1.7k nodes, 280–470 ms → 60–170 ms tasks on the same repro). But it must be rebased onto main, finding 1 (full remount when windowing switches on at 40 items or on a viewport-width change) needs fixing with a test, and it should either enable the window at all widths or explicitly leave #1301 open for desktop.</p>
+
+  <h2>Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/1304">#1304</a> Composer keystroke cost scales with the mounted timeline size — same root cause (mounted DOM grows without bound).</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1300">#1300</a> the seeded perf fixture (<code>pnpm seed:perf</code>) used here.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1131">#1131</a>, <a href="https://github.com/get-bb/bb/issues/1207">#1207</a> server-side timeline read isolation (referenced in the issue comment; separate mechanism).</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1616">#1616</a> iOS Safari performance audit (broader mobile perf list).</li>
+    <li><a href="https://github.com/get-bb/bb/pull/898">#898</a> "Fix long thread timeline scroll stalls" and <a href="https://github.com/get-bb/bb/pull/1285">#1285</a> re-render amplifiers — earlier constant-factor fixes; neither bounds mounted DOM.</li>
+    <li><a href="https://github.com/get-bb/bb/pull/1384">#1384</a> Window large mobile timelines (reviewed above).</li>
+  </ul>
+
+  <h2>Appendix</h2>
+  <details><summary>Commands run (in order)</summary>
+<pre># worktree setup
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+# dev instance + fixture
+scripts/bb-dev-app current ; pnpm dev:stop
+pnpm seed:perf -- --projects 1 --threads 8 --events 60000 --seed 42
+scripts/bb-dev-app current
+sqlite3 &lt;data&gt;/bb.db &quot;select thread_id, count(*) c from events group by thread_id order by c desc limit 8;&quot;
+curl -s -o /tmp/1301-latest.json -w &#x27;status=%{http_code} bytes=%{size_download} time=%{time_total}\n&#x27; http://localhost:21028/api/v1/threads/thr_wfjb5qctw4/timeline
+node /tmp/bb-reports/issues/1301-walk-pages.mjs
+# browser (dev-browser CLI, Playwright Chromium headless)
+dev-browser --browser bb1301 --headless --timeout 120 run browser-01-open.js
+dev-browser --browser bb1301 --headless --timeout 300 run browser-02-scroll-history.js
+dev-browser --browser bb1301 --headless --timeout 300 run browser-03-wheel-scroll.js
+dev-browser --browser bb1301 --headless --timeout 300 run browser-04-profile.js
+# unit repro on main
+cd apps/app &amp;&amp; pnpm exec vitest run src/components/thread/timeline/ThreadTimelineRows.issue-1301.test.tsx
+# PR 1384
+git fetch origin pull/1384/head:pr-1384 ; git checkout -b pr-1384-merge pr-1384 ; git merge 16ceb3a54   # 1 conflict, resolved
+pnpm install --frozen-lockfile --prefer-offline ; pnpm exec turbo run typecheck --filter=@bb/app
+cd apps/app &amp;&amp; pnpm exec vitest run src/components/thread/timeline/ src/components/ui/bottom-anchored-scroll-body
+scripts/bb-dev-app current
+dev-browser ... run browser-05-pr1384-wheel-scroll.js ; browser-06-pr1384-scroll-down.js ; browser-07-pr1384-desktop.js
+cd apps/app &amp;&amp; pnpm exec vitest run src/components/thread/timeline/ThreadTimelineRows.pr1384-threshold.test.tsx   # fails (finding 1)
+git checkout 16ceb3a54 ; pnpm dev:stop</pre>
+  </details>
+  <details><summary>Latest-page fetch (curl)</summary><pre>status=200 bytes=109302 time=0.058081
+rows 92 olderCursor {&quot;anchorSeq&quot;:8182,&quot;anchorId&quot;:&quot;thr_wfjb5qctw4:user-seed:8182&quot;} kinds conversation 35, turn 17, work 40</pre></details>
+  <details><summary>Scroll-down check on PR branch (browser-06 output)</summary><pre>{&quot;label&quot;:&quot;up-2&quot;,&quot;nodes&quot;:1675,&quot;rows&quot;:820,&quot;realized&quot;:16,&quot;visible&quot;:8,&quot;blankVisible&quot;:0,&quot;blankIds&quot;:[],&quot;scrollTop&quot;:0,&quot;scrollHeight&quot;:70073}
+{&quot;label&quot;:&quot;down-1&quot;,&quot;nodes&quot;:1927,&quot;rows&quot;:820,&quot;realized&quot;:35,&quot;visible&quot;:12,&quot;blankVisible&quot;:0,&quot;blankIds&quot;:[],&quot;scrollTop&quot;:4200,&quot;scrollHeight&quot;:69534}
+{&quot;label&quot;:&quot;down-2&quot;,&quot;nodes&quot;:1835,&quot;rows&quot;:820,&quot;realized&quot;:32,&quot;visible&quot;:10,&quot;blankVisible&quot;:0,&quot;blankIds&quot;:[],&quot;scrollTop&quot;:8400,&quot;scrollHeight&quot;:69534}
+{&quot;label&quot;:&quot;down-3&quot;,&quot;nodes&quot;:2244,&quot;rows&quot;:820,&quot;realized&quot;:38,&quot;visible&quot;:11,&quot;blankVisible&quot;:0,&quot;blankIds&quot;:[],&quot;scrollTop&quot;:12600,&quot;scrollHeight&quot;:69411}
+{&quot;label&quot;:&quot;down-4&quot;,&quot;nodes&quot;:1993,&quot;rows&quot;:820,&quot;realized&quot;:30,&quot;visible&quot;:8,&quot;blankVisible&quot;:0,&quot;blankIds&quot;:[],&quot;scrollTop&quot;:16800,&quot;scrollHeight&quot;:69167}
+{&quot;label&quot;:&quot;down-5&quot;,&quot;nodes&quot;:1927,&quot;rows&quot;:820,&quot;realized&quot;:31,&quot;visible&quot;:10,&quot;blankVisible&quot;:0,&quot;blankIds&quot;:[],&quot;scrollTop&quot;:21000,&quot;scrollHeight&quot;:69167}
+{&quot;label&quot;:&quot;down-6&quot;,&quot;nodes&quot;:2169,&quot;rows&quot;:820,&quot;realized&quot;:39,&quot;visible&quot;:8,&quot;blankVisible&quot;:0,&quot;blankIds&quot;:[],&quot;scrollTop&quot;:25200,&quot;scrollHeight&quot;:69163}
+{&quot;label&quot;:&quot;down-7&quot;,&quot;nodes&quot;:1894,&quot;rows&quot;:820,&quot;realized&quot;:33,&quot;visible&quot;:12,&quot;blankVisible&quot;:0,&quot;blankIds&quot;:[],&quot;scrollTop&quot;:29400,&quot;scrollHeight&quot;:69052}
+{&quot;label&quot;:&quot;down-8&quot;,&quot;nodes&quot;:1978,&quot;rows&quot;:820,&quot;realized&quot;:34,&quot;visible&quot;:11,&quot;blankVisible&quot;:0,&quot;blankIds&quot;:[],&quot;scrollTop&quot;:33600,&quot;scrollHeight&quot;:69052}
+{&quot;label&quot;:&quot;down-9&quot;,&quot;nodes&quot;:2042,&quot;rows&quot;:820,&quot;realized&quot;:30,&quot;visible&quot;:8,&quot;blankVisible&quot;:0,&quot;blankIds&quot;:[],&quot;scrollTop&quot;:37800,&quot;scrollHeight&quot;:69052}
+{&quot;label&quot;:&quot;down-10&quot;,&quot;nodes&quot;:2066,&quot;rows&quot;:820,&quot;realized&quot;:39,&quot;visible&quot;:12,&quot;blankVisible&quot;:0,&quot;blankIds&quot;:[],&quot;scrollTop&quot;:42000,&quot;scrollHeight&quot;:68445}
+{&quot;label&quot;:&quot;down-11&quot;,&quot;nodes&quot;:1896,&quot;rows&quot;:820,&quot;realized&quot;:34,&quot;visible&quot;:9,&quot;blankVisible&quot;:0,&quot;blankIds&quot;:[],&quot;scrollTop&quot;:46200,&quot;scrollHeight&quot;:68445}
+{&quot;label&quot;:&quot;down-12&quot;,&quot;nodes&quot;:1991,&quot;rows&quot;:820,&quot;realized&quot;:35,&quot;visible&quot;:8,&quot;blankVisible&quot;:0,&quot;blankIds&quot;:[],&quot;scrollTop&quot;:50400,&quot;scrollHeight&quot;:68707}
+{&quot;label&quot;:&quot;down-13&quot;,&quot;nodes&quot;:1980,&quot;rows&quot;:820,&quot;realized&quot;:34,&quot;visible&quot;:13,&quot;blankVisible&quot;:0,&quot;blankIds&quot;:[],&quot;scrollTop&quot;:54600,&quot;scrollHeight&quot;:68707}
+{&quot;label&quot;:&quot;down-14&quot;,&quot;nodes&quot;:1972,&quot;rows&quot;:820,&quot;realized&quot;:37,&quot;visible&quot;:12,&quot;blankVisible&quot;:0,&quot;blankIds&quot;:[],&quot;scrollTop&quot;:58800,&quot;scrollHeight&quot;:68707}
+{&quot;label&quot;:&quot;down-15&quot;,&quot;nodes&quot;:2031,&quot;rows&quot;:820,&quot;realized&quot;:41,&quot;visible&quot;:12,&quot;blankVisible&quot;:0,&quot;blankIds&quot;:[],&quot;scrollTop&quot;:63000,&quot;scrollHeight&quot;:68302}
+{&quot;label&quot;:&quot;down-16&quot;,&quot;nodes&quot;:1804,&quot;rows&quot;:820,&quot;realized&quot;:24,&quot;visible&quot;:12,&quot;blankVisible&quot;:0,&quot;blankIds&quot;:[],&quot;scrollTop&quot;:67200,&quot;scrollHeight&quot;:68302}
+{&quot;label&quot;:&quot;down-17&quot;,&quot;nodes&quot;:1730,&quot;rows&quot;:820,&quot;realized&quot;:20,&quot;visible&quot;:8,&quot;blankVisible&quot;:0,&quot;blankIds&quot;:[],&quot;scrollTop&quot;:67507,&quot;scrollHeight&quot;:68303}
+/home/sawyer/.dev-browser/tmp/1301-pr1384-after-scroll-down.png
+</pre></details>
+  <details><summary>Hostile PR test: threshold remount (source)</summary><pre>// @vitest-environment jsdom
+//
+// Hostile test for PR #1384 (issue #1301 review): crossing the 40-item
+// windowing threshold on a compact viewport swaps every row&amp;#x27;s wrapper element
+// type (plain &amp;lt;div&amp;gt; -&amp;gt; TimelineWindowedListItem), which remounts the whole
+// timeline subtree and drops row-local state.
+
+import { act, cleanup, render } from &amp;quot;@testing-library/react&amp;quot;;
+import { afterEach, describe, expect, it, vi } from &amp;quot;vitest&amp;quot;;
+import { MemoryRouter } from &amp;quot;react-router-dom&amp;quot;;
+import { CompactViewportOverrideProvider } from &amp;quot;@bb/shared-ui/hooks/use-compact-viewport&amp;quot;;
+import {
+  BottomAnchorContext,
+  type BottomAnchorContextValue,
+} from &amp;quot;@/components/ui/bottom-anchored-scroll-body&amp;quot;;
+import { conversationRow } from &amp;quot;@/test/fixtures/thread-timeline-rows&amp;quot;;
+import { ThreadTimelineRows } from &amp;quot;./ThreadTimelineRows&amp;quot;;
+
+afterEach(() =&amp;gt; {
+  cleanup();
+  vi.unstubAllGlobals();
+});
+
+function makeRows(count: number) {
+  return Array.from({ length: count }, (_, index) =&amp;gt;
+    conversationRow({
+      id: `message_${index}`,
+      role: index % 2 === 0 ? &amp;quot;user&amp;quot; : &amp;quot;assistant&amp;quot;,
+      text: `Timeline message ${index}`,
+      sourceSeqStart: index + 1,
+      sourceSeqEnd: index + 1,
+      threadId: &amp;quot;thr_threshold&amp;quot;,
+    }),
+  );
+}
+
+describe(&amp;quot;PR #1384 windowing threshold&amp;quot;, () =&amp;gt; {
+  it(&amp;quot;remounts every timeline row when the 40th item arrives on a compact viewport&amp;quot;, () =&amp;gt; {
+    vi.stubGlobal(
+      &amp;quot;IntersectionObserver&amp;quot;,
+      class IntersectionObserverMock {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    const scrollElement = document.createElement(&amp;quot;div&amp;quot;);
+    scrollElement.getBoundingClientRect = () =&amp;gt;
+      ({ top: 0, bottom: 800 }) as DOMRect;
+    const bottomAnchor: BottomAnchorContextValue = {
+      captureScrollAnchor: vi.fn(),
+      getScrollElement: () =&amp;gt; scrollElement,
+      isAtBottom: true,
+      scrollElementIntoView: vi.fn(),
+      scrollElementIntoViewClampedToMaxScroll: vi.fn(),
+      scrollToBottom: vi.fn(),
+    };
+    const renderTimeline = (rowCount: number) =&amp;gt; (
+      &amp;lt;MemoryRouter&amp;gt;
+        &amp;lt;BottomAnchorContext.Provider value={bottomAnchor}&amp;gt;
+          &amp;lt;CompactViewportOverrideProvider isCompactViewport&amp;gt;
+            &amp;lt;ThreadTimelineRows
+              threadId=&amp;quot;thr_threshold&amp;quot;
+              timelineRows={makeRows(rowCount)}
+              threadRuntimeDisplayStatus=&amp;quot;idle&amp;quot;
+              workspaceRootPath={undefined}
+            /&amp;gt;
+          &amp;lt;/CompactViewportOverrideProvider&amp;gt;
+        &amp;lt;/BottomAnchorContext.Provider&amp;gt;
+      &amp;lt;/MemoryRouter&amp;gt;
+    );
+
+    const { container, rerender } = render(renderTimeline(39));
+    expect(container.querySelector(&amp;#x27;[data-timeline-windowed=&amp;quot;true&amp;quot;]&amp;#x27;)).toBeNull();
+    const before = container.querySelector(&amp;#x27;[data-timeline-row-id=&amp;quot;message_0&amp;quot;]&amp;#x27;);
+    expect(before).not.toBeNull();
+    const beforeInner = before?.firstElementChild ?? null;
+    expect(beforeInner).not.toBeNull();
+
+    // Same thread, one more row appended (a new streamed message).
+    act(() =&amp;gt; {
+      rerender(renderTimeline(40));
+    });
+    expect(
+      container.querySelector(&amp;#x27;[data-timeline-windowed=&amp;quot;true&amp;quot;]&amp;#x27;),
+    ).not.toBeNull();
+    const after = container.querySelector(&amp;#x27;[data-timeline-row-id=&amp;quot;message_0&amp;quot;]&amp;#x27;);
+    const afterInner = after?.firstElementChild ?? null;
+
+    // The row content for message_0 did not change, so a stable list keeps
+    // the same DOM nodes. If these differ, React unmounted and remounted the
+    // row (and every other row) purely because the wrapper type changed.
+    expect(after).toBe(before);
+    expect(afterInner).toBe(beforeInner);
+  });
+});
+</pre></details>
+  <details><summary>Page walker script (1301-walk-pages.mjs)</summary><pre>const base = &amp;quot;http://localhost:21028&amp;quot;;
+const threadId = process.argv[2] ?? &amp;quot;thr_wfjb5qctw4&amp;quot;;
+let url = `${base}/api/v1/threads/${threadId}/timeline`;
+let page = 0, total = 0, bytes = 0;
+for (;;) {
+  const t0 = performance.now();
+  const res = await fetch(url);
+  const text = await res.text();
+  const ms = (performance.now() - t0).toFixed(0);
+  const body = JSON.parse(text); if (!body.rows) { console.log(&amp;quot;ERR&amp;quot;, res.status, url, text.slice(0,300)); break; }
+  page += 1; total += body.rows.length; bytes += text.length;
+  const c = body.timelinePage.olderCursor;
+  console.log(`page ${page} rows=${body.rows.length} bytes=${text.length} ms=${ms} olderCursor=${JSON.stringify(c)}`);
+  if (!c) break;
+  url = `${base}/api/v1/threads/${threadId}/timeline?beforeAnchorSeq=${c.anchorSeq}&amp;amp;beforeAnchorId=${encodeURIComponent(c.anchorId)}`;
+}
+console.log(`TOTAL pages=${page} rows=${total} bytes=${bytes}`);
+</pre></details>
+  <details><summary>Browser scripts</summary>
+    <p>browser-01-open.js</p><pre>// dev-browser script: open the seeded 9,001-event thread at a 390x844 viewport
+// and record the initial DOM size.
+const page = await browser.getPage(&amp;quot;thread&amp;quot;);
+await page.setViewportSize({ width: 390, height: 844 });
+await page.goto(&amp;quot;http://localhost:13028/projects/proj_mgvp7iamvh/threads/thr_wfjb5qctw4&amp;quot;, { waitUntil: &amp;quot;networkidle&amp;quot;, timeout: 60000 });
+await page.waitForTimeout(3000);
+const info = await page.evaluate(() =&amp;gt; {
+  const rows = document.querySelectorAll(&amp;quot;[data-timeline-row-id]&amp;quot;).length;
+  const nodes = document.getElementsByTagName(&amp;quot;*&amp;quot;).length;
+  const scrollers = Array.from(document.querySelectorAll(&amp;quot;*&amp;quot;)).filter(e =&amp;gt; { const s = getComputedStyle(e); return (s.overflowY===&amp;quot;auto&amp;quot;||s.overflowY===&amp;quot;scroll&amp;quot;) &amp;amp;&amp;amp; e.scrollHeight &amp;gt; e.clientHeight + 10; }).map(e =&amp;gt; ({tag:e.tagName, cls:e.className.toString().slice(0,80), sh:e.scrollHeight, ch:e.clientHeight, st:e.scrollTop}));
+  return { rows, nodes, scrollers, url: location.href };
+});
+console.log(JSON.stringify(info, null, 2));
+const shot = await page.screenshot();
+console.log(await saveScreenshot(shot, &amp;quot;1301-initial.png&amp;quot;));
+</pre>
+    <p>browser-03-wheel-scroll.js</p><pre>// dev-browser script: reload the thread, then scroll up with real wheel events
+// (like a user flicking upward) until history is exhausted. Records DOM/rows
+// after each burst and lists long tasks.
+const page = await browser.getPage(&amp;quot;thread&amp;quot;);
+await page.setViewportSize({ width: 390, height: 844 });
+await page.goto(&amp;quot;http://localhost:13028/projects/proj_mgvp7iamvh/threads/thr_wfjb5qctw4&amp;quot;, { waitUntil: &amp;quot;networkidle&amp;quot;, timeout: 60000 });
+await page.waitForTimeout(2500);
+await page.evaluate(() =&amp;gt; {
+  window.__bb1301 = { longTasks: [], samples: [] };
+  const po = new PerformanceObserver((list) =&amp;gt; {
+    for (const e of list.getEntries()) window.__bb1301.longTasks.push({ start: Math.round(e.startTime), dur: Math.round(e.duration) });
+  });
+  po.observe({ type: &amp;quot;longtask&amp;quot;, buffered: false });
+});
+const sample = (label) =&amp;gt; page.evaluate((label) =&amp;gt; {
+  const el = document.querySelector(&amp;quot;.thread-scrollbar&amp;quot;);
+  return { label, nodes: document.getElementsByTagName(&amp;quot;*&amp;quot;).length, rows: document.querySelectorAll(&amp;quot;[data-timeline-row-id]&amp;quot;).length, scrollHeight: el.scrollHeight, scrollTop: el.scrollTop, longTasks: window.__bb1301.longTasks.length };
+}, label);
+console.log(JSON.stringify(await sample(&amp;quot;before&amp;quot;)));
+await page.mouse.move(195, 400);
+let lastRows = -1, stable = 0, tookMid = false;
+for (let i = 1; i &amp;lt;= 60; i++) {
+  for (let k = 0; k &amp;lt; 40; k++) { await page.mouse.wheel(0, -1500); await page.waitForTimeout(20); }
+  await page.waitForTimeout(800);
+  const s = await sample(&amp;quot;burst-&amp;quot; + i);
+  console.log(JSON.stringify(s));
+  if (!tookMid &amp;amp;&amp;amp; s.rows &amp;gt; 300) { tookMid = true; console.log(await saveScreenshot(await page.screenshot(), &amp;quot;1301-mid-scroll.png&amp;quot;)); }
+  if (s.rows === lastRows &amp;amp;&amp;amp; s.scrollTop === 0) { stable += 1; if (stable &amp;gt;= 2) break; } else stable = 0;
+  lastRows = s.rows;
+}
+const lt = await page.evaluate(() =&amp;gt; window.__bb1301.longTasks);
+console.log(&amp;quot;LONGTASKS &amp;quot; + JSON.stringify(lt));
+console.log(await saveScreenshot(await page.screenshot(), &amp;quot;1301-top-of-history.png&amp;quot;));
+</pre>
+    <p>browser-04-profile.js</p><pre>// dev-browser script: CPU-profile a single older-page prepend via CDP and print
+// the top self-time frames plus how much of the wall time was React render/commit
+// vs. browser layout. Also measures the &amp;quot;empty&amp;quot; cost of scrolling with no load.
+const page = await browser.getPage(&amp;quot;thread&amp;quot;);
+await page.setViewportSize({ width: 390, height: 844 });
+await page.goto(&amp;quot;http://localhost:13028/projects/proj_mgvp7iamvh/threads/thr_wfjb5qctw4&amp;quot;, { waitUntil: &amp;quot;networkidle&amp;quot;, timeout: 60000 });
+await page.waitForTimeout(2500);
+const cdp = await page.context().newCDPSession(page);
+await cdp.send(&amp;quot;Profiler.enable&amp;quot;);
+await cdp.send(&amp;quot;Profiler.setSamplingInterval&amp;quot;, { interval: 200 });
+
+async function profileOnePage(label) {
+  const before = await page.evaluate(() =&amp;gt; document.querySelectorAll(&amp;quot;[data-timeline-row-id]&amp;quot;).length);
+  await cdp.send(&amp;quot;Profiler.start&amp;quot;);
+  const t0 = Date.now();
+  await page.evaluate(() =&amp;gt; { const el = document.querySelector(&amp;quot;.thread-scrollbar&amp;quot;); el.scrollTop = 0; });
+  // wait for one page to land
+  await page.waitForFunction((n) =&amp;gt; document.querySelectorAll(&amp;quot;[data-timeline-row-id]&amp;quot;).length &amp;gt; n, before, { timeout: 15000 }).catch(() =&amp;gt; {});
+  await page.waitForTimeout(700);
+  const { profile } = await cdp.send(&amp;quot;Profiler.stop&amp;quot;);
+  const after = await page.evaluate(() =&amp;gt; document.querySelectorAll(&amp;quot;[data-timeline-row-id]&amp;quot;).length);
+  // aggregate self time by function
+  const byId = new Map(profile.nodes.map((n) =&amp;gt; [n.id, n]));
+  const self = new Map();
+  const dt = profile.timeDeltas; const samples = profile.samples;
+  let total = 0;
+  for (let i = 0; i &amp;lt; samples.length; i++) {
+    const n = byId.get(samples[i]); const d = (dt[i] || 0) / 1000; total += d;
+    const cf = n.callFrame; const url = (cf.url || &amp;quot;&amp;quot;).split(&amp;quot;/&amp;quot;).slice(-1)[0].split(&amp;quot;?&amp;quot;)[0];
+    const key = (cf.functionName || &amp;quot;(anon)&amp;quot;) + &amp;quot; @ &amp;quot; + url + &amp;quot;:&amp;quot; + cf.lineNumber;
+    self.set(key, (self.get(key) || 0) + d);
+  }
+  const top = [...self.entries()].sort((a, b) =&amp;gt; b[1] - a[1]).slice(0, 30).map(([k, v]) =&amp;gt; v.toFixed(1) + &amp;quot;ms  &amp;quot; + k);
+  // bucket by url
+  const byUrl = new Map();
+  for (let i = 0; i &amp;lt; samples.length; i++) { const n = byId.get(samples[i]); const d = (dt[i] || 0) / 1000; const url = (n.callFrame.url || &amp;quot;(native/&amp;quot; + n.callFrame.functionName + &amp;quot;)&amp;quot;).split(&amp;quot;/&amp;quot;).slice(-1)[0].split(&amp;quot;?&amp;quot;)[0]; byUrl.set(url, (byUrl.get(url) || 0) + d); }
+  const urls = [...byUrl.entries()].sort((a, b) =&amp;gt; b[1] - a[1]).slice(0, 15).map(([k, v]) =&amp;gt; v.toFixed(1) + &amp;quot;ms  &amp;quot; + k);
+  console.log(`=== ${label}: rows ${before} -&amp;gt; ${after}, sampled ${total.toFixed(0)}ms ===`);
+  console.log(top.join(&amp;quot;\n&amp;quot;));
+  console.log(&amp;quot;--- by script ---\n&amp;quot; + urls.join(&amp;quot;\n&amp;quot;));
+  await writeFile(`1301-profile-${label}.cpuprofile`, JSON.stringify(profile));
+}
+await profileOnePage(&amp;quot;page1&amp;quot;);
+await profileOnePage(&amp;quot;page2&amp;quot;);
+// load the rest to make the loaded window large, then profile again
+for (let i = 0; i &amp;lt; 6; i++) { await page.evaluate(() =&amp;gt; { document.querySelector(&amp;quot;.thread-scrollbar&amp;quot;).scrollTop = 0; }); await page.waitForTimeout(1500); }
+await profileOnePage(&amp;quot;pageLate&amp;quot;);
+</pre>
+  </details>
+
+  <h2>Verification</h2>
+  <p>A second pass re-ran the report in a fresh checkout of the same worktree path (HEAD <code>c25298f69</code>, two commits past <code>16ceb3a54</code>; <code>git diff --stat 16ceb3a54 HEAD -- apps/app/src/components/thread/timeline</code> touches only one test file, so the code under investigation is identical to the base commit). Findings:</p>
+  <ul>
+    <li><b>Permalinks checked</b> against <code>16ceb3a54</code>: <code>useThreadTimelineController.ts#L227-L236</code> (<code>prependOlderTimelineRows</code>), <code>#L496-L515</code> (<code>setLoadedTimeline</code> prepend), <code>useAutoLoadOlderRows.ts#L9</code> (600 px prefetch margin), <code>ThreadTimelineRows.tsx#L1906-L1928</code> (<code>items.map</code> mounting every row), <code>conversation-message-overflow.tsx#L135</code> (synchronous <code>readOverflowMeasurement</code>), <code>height-transition.tsx#L299</code> (<code>inner.offsetHeight</code>) all point at the quoted code.</li>
+    <li><b>Unit repro re-run</b> after <code>pnpm install --frozen-lockfile --prefer-offline</code> and <code>pnpm exec turbo run build</code> (14/14 tasks, 13 cached): <a href="1301/repro/ThreadTimelineRows.issue-1301.test.tsx">ThreadTimelineRows.issue-1301.test.tsx</a> still fails with <code>AssertionError: expected 800 to be less than 200</code> (<a href="1301/repro/issue-1301-test-output-verify.log">issue-1301-test-output-verify.log</a>). The file was copied into <code>apps/app/src/components/thread/timeline/</code>, run with <code>pnpm exec vitest run &lt;path&gt;</code> from <code>apps/app</code>, and removed again.</li>
+    <li><b>Browser repro re-run</b> on the same seeded data dir (still contained <code>thr_wfjb5qctw4</code> with 9,001 events) with the wheel-scroll script (<a href="1301/repro/browser-08-verify-wheel-scroll.js">browser-08-verify-wheel-scroll.js</a>, run as <code>dev-browser --headless --timeout 180 run …</code>; note the CLI needs <code>--headless</code> on this machine because there is no X server, and the default 30 s script timeout is too short for the full scroll). Output (<a href="1301/repro/browser-08-output.log">browser-08-output.log</a>) matches the original run to the node:
+<pre>{"label":"before","nodes":2403,"rows":84,"scrollHeight":6552,"scrollTop":5756,"longTasks":0}
+{"label":"burst-1","nodes":21082,"rows":820,"scrollHeight":68302,"scrollTop":0,"longTasks":10}
+{"label":"burst-2","nodes":21082,"rows":820,"scrollHeight":68302,"scrollTop":0,"longTasks":10}
+{"label":"burst-3","nodes":21082,"rows":820,"scrollHeight":68302,"scrollTop":0,"longTasks":10}
+LONGTASKS [{"start":11206,"dur":307},{"start":11528,"dur":285},{"start":12016,"dur":286},{"start":12322,"dur":260},{"start":12778,"dur":239},{"start":13280,"dur":415},{"start":13726,"dur":331},{"start":14299,"dur":479},{"start":15017,"dur":463},{"start":15758,"dur":435}]</pre>
+      10 long tasks, min 239 ms, median 319 ms, max 479 ms; DOM 2,403 → 21,082 nodes, never decreasing. Screenshot: <a href="assets/1301-verify-top-of-history.png">assets/1301-verify-top-of-history.png</a>.
+      <figure><img src="assets/1301-verify-top-of-history.png" alt="Verification run, top of history" width="390"><figcaption>Verification run at HEAD c25298f69: top of history reached with 820 rows / 21,082 nodes mounted.</figcaption></figure>
+    </li>
+    <li><b>PR state</b>: #1384 is still open (branch <code>bb/mobile-timeline-virtualization</code>) and still not linked to #1301; the review above stands. The PR-branch numbers were not re-run in this pass.</li>
+    <li>Verdict and confidence unchanged: <b>REPRODUCED</b>, root cause <b>high</b>.</li>
+  </ul>
+  <p class="meta">Artifacts: <a href="1301/repro/">1301/repro/</a> (scripts, logs, cpuprofiles, diff, tests) · screenshots in <a href="assets/">assets/</a> (<code>1301-*.png</code>). Report written by an agent (Claude); numbers are from a dev build on desktop hardware.</p>
+</main></body></html>

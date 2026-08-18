@@ -1,0 +1,496 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1604 Idle agent processes are never reclaimed for non-Codex providers</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#1a7f37; --warn:#9a6700; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.ok { background:var(--ok); color:#fff; border-color:var(--ok); }
+  .pill.warn { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .verdict { font-weight:600; }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; background:#fff; }
+  figcaption { font-size:13px; color:var(--muted); margin-top:6px; }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .v { font-weight:600; } .v.ok { color:var(--ok); } .v.no { color:var(--high); } .v.un { color:var(--warn); }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1604 · Idle agent processes are never reclaimed for non-Codex providers</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill high">host</span> <span class="pill">Priority: not set on issue</span> <span class="pill">Effort: not set on issue</span>
+    <a href="https://github.com/get-bb/bb/issues/1604">open on GitHub</a>
+    <span>investigated 2026-08-18</span>
+    <span>base commit <code>16ceb3a54</code></span>
+  </p>
+  <p class="meta">
+    <span class="verdict">Verdict: <span class="pill high">REPRODUCED</span> (with default settings; an opt-in mitigation exists on main)</span>
+    <span class="verdict">Root-cause confidence: <span class="pill ok">high</span></span>
+  </p>
+
+  <h2>TL;DR</h2>
+  <p>Every bb thread that runs on Claude Code (and Pi, and ACP agents) keeps its agent OS process alive for as long as the host daemon runs, even after the thread has been idle for hours. Only Codex threads get their process released after 30 idle minutes. Each retained <code>claude</code> process holds roughly 300-350 MB RSS on this machine, so a busy user quietly accumulates gigabytes of idle agents. The cause is a provider gate in the idle-session reaper: <code>findReapableIdleProviderSession</code> in <code>packages/agent-runtime/src/runtime.ts</code> returns <code>null</code> for any thread whose provider is not <code>codex</code> unless the <code>providerSessionReaping</code> experiment is on, and that experiment defaults to <code>false</code>. The generalized reaper was added ~2.5 h after the issue was filed (PR #1606, commit <code>3bc9ce54b</code>) but only behind that off-by-default toggle, so an ordinary installation at the base commit still exhibits exactly the reported behavior. I reproduced it live (twice, once in the original investigation and once during revision): with defaults, a Codex thread's process was reaped 57 s after going idle (timers shortened to 45 s / 15 s for the demo) while the Claude Code thread's <code>claude</code> process survived ~17 sweeps at more than 5x the threshold; flipping the experiment on released it on the next sweep, and the next turn resumed the same Claude session with history intact.</p>
+
+  <h2>Claims vs findings</h2>
+  <table>
+    <tr><th>Claim (from issue)</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>The reaper only reaps Codex; Claude Code and ACP retain one process per idle thread indefinitely.</td><td><span class="v ok">Verified</span> (default config)</td><td>Unit repro fails on main: <code>reapIdleProviderSessions(&#123;idleForMs: 30min, providerSessionReapingEnabled:false&#125;)</code> returns <code>[]</code> for an idle restorable <code>claude-code</code> thread and <code>[thread]</code> for <code>codex</code>. Live: <code>claude</code> pid 1648559 survived 305 s (~260 s idle; threshold 45 s, sweep 15 s, i.e. ~17 sweeps) while the codex process was released at 57 s idle; the daemon log shows only the codex reap.</td></tr>
+    <tr><td>Root cause is <code>if (!isThreadScopedCodexProcess(proc)) continue;</code> at <code>runtime.ts:2205</code> plus the gate in <code>findReapableIdleProviderSession</code> at <code>runtime.ts:707</code>.</td><td><span class="v ok">Verified</span> (line numbers moved)</td><td>At base commit the two gates are at <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/runtime.ts#L813-L823"><code>packages/agent-runtime/src/runtime.ts:813-823</code></a> and <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/runtime.ts#L2404-L2415"><code>packages/agent-runtime/src/runtime.ts:2404-2415</code></a>. Both are now conditional on <code>providerSessionReapingEnabled</code>; with the default <code>false</code> they behave exactly as described.</td></tr>
+    <tr><td>Both gates landed in <code>2a84ecfdc</code> (#130) which scoped only Codex.</td><td><span class="v ok">Verified</span></td><td>Comment block at <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/runtime.ts#L462-L469"><code>packages/agent-runtime/src/runtime.ts:462-469</code></a> ("Codex runs one provider process per thread ... the pre-experiment idle reap keys off isThreadScopedCodexProcess") and <code>git log -S</code>.</td></tr>
+    <tr><td>Idle tracking (<code>observeProviderSessionIdleState</code>) is already provider-agnostic.</td><td><span class="v ok">Verified</span></td><td><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/runtime.ts#L782-L799"><code>packages/agent-runtime/src/runtime.ts:782-799</code></a> keys on generic <code>turn/started</code>, <code>turn/completed</code>, <code>provider/error</code>; start/resume also mark idle (lines 1642, 1971).</td></tr>
+    <tr><td>Claude Code sessions survive losing their process and resume with in-agent history.</td><td><span class="v ok">Verified</span> (graceful path)</td><td>After the reap the next turn spawned a new <code>claude</code> pid (1719138) and answered "What was my previous message?" with <code>"Reply only with ok."</code>; the <code>events</code> table shows one <code>provider_thread_id</code> spanning both turns.</td></tr>
+    <tr><td>Nothing calls the manual release verb (#1573/#1584) for an ordinary thread that goes idle.</td><td><span class="v ok">Verified</span></td><td>#1584 merged (<code>1c3f3eff</code>): <code>thread.stop</code> on an idle thread now releases the runtime, but only on explicit stop. The scheduled reaper is the only automatic caller and it is gated as above.</td></tr>
+    <tr><td>~215 MB per idle agent, 5.2 GB across 24 idle agents, event-loop stalls, swap.</td><td><span class="v un">Unverified</span> (macOS measurements)</td><td>Cannot re-measure the reporter's host. On this Linux box a fresh idle <code>claude</code> process shows 319-349 MB RSS (see census); the mechanism is consistent with the claim.</td></tr>
+    <tr><td>ACP restorability depends on <code>agentCapabilities.loadSession</code>; must gate on it.</td><td><span class="v ok">Verified / already done</span></td><td><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/provider-acp/src/bridge/bridge.ts#L1785"><code>plugins/provider-acp/src/bridge/bridge.ts:1785</code></a> and line 2311 report <code>sessionRestorable: session.supportsLoadSession</code>; the experiment path only considers <code>runtimeConfig.sessionRestorable</code> threads.</td></tr>
+    <tr><td>Non-Codex process keys are shared, so forgetting thread state before shutdown is unsafe.</td><td><span class="v ok">Verified concern, handled</span></td><td>The experiment path uses <code>runtime.stopThread</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/runtime.ts#L2160-L2203"><code>packages/agent-runtime/src/runtime.ts:2160-2203</code></a>), which sends <code>thread/stop</code> to the bridge (bridge closes only that thread's SDK child), then <code>releaseIdleProviderProcess</code> shuts a process down only if it is a thread-scoped Codex process with zero threads. Shared bridge processes stay up; the memory-heavy <code>claude</code> child is what goes away.</td></tr>
+  </table>
+
+  <h2>Environment</h2>
+  <table>
+    <tr><td>bb source</td><td><code>16ceb3a540f81c1189efaffb27a39b1d9443abf5</code> (main, 2026-08-18) with the reap timers shortened for the live demo (see patch below; not needed for the unit repro)</td></tr>
+    <tr><td>OS / node</td><td>Linux 7.0.0-29-generic x86_64 · node v24.18.0 (dev launcher may select node 22)</td></tr>
+    <tr><td>Providers</td><td>Claude Code CLI 2.1.234, codex-cli 0.147.0</td></tr>
+    <tr><td>Dev instance</td><td>App :18265 · Server :26265 · Host daemon :34265 · data dir <code>/home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-35-374641e1c5d8</code> (printed by <code>scripts/bb-dev-app current</code>; the daemon log is <code>&lt;data dir&gt;/logs/host-daemon.1.log</code>). An earlier run of the same procedure on a sibling instance (:25677) gave the same result.</td></tr>
+    <tr><td>Project</td><td><code>proj_4kkaejj9fe</code> "qa" on <code>/tmp/bb-1604-repo</code>, host <code>host_gekqex8vg6</code> (all ids below are from this run; yours will differ)</td></tr>
+    <tr><td>Threads</td><td><code>thr_rzkkwjnmu5</code> (claude-code) · <code>thr_797gima4ej</code> (codex)</td></tr>
+  </table>
+
+  <h2>Minimal reproduction</h2>
+  <h3>A. Unit-level (fails on main, no dev instance needed)</h3>
+  <ol>
+    <li>Save the test below as <code>packages/agent-runtime/src/issue-1604.repro.test.ts</code> (copy in <a href="1604/repro/issue-1604.repro.test.ts">1604/repro/issue-1604.repro.test.ts</a>).</li>
+    <li>Run from <code>packages/agent-runtime</code>: <code>pnpm exec vitest run src/issue-1604.repro.test.ts</code></li>
+    <li><b>Expected</b>: all three tests pass (an idle restorable Claude Code session is released like a Codex one).<br><b>Actual</b>: the first test fails: <code>expected [] to deeply equal [ ObjectContaining&#123;providerId:"claude-code"&#125; ]</code>. The Codex baseline passes; the opt-in (<code>providerSessionReapingEnabled: true</code>) variant passes.</li>
+  </ol>
+  <pre>/**
+ * Repro for get-bb/bb#1604: idle agent sessions are never reclaimed for
+ * non-Codex providers under the daemon&#x27;s DEFAULT policy.
+ *
+ * The daemon calls `reapIdleProviderSessions` every 5 minutes with
+ * `idleForMs: 30min` and `providerSessionReapingEnabled` = the value of the
+ * `providerSessionReaping` experiment, whose default is `false`
+ * (packages/domain/src/experiments.ts). This test drives the runtime the way
+ * the daemon does with the default policy and asserts what a user expects:
+ * an idle, restorable Claude Code-shaped session is released.
+ *
+ * On main (16ceb3a54) the first assertion FAILS: `reapedSessions` is `[]`
+ * because `findReapableIdleProviderSession` rejects every non-Codex thread
+ * when the experiment is off. The second `it` shows the Codex baseline for
+ * contrast (it passes), and the third shows the opt-in path (it passes).
+ */
+import { mkdtempSync, rmSync, writeFileSync } from &quot;node:fs&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { afterEach, beforeEach, describe, expect, it } from &quot;vitest&quot;;
+import { createAgentRuntimeWithAdapters } from &quot;./runtime.js&quot;;
+import {
+  createFakeAdapter,
+  fullRuntimeOptions,
+} from &quot;./test/runtime-test-harness.js&quot;;
+
+// Same idle policy the daemon uses (apps/host-daemon/src/app.ts:66).
+const IDLE_PROVIDER_SESSION_REAP_AFTER_MS = 30 * 60 * 1000;
+
+function writeRestorableProviderScript(scriptPath: string): void {
+  writeFileSync(
+    scriptPath,
+    `const readline = require(&quot;readline&quot;);
+const rl = readline.createInterface({ input: process.stdin });
+process.on(&quot;SIGTERM&quot;, () =&gt; process.exit(0));
+function send(m) { process.stdout.write(JSON.stringify(m) + &quot;\\n&quot;); }
+rl.on(&quot;line&quot;, (line) =&gt; {
+  const message = JSON.parse(line);
+  const p = message.params ?? {};
+  if (message.method === &quot;initialize&quot; || message.method === &quot;skills/configure&quot;) {
+    send({ jsonrpc: &quot;2.0&quot;, id: message.id, result: { ok: true } });
+    return;
+  }
+  if (message.method === &quot;thread/start&quot;) {
+    const providerThreadId = &quot;prov-&quot; + p.threadId;
+    // Every real bridge (claude-code, codex, pi, ACP w/ loadSession) reports
+    // sessionRestorable: true on thread/start.
+    send({ jsonrpc: &quot;2.0&quot;, id: message.id, result: { providerThreadId, sessionRestorable: true } });
+    send({ jsonrpc: &quot;2.0&quot;, method: &quot;thread/identity&quot;, params: { threadId: p.threadId, providerThreadId } });
+    return;
+  }
+  if (message.method === &quot;thread/stop&quot;) {
+    send({ jsonrpc: &quot;2.0&quot;, id: message.id, result: { ok: true } });
+    return;
+  }
+  send({ jsonrpc: &quot;2.0&quot;, id: message.id, result: { ok: true } });
+});`,
+  );
+}
+
+describe(&quot;issue #1604: idle non-Codex sessions under the default reap policy&quot;, () =&gt; {
+  let tmpDir: string;
+  beforeEach(() =&gt; {
+    tmpDir = mkdtempSync(join(tmpdir(), &quot;bb-1604-&quot;));
+  });
+  afterEach(() =&gt; {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  async function startIdleThread(providerId: string) {
+    const scriptPath = join(tmpDir, `${providerId}-provider.cjs`);
+    writeRestorableProviderScript(scriptPath);
+    const runtime = createAgentRuntimeWithAdapters({
+      workspacePath: tmpDir,
+      onEvent: () =&gt; {},
+      onToolCall: async () =&gt; ({
+        contentItems: [{ type: &quot;inputText&quot;, text: &quot;ok&quot; }],
+        success: true,
+      }),
+      adapterFactory: () =&gt; ({
+        ...createFakeAdapter(scriptPath),
+        displayName: providerId,
+        id: providerId,
+      }),
+    });
+    await runtime.startThread({
+      environmentId: &quot;env-1&quot;,
+      threadId: `t-${providerId}`,
+      projectId: &quot;p1&quot;,
+      providerId,
+      options: fullRuntimeOptions,
+    });
+    return runtime;
+  }
+
+  it(&quot;BUG: a Claude Code session idle for &gt; 30 min is NOT released with the default policy&quot;, async () =&gt; {
+    const runtime = await startIdleThread(&quot;claude-code&quot;);
+    try {
+      const result = await runtime.reapIdleProviderSessions({
+        idleForMs: IDLE_PROVIDER_SESSION_REAP_AFTER_MS,
+        // Pretend the daemon sweep runs 31 minutes after the thread went idle.
+        nowMs: Date.now() + IDLE_PROVIDER_SESSION_REAP_AFTER_MS + 60_000,
+        providerSessionReapingEnabled: false, // defaultExperiments.providerSessionReaping
+      });
+      // Expected by the issue: the idle claude-code session is released.
+      // Actual on main: [] — nothing is ever reaped for non-Codex providers.
+      expect(result.reapedSessions).toEqual([
+        expect.objectContaining({ providerId: &quot;claude-code&quot;, threadId: &quot;t-claude-code&quot; }),
+      ]);
+      expect(runtime.hasThread(&quot;t-claude-code&quot;)).toBe(false);
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it(&quot;baseline: the same idle session IS released when the provider is codex&quot;, async () =&gt; {
+    const runtime = await startIdleThread(&quot;codex&quot;);
+    try {
+      const result = await runtime.reapIdleProviderSessions({
+        idleForMs: IDLE_PROVIDER_SESSION_REAP_AFTER_MS,
+        nowMs: Date.now() + IDLE_PROVIDER_SESSION_REAP_AFTER_MS + 60_000,
+        providerSessionReapingEnabled: false,
+      });
+      expect(result.reapedSessions).toEqual([
+        expect.objectContaining({ providerId: &quot;codex&quot;, threadId: &quot;t-codex&quot; }),
+      ]);
+      expect(runtime.hasThread(&quot;t-codex&quot;)).toBe(false);
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it(&quot;opt-in: with the providerSessionReaping experiment on, claude-code IS released&quot;, async () =&gt; {
+    const runtime = await startIdleThread(&quot;claude-code&quot;);
+    try {
+      const result = await runtime.reapIdleProviderSessions({
+        idleForMs: IDLE_PROVIDER_SESSION_REAP_AFTER_MS,
+        nowMs: Date.now() + IDLE_PROVIDER_SESSION_REAP_AFTER_MS + 60_000,
+        providerSessionReapingEnabled: true,
+      });
+      expect(result.reapedSessions).toEqual([
+        expect.objectContaining({ providerId: &quot;claude-code&quot;, threadId: &quot;t-claude-code&quot; }),
+      ]);
+      expect(runtime.hasThread(&quot;t-claude-code&quot;)).toBe(false);
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+});
+</pre>
+  <p>Output (<a href="1604/repro/vitest-output.txt">vitest-output.txt</a>):</p>
+  <pre>
+ RUN  v4.1.1 /home/sawyer/projects/bb/.claude/worktrees/wf_debcf606-e4a-13/packages/agent-runtime
+
+ ❯ |@bb/agent-runtime| src/issue-1604.repro.test.ts (3 tests | 1 failed) 81ms
+     × BUG: a Claude Code session idle for &gt; 30 min is NOT released with the default policy 31ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |@bb/agent-runtime| src/issue-1604.repro.test.ts &gt; issue #1604: idle non-Codex sessions under the default reap policy &gt; BUG: a Claude Code session idle for &gt; 30 min is NOT released with the default policy
+AssertionError: expected [] to deeply equal [ ObjectContaining{…} ]
+
+- Expected
++ Received
+
+- [
+-   ObjectContaining {
+-     &quot;providerId&quot;: &quot;claude-code&quot;,
+-     &quot;threadId&quot;: &quot;t-claude-code&quot;,
+-   },
+- ]
++ []
+
+ ❯ src/issue-1604.repro.test.ts:107:37
+    105|       // Expected by the issue: the idle claude-code session is releas…
+    106|       // Actual on main: [] — nothing is ever reaped for non-Codex pro…
+    107|       expect(result.reapedSessions).toEqual([
+       |                                     ^
+    108|         expect.objectContaining({ providerId: &quot;claude-code&quot;, threadId:…
+    109|       ]);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 2 passed (3)
+   Start at  04:38:31
+   Duration  1.01s (transform 540ms, setup 0ms, import 826ms, tests 81ms, environment 0ms)
+
+</pre>
+
+  <h3>B. Live (real Claude Code + Codex processes)</h3>
+  <p>The production timers are 30 min idle / 5 min sweep. To watch it happen in minutes I shortened them in my worktree only (<a href="1604/repro/timing-patch.diff">timing-patch.diff</a>); the logic under test is untouched:</p>
+  <pre>diff --git a/apps/host-daemon/src/app.ts b/apps/host-daemon/src/app.ts
+index 3b5cac969..f5f160272 100644
+--- a/apps/host-daemon/src/app.ts
++++ b/apps/host-daemon/src/app.ts
+@@ -63,8 +63,8 @@ interface SessionState {
+ }
+ 
+ const INTERACTIVE_INTERRUPT_RETRY_DELAY_MS = 1_000;
+-const IDLE_PROVIDER_SESSION_REAP_AFTER_MS = 30 * 60 * 1000;
+-const IDLE_PROVIDER_SESSION_REAP_INTERVAL_MS = 5 * 60 * 1000;
++const IDLE_PROVIDER_SESSION_REAP_AFTER_MS = 45 * 1000; // REPRO #1604: was 30 * 60 * 1000
++const IDLE_PROVIDER_SESSION_REAP_INTERVAL_MS = 15 * 1000; // REPRO #1604: was 5 * 60 * 1000
+ const RUNTIME_SHELL_ENV_REFRESH_TTL_MS = 10_000;
+ 
+ type RuntimeShellEnv = NonNullable&lt;AgentRuntimeOptions[&quot;shellEnv&quot;]&gt;;
+</pre>
+  <p>Everything below was run from the repo root of a fresh worktree at the base commit. Ids (<code>host_…</code>, <code>proj_…</code>, <code>thr_…</code>, pids) are from this run - substitute your own. Note that <code>eval "$(scripts/bb-dev-app env)"</code> exports <b>both</b> <code>BB_SERVER_URL</code> and <code>BB_HOST_DAEMON_PORT</code>; if only the server URL is set, <code>thread spawn</code> resolves the host id from the default-port daemon and fails with <code>HTTP 404: Host not found</code>.</p>
+  <ol>
+    <li>Apply the timing patch, build, start your own instance and load its env:
+      <pre>git apply /tmp/bb-reports/issues/1604/repro/timing-patch.diff
+pnpm exec turbo run build --filter=@bb/host-daemon
+scripts/bb-dev-app current          # prints App/Server/Host daemon URLs and the data dir
+eval "$(scripts/bb-dev-app env)"    # exports BB_SERVER_URL and BB_HOST_DAEMON_PORT
+DATA_DIR=/home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-35-374641e1c5d8   # the "Data dir:" line printed above
+LOG=$DATA_DIR/logs/host-daemon.1.log</pre></li>
+    <li>Confirm the default experiment state (wait ~20 s after start for the server to come up):
+      <pre>$ curl -s $BB_SERVER_URL/api/v1/system/config | jq -c .experiments
+{"claudeCodeMockCliTraffic":false,"editMessages":true,"newOnboarding":false,"providerSessionReaping":false}</pre></li>
+    <li>Create a scratch git repo, look up your host id, and create a project on it:
+      <pre>$ mkdir -p /tmp/bb-1604-repo &amp;&amp; cd /tmp/bb-1604-repo &amp;&amp; git init -q -b main &amp;&amp; echo "# 1604" &gt; README.md &amp;&amp; git add . &amp;&amp; git commit -qm init &amp;&amp; cd -
+$ pnpm --silent bb:dev machine list
+Name  ID               Status     Last seen
+----  ---------------  ---------  ---------
+bee   host_gekqex8vg6  connected  just now
+$ HOST_ID=$(pnpm --silent bb:dev machine list --json | jq -r '.[0].id')
+$ curl -s -X POST $BB_SERVER_URL/api/v1/projects -H 'content-type: application/json' \
+    -d "{\"name\":\"qa\",\"source\":{\"type\":\"local_path\",\"path\":\"/tmp/bb-1604-repo\",\"hostId\":\"$HOST_ID\"}}" | jq -c '{id,name}'
+{"id":"proj_4kkaejj9fe","name":"qa"}</pre></li>
+    <li>Spawn one thread per provider (tiny prompts; the <code>--json</code> output includes the thread id) and wait until both are idle:
+      <pre>$ date -u
+Tue Aug 18 05:27:05 AM UTC 2026
+$ pnpm --silent bb:dev thread spawn --project proj_4kkaejj9fe --provider claude-code --permission-mode accept-edits --title "1604 claude" --prompt "Reply only with ok." --json | jq -c '{id}'
+{"id":"thr_rzkkwjnmu5"}
+$ pnpm --silent bb:dev thread spawn --project proj_4kkaejj9fe --provider codex --permission-mode accept-edits --title "1604 codex" --prompt "Reply only with ok." --json | jq -c '{id}'
+{"id":"thr_797gima4ej"}
+$ pnpm --silent bb:dev thread list --project proj_4kkaejj9fe      # ~40 s later
+ID              Project          Status
+--------------  ---------------  ------------
+thr_797gima4ej  proj_4kkaejj9fe  idle
+--------------  ---------------  ------------
+thr_rzkkwjnmu5  proj_4kkaejj9fe  idle</pre></li>
+    <li>Census the agent processes by the <code>BB_THREAD_ID</code> in their environment (<a href="1604/repro/census.sh">census.sh</a>; Linux only - it reads <code>/proc</code>; the header comment gives the macOS <code>ps eww</code> equivalent) and grep the daemon log for the reap line. The log is pino JSON; the <code>jq</code> filter below only reshapes it for readability - the raw lines are in the appendix.
+      <pre>$ date -u; /tmp/bb-reports/issues/1604/repro/census.sh thr_rzkkwjnmu5 thr_797gima4ej
+Tue Aug 18 05:27:59 AM UTC 2026
+1648559  thr_rzkkwjnmu5      344 MB  /home/sawyer/.local/bin/claude --output-format stream-json --verbose --input-format stream
+
+$ date -u; /tmp/bb-reports/issues/1604/repro/census.sh thr_rzkkwjnmu5 thr_797gima4ej
+Tue Aug 18 05:28:32 AM UTC 2026
+1648559  thr_rzkkwjnmu5      346 MB  /home/sawyer/.local/bin/claude --output-format stream-json --verbose --input-format stream
+$ grep '"Reaped idle provider sessions"' $LOG | jq -c '{time:(.time/1000|todate),sessions}'
+{"time":"2026-08-18T05:28:17Z","sessions":[{"environmentId":"env_z7idv6edx4","idleForMs":57081,"providerId":"codex","threadId":"thr_797gima4ej"}]}
+
+$ date -u; /tmp/bb-reports/issues/1604/repro/census.sh thr_rzkkwjnmu5 thr_797gima4ej; ps -o pid,etimes,rss -p 1648559
+Tue Aug 18 05:32:15 AM UTC 2026
+1648559  thr_rzkkwjnmu5      328 MB  /home/sawyer/.local/bin/claude --output-format stream-json --verbose --input-format stream
+    PID ELAPSED   RSS
+1648559     305 336576
+$ grep -c '"Reaped idle provider sessions"' $LOG
+1</pre>
+      <b>Expected</b>: both idle sessions released after the 45 s threshold. <b>Actual</b>: Codex released at 57 s idle (its <code>codex app-server</code> child is gone; it never shows up in the census because the codex process does not carry <code>BB_THREAD_ID</code> in its env - watch it with <code>ps -eo pid,etimes,args | grep 'codex app-server'</code> if you want to see it die). The Claude Code process is still alive at 305 s (~260 s idle, ~17 sweeps, &gt;5x threshold) and no <code>claude-code</code> reap line ever appears. With production timers this is 30 minutes / forever.</li>
+    <li>Control: turn the opt-in experiment on and watch the very next sweep release it, then prove the session resumes:
+      <pre>$ date -u; pnpm --silent bb:dev settings experiment providerSessionReaping true
+Tue Aug 18 05:32:21 AM UTC 2026
+providerSessionReaping updated
+$ curl -s $BB_SERVER_URL/api/v1/system/config | jq -c .experiments
+{"claudeCodeMockCliTraffic":false,"editMessages":true,"newOnboarding":false,"providerSessionReaping":true}
+
+$ date -u; /tmp/bb-reports/issues/1604/repro/census.sh thr_rzkkwjnmu5      # (no output: pid 1648559 is gone)
+Tue Aug 18 05:32:33 AM UTC 2026
+$ grep '"Reaped idle provider sessions"' $LOG | jq -c '{time:(.time/1000|todate),sessions}'
+{"time":"2026-08-18T05:28:17Z","sessions":[{"environmentId":"env_z7idv6edx4","idleForMs":57081,"providerId":"codex","threadId":"thr_797gima4ej"}]}
+{"time":"2026-08-18T05:32:32Z","sessions":[{"environmentId":"env_z7idv6edx4","idleForMs":316639,"providerId":"claude-code","threadId":"thr_rzkkwjnmu5"}]}
+
+$ pnpm --silent bb:dev thread tell thr_rzkkwjnmu5 "What was my previous message to you? Quote it exactly, nothing else."
+Thread thr_rzkkwjnmu5 steered
+$ pnpm --silent bb:dev thread wait thr_rzkkwjnmu5
+Thread thr_rzkkwjnmu5 reached status idle.
+$ /tmp/bb-reports/issues/1604/repro/census.sh thr_rzkkwjnmu5
+1719138  thr_rzkkwjnmu5      357 MB  /home/sawyer/.local/bin/claude --output-format stream-json --verbose --input-format stream      # new pid</pre>
+      Thread log after resume (<code>pnpm --silent bb:dev thread log thr_rzkkwjnmu5</code>, saved as <a href="1604/repro/thread-log-after-resume.txt">thread-log-after-resume.txt</a>):
+      <pre>── User ────────────────────────────────────────────────────
+Reply only with ok.
+
+── Provisioned thread ──────────────────────────────────────
+  Preparing workspace
+  Using workspace: /tmp/bb-1604-repo
+  Using branch: main (d24c206)
+
+── Assistant ───────────────────────────────────────────────
+ok
+
+── User ────────────────────────────────────────────────────
+What was my previous message to you? Quote it exactly, nothing else.
+
+── Assistant ───────────────────────────────────────────────
+"Reply only with ok."
+</pre>
+      Same provider session across both turns (<a href="1604/repro/events-provider-thread-id.txt">events query</a>; the empty first row is pre-identity provisioning events):
+      <pre>$ sqlite3 -header -column "file:$DATA_DIR/bb.db?mode=ro" "SELECT provider_thread_id, MIN(sequence) min_seq, MAX(sequence) max_seq, COUNT(*) n FROM events WHERE thread_id='thr_rzkkwjnmu5' GROUP BY provider_thread_id"
+provider_thread_id                    min_seq  max_seq  n
+------------------------------------  -------  -------  --
+                                      1        17       7
+92637946-e901-4757-8098-0ff5d595c636  7        28       20</pre></li>
+    <li>Clean up: <code>pnpm dev:stop</code>, then <code>git checkout apps/host-daemon/src/app.ts</code> to drop the timing patch.</li>
+  </ol>
+  <figure><img src="assets/1604-experiments-default-off.png" alt="Settings → Experiments with Idle provider session release off"><figcaption>Settings → Experiments on a fresh dev instance. "Idle provider session release" is off by default; this is the switch that decides whether non-Codex idle agents are ever reclaimed.</figcaption></figure>
+  <figure><img src="assets/1604-experiments-on.png" alt="Settings → Experiments after enabling Idle provider session release"><figcaption>After <code>bb settings experiment providerSessionReaping true</code>. On the next sweep (11 s later in this run) the daemon released the idle Claude Code session.</figcaption></figure>
+
+  <h2>Root cause</h2>
+  <p>The daemon runs one scheduled sweep (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/app.ts#L157-L210"><code>apps/host-daemon/src/app.ts:157-210</code></a>) every 5 minutes with <code>idleForMs = 30 min</code> and <code>providerSessionReapingEnabled</code> read from the server's <code>/internal/runtime-policy</code>, which is simply <code>getExperiments(db).providerSessionReaping</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/internal/session.ts#L40-L44"><code>apps/server/src/internal/session.ts:40-44</code></a>). That experiment defaults to <code>false</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/domain/src/experiments.ts#L30-L35"><code>packages/domain/src/experiments.ts:30-35</code></a>):</p>
+  <pre>export const defaultExperiments: Experiments = &#123;
+  claudeCodeMockCliTraffic: false,
+  editMessages: true,
+  newOnboarding: false,
+  providerSessionReaping: false,
+&#125;;</pre>
+  <p>Inside the runtime, candidate selection has an explicit provider gate (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/runtime.ts#L813-L823"><code>packages/agent-runtime/src/runtime.ts:813-823</code></a>):</p>
+  <pre>const runtimeConfig = threadRuntimeConfigs.get(args.threadId);
+if (
+  !runtimeConfig ||
+  // The experiment extends release to every restorable provider. It does
+  // not gate release: Codex idle sessions are released without it ...
+  (args.providerSessionReapingEnabled
+    ? !runtimeConfig.sessionRestorable
+    : runtimeConfig.providerId !== CODEX_PROVIDER_ID)
+) &#123;
+  return null;
+&#125;</pre>
+  <p>and a second one on the process (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/runtime.ts#L2404-L2415"><code>packages/agent-runtime/src/runtime.ts:2404-2415</code></a>): with the experiment off a candidate is dropped unless <code>isThreadScopedCodexProcess(proc)</code>, which can only be true for Codex because only Codex gets a per-thread process key (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/runtime.ts#L470-L478"><code>packages/agent-runtime/src/runtime.ts:470-478</code></a>). So with defaults, the idle timestamps recorded for every provider by <code>observeProviderSessionIdleState</code> are never acted on for anything but Codex, and the per-thread <code>claude</code> child that the Claude Code bridge spawns lives until the daemon exits, the thread is stopped explicitly (#1584), or the environment is cleaned up (which destroys the workspace).</p>
+  <p><b>History.</b> The Codex-only shape came from #130 (<code>2a84ecfdc</code>, per-thread Codex processes). PR #1606 (<code>3bc9ce54b</code>, merged 2026-08-14 17:34, ~2.5 h after this issue was filed) added everything the issue asks for in point 1: restorability reported per session on <code>thread/start</code> by every bridge (Claude Code always <code>true</code>, ACP <code>supportsLoadSession</code>, Codex/Pi <code>true</code>), release via <code>stopThread</code>, and protection for open background work / agents / monitors. It deliberately shipped default-off. Nothing implements points 2 (demand-driven eviction at <code>ensureEnvironment</code>) or 3 (bounded idle pool / memory-pressure trigger).</p>
+  <p><b>Deeper issue.</b> Even with the experiment on, reclamation is time-based only: a burst of subagents that all go idle is retained in full for 30 minutes regardless of host memory. That residual concern (issue points 2-3) is not addressed anywhere on main.</p>
+
+  <h2>Proposed fix (first principles)</h2>
+  <ol>
+    <li><b>Make restorable-session release the default.</b> Flip <code>defaultExperiments.providerSessionReaping</code> to <code>true</code> in <code>packages/domain/src/experiments.ts</code> (or, cleaner, remove the experiment and the two <code>providerSessionReapingEnabled ? ... : ...</code> branches so the reaper is simply "restorable + idle + no open work"). Update <code>docs/configuration.md</code>, the Settings copy in <code>apps/app/src/views/SettingsView.tsx</code>, and the tests that pin the default (<code>packages/db/test/experiments.test.ts</code>, <code>apps/server/test/system/experiments.test.ts</code>, <code>runtime.process-lifecycle.test.ts</code> "only when the experiment is on"). Flipping the default is not a wire change. Removing the field from <code>HostDaemonRuntimePolicy</code> would be, and would need a <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump.</li>
+    <li><b>Risks to check before flipping:</b> (a) ACP agents that report <code>supportsLoadSession</code> but restore poorly - the gate is only as good as the agent's claim; (b) any per-session in-bridge state that does not survive resume (Claude Code one-off permission grants held in the bridge session, plan-mode state) - <code>handleThreadResume</code> rebuilds from <code>params</code>, so server-owned settings survive, but transient in-session grants may not; (c) UI surprise: the thread's next turn pays a cold start. These are the same trade-offs Codex users have had since #130.</li>
+    <li><b>Optional follow-up (issue points 2-3):</b> in <code>RuntimeManager.ensureEnvironment</code>, before creating a new runtime, call <code>reapIdleProviderSessions(&#123;idleForMs: 0&#125;)</code> across environments when the number of idle restorable sessions exceeds a static cap (e.g. <code>max(2, floor(totalmem/2GiB))</code>). Keep it static and portable first; PSI-based triggers can come later.</li>
+  </ol>
+
+  <h2>PR review</h2>
+  <p>No open PRs are linked to this issue. The relevant merged PR is <a href="https://github.com/get-bb/bb/pull/1606">#1606</a> (opt-in experiment); its runtime path was exercised above and behaved correctly (release on the next sweep and clean resume in both live runs; in the first run I also let it sit and observed a second reap 53 s after the resumed session went idle again).</p>
+
+  <h2>Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/pull/1606">#1606</a> Add provider session release experiment (merged; the opt-in mitigation)</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1573">#1573</a> / <a href="https://github.com/get-bb/bb/pull/1584">#1584</a> Release agent runtimes on thread stop (merged; manual release verb)</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1131">#1131</a> Synchronous SQLite on the event loop (the stalls memory pressure amplifies)</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1363">#1363</a> Provider processes need one host-daemon lease owner tied to active turns</li>
+    <li><a href="https://github.com/get-bb/bb/pull/130">#130</a> Run Codex app-server per thread (origin of the Codex-only gate)</li>
+  </ul>
+
+  <h2>Appendix</h2>
+  <h3>Daemon reap log lines, verbatim (<a href="1604/repro/host-daemon-reap-lines.jsonl">jsonl</a>)</h3>
+  <pre>{&quot;level&quot;:30,&quot;time&quot;:1787030897429,&quot;component&quot;:&quot;host-daemon&quot;,&quot;serverUrl&quot;:&quot;http://127.0.0.1:26265&quot;,&quot;count&quot;:1,&quot;sessions&quot;:[{&quot;environmentId&quot;:&quot;env_z7idv6edx4&quot;,&quot;idleForMs&quot;:57081,&quot;providerId&quot;:&quot;codex&quot;,&quot;threadId&quot;:&quot;thr_797gima4ej&quot;}],&quot;msg&quot;:&quot;Reaped idle provider sessions&quot;}
+{&quot;level&quot;:30,&quot;time&quot;:1787031152763,&quot;component&quot;:&quot;host-daemon&quot;,&quot;serverUrl&quot;:&quot;http://127.0.0.1:26265&quot;,&quot;count&quot;:1,&quot;sessions&quot;:[{&quot;environmentId&quot;:&quot;env_z7idv6edx4&quot;,&quot;idleForMs&quot;:316639,&quot;providerId&quot;:&quot;claude-code&quot;,&quot;threadId&quot;:&quot;thr_rzkkwjnmu5&quot;}],&quot;msg&quot;:&quot;Reaped idle provider sessions&quot;}
+</pre>
+  <h3>Process census script (<a href="1604/repro/census.sh">census.sh</a>, Linux only)</h3>
+  <pre>#!/usr/bin/env bash
+# Linux only (reads /proc). Lists every process whose environment carries
+# BB_THREAD_ID (i.e. an agent process spawned by the bb host daemon for a
+# thread), with RSS in MB. Processes you cannot read are skipped silently.
+# On macOS use instead:  ps -eo pid,etime,rss,command | grep -E &#x27;claude|codex app-server&#x27; | grep -v grep
+#                        and `ps eww -o command -p &lt;pid&gt; | tr &#x27; &#x27; &#x27;\n&#x27; | grep BB_THREAD_ID` to map pid -&gt; thread.
+# Usage: census.sh [thread-id-substring ...]
+for pid in $(ls /proc | grep -E &#x27;^[0-9]+$&#x27;); do
+  envf=/proc/$pid/environ
+  [ -r &quot;$envf&quot; ] || continue
+  tid=$(tr &#x27;\0&#x27; &#x27;\n&#x27; &lt; &quot;$envf&quot; 2&gt;/dev/null | grep &#x27;^BB_THREAD_ID=&#x27; | cut -d= -f2)
+  [ -n &quot;$tid&quot; ] || continue
+  if [ $# -gt 0 ]; then
+    match=0; for want in &quot;$@&quot;; do case &quot;$tid&quot; in *&quot;$want&quot;*) match=1;; esac; done
+    [ $match = 1 ] || continue
+  fi
+  rss_kb=$(awk &#x27;/VmRSS/{print $2}&#x27; /proc/$pid/status 2&gt;/dev/null)
+  cmd=$(tr &#x27;\0&#x27; &#x27; &#x27; &lt; /proc/$pid/cmdline 2&gt;/dev/null | cut -c1-90)
+  printf &#x27;%-8s %-16s %6s MB  %s\n&#x27; &quot;$pid&quot; &quot;$tid&quot; &quot;$((rss_kb/1024))&quot; &quot;$cmd&quot;
+done 2&gt;/dev/null
+</pre>
+  <h3>Commands run</h3>
+  <pre>gh issue view 1604 --repo get-bb/bb --json ...
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+cp /tmp/bb-reports/issues/1604/repro/issue-1604.repro.test.ts packages/agent-runtime/src/ &amp;&amp; cd packages/agent-runtime &amp;&amp; pnpm exec vitest run src/issue-1604.repro.test.ts
+git apply /tmp/bb-reports/issues/1604/repro/timing-patch.diff
+pnpm exec turbo run build --filter=@bb/host-daemon
+scripts/bb-dev-app current
+eval &quot;$(scripts/bb-dev-app env)&quot;
+curl -s $BB_SERVER_URL/api/v1/system/config | jq -c .experiments
+mkdir -p /tmp/bb-1604-repo &amp;&amp; cd /tmp/bb-1604-repo &amp;&amp; git init -q -b main &amp;&amp; echo &quot;# 1604&quot; &gt; README.md &amp;&amp; git add . &amp;&amp; git commit -qm init
+HOST_ID=$(pnpm --silent bb:dev machine list --json | jq -r &#x27;.[0].id&#x27;)
+curl -s -X POST $BB_SERVER_URL/api/v1/projects -H &#x27;content-type: application/json&#x27; -d &quot;{\&quot;name\&quot;:\&quot;qa\&quot;,\&quot;source\&quot;:{\&quot;type\&quot;:\&quot;local_path\&quot;,\&quot;path\&quot;:\&quot;/tmp/bb-1604-repo\&quot;,\&quot;hostId\&quot;:\&quot;$HOST_ID\&quot;}}&quot;
+pnpm --silent bb:dev thread spawn --project proj_4kkaejj9fe --provider claude-code --permission-mode accept-edits --title &quot;1604 claude&quot; --prompt &quot;Reply only with ok.&quot; --json
+pnpm --silent bb:dev thread spawn --project proj_4kkaejj9fe --provider codex --permission-mode accept-edits --title &quot;1604 codex&quot; --prompt &quot;Reply only with ok.&quot; --json
+pnpm --silent bb:dev thread list --project proj_4kkaejj9fe
+/tmp/bb-reports/issues/1604/repro/census.sh thr_rzkkwjnmu5 thr_797gima4ej   (repeated)
+grep &#x27;&quot;Reaped idle provider sessions&quot;&#x27; $DATA_DIR/logs/host-daemon.1.log
+pnpm --silent bb:dev settings experiment providerSessionReaping true
+pnpm --silent bb:dev thread tell thr_rzkkwjnmu5 &quot;What was my previous message to you? Quote it exactly, nothing else.&quot;
+pnpm --silent bb:dev thread wait thr_rzkkwjnmu5
+pnpm --silent bb:dev thread log thr_rzkkwjnmu5
+sqlite3 -header -column &quot;file:$DATA_DIR/bb.db?mode=ro&quot; &quot;SELECT provider_thread_id, MIN(sequence), MAX(sequence), COUNT(*) FROM events WHERE thread_id=&#x27;thr_rzkkwjnmu5&#x27; GROUP BY provider_thread_id&quot;
+pnpm dev:stop
+</pre>
+  <h3>Notes</h3>
+  <ul>
+    <li>The unit repro passes/fails independently of the timing patch; the patch only exists so the live demo takes minutes instead of 30+.</li>
+    <li>Real turns were sent to Claude Code (2) and Codex (1), all with tiny prompts.</li>
+    <li>Priority/Effort GitHub project fields were not readable through <code>gh issue view</code>; only the <code>host</code> label is present.</li>
+    <li>Note: <code>bb thread tell</code> from inside another bb thread inherits <code>BB_THREAD_ID</code> and fails with "Sender thread is invalid"; unset it first.</li>
+    <li>Note: <code>pnpm bb:dev … --json</code> prints a turbo preamble to stdout; use <code>pnpm --silent bb:dev … --json</code> (or <code>node packages/scripts/dist/commands/run-cli.js …</code>) when piping to <code>jq</code>.</li>
+    <li>Note: <code>bb thread spawn</code> resolves the host id from the local daemon at <code>BB_HOST_DAEMON_PORT</code>; without that variable it asks the default-port (user's real) daemon and the dev server answers <code>HTTP 404: Host not found</code>. <code>eval "$(scripts/bb-dev-app env)"</code> sets it.</li>
+  </ul>
+
+  <h2>Verification</h2>
+  <p>An independent verifier followed this report on a pristine <code>16ceb3a54</code> tree and reproduced both parts: the unit repro failed with the identical assertion (<code>expected [] to deeply equal [ ObjectContaining{providerId: claude-code, …} ]</code> at <code>issue-1604.repro.test.ts:107</code>), and the live run on their own instance (:11085/:19085/:27085) showed the codex session reaped at 55.7 s idle while the claude-code process (354 MB RSS) survived 191 s idle with zero claude-code reap lines; enabling <code>providerSessionReaping</code> produced a reap 16 s later and the next turn resumed the same provider session. All root-cause code claims and the <code>git log -S</code> history were re-checked and confirmed, and nothing after the base commit changes the behaviour. The verifier flagged that section B was not self-contained (project-creation curl referenced "the brief", host/project ids hardcoded without a substitution note, daemon log path elided, <code>census.sh</code> Linux-only and noisy, and inline log lines reshaped without showing the transformation).</p>
+  <p><b>What changed in this revision:</b> section B was re-run end to end on a fresh instance (:18265/:26265/:34265, project <code>proj_4kkaejj9fe</code>, threads <code>thr_rzkkwjnmu5</code>/<code>thr_797gima4ej</code>) with every command written out - scratch repo creation, <code>machine list</code> for the host id, the full project-creation curl, <code>--silent</code> for JSON piping, the concrete data-dir/log path, and the <code>jq</code> reshaping filter shown next to its output. All outputs, the appendix log lines, <code>thread-log-after-resume.txt</code>, <code>events-provider-thread-id.txt</code>, <code>host-daemon-reap-lines.jsonl</code> and <code>vitest-output.txt</code> were replaced with this run's real output. <code>census.sh</code> now states it is Linux-only, gives the macOS equivalent and silences unreadable-process errors. Two pitfalls hit while re-running (turbo preamble on stdout; <code>Host not found</code> when <code>BB_HOST_DAEMON_PORT</code> is unset) are documented in Notes. Numbers in the claims table were updated to this run (claude alive at 305 s / ~17 sweeps; codex reaped at 57 s). Verdict, root cause and proposed fix are unchanged.</p>
+
+</main></body></html>

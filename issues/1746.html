@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1746 plugin background services can kill the server</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#1a7f37; --warn:#9a6700; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.ok { background:var(--ok); color:#fff; border-color:var(--ok); }
+  .pill.warn { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .verdict { font-weight:600; }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; background:#fff; }
+  figcaption { font-size:13px; color:var(--muted); margin-top:6px; }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; } @media (max-width:700px){ .grid{grid-template-columns:1fr;} }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1746 · Plugin background services can kill the server: supervisor only sees the promise chain</h1>
+  <p class="meta">
+    <span class="pill">Type: Feature request / robustness</span> <span class="pill high">Priority: High (host-wide crash loop)</span> <span class="pill">Effort: Medium–Large</span>
+    <span class="pill">plugins</span> <span class="pill">host</span>
+    <a href="https://github.com/get-bb/bb/issues/1746">open on GitHub</a>
+    <span>report · 2026-08-18</span>
+    <span>base commit <code>16ceb3a54</code> (main)</span>
+  </p>
+  <p class="meta">
+    <span class="verdict">Verdict: <span class="pill high">REPRODUCED</span></span>
+    <span class="verdict">Root-cause confidence: <span class="pill ok">high</span></span>
+    <span>Type / Priority / Effort are my classification (issue has no project fields; labels: plugins, host).</span>
+  </p>
+
+  <h2>1. TL;DR</h2>
+  <p>
+    bb plugins run <em>inside</em> the server process (loaded with jiti in <code>plugin-runtime.ts</code>). A plugin background service is supervised only through the promise returned by its <code>start(signal)</code>. If plugin code raises an error <em>outside</em> that promise chain — an EventEmitter <code>'error'</code> with no listener, a throw in a <code>setTimeout</code> callback, or a detached promise rejection — Node turns it into an uncaught exception. The server only registers <code>process.on("uncaughtExceptionMonitor")</code>, which writes a crash dump and deliberately lets Node exit. So one careless plugin kills the whole server; the supervisor's backoff/restart never fires; the process supervisor restarts the server, the plugin autoloads, and it dies again — a crash loop.
+    Because every crash tears down the server, the host daemon's session gets closed as <code>replaced</code> on reconnect and users see thread interruptions that look like a host-daemon problem. The crash dump names the throwing library, not the owning plugin, and the plugin's status stays "running" the whole time.
+    I reproduced the whole chain on a fresh dev instance in under a minute with an 18-line plugin: 14 <code>process-server-uncaughtException-*.json</code> dumps, 4 daemon sessions closed as <code>replaced</code>, dev-supervisor restart backoff, and a UI still showing the service as <em>Running</em>.
+  </p>
+
+  <h2>2. Claims vs findings</h2>
+  <table>
+    <tr><th>Claim (from issue)</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Plugin services are supervised only via the <code>start()</code> promise chain (<code>runService</code>/<code>onServiceSettled</code>)</td><td class="ok">Verified</td><td><code>apps/server/src/services/plugins/plugin-runtime.ts</code> L557–L631 (issue says L427; line numbers moved on main). Only <code>current.then(ok, crash)</code> is observed.</td></tr>
+    <tr><td>Server registers only <code>uncaughtExceptionMonitor</code>, which observes and lets the process die</td><td class="ok">Verified</td><td><code>packages/process-utils/src/index.ts</code> L327–L349 (issue says L257/L271); called from <code>apps/server/src/index.ts</code> L11. No <code>uncaughtException</code>/<code>unhandledRejection</code> handler anywhere in <code>apps/server/src</code>.</td></tr>
+    <tr><td>An EventEmitter <code>'error'</code> with no listener, from a timer tick, kills the server</td><td class="ok">Verified (live)</td><td>Installed repro plugin → server exited code 1 three seconds after load, dump written, dev-supervisor restarted it, loop repeated 14× until I removed the plugin.</td></tr>
+    <tr><td>Same hole for detached promise rejections and raw timer throws</td><td class="ok">Verified</td><td>Node default <code>--unhandled-rejections=throw</code>: <code>node -e 'setTimeout(()=>{void Promise.reject(new Error("x"))},10)'</code> exits 1. Timer throw goes to the same monitor (see <code>als-attribution-check.mjs</code> output).</td></tr>
+    <tr><td>Each crash dropped the host daemon connection; DB shows <code>host_daemon_sessions</code> closed as <code>replaced</code></td><td class="ok">Verified (mechanism)</td><td>My run: 4 sessions closed as <code>replaced</code>. Note: not 1:1 with crashes — the daemon reconnected to the same session across several fast restarts (session lease outlived the short outage), so counts differ from the issue's 1613/1321. Producer: <code>apps/server/src/internal/session-owner-side-effects.ts</code> L99–L101.</td></tr>
+    <tr><td>User-visible symptom “Thread interrupted because the host daemon disconnected”</td><td class="ok">Verified (code path)</td><td>String at <code>apps/server/src/services/threads/thread-lifecycle.ts</code> L390, reason <code>host-daemon-restarted</code>, emitted from <code>session-owner-side-effects.ts</code> L118 when a session is replaced by a different daemon instance. I did not run an active thread during the crash loop (would cost real provider usage); the path is deterministic.</td></tr>
+    <tr><td>Crash dumps do not name the owning plugin</td><td class="ok">Verified, with nuance</td><td>Dump contains only <code>error.name/message/stack</code>. In my repro the stack happens to include the plugin file (<code>file:///tmp/bb-1746-plugin/server.js?bbPluginLoad=…</code>) because the timer callback lives in the plugin itself. With imapflow the callback is inside <code>node_modules/imapflow</code>, so no plugin frame appears — matches the issue. There is no plugin id field in the dump either way.</td></tr>
+    <tr><td>1321 dumps over 5 days, ~5m11s cadence, on bb 0.35.1 / Ubuntu 22.04</td><td class="unv">Unverified</td><td>Reporter's production data; consistent with the mechanism (imapflow's default socket timeout ≈ 5 min).</td></tr>
+    <tr><td>Attribution via <code>AsyncResource</code>/<code>AsyncLocalStorage</code> is feasible</td><td class="ok">Verified (experiment)</td><td><code>als.getStore()</code> inside <code>uncaughtExceptionMonitor</code> and <code>unhandledRejection</code> returns the plugin's store for all three failure shapes on Node 24.18 (see §7 and appendix).</td></tr>
+    <tr><td>Already fixed on main?</td><td class="no">No</td><td>Base <code>16ceb3a54</code> still has monitor-only diagnostics and promise-only supervision.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb: main @ <code>16ceb3a540f81c1189efaffb27a39b1d9443abf5</code>, worktree <code>/home/sawyer/projects/bb/.claude/worktrees/wf_debcf606-e4a-3</code></li>
+    <li>OS: Linux 7.0.0-29-generic x86_64; Node v24.18.0</li>
+    <li>Dev instance (<code>scripts/bb-dev-app current</code>): App <code>http://localhost:16215</code>, Server <code>http://localhost:24215</code>, Host daemon <code>http://127.0.0.1:32215</code>, data dir <code>~/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-3-99edd75f30b8</code></li>
+    <li>Server run under <code>apps/server/scripts/dev-supervisor.mjs</code> (restarts on unexpected exit with backoff — same shape as a production process manager)</li>
+    <li>No providers were exercised; no real agent turns spent.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <h3>4a. Live: 18-line plugin crash-loops the server</h3>
+  <ol>
+    <li>Create the plugin (files also saved at <a href="1746/repro/package.json">1746/repro/package.json</a> and <a href="1746/repro/server.js">1746/repro/server.js</a>):
+<pre>mkdir -p /tmp/bb-1746-plugin
+cat &gt; /tmp/bb-1746-plugin/package.json &lt;&lt;'EOF'
+{ "name": "bb-plugin-crashy-service", "version": "0.1.0", "type": "module",
+  "bb": { "name": "Crashy service (issue 1746 repro)",
+          "description": "Background service whose EventEmitter emits an unhandled 'error' from a timer callback, like an ImapFlow socket timeout.",
+          "branding": { "icon": "Zap" }, "server": "./server.js" } }
+EOF</pre>
+<pre>// /tmp/bb-1746-plugin/server.js
+import { EventEmitter } from "node:events";
+
+// Mimics an ImapFlow client created without an 'error' listener: the socket
+// timeout fires from a timer on a later tick, and Node rethrows an unlistened
+// 'error' event as an uncaught exception.
+export default function (bb) {
+  bb.background.service("imap-poller", {
+    async start(signal) {
+      bb.log.info("imap-poller started; will emit unhandled 'error' in 3s");
+      const client = new EventEmitter(); // no client.on("error", ...) — the bug
+      setTimeout(() =&gt; {
+        client.emit("error", new Error("Socket timeout"));
+      }, 3_000);
+      // The service itself never rejects: it just waits for abort.
+      await new Promise((resolve) =&gt; signal.addEventListener("abort", resolve));
+    },
+  });
+}</pre></li>
+    <li>Start a dev instance and install the plugin:
+<pre>scripts/bb-dev-app current
+eval "$(scripts/bb-dev-app env)"
+pnpm bb:dev plugin install /tmp/bb-1746-plugin --yes</pre>
+      Output (verbatim, <a href="1746/repro/install-output.txt">install-output.txt</a>):
+<pre>Installing bb-plugin-crashy-service@0.1.0 from /tmp/bb-1746-plugin
+Plugins are full-trust code running inside the BB server. They can read all local BB data, including other plugins' secrets.
+Installed:
+crashy-service@0.1.0  running
+  source: path:/tmp/bb-1746-plugin
+  service imap-poller: running</pre></li>
+    <li><strong>Expected:</strong> after 3 s the service crashes, <code>onServiceSettled</code> logs <code>service imap-poller crashed: Socket timeout — restarting in 1000ms</code>, server keeps running.<br>
+        <strong>Actual:</strong> the server process exits with code 1. Data-dir logs 8 s later:
+<pre>$ ls &lt;data dir&gt;/logs
+host-daemon.1.log
+process-server-uncaughtException-2026-08-18T04-37-58-283Z-8d7f7cd3-….json
+server.1.log</pre>
+      Dump contents (<a href="1746/repro/process-server-uncaughtException-2026-08-18T04-37-58-283Z-8d7f7cd3-2b01-44d1-8e36-dfe60f3718bf.json">saved</a>) — note there is no field identifying the plugin:
+<pre>{
+  "diagnosticVersion": 1,
+  "kind": "uncaughtException",
+  "processName": "server",
+  "occurredAt": "2026-08-18T04:37:58.283Z",
+  "pid": 1157523,
+  "runtime": { "nodeVersion": "v24.18.0", "platform": "linux", "arch": "x64", "execPath": "…/node" },
+  "error": {
+    "name": "Error",
+    "message": "Socket timeout",
+    "stack": "Error: Socket timeout\n    at Timeout._onTimeout (file:///tmp/bb-1746-plugin/server.js?bbPluginLoad=12.12:12:30)\n    at listOnTimeout (node:internal/timers:605:17)\n    at process.processTimers (node:internal/timers:541:7)"
+  }
+}</pre>
+      Supervisor stderr (<a href="1746/repro/dev-log-excerpt.txt">dev-log-excerpt.txt</a>):
+<pre>Error: Socket timeout
+    at Timeout._onTimeout (file:///tmp/bb-1746-plugin/server.js?bbPluginLoad=12.12:12:30)
+    …
+Emitted 'error' event at:
+    at Timeout._onTimeout (file:///tmp/bb-1746-plugin/server.js?bbPluginLoad=12.12:12:16)
+[dev-supervisor:server] Child exited unexpectedly with exit code 1. Restarting in 1s.
+[dev-supervisor:server] Child exited unexpectedly with exit code 1. Restarting in 2s.
+[dev-supervisor:server] Child exited unexpectedly with exit code 1. Restarting in 4s.
+[dev-supervisor:server] Child exited unexpectedly with exit code 1. Restarting in 8s.</pre></li>
+    <li>Crash loop: each restart autoloads the plugin, which kills the server again. Server log (excerpt) shows the same "Server listening → plugin crashy-service loaded → Server listening" pattern; 14 dumps accumulated in ~3 minutes (<a href="1746/repro/dump-list.txt">dump-list.txt</a>). Host daemon sessions (<a href="1746/repro/host_daemon_sessions.txt">host_daemon_sessions.txt</a>):
+<pre>$ sqlite3 -header bb.db "select id,status,close_reason,datetime(created_at/1000,'unixepoch'),datetime(closed_at/1000,'unixepoch') from host_daemon_sessions"
+id|status|close_reason|created|closed
+hses_brarz52xtc|closed|replaced|2026-08-18 04:36:14|2026-08-18 04:38:02
+hses_ehy38kfahz|closed|replaced|2026-08-18 04:38:02|2026-08-18 04:38:09
+hses_wmrgf2656b|closed|replaced|2026-08-18 04:38:09|2026-08-18 04:38:20
+hses_yhu29x3gam|closed|replaced|2026-08-18 04:38:20|2026-08-18 04:41:07
+hses_kqn7m88wd9|active||2026-08-18 04:41:07|</pre></li>
+    <li>Meanwhile the UI reports the plugin and its service as healthy:</li>
+  </ol>
+  <div class="grid">
+    <figure><img src="assets/1746-plugins-list.png" alt="Installed plugins list with Crashy service enabled"><figcaption>Installed plugins page during the crash loop. "Crashy service (issue 1746 repro)" is enabled like any other plugin; nothing flags it.</figcaption></figure>
+    <figure><img src="assets/1746-plugin-detail.png" alt="Plugin detail showing background service imap-poller Running"><figcaption>Plugin detail page: Background services → <b>imap-poller: Running</b>, captured while that service was killing the server every ~7 s. The status is reset to running on every restart because the crash never reaches <code>onServiceSettled</code>.</figcaption></figure>
+  </div>
+  <ol start="6">
+    <li>Stop the loop: <code>bb plugin remove crashy-service</code> (needs to be issued in the ~5 s window the server is up; I polled <code>/api/v1/plugins</code> until it answered). Then <code>pnpm dev:stop</code>.</li>
+  </ol>
+
+  <h3>4b. Standalone: supervisor never sees the throw</h3>
+  <p>Same mechanism without a running bb, using the real <code>installSafeProcessDiagnostics</code> and a copy of <code>runService</code>. File: <a href="1746/repro/repro-1746-service-supervisor-gap.mts">repro-1746-service-supervisor-gap.mts</a> (also placed at <code>apps/server/test/</code> in my worktree).</p>
+<pre>// Issue #1746 standalone repro (run with: node --import tsx apps/server/test/repro-1746-service-supervisor-gap.mts)
+import { EventEmitter } from "node:events";
+import { mkdtempSync, readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { installSafeProcessDiagnostics } from "@bb/process-utils";
+
+const logsDir = mkdtempSync(join(tmpdir(), "bb-1746-"));
+installSafeProcessDiagnostics({ logsDir, processName: "repro" });
+
+let supervisorSawCrash = false;
+function runService(start: (signal: AbortSignal) =&gt; Promise&lt;void&gt;): void {
+  const controller = new AbortController();
+  const current = (async () =&gt; {
+    await start(controller.signal);
+  })();
+  current.then(
+    () =&gt; console.log("supervisor: service stopped cleanly"),
+    (error) =&gt; {
+      supervisorSawCrash = true;
+      console.log("supervisor saw crash:", String(error));
+    },
+  );
+}
+
+runService(async (signal) =&gt; {
+  const client = new EventEmitter(); // ImapFlow without .on("error")
+  setTimeout(() =&gt; client.emit("error", new Error("Socket timeout")), 50);
+  await new Promise&lt;void&gt;((resolve) =&gt; signal.addEventListener("abort", () =&gt; resolve()));
+});
+
+process.on("exit", (code) =&gt; {
+  console.log(`exit code=${code} supervisorSawCrash=${supervisorSawCrash}`);
+  console.log("dumps:", readdirSync(logsDir));
+});</pre>
+<pre>$ cd apps/server &amp;&amp; node --conditions=source --import tsx test/repro-1746-service-supervisor-gap.mts
+exit code=1 supervisorSawCrash=false
+dumps: [ 'process-repro-uncaughtException-2026-08-18T04-41-44-709Z-e50cd111-….json' ]
+node:events:487
+      throw er; // Unhandled 'error' event
+      ^
+Error: Socket timeout
+    at Timeout._onTimeout (…/apps/server/test/repro-1746-service-supervisor-gap.mts:38:41)
+EXIT=1</pre>
+  <p>Expected (if supervision were sufficient): <code>supervisor saw crash: Error: Socket timeout</code> and exit code 0. Actual: <code>supervisorSawCrash=false</code>, exit code 1.</p>
+
+  <h2>5. Root cause</h2>
+  <p><strong>Plugins are in-process, full-trust code.</strong> <code>plugin-runtime.ts</code> imports the plugin's server entry with jiti into the server's own module graph and calls its factory (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/plugins/plugin-runtime.ts#L1478-L1500">plugin-runtime.ts L1478–L1500</a>). Nothing isolates plugin execution from server execution.</p>
+  <p><strong>Supervision is promise-only.</strong> <code>runService</code> wraps <code>start(signal)</code> and only attaches handlers to that promise (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/plugins/plugin-runtime.ts#L556-L572">plugin-runtime.ts L556–L572</a>):</p>
+<pre>function runService(id: string, service: ServiceRuntime): void {
+  const controller = new AbortController();
+  …
+  const current = (async () =&gt; {
+    await service.record.start(controller.signal);
+  })();
+  service.current = current;
+  current.then(
+    () =&gt; onServiceSettled(id, service, { crashed: false }),
+    (error: unknown) =&gt; onServiceSettled(id, service, { crashed: true, error }),
+  );
+}</pre>
+  <p>Anything the service schedules that fails outside that chain — Node's <code>EventEmitter</code> re-throwing an unlistened <code>'error'</code> (<code>node:events:487 throw er; // Unhandled 'error' event</code>), a throw in a timer callback, or a promise rejection nobody awaits — becomes a process-level uncaught exception / unhandled rejection. <code>onServiceSettled</code> and its backoff at <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/plugins/plugin-runtime.ts#L574-L631">L574–L631</a> never run.</p>
+  <p><strong>The process-level handler is observe-only.</strong> <code>installSafeProcessDiagnostics</code> registers <em>only</em> <code>uncaughtExceptionMonitor</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/process-utils/src/index.ts#L327-L349">process-utils/src/index.ts L327–L349</a>), whose contract is that it cannot prevent the default exit:</p>
+<pre>process.on("uncaughtExceptionMonitor", handleUncaughtExceptionMonitor);</pre>
+  <p>There is no <code>uncaughtException</code> and no <code>unhandledRejection</code> handler in <code>apps/server/src</code>, so Node's defaults apply: exit code 1 in both cases (Node ≥15 default <code>--unhandled-rejections=throw</code>). This is a deliberate choice for server-owned code (comment at <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/process-utils/src/index.ts#L321-L326">L321–L326</a>), and it is correct for server-owned code; it just gives plugin code the same blast radius as the server itself.</p>
+  <p><strong>Why the visible symptoms follow.</strong></p>
+  <ul>
+    <li><em>Crash loop:</em> the process manager restarts the server; startup loads every enabled plugin (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/plugins/plugin-runtime.ts#L1573-L1617">L1573–L1617</a> starts services), the plugin re-arms its faulty timer, and the cycle repeats at whatever period the plugin's fault has (5 min for an IMAP socket timeout; 3 s in my repro). Nothing counts these crashes per plugin, so nothing auto-disables it.</li>
+    <li><em>Daemon "disconnects":</em> the daemon's WebSocket dies with the server; on reconnect the server opens a new session and closes the old one with reason <code>replaced</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/internal/session-owner-side-effects.ts#L86-L102">session-owner-side-effects.ts L86–L102</a>). If the daemon reconnects with a different instance id, active threads are interrupted with reason <code>host-daemon-restarted</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/internal/session-owner-side-effects.ts#L116-L120">L116–L120</a>), rendered as “Thread interrupted because the host daemon disconnected” (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/thread-lifecycle.ts#L386-L391">thread-lifecycle.ts L386–L391</a>). The daemon is blamed for a server crash.</li>
+    <li><em>No attribution:</em> <code>writeSafeProcessDiagnosticReport</code> serializes only the error (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/process-utils/src/index.ts#L283-L317">L283–L317</a>). The runtime knows the plugin id when it starts a service, but that identity is not carried into the async context, so the monitor cannot report it. When the throwing frame is inside a dependency (imapflow), even the stack does not name the plugin.</li>
+    <li><em>Status lies:</em> the service state is set to <code>running</code> in <code>runService</code> and only changed by <code>onServiceSettled</code>, which never runs, so the UI shows “Running” right up to (and after) each crash.</li>
+  </ul>
+  <p><strong>Deeper issue.</strong> The same shape already bit the host daemon (#1505, watcher child EPIPE) and is inherent to hosting untrusted-quality code in the same process with observe-only crash handling. Any fix short of out-of-process hosting is a mitigation, but a valuable one.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>I am confident about the cause. A layered fix, cheapest first, all inside the server (product policy) plus one small addition to <code>@bb/process-utils</code>:</p>
+  <ol>
+    <li><strong>Attribution (safe, no semantics change).</strong> Add an <code>AsyncLocalStorage&lt;{ pluginId: string; surface: string }&gt;</code> owned by the plugin runtime and enter it around every plugin entry point: factory call, <code>runService</code>, schedule ticks, route/handler/tool invocations. Extend <code>installSafeProcessDiagnostics</code> with an optional <code>attribution?: () =&gt; Record&lt;string,string&gt; | undefined</code> that the monitor calls and merges into the report (e.g. <code>"attribution": {"pluginId":"crashy-service","surface":"service:imap-poller"}</code>). Verified feasible: in my experiment <code>als.getStore()</code> inside <code>uncaughtExceptionMonitor</code> returned the plugin store for an unlistened emitter error, a timer throw, and a detached rejection (Node 24.18). Also register an <code>unhandledRejection</code> handler that writes the same report then rethrows (or exits) — today rejections crash without a dump of the <code>unhandledRejection</code> kind. Risk: ALS context loss through some user-land pools/queues (Node built-ins propagate correctly); when the store is missing, log “unattributed”.</li>
+    <li><strong>Containment.</strong> Switch <code>process.on("uncaughtExceptionMonitor")</code> to also install <code>process.on("uncaughtException")</code> <em>only</em> when the store attributes the throw to a plugin: mark that plugin's service crashed (route into <code>onServiceSettled</code> with <code>{crashed:true,error}</code>, which already does backoff), increment a per-plugin crash counter, and after N crashes in a window auto-disable the plugin with a status detail (“disabled: crashed the server N times: Socket timeout”), reusing the <code>reportNeedsConfiguration</code>/<code>setStatus("error")</code> surface. For unattributed throws keep the current behavior (write dump, let Node exit). Tradeoff: continuing after an uncaught exception from plugin code can leave that plugin's own state inconsistent; since the plugin is aborted and restarted (or disabled) that is acceptable, and server-owned state is untouched by construction (server code never runs inside the plugin ALS scope). What could go wrong: a plugin handler invoked <em>by</em> server code (e.g. a thread-event handler) throwing synchronously is already caught by the call site; the ALS scope must be entered per invocation so a server continuation is not misattributed to a plugin — the store should be set only for the duration of the plugin call and its descendants.</li>
+    <li><strong>Crash-loop breaker even without attribution.</strong> Persist a “last load attempt” marker per plugin; if the server dies within X seconds of loading plugin P repeatedly (K times), start P disabled with an explanatory status. This is the same idea as browser “safe mode” and catches cases where the ALS store is lost.</li>
+    <li>Optional, larger: run plugin server entries in a <code>worker_threads</code> Worker per plugin. Out of scope for this issue as the reporter notes.</li>
+  </ol>
+  <p>Suggested tests: a <code>plugin-service.test.ts</code> case with a fixture service that emits an unlistened <code>'error'</code> from a timer, asserting the report includes <code>pluginId</code> and that after the change the runtime records a crash / disables the plugin without the vitest worker dying (run in a child process helper if needed); a process-utils unit test for the attribution hook.</p>
+
+  <h2>7. PR review</h2>
+  <p>No open PRs are linked to this issue.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/1505">#1505</a> (closed) — Host daemon crashes on unhandled EPIPE from the watcher child ping, killing every thread on the host. Same shape: out-of-band error, observe-only handler, whole process dies.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1363">#1363</a> — Provider processes need one host-daemon lease owner (ownership/attribution gap, cited by reporter).</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1393">#1393</a> — Host lacks global admission control across work sources (records the same “host daemon disconnected” symptom).</li>
+    <li><a href="https://github.com/get-bb/bb/issues/920">#920</a> (closed) — Plugin reload leaks ESM module graphs (context on in-process plugin loading).</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>ALS attribution feasibility experiment</h3>
+  <p>File: <a href="1746/repro/als-attribution-check.mjs">als-attribution-check.mjs</a></p>
+<pre>// Feasibility check for the "attribute via AsyncLocalStorage" direction.
+import { AsyncLocalStorage } from "node:async_hooks";
+import { EventEmitter } from "node:events";
+
+const als = new AsyncLocalStorage();
+const mode = process.argv[2] ?? "emitter";
+
+process.on("uncaughtExceptionMonitor", (err) =&gt; {
+  console.log(`[monitor] ${mode}: error=${err.message} pluginId=${als.getStore()?.pluginId ?? "&lt;none&gt;"}`);
+});
+process.on("unhandledRejection", (err) =&gt; {
+  console.log(`[unhandledRejection] ${mode}: error=${err?.message} pluginId=${als.getStore()?.pluginId ?? "&lt;none&gt;"}`);
+  process.exit(0);
+});
+
+als.run({ pluginId: "crashy-service" }, () =&gt; {
+  if (mode === "emitter") {
+    const client = new EventEmitter();
+    setTimeout(() =&gt; client.emit("error", new Error("Socket timeout")), 20);
+  } else if (mode === "timer-throw") {
+    setTimeout(() =&gt; { throw new Error("timer throw"); }, 20);
+  } else if (mode === "rejection") {
+    setTimeout(() =&gt; { void Promise.reject(new Error("detached rejection")); }, 20);
+  }
+});</pre>
+<pre>$ node als-attribution-check.mjs emitter;     echo exit=$?
+[monitor] emitter: error=Socket timeout pluginId=crashy-service
+exit=1
+$ node als-attribution-check.mjs timer-throw; echo exit=$?
+[monitor] timer-throw: error=timer throw pluginId=crashy-service
+exit=1
+$ node als-attribution-check.mjs rejection;   echo exit=$?
+[unhandledRejection] rejection: error=detached rejection pluginId=crashy-service
+exit=0   (handler called process.exit(0); without a handler Node exits 1)</pre>
+
+  <h3>Server log excerpt (crash → restart → reload)</h3>
+<pre>{"level":30,"time":1787027875283,"msg":"[plugin:crashy-service] imap-poller started; will emit unhandled 'error' in 3s"}
+{"level":30,"time":1787027875283,"msg":"plugin crashy-service@0.1.0 loaded"}
+{"level":30,"time":1787027881720,"bindHost":"127.0.0.1","port":24215,"msg":"Server listening"}      &lt;- new pid after crash
+{"level":30,"time":1787027882033,"msg":"[plugin:crashy-service] imap-poller started; will emit unhandled 'error' in 3s"}
+{"level":30,"time":1787027882033,"msg":"plugin crashy-service@0.1.0 loaded"}
+{"level":30,"time":1787027882325,"sessionId":"hses_ehy38kfahz","hostId":"host_5jzmacr7b9","replacedSessionId":"hses_brarz52xtc","msg":"Session opened"}</pre>
+  <p>Note: no <code>service … crashed</code> warning ever appears — the supervisor path was never entered.</p>
+
+  <h3>Commands run</h3>
+<pre>gh issue view 1746 --repo get-bb/bb --json title,body,labels,state,createdAt,author,comments
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+scripts/bb-dev-app current
+export BB_SERVER_URL=http://localhost:24215 BB_HOST_DAEMON_PORT=32215 BB_PROJECT_ID=proj_personal
+pnpm bb:dev machine list
+pnpm bb:dev plugin install /tmp/bb-1746-plugin --yes
+ls ~/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-3-99edd75f30b8/logs
+cat …/logs/process-server-uncaughtException-*.json
+cat …/logs/server.1.log
+grep dev-supervisor:server ~/.bb-dev/launchers/projects-bb-.claude-worktrees-wf_debcf606-e4a-3/dev.log
+sqlite3 -header …/bb.db "select id,status,close_reason,… from host_daemon_sessions order by created_at"
+dev-browser --browser bb1746 --headless run /tmp/bb-1746-shot3.js      # screenshots
+bash /tmp/bb-1746-remove.sh   # polls /api/v1/plugins then: bb plugin remove crashy-service
+cd apps/server &amp;&amp; node --conditions=source --import tsx test/repro-1746-service-supervisor-gap.mts
+node /tmp/bb-1746-als.mjs emitter | timer-throw | rejection
+node -e 'setTimeout(()=&gt;{ void Promise.reject(new Error("detached")); },10)'; echo $?   # 1
+pnpm dev:stop</pre>
+  <h3>Artifacts</h3>
+  <ul>
+    <li><a href="1746/repro/package.json">1746/repro/package.json</a>, <a href="1746/repro/server.js">1746/repro/server.js</a> — repro plugin</li>
+    <li><a href="1746/repro/repro-1746-service-supervisor-gap.mts">1746/repro/repro-1746-service-supervisor-gap.mts</a> — standalone repro</li>
+    <li><a href="1746/repro/als-attribution-check.mjs">1746/repro/als-attribution-check.mjs</a> — attribution feasibility</li>
+    <li><a href="1746/repro/install-output.txt">install-output.txt</a>, <a href="1746/repro/dev-log-excerpt.txt">dev-log-excerpt.txt</a>, <a href="1746/repro/host_daemon_sessions.txt">host_daemon_sessions.txt</a>, <a href="1746/repro/dump-list.txt">dump-list.txt</a>, two <code>process-server-uncaughtException-*.json</code> dumps</li>
+    <li>Screenshots: <code>assets/1746-plugins-list.png</code>, <code>assets/1746-plugin-detail.png</code></li>
+  </ul>
+</main></body></html>

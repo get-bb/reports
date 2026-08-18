@@ -1,0 +1,754 @@
+diff --git a/packages/agent-providers/src/catalog.ts b/packages/agent-providers/src/catalog.ts
+index 117600f523..80e46095ae 100644
+--- a/packages/agent-providers/src/catalog.ts
++++ b/packages/agent-providers/src/catalog.ts
+@@ -147,9 +147,8 @@ const ACP_COMPOSER_ACTIONS: ProviderComposerAction[] = [
+ // Fork support is negotiated with each agent before the bridge sends the
+ // unstable ACP session/fork request; agents that do not advertise it fail the
+ // fork without falling back to a fresh session.
+-// Cursor exposes a `-fast` service tail per model; the bridge resolves it from
+-// the serviceTier (the "Fast mode" toggle), so service tier is supported here
+-// rather than fanning fast variants out as separate model-list entries.
++// Cursor exposes Fast mode as an ACP config option, so it supports the shared
++// service tier without separate model entries.
+ const ACP_CAPABILITIES: ProviderCapabilities = {
+   supportsArchive: false,
+   supportsRename: false,
+diff --git a/packages/agent-runtime/src/acp/adapter.test.ts b/packages/agent-runtime/src/acp/adapter.test.ts
+index 81ffcd5c49..b0f6295862 100644
+--- a/packages/agent-runtime/src/acp/adapter.test.ts
++++ b/packages/agent-runtime/src/acp/adapter.test.ts
+@@ -44,10 +44,21 @@ function createCompactingAdapter(): AcpProviderAdapter {
+   });
+ }
+ 
+-const CURSOR_LIST_COMMAND = {
+-  command: "cursor-agent",
+-  args: ["--list-models"],
+-};
++function createModelCliAdapter(): AcpProviderAdapter {
++  return createAcpProviderAdapter({
++    profile: {
++      providerId: "acp-custom",
++      displayName: "Custom ACP",
++      agentCommand: { command: "custom-acp", args: ["serve"] },
++      modelCli: {
++        listArgs: ["models", "list"],
++        selectFlag: "--model",
++        primaryModels: [],
++      },
++    },
++    additionalWorkspaceWriteRoots: [],
++  });
++}
+ 
+ const THREAD_CONTEXT = { threadId: "thread-1" };
+ 
+@@ -161,6 +172,7 @@ describe("acp adapter command plans", () => {
+         workspaceWriteRoots: ["/workspace", "/extra-root"],
+         envVars: { BB_THREAD_ID: "thread-1" },
+         instructions: "Stay focused.",
++        parameterizedModelPicker: true,
+       },
+     });
+   });
+@@ -513,18 +525,17 @@ describe("acp compaction events", () => {
+   });
+ });
+ 
+-describe("acp adapter model cli", () => {
+-  it("requests the profile's model list command with its primary families", () => {
+-    const plan = createAdapter().buildCommandPlan({ type: "model/list" });
+-    expect(plan).toMatchObject({
++describe("acp adapter models", () => {
++  it("discovers Cursor models from its ACP session", () => {
++    expect(createAdapter().buildCommandPlan({ type: "model/list" })).toEqual({
+       kind: "request",
+       method: "model/list",
+-      params: { listCommand: CURSOR_LIST_COMMAND },
++      params: {
++        agent: { command: "cursor-agent", args: ["acp"] },
++        primaryModels: ["grok-4.6", "grok-4.5"],
++        parameterizedModelPicker: true,
++      },
+     });
+-    const params = (plan as { params: Record<string, unknown> }).params;
+-    const primaryModels = params.primaryModels as string[];
+-    expect(primaryModels).toContain("auto");
+-    expect(primaryModels.length).toBeGreaterThan(1);
+   });
+ 
+   it("requests ACP-native session discovery when the profile has no model CLI", () => {
+@@ -554,15 +565,16 @@ describe("acp adapter model cli", () => {
+     });
+   });
+ 
+-  it("forwards the session model and reasoning level for bridge resolution", () => {
++  it("forwards Cursor's parameterized ACP model selection", () => {
+     const plan = createAdapter().buildCommandPlan({
+       type: "thread/start",
+       threadId: "thread-1",
+       cwd: "/workspace",
+       options: {
+         ...fullProviderExecutionContext,
+-        model: "gpt-5.3-codex",
++        model: "grok-4.6",
+         reasoningLevel: "high",
++        serviceTier: "fast",
+       },
+       instructionMode: "append",
+     });
+@@ -570,11 +582,11 @@ describe("acp adapter model cli", () => {
+       params: {
+         agent: { command: "cursor-agent", args: ["acp"] },
+         modelSelection: {
+-          listCommand: CURSOR_LIST_COMMAND,
+-          selectFlag: "--model",
+-          model: "gpt-5.3-codex",
++          modelId: "grok-4.6",
+           reasoningLevel: "high",
++          serviceTier: "fast",
+         },
++        parameterizedModelPicker: true,
+       },
+     });
+   });
+@@ -651,7 +663,7 @@ describe("acp adapter model cli", () => {
+     });
+     expect(plan).toMatchObject({
+       params: {
+-        modelSelection: { model: "gpt-5.3-codex" },
++        modelSelection: { modelId: "gpt-5.3-codex" },
+       },
+     });
+     const params = (plan as { params: Record<string, unknown> }).params;
+@@ -659,8 +671,8 @@ describe("acp adapter model cli", () => {
+     expect("reasoningLevel" in selection).toBe(false);
+   });
+ 
+-  it("forwards Fast mode as the model selection service tier", () => {
+-    const plan = createAdapter().buildCommandPlan({
++  it("forwards Fast mode to an agent with launch-time model selection", () => {
++    const plan = createModelCliAdapter().buildCommandPlan({
+       type: "thread/start",
+       threadId: "thread-1",
+       cwd: "/workspace",
+@@ -678,8 +690,8 @@ describe("acp adapter model cli", () => {
+     });
+   });
+ 
+-  it("omits a default service tier from the model selection", () => {
+-    const plan = createAdapter().buildCommandPlan({
++  it("omits a default service tier from launch-time model selection", () => {
++    const plan = createModelCliAdapter().buildCommandPlan({
+       type: "thread/start",
+       threadId: "thread-1",
+       cwd: "/workspace",
+diff --git a/packages/agent-runtime/src/acp/adapter.ts b/packages/agent-runtime/src/acp/adapter.ts
+index 5894fbd4de..fff273c910 100644
+--- a/packages/agent-runtime/src/acp/adapter.ts
++++ b/packages/agent-runtime/src/acp/adapter.ts
+@@ -561,6 +561,12 @@ export function createAcpProviderAdapter(
+       : { permissionCli: profile.permissionCli };
+   }
+ 
++  function buildParameterizedModelPickerParam(): Record<string, unknown> {
++    return profile.parameterizedModelPicker === true
++      ? { parameterizedModelPicker: true }
++      : {};
++  }
++
+   const turnState = createProviderTurnStateRegistry<AcpTurnState>({
+     createState: () => ({
+       assistantMessageCounter: 0,
+@@ -1310,6 +1316,7 @@ export function createAcpProviderAdapter(
+       ...buildModelSelectionParam(command.options),
+       ...buildReasoningCliParam(),
+       ...buildNativeReasoningParam(),
++      ...buildParameterizedModelPickerParam(),
+       ...buildPermissionCliParam(),
+       ...(profile.reasoningCli !== undefined &&
+       command.options.reasoningLevel !== undefined
+@@ -1346,6 +1353,10 @@ export function createAcpProviderAdapter(
+           ...(options.reasoningLevel !== undefined
+             ? { reasoningLevel: options.reasoningLevel }
+             : {}),
++          ...(profile.parameterizedModelPicker === true &&
++          options.serviceTier !== undefined
++            ? { serviceTier: options.serviceTier }
++            : {}),
+         },
+       };
+     }
+@@ -1402,7 +1413,12 @@ export function createAcpProviderAdapter(
+               params: {
+                 ...(listCommand !== undefined ? { listCommand } : {}),
+                 ...(agent !== undefined ? { agent } : {}),
+-                primaryModels: [...(profile.modelCli?.primaryModels ?? [])],
++                primaryModels: [
++                  ...(profile.primaryModels ??
++                    profile.modelCli?.primaryModels ??
++                    []),
++                ],
++                ...buildParameterizedModelPickerParam(),
+                 ...buildReasoningCliParam(),
+                 ...buildNativeReasoningParam(),
+               },
+diff --git a/packages/agent-runtime/src/acp/bridge-protocol.ts b/packages/agent-runtime/src/acp/bridge-protocol.ts
+index 210fa0a171..fd816de0a9 100644
+--- a/packages/agent-runtime/src/acp/bridge-protocol.ts
++++ b/packages/agent-runtime/src/acp/bridge-protocol.ts
+@@ -72,9 +72,12 @@ const acpBridgeModelListParamsSchema = z.object({
+   /**
+    * Family ids served in the picker's default list; the rest become
+    * selected-only "more models". No matches (or an empty list) serves
+-   * everything as primary.
++   * everything as primary. ACP-native discovery probes these ids first for
++   * reasoning options. It still returns all ACP-native models as primary.
+    */
+   primaryModels: z.array(z.string()).default([]),
++  /** Enables Cursor's separate model, reasoning, and Fast mode options. */
++  parameterizedModelPicker: z.boolean().optional(),
+   reasoningCli: acpBridgeReasoningCliSchema.optional(),
+   nativeReasoning: acpBridgeNativeReasoningSchema.optional(),
+ });
+@@ -82,11 +85,10 @@ const acpBridgeModelListParamsSchema = z.object({
+ /**
+  * Session-level model pin. CLI-style agents resolve (model, reasoningLevel,
+  * serviceTier) to a raw model id and launch with `<selectFlag> <resolved-id>`.
+- * ACP-native agents receive `{ modelId }` after `session/new` — via their
+- * "model"-category config option (`session/set_config_option`) when they
+- * advertise one, otherwise via legacy `session/set_model`; if they expose a
+- * `thought_level` config option, the bridge applies `reasoningLevel` via
+- * `session/set_config_option`. Absent when the thread has no model preference.
++ * ACP-native agents receive these selections after `session/new`. The bridge
++ * uses the model config option, or legacy `session/set_model` when absent.
++ * It uses `thought_level` for reasoning and `fast` for the service tier.
++ * The selection is absent when the thread has no model preference.
+  */
+ const acpBridgeCliModelSelectionSchema = z.object({
+   listCommand: acpBridgeAgentCommandSchema,
+@@ -99,6 +101,7 @@ const acpBridgeCliModelSelectionSchema = z.object({
+ const acpBridgeNativeModelSelectionSchema = z.object({
+   modelId: z.string().min(1),
+   reasoningLevel: reasoningLevelSchema.optional(),
++  serviceTier: serviceTierSchema.optional(),
+ });
+ 
+ const acpBridgeModelSelectionSchema = z.union([
+@@ -121,6 +124,7 @@ const acpBridgeSessionParamsSchema = z.object({
+   launchReasoningLevel: reasoningLevelSchema.optional(),
+   reasoningCli: acpBridgeReasoningCliSchema.optional(),
+   nativeReasoning: acpBridgeNativeReasoningSchema.optional(),
++  parameterizedModelPicker: z.boolean().optional(),
+   /**
+    * Launch-time permission flags for agents whose own prompt policy must be
+    * selected by CLI args rather than by ACP permission responses.
+diff --git a/packages/agent-runtime/src/acp/bridge/bridge.test.ts b/packages/agent-runtime/src/acp/bridge/bridge.test.ts
+index 0767c0f0fa..99aab28376 100644
+--- a/packages/agent-runtime/src/acp/bridge/bridge.test.ts
++++ b/packages/agent-runtime/src/acp/bridge/bridge.test.ts
+@@ -99,7 +99,12 @@ interface StartThreadArgs {
+         model: string;
+         reasoningLevel?: ReasoningLevel;
+       }
+-    | { modelId: string; reasoningLevel?: ReasoningLevel };
++    | {
++        modelId: string;
++        reasoningLevel?: ReasoningLevel;
++        serviceTier?: "default" | "fast";
++      };
++  parameterizedModelPicker?: boolean;
+   launchReasoningLevel?: ReasoningLevel;
+   reasoningCli?: {
+     flag: string;
+@@ -144,6 +149,9 @@ async function startThread(args?: StartThreadArgs): Promise<{
+     ...(args?.nativeReasoning !== undefined
+       ? { nativeReasoning: args.nativeReasoning }
+       : {}),
++    ...(args?.parameterizedModelPicker === true
++      ? { parameterizedModelPicker: true }
++      : {}),
+     ...(args?.permissionCli !== undefined
+       ? { permissionCli: args.permissionCli }
+       : {}),
+@@ -415,6 +423,37 @@ describe("acp bridge", () => {
+     });
+   });
+ 
++  it("advertises parameterized model selection and probes primary models first", async () => {
++    const initializeLog = join(workspaceDir, "discovery-initialize.jsonl");
++    const selectionLog = join(workspaceDir, "primary-model-selections.txt");
++    const modelListId = sendRequest("model/list", {
++      agent: {
++        command: process.execPath,
++        args: [FAKE_AGENT_PATH],
++        envVars: {
++          FAKE_ACP_INITIALIZE_LOG: initializeLog,
++          FAKE_ACP_MODEL_CONFIG: "1",
++          FAKE_ACP_SET_CONFIG_LOG: selectionLog,
++          FAKE_ACP_THOUGHT_LEVEL_CONFIG: "1",
++        },
++      },
++      primaryModels: ["fake/strong"],
++      parameterizedModelPicker: true,
++    });
++
++    await waitForResponse(modelListId);
++    await waitForFileWithRealTimer(initializeLog);
++    const initializeParams = JSON.parse(
++      readFileSync(initializeLog, "utf8").trim(),
++    );
++    expect(initializeParams.clientCapabilities).toMatchObject({
++      _meta: { parameterizedModelPicker: true },
++    });
++    expect(readFileSync(selectionLog, "utf8").split("\n")[0]).toBe(
++      "fake/strong",
++    );
++  });
++
+   it("discovers ACP-native models from session models state", async () => {
+     const modelListId = sendRequest("model/list", {
+       agent: {
+@@ -893,6 +932,26 @@ describe("acp bridge", () => {
+     expect(agentMessageTexts()).toContain("selected-model:fake/strong");
+   });
+ 
++  it("advertises parameterized model selection during a live session", async () => {
++    const initializeLog = join(workspaceDir, "session-initialize.jsonl");
++    await startThread({
++      envVars: {
++        FAKE_ACP_INITIALIZE_LOG: initializeLog,
++        FAKE_ACP_MODEL_CONFIG: "1",
++      },
++      modelSelection: { modelId: "fake/strong" },
++      parameterizedModelPicker: true,
++    });
++
++    await waitForFileWithRealTimer(initializeLog);
++    const initializeParams = JSON.parse(
++      readFileSync(initializeLog, "utf8").trim(),
++    );
++    expect(initializeParams.clientCapabilities).toMatchObject({
++      _meta: { parameterizedModelPicker: true },
++    });
++  });
++
+   it("falls back to session/set_model when the model config option errors", async () => {
+     const { providerThreadId } = await startThread({
+       envVars: {
+@@ -944,6 +1003,39 @@ describe("acp bridge", () => {
+     expect(agentMessageTexts()).toContain("selected-effort:xhigh");
+   });
+ 
++  it.each([
++    {
++      serviceTier: "fast" as const,
++      initialFast: "false",
++      selectedFast: "true",
++    },
++    {
++      serviceTier: "default" as const,
++      initialFast: "true",
++      selectedFast: "false",
++    },
++  ])(
++    "maps the $serviceTier service tier to Fast mode $selectedFast",
++    async ({ serviceTier, initialFast, selectedFast }) => {
++      const { providerThreadId } = await startThread({
++        envVars: {
++          FAKE_ACP_FAST_CONFIG: "1",
++          FAKE_ACP_INITIAL_FAST: initialFast,
++          FAKE_ACP_MODEL_CONFIG: "1",
++        },
++        modelSelection: { modelId: "fake/strong", serviceTier },
++      });
++
++      sendRequest("turn/start", {
++        threadId: providerThreadId,
++        input: [{ type: "text", text: "echo-selected-fast", mentions: [] }],
++      });
++      await waitForTurnCompleted();
++
++      expect(agentMessageTexts()).toContain(`selected-fast:${selectedFast}`);
++    },
++  );
++
+   it("applies configured native reasoning when the ACP agent does not advertise thought_level", async () => {
+     const { providerThreadId } = await startThread({
+       envVars: {
+diff --git a/packages/agent-runtime/src/acp/bridge/bridge.ts b/packages/agent-runtime/src/acp/bridge/bridge.ts
+index 3515b5ab12..e193063f81 100644
+--- a/packages/agent-runtime/src/acp/bridge/bridge.ts
++++ b/packages/agent-runtime/src/acp/bridge/bridge.ts
+@@ -646,6 +646,19 @@ async function authenticateAcpAgent(args: {
+   });
+ }
+ 
++function acpClientCapabilities(
++  parameterizedModelPicker?: boolean,
++  fsAccess = false,
++) {
++  return {
++    fs: { readTextFile: fsAccess, writeTextFile: fsAccess },
++    terminal: false,
++    ...(parameterizedModelPicker === true
++      ? { _meta: { parameterizedModelPicker: true } }
++      : {}),
++  };
++}
++
+ /**
+  * Run the agent's model list command and build the variant catalog, cached
+  * per list command for the bridge's lifetime (model/list refreshes it on the
+@@ -705,8 +718,14 @@ async function loadAgentModelCatalog(
+ 
+ async function loadSessionDiscoveredModels(
+   agent: AcpBridgeAgentCommand,
++  primaryModels: readonly string[],
++  parameterizedModelPicker?: boolean,
+ ): Promise<AvailableModel[] | null> {
+-  const key = JSON.stringify(agent);
++  const key = JSON.stringify({
++    agent,
++    primaryModels,
++    parameterizedModelPicker,
++  });
+   if (
+     cachedSessionDiscoveredModels?.key === key &&
+     Date.now() - cachedSessionDiscoveredModels.fetchedAt <
+@@ -751,10 +770,7 @@ async function loadSessionDiscoveredModels(
+           params: {
+             protocolVersion: ACP_PROTOCOL_VERSION,
+             clientInfo: { name: "bb", version: "1.0.0" },
+-            clientCapabilities: {
+-              fs: { readTextFile: false, writeTextFile: false },
+-              terminal: false,
+-            },
++            clientCapabilities: acpClientCapabilities(parameterizedModelPicker),
+           },
+           resultSchema: acpInitializeResultSchema,
+         });
+@@ -796,6 +812,7 @@ async function loadSessionDiscoveredModels(
+       connection,
+       sessionId: newSession.sessionId,
+       modelOption,
++      primaryModels,
+     });
+     const models =
+       reasoningByModel === null
+@@ -826,12 +843,30 @@ async function discoverAcpNativeReasoningByModel(args: {
+   connection: AcpAgentConnection;
+   sessionId: string;
+   modelOption: AcpConfigOption | undefined;
++  primaryModels: readonly string[];
+ }): Promise<ReadonlyMap<string, AcpNativeReasoningSupport> | null> {
+   const modelOptions = args.modelOption?.options ?? [];
+   if (!args.modelOption || modelOptions.length === 0) {
+     return null;
+   }
+   const modelOption = args.modelOption;
++  const modelByValue = new Map(
++    modelOptions.map((model) => [model.value, model] as const),
++  );
++  const modelsToProbe: typeof modelOptions = [];
++  const addedModels = new Set<string>();
++  for (const value of args.primaryModels) {
++    const model = modelByValue.get(value);
++    if (model && !addedModels.has(model.value)) {
++      modelsToProbe.push(model);
++      addedModels.add(model.value);
++    }
++  }
++  for (const model of modelOptions) {
++    if (!addedModels.has(model.value)) {
++      modelsToProbe.push(model);
++    }
++  }
+ 
+   // Each probe is one set_config_option round trip to the local agent, so
+   // work is bounded by the time budget rather than a model-count cutoff
+@@ -852,7 +887,7 @@ async function discoverAcpNativeReasoningByModel(args: {
+   try {
+     return await Promise.race([
+       (async () => {
+-        for (const model of modelOptions) {
++        for (const model of modelsToProbe) {
+           const configState = await args.connection.request({
+             method: "session/set_config_option",
+             params: {
+@@ -1057,6 +1092,12 @@ async function selectAcpNativeModel(args: {
+     modelSelection: selection,
+     nativeReasoning: args.nativeReasoning,
+   });
++  await selectAcpNativeServiceTier({
++    connection: args.connection,
++    sessionId: args.sessionId,
++    configOptions,
++    modelSelection: selection,
++  });
+ }
+ 
+ async function selectAcpNativeReasoning(args: {
+@@ -1101,6 +1142,41 @@ async function selectAcpNativeReasoning(args: {
+   }
+ }
+ 
++async function selectAcpNativeServiceTier(args: {
++  connection: AcpAgentConnection;
++  sessionId: string;
++  configOptions: readonly AcpConfigOption[] | undefined;
++  modelSelection: Extract<
++    AcpBridgeThreadStartParams["modelSelection"],
++    { modelId: string }
++  >;
++}): Promise<void> {
++  const serviceTier = args.modelSelection.serviceTier;
++  if (serviceTier === undefined) {
++    return;
++  }
++  const fastOption = (args.configOptions ?? []).find(
++    (option) => option.id === "fast" && option.type === "select",
++  );
++  const value = serviceTier === "fast" ? "true" : "false";
++  if (!fastOption?.options?.some((option) => option.value === value)) {
++    return;
++  }
++  try {
++    await args.connection.request({
++      method: "session/set_config_option",
++      params: {
++        sessionId: args.sessionId,
++        configId: fastOption.id,
++        value,
++      },
++      resultSchema: acpConfigStateResultSchema,
++    });
++  } catch {
++    // Unsupported or stale service tiers should leave the agent default intact.
++  }
++}
++
+ // ---------------------------------------------------------------------------
+ // Prompt content
+ // ---------------------------------------------------------------------------
+@@ -1505,10 +1581,10 @@ async function startAgentSession(
+       params: {
+         protocolVersion: ACP_PROTOCOL_VERSION,
+         clientInfo: { name: "bb", version: "1.0.0" },
+-        clientCapabilities: {
+-          fs: { readTextFile: true, writeTextFile: true },
+-          terminal: false,
+-        },
++        clientCapabilities: acpClientCapabilities(
++          params.parameterizedModelPicker,
++          true,
++        ),
+       },
+       resultSchema: acpInitializeResultSchema,
+     });
+@@ -1938,7 +2014,11 @@ async function handleRequest(
+       }
+       const sessionDiscoveredModels =
+         request.params.listCommand === undefined && request.params.agent
+-          ? await loadSessionDiscoveredModels(request.params.agent)
++          ? await loadSessionDiscoveredModels(
++              request.params.agent,
++              request.params.primaryModels,
++              request.params.parameterizedModelPicker,
++            )
+           : null;
+       if (sessionDiscoveredModels) {
+         sendResult(request.id, {
+diff --git a/packages/agent-runtime/src/acp/bridge/fake-acp-agent.mjs b/packages/agent-runtime/src/acp/bridge/fake-acp-agent.mjs
+index 6d699c1e66..c46a571a25 100755
+--- a/packages/agent-runtime/src/acp/bridge/fake-acp-agent.mjs
++++ b/packages/agent-runtime/src/acp/bridge/fake-acp-agent.mjs
+@@ -21,6 +21,9 @@
+  * - FAKE_ACP_MODELS_FIELD=1  → advertise legacy ACP models state
+  * - FAKE_ACP_THOUGHT_LEVEL_CONFIG=1
+  *                            → advertise per-model effort configOptions
++ * - FAKE_ACP_FAST_CONFIG=1   → advertise the Fast mode config option
++ * - FAKE_ACP_INITIAL_FAST    → set the initial Fast mode value
++ * - FAKE_ACP_INITIALIZE_LOG  → append initialize params as JSON
+  * - FAKE_ACP_UNMAPPED_REASONING_CONFIG=1
+  *                            → advertise unmapped thought_level values
+  * - FAKE_ACP_ACCEPT_NATIVE_REASONING=1
+@@ -28,6 +31,7 @@
+  *                              advertising a thought_level config option
+  * - FAKE_ACP_SET_CONFIG_MODEL_ERROR=1
+  *                            → fail session/set_config_option for model values
++ * - FAKE_ACP_SET_CONFIG_LOG  → append selected model values
+  * - FAKE_ACP_MODEL_COUNT=<n> → pad the catalog to n reasoning-capable models
+  *                              (exercises large-catalog reasoning discovery)
+  * - FAKE_ACP_AUTH_METHODS    → comma-separated auth method ids to advertise;
+@@ -53,6 +57,7 @@ const usageSessionId = process.env.FAKE_ACP_USAGE_SESSION_ID;
+ const modelConfig = process.env.FAKE_ACP_MODEL_CONFIG === "1";
+ const modelsField = process.env.FAKE_ACP_MODELS_FIELD === "1";
+ const thoughtLevelConfig = process.env.FAKE_ACP_THOUGHT_LEVEL_CONFIG === "1";
++const fastConfig = process.env.FAKE_ACP_FAST_CONFIG === "1";
+ const unmappedReasoningConfig =
+   process.env.FAKE_ACP_UNMAPPED_REASONING_CONFIG === "1";
+ const acceptNativeReasoning =
+@@ -73,6 +78,7 @@ let activePromptId = null;
+ let nextAgentRequestId = 1000;
+ let selectedModel = "fake/default";
+ let selectedEffort = "none";
++let selectedFast = process.env.FAKE_ACP_INITIAL_FAST ?? "false";
+ let authenticatedMethod = null;
+ let activeSessionId = sessionId;
+ const pendingClientRequests = new Map();
+@@ -173,6 +179,17 @@ function configOptions() {
+       options: fakeModels,
+     },
+     effortOptionForModel(selectedModel),
++    ...(fastConfig
++      ? [
++          {
++            id: "fast",
++            name: "Fast mode",
++            type: "select",
++            currentValue: selectedFast,
++            options: [{ value: "false" }, { value: "true" }],
++          },
++        ]
++      : []),
+   ].filter(Boolean);
+ }
+ 
+@@ -313,6 +330,8 @@ async function handlePrompt(message) {
+     notifyUpdate(messageChunk(`selected-model:${selectedModel}`));
+   } else if (text.includes("echo-selected-effort")) {
+     notifyUpdate(messageChunk(`selected-effort:${selectedEffort}`));
++  } else if (text.includes("echo-selected-fast")) {
++    notifyUpdate(messageChunk(`selected-fast:${selectedFast}`));
+   } else if (text.includes("echo-auth-method")) {
+     notifyUpdate(messageChunk(`auth-method:${authenticatedMethod ?? "none"}`));
+   } else if (text.includes("echo-electron-run-as-node")) {
+@@ -355,6 +374,12 @@ async function handleMessage(message) {
+       if (hangInitialize) {
+         return;
+       }
++      if (process.env.FAKE_ACP_INITIALIZE_LOG) {
++        appendFileSync(
++          process.env.FAKE_ACP_INITIALIZE_LOG,
++          `${JSON.stringify(message.params)}\n`,
++        );
++      }
+       send({
+         jsonrpc: "2.0",
+         id: message.id,
+@@ -511,6 +536,9 @@ async function handleMessage(message) {
+           });
+           return;
+         }
++        if (process.env.FAKE_ACP_SET_CONFIG_LOG) {
++          appendFileSync(process.env.FAKE_ACP_SET_CONFIG_LOG, `${value}\n`);
++        }
+         selectedModel = value;
+         send({ jsonrpc: "2.0", id: message.id, result: configState() });
+         return;
+@@ -533,6 +561,19 @@ async function handleMessage(message) {
+         send({ jsonrpc: "2.0", id: message.id, result: configState() });
+         return;
+       }
++      if (configId === "fast") {
++        if (!fastConfig || (value !== "false" && value !== "true")) {
++          send({
++            jsonrpc: "2.0",
++            id: message.id,
++            error: { code: -32602, message: `fast mode not found: ${value}` },
++          });
++          return;
++        }
++        selectedFast = value;
++        send({ jsonrpc: "2.0", id: message.id, result: configState() });
++        return;
++      }
+       if (configId === "reasoning_effort" && acceptNativeReasoning) {
+         if (typeof value !== "string") {
+           send({
+diff --git a/packages/agent-runtime/src/acp/profiles.ts b/packages/agent-runtime/src/acp/profiles.ts
+index ced6cd92e7..a390ab5b29 100644
+--- a/packages/agent-runtime/src/acp/profiles.ts
++++ b/packages/agent-runtime/src/acp/profiles.ts
+@@ -35,11 +35,14 @@ export interface AcpAgentProfile {
+   reasoningCli?: AcpAgentReasoningCli;
+   nativeReasoning?: AcpAgentNativeReasoning;
+   permissionCli?: AcpAgentPermissionCli;
++  /** Enables an agent extension for separate model configuration options. */
++  parameterizedModelPicker?: boolean;
++  /** Model ids to probe first during ACP-native reasoning discovery. */
++  primaryModels?: string[];
+ }
+ 
+ interface BuiltInAcpAgentProfile extends AcpAgentProfile {
+   providerId: AcpAgentProviderId;
+-  modelCli: AcpAgentModelCli;
+ }
+ 
+ export const ACP_AGENT_PROFILES: readonly BuiltInAcpAgentProfile[] = [
+@@ -51,23 +54,10 @@ export const ACP_AGENT_PROFILES: readonly BuiltInAcpAgentProfile[] = [
+     // on PATH cannot silently replace Cursor and collapse model discovery to
+     // the synthetic fallback.
+     agentCommand: { command: "cursor-agent", args: ["acp"] },
+-    // Global flags must precede the `acp` subcommand, matching the documented
+-    // `cursor-agent --api-key ... acp` form.
+-    modelCli: {
+-      listArgs: ["--list-models"],
+-      selectFlag: "--model",
+-      // Family ids (the default variant's raw id), not raw variant ids: the
+-      // catalog folds effort and the `-fast` tail into one entry per family.
+-      primaryModels: [
+-        "auto",
+-        "cursor-grok-4.5-medium",
+-        "gpt-5.6-sol-medium",
+-        "claude-opus-5-thinking-medium",
+-        "claude-fable-5-thinking-medium",
+-        // Composer is one family now; its `-fast` twin is the Fast-mode tier.
+-        "composer-2.5",
+-      ],
+-    },
++    // Cursor exposes model effort and Fast mode as separate ACP config options
++    // only when the client advertises this Cursor extension capability.
++    parameterizedModelPicker: true,
++    primaryModels: ["grok-4.6", "grok-4.5"],
+   },
+ ];
+ 
+diff --git a/packages/host-daemon-contract/src/commands.ts b/packages/host-daemon-contract/src/commands.ts
+index ad3daeadb5..7aab483894 100644
+--- a/packages/host-daemon-contract/src/commands.ts
++++ b/packages/host-daemon-contract/src/commands.ts
+@@ -36,7 +36,7 @@ import {
+   providerCliStatusResponseSchema,
+ } from "./local.js";
+ 
+-export const HOST_DAEMON_PROTOCOL_VERSION = 123 as const;
++export const HOST_DAEMON_PROTOCOL_VERSION = 124 as const;
+ 
+ export {
+   BRANCH_LIST_LIMIT_MAX,
+diff --git a/packages/host-daemon-contract/test/contract.test.ts b/packages/host-daemon-contract/test/contract.test.ts
+index 4040da4e93..8849c58526 100644
+--- a/packages/host-daemon-contract/test/contract.test.ts
++++ b/packages/host-daemon-contract/test/contract.test.ts
+@@ -1060,6 +1060,9 @@ describe("host-daemon local schemas", () => {
+ });
+ 
+ describe("host-daemon command schemas", () => {
++  // Version 124 advertises Cursor's parameterized model picker and sends its
++  // model, reasoning, and Fast mode as ACP config options. Older daemons use
++  // launch-only model variants that Cursor ACP ignores.
+   // Version 123 adds required status-enrichment budgets and a required
+   // diff-files truncation marker. Older daemons cannot safely enforce or
+   // interpret the new bounded workspace response contract.
+@@ -1093,7 +1096,7 @@ describe("host-daemon command schemas", () => {
+   // mixed version. Version 113 carried the Devin Desktop open target rename
+   // and remains part of the protocol lineage.
+   it("uses the current host-daemon protocol version", () => {
+-    expect(HOST_DAEMON_PROTOCOL_VERSION).toBe(123);
++    expect(HOST_DAEMON_PROTOCOL_VERSION).toBe(124);
+   });
+ 
+   it("requires an explicit intent on a thread stop command", () => {

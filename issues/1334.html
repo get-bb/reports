@@ -1,0 +1,585 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1334 co-located execution workload starves the bb server</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-yes { color:var(--high); }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:4px; }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1334 · Co-located execution workload can starve the bb server and leave threads spinning</h1>
+  <p class="meta">
+    <span class="pill">Bug / architecture</span> <span class="pill high">High</span> <span class="pill">Effort: Large</span>
+    <span class="pill">perf</span> <span class="pill">host</span>
+    <a href="https://github.com/get-bb/bb/issues/1334">open on GitHub</a>
+    <span>2026-08-18</span>
+    <span>base <code>16ceb3a540f81c1189efaffb27a39b1d9443abf5</code> (main)</span>
+  </p>
+  <p class="meta">
+    <span class="verdict v-yes">Verdict: REPRODUCED</span>
+    <span>· root-cause confidence: <b>high</b></span>
+    <span>· linked open PRs: none</span>
+  </p>
+
+  <h2>TL;DR</h2>
+  <p>When bb is deployed the documented way on Linux (<code>npx bb-app</code> or the packaged <code>bb-app</code> under a systemd unit), the launcher forks the <b>server</b> (control plane: HTTP API, web UI, SQLite) and the <b>primary host daemon</b> (execution plane: provider processes, agent shell commands, their descendants) as ordinary child processes. Linux puts every descendant into the same cgroup as its parent, so under a unit with <code>MemoryHigh=</code> the server, the daemon, every provider CLI and every process an agent starts share one memory budget. When the execution side pushes the cgroup over <code>memory.high</code>, the kernel throttles <em>every</em> task in that cgroup that allocates memory (<code>mem_cgroup_handle_over_high</code>, up to 2 s per allocation batch) — including the server that would have to report or stop the runaway work.</p>
+  <p>I reproduced this end to end on the base commit with the real <code>bb-app</code> launcher inside a <code>systemd-run --scope</code> with <code>MemoryHigh=800M</code>: a single 1 GiB memory hog started in the same cgroup made <code>curl --max-time 5 /health</code> time out repeatedly, put the server process into uninterruptible sleep in <code>__mem_cgroup_handle_over_high</code>, produced 72 <code>Event loop stalled</code> lines in the server log and 15 in the daemon log plus 2 <code>heartbeat timer delayed</code> warnings (one 34.9 s stall; heartbeat gap 35.7 s &gt; 30 s lease), a <code>command_timeout</code> on a provider status request, and left the web UI on its loading skeleton for tens of seconds. Kernel <code>memory.events</code> showed <code>oom_kill 0</code> throughout, matching the reporter's "control-plane dead zone, not an OOM" observation.</p>
+  <p>Two product gaps make the symptom "spin indefinitely" rather than "fail with a reason": (1) there is no <em>documented or supported</em> way to run the server and the primary daemon in separate resource domains on one machine — the install script, <code>bb-app --help</code> and the docs only offer the combined launcher. (Correction after verification: a split <em>is</em> technically possible today with the packaged-but-undocumented <code>bb-server</code> bin plus <code>bb-app host-daemon join --server-url http://127.0.0.1:&lt;port&gt;</code>; I verified it works, see Root cause §1. It is a workaround, not a supported mode.), and (2) since #421 the server decides host liveness solely from the presence of a registered daemon WebSocket in memory and never consults the heartbeat lease, so a throttled daemon whose socket is still open is reported <code>connected</code> and its threads stay <code>active</code> with no deadline. Nothing in the server, daemon, or UI observes host pressure.</p>
+
+  <h2>Claims vs findings</h2>
+  <table>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Packaged <code>bb-app</code> starts server and primary host daemon as managed child processes, so under systemd they share one service cgroup with provider runtimes and agent-launched descendants</td><td class="ok">Verified</td><td><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/bb-app/src/launcher.ts#L2264-L2270"><code>packages/bb-app/src/launcher.ts#L2264-L2270</code></a> (<code>spawn</code> without any cgroup/scope isolation), <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/bb-app/src/launcher.ts#L2898-L2966"><code>packages/bb-app/src/launcher.ts#L2898-L2966</code></a>. Repro baseline listing shows launcher, server, daemon and its plugin workers all in <code>run-p….scope</code>; the memhog spawned by the script landed in the same cgroup.</td></tr>
+    <tr><td>Cgroup above <code>MemoryHigh</code> puts server (and others) into uninterruptible sleep in <code>mem_cgroup_handle_over_high</code></td><td class="ok">Verified</td><td><code>wchan-sample.out</code>: <code>server(1509173) state=D wchan=__mem_cgroup_handle_over_high</code> in 22 of 60 samples while the hog ran; the hog itself sat there permanently.</td></tr>
+    <tr><td><code>curl --max-time 5 http://127.0.0.1:38886/health</code> and the daemon port time out</td><td class="ok">Verified</td><td><code>external-probe.run2.out</code>: 5 timeouts in 13 probes of <code>/health</code>; <code>run3</code>: <code>/health</code>, <code>/api/v1/threads</code> and daemon <code>/</code> all hit the 5 s timeout together at 05:33:07–05:33:36. Recovered to &lt;1 ms within seconds of killing the hog.</td></tr>
+    <tr><td>Journal shows repeated server and host-daemon event-loop stalls, multi-second delays; provider requests time out</td><td class="ok">Verified</td><td>Server log: 72 × <code>Event loop stalled</code> (maxDelayMs 2046–10242, one request in flight 45 s); daemon log: 15 stalls incl. <code>maxDelayMs 34863</code> and <code>heartbeat timer delayed gapMs 35688</code>; <code>Failed to resolve known ACP agent status … command_timeout … 504</code>. See Appendix.</td></tr>
+    <tr><td>Not an OOM kill: <code>memory.events oom 0 oom_kill 0</code> (comment 1)</td><td class="ok">Verified</td><td>All <code>memory.events</code> samples in the run: <code>oom 0 oom_kill 0</code>, <code>high</code> counter climbing to 109,119. Same mechanism (reclaim throttling) as the reporter's 2,677,099 <code>high</code> events.</td></tr>
+    <tr><td>App shows a spinner without explaining that the host is resource-exhausted</td><td class="ok">Verified (delayed load in my scaled-down repro)</td><td>Screenshot A: loading skeleton 4 s after DOMContentLoaded (navigation itself took 6.6 s). At my pressure level the page finished loading after ~30 s (Screenshot B); the reporter's cgroup was under far heavier pressure (199 s query). Nothing in the UI names the cause in either state.</td></tr>
+    <tr><td>Host stays "connected"/threads keep spinning while daemon is frozen (implicit in "threads spinning")</td><td class="ok">Verified in code + unit test</td><td><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/thread-runtime-display.ts#L143-L153"><code>apps/server/src/services/threads/thread-runtime-display.ts#L143-L153</code></a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/lib/entity-lookup.ts#L104-L113"><code>apps/server/src/services/lib/entity-lookup.ts#L104-L113</code></a>: liveness = socket registered in hub, lease ignored (by design since #421). Repro test below passes on main; <code>/api/v1/hosts</code> returned <code>"status":"connected"</code> during the freeze.</td></tr>
+    <tr><td>No server-only mode / no way to isolate the primary daemon</td><td class="unv">Partially refuted</td><td><b>No documented/supported mode</b>: <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/bb-app/src/launcher.ts#L1397-L1446"><code>packages/bb-app/src/launcher.ts#L1397-L1446</code></a> commands are start/stop/host-daemon/client/config/env/help; the help text (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/bb-app/src/launcher.ts#L2868-L2884"><code>#L2868-L2884</code></a>), <code>docs/</code> and the installer never mention a server-only mode. <b>But a split works today</b>: the packaged <code>bb-server</code> bin (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/bb-app/src/launcher.ts#L2626-L2680"><code>#L2626-L2680</code></a>, <code>package.json</code> <code>bin</code>, present since the original npx packaging commit <code>0ba37b81a</code>, mentioned nowhere in docs) starts only the server, and <code>bb-app host-daemon join --server-url http://127.0.0.1:&lt;port&gt;</code> enrolls a daemon against it (loopback <code>/internal/hosts/enroll-key</code> is unauthenticated, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/server.ts#L388-L392"><code>apps/server/src/server.ts#L388-L392</code></a>). Verified with <a href="1334/repro/split-deploy-check.sh">split-deploy-check.sh</a> / <a href="1334/repro/split-deploy-check-shared.sh">split-deploy-check-shared.sh</a>: <code>/api/v1/hosts</code> = <code>[]</code> with only <code>bb-server</code> up, then <code>"status":"connected"</code> after the join. Each process is a separate top-level process, so an operator can put them in separate systemd units. Caveats: with separate data dirs the server has no <code>&lt;dataDir&gt;/host-id</code> and falls back to "the single connected host" for primary-host resolution (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/hosts/primary-host.ts#L70-L76"><code>primary-host.ts#L70-L76</code></a>); sharing one data dir avoids that (<code>primaryHostId</code> flips from <code>null</code> to the joined host). Neither variant is documented, tested, or produced by the installer.</td></tr>
+    <tr><td>Browser daemon "reparented to user systemd manager but remained in bb.service's cgroup"</td><td class="unv">Unverified but consistent</td><td>Standard Linux semantics: reparenting on parent exit does not change cgroup membership; only an explicit <code>cgroup.procs</code> write or <code>systemd-run</code> does. My memhog stayed in the scope after its parent subshell would have exited.</td></tr>
+    <tr><td>Comment 2: 17 Codex app-servers ≈ 1.26 GiB RSS with 4 active threads on 0.37.0</td><td class="unv">Plausible, not reproduced</td><td>One app-server per bb thread (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/provider-codex/src/bridge/bridge.ts#L1640-L1660"><code>plugins/provider-codex/src/bridge/bridge.ts#L1640-L1660</code></a>); the daemon idle-reaps provider sessions only after 30 min (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/app.ts#L66-L67"><code>apps/host-daemon/src/app.ts#L66-L67</code></a>). Idle-but-not-yet-reaped sessions would explain the count; not measured here.</td></tr>
+    <tr><td>Comment 2: on 0.37.0 the server was OOM-killed at <code>MemoryMax=4G</code></td><td class="unv">Unverified</td><td>Consistent with the shared-cgroup design (kernel picks the largest RSS task in the cgroup; a fat server heap, see #1748, is a likely victim). Not reproduced (my run set <code>MemoryMax</code> well above use to isolate the throttling behaviour).</td></tr>
+  </table>
+
+  <h2>Environment</h2>
+  <ul>
+    <li>bb: worktree at <code>16ceb3a540f81c1189efaffb27a39b1d9443abf5</code> (main, 2026-08-18), built with <code>pnpm exec turbo run build</code>; the packaged launcher <code>packages/bb-app/dist/bb-app.js</code> was run directly (same code path as <code>npx bb-app</code>).</li>
+    <li>OS: Ubuntu 26.04 LTS, kernel 7.0.0-29-generic, cgroup v2 (<code>cgroup2fs</code>), systemd user session; 16 vCPU / 58 GiB RAM host (limits imposed with <code>systemd-run --user --scope</code>).</li>
+    <li>Node v24.18.0.</li>
+    <li>Isolated instance: data dir <code>/tmp/bb-1334-scope-data</code>, server <code>http://127.0.0.1:48861</code>, host daemon port 48862 (host id <code>host_zgj5r8yyt9</code>). No providers were exercised; no real turns run.</li>
+    <li>Cgroup limits used: <code>MemoryHigh=800M MemoryMax=2200M MemorySwapMax=64M</code> (bb baseline in the scope was ~545 MiB; hog target 1024 MiB).</li>
+    <li>Split-deployment cross-check (revision): <code>bb-server</code> on <code>http://127.0.0.1:48881</code>, daemon port 48882, data dirs <code>/tmp/bb-1334-split/{server-data,daemon-data}</code> and <code>/tmp/bb-1334-split-shared/shared-data</code>; no cgroup limits, plain shell.</li>
+  </ul>
+
+  <h2>Minimal reproduction</h2>
+  <p>Everything below is under <a href="1334/repro/">1334/repro/</a>. Requires Linux with cgroup v2 and a systemd user session (<code>systemd-run --user</code> works). No provider account needed.</p>
+  <ol>
+    <li>Build bb: <code>pnpm install --frozen-lockfile &amp;&amp; pnpm exec turbo run build</code>.</li>
+    <li>Start the packaged launcher inside one memory-limited scope and, once healthy, start a memory hog in the same cgroup:
+<pre>systemd-run --user --scope --quiet -p MemoryHigh=800M -p MemoryMax=2200M -p MemorySwapMax=64M \
+  /tmp/bb-reports/issues/1334/repro/run-in-scope-v2.sh &lt;worktree&gt; /tmp/bb-1334-scope-data 48861 48862 1024 200 \
+  | tee run-in-scope-v2.out</pre>
+      The script starts <code>node packages/bb-app/dist/bb-app.js --data-dir … --server-port 48861 --host-daemon-port 48862</code>, waits for <code>/health</code>, lists the cgroup members, then runs <code>memhog.mjs 1024</code> (allocates and keeps touching 1 GiB) in the same cgroup, sampling <code>memory.*</code> and per-process <code>wchan</code>.</li>
+    <li>From a second shell (outside the cgroup — this is what a browser tab or the CLI is), probe the control plane while generating light API load:
+<pre>/tmp/bb-reports/issues/1334/repro/external-probe.sh 48861 48862 90 6 | tee external-probe.run2.out</pre>
+      <b>When to run it:</b> the hog is itself throttled (it reaches ~350 MiB in ~20 s but ~450 MiB only after ~4–5 min and ~512 MiB after ~13 min, see <code>memhog.out</code>), so pressure builds slowly. Probing right after the hog starts shows only 0.3–3 s latencies. The 5 s <code>TIMEOUT</code> lines appear once the hog is well past <code>memory.high</code> — in my run ~11 min after hog start (05:19:27 → first timeouts 05:30:23), in the verifier's run ~5 min. Wait until the memhog log shows ≥ ~450 MiB resident (or <code>memory.pressure full avg60</code> in the scope output is &gt; 50) and then run the probe for 90–240 s. Budget ~15–20 min for the whole scope run. Use a <em>fresh</em> data dir and free ports (<code>ss -ltn | grep 4886</code>); <code>/tmp/bb-1334-scope-data</code> above is the dir I used and still contains my DB.</li>
+    <li>Optionally sample kernel wait channels: <code>wchan-sample.sh &lt;serverPid&gt; &lt;daemonPid&gt; &lt;hogPid&gt; 60</code>.</li>
+    <li>Kill the hog (<code>kill &lt;hogPid&gt;</code>) and re-probe: everything is back to sub-millisecond within seconds.</li>
+  </ol>
+
+  <h3>Expected</h3>
+  <p><code>/health</code> keeps answering in ~1 ms (as at baseline), or the affected turn/host is failed or paused with an actionable "execution host resource exhausted" state.</p>
+
+  <h3>Actual — control plane probes from outside the cgroup (<code>external-probe.run2.out</code>)</h3>
+<pre>05:30:19 server /health -&gt; 200 in 0.001366s | server /api/v1/threads -&gt; 200 in 2.059691s | daemon / -&gt; 404 in 0.000779s
+05:30:23 server /health -&gt; 000 in 5.002463s | server /health -&gt; TIMEOUT(5s) | server /api/v1/threads -&gt; 000 in 5.002989s | server /api/v1/threads -&gt; TIMEOUT(5s) | daemon / -&gt; 404 in 0.000833s
+05:30:35 server /health -&gt; 000 in 5.002096s | server /health -&gt; TIMEOUT(5s) | server /api/v1/threads -&gt; 000 in 5.002239s | server /api/v1/threads -&gt; TIMEOUT(5s) | daemon / -&gt; 404 in 0.001067s
+05:30:47 server /health -&gt; 000 in 5.002784s | server /health -&gt; TIMEOUT(5s) | server /api/v1/threads -&gt; 000 in 5.002398s | server /api/v1/threads -&gt; TIMEOUT(5s) | daemon / -&gt; 404 in 0.000962s
+05:30:59 server /health -&gt; 200 in 2.918437s | server /api/v1/threads -&gt; 200 in 0.002262s | daemon / -&gt; 404 in 0.000906s
+05:31:04 server /health -&gt; 200 in 2.060022s | server /api/v1/threads -&gt; 000 in 5.002737s | server /api/v1/threads -&gt; TIMEOUT(5s) | daemon / -&gt; 404 in 0.001216s
+05:31:13 server /health -&gt; 000 in 5.002017s | server /health -&gt; TIMEOUT(5s) | server /api/v1/threads -&gt; 200 in 0.260073s | daemon / -&gt; 404 in 0.110452s
+05:31:21 server /health -&gt; 200 in 1.965160s | server /api/v1/threads -&gt; 200 in 0.003724s | daemon / -&gt; 404 in 0.000958s
+05:31:25 server /health -&gt; 200 in 2.062966s | server /api/v1/threads -&gt; 200 in 0.002282s | daemon / -&gt; 404 in 0.000963s
+05:31:29 server /health -&gt; 200 in 2.071275s | server /api/v1/threads -&gt; 200 in 0.001878s | daemon / -&gt; 404 in 0.001033s
+05:31:33 server /health -&gt; 200 in 2.067763s | server /api/v1/threads -&gt; 200 in 4.091335s | daemon / -&gt; 404 in 0.000936s
+05:31:41 server /health -&gt; 200 in 0.032953s | server /api/v1/threads -&gt; 200 in 2.034843s | daemon / -&gt; 404 in 0.000793s
+05:31:45 server /health -&gt; 200 in 0.029337s | server /api/v1/threads -&gt; 200 in 2.043917s | daemon / -&gt; 404 in 0.000745s
+</pre>
+  <p>Baseline before the hog (from <code>run-in-scope-v2.out</code>): <code>server /health -&gt; 200 in 0.001352s</code>, <code>/api/v1/threads -&gt; 200 in 0.002189s</code>, <code>daemon / -&gt; 404 in 0.002121s</code>. During the third probe run the daemon port timed out too:</p>
+<pre>05:32:27 server /health -&gt; 200 in 0.000460s | server /api/v1/threads -&gt; 200 in 2.054506s | daemon / -&gt; 404 in 0.000808s
+05:32:31 server /health -&gt; 200 in 0.030440s | server /api/v1/threads -&gt; 200 in 2.040971s | daemon / -&gt; 404 in 0.001010s
+05:32:36 server /health -&gt; 200 in 0.034359s | server /api/v1/threads -&gt; 200 in 0.001146s | daemon / -&gt; 404 in 0.001073s
+05:32:38 server /health -&gt; 200 in 0.020831s | server /api/v1/threads -&gt; 200 in 4.086693s | daemon / -&gt; 404 in 0.001464s
+05:32:44 server /health -&gt; 200 in 4.121698s | server /api/v1/threads -&gt; 000 in 5.002313s | server /api/v1/threads -&gt; TIMEOUT(5s) | daemon / -&gt; 404 in 0.000861s
+05:32:55 server /health -&gt; 000 in 5.002106s | server /health -&gt; TIMEOUT(5s) | server /api/v1/threads -&gt; 000 in 5.002148s | server /api/v1/threads -&gt; TIMEOUT(5s) | daemon / -&gt; 404 in 0.001317s
+05:33:07 server /health -&gt; 200 in 3.474826s | server /api/v1/threads -&gt; 000 in 5.006310s | server /api/v1/threads -&gt; TIMEOUT(5s) | daemon / -&gt; 000 in 5.002705s
+daemon / -&gt; TIMEOUT(5s)
+05:33:22 server /health -&gt; 000 in 5.002448s | server /health -&gt; TIMEOUT(5s) | server /api/v1/threads -&gt; 200 in 1.399491s | daemon / -&gt; 000 in 5.002223s
+daemon / -&gt; TIMEOUT(5s)
+05:33:36 server /health -&gt; 000 in 5.002383s | server /health -&gt; TIMEOUT(5s) | server /api/v1/threads -&gt; 200 in 4.344347s | daemon / -&gt; 000 in 5.002765s
+daemon / -&gt; TIMEOUT(5s)
+</pre>
+
+  <h3>Actual — where the server is sleeping (<code>wchan-sample.out</code>, sampled every 250 ms)</h3>
+<pre>05:29:07.478 server(1509173) state=S wchan=ep_poll | daemon(1509238) state=S wchan=ep_poll | hog(1513061) state=D wchan=__mem_cgroup_handle_over_high
+05:29:07.751 server(1509173) state=S wchan=ep_poll | daemon(1509238) state=S wchan=ep_poll | hog(1513061) state=D wchan=__mem_cgroup_handle_over_high
+05:29:08.027 server(1509173) state=S wchan=ep_poll | daemon(1509238) state=S wchan=ep_poll | hog(1513061) state=D wchan=__mem_cgroup_handle_over_high
+05:29:08.302 server(1509173) state=S wchan=ep_poll | daemon(1509238) state=S wchan=ep_poll | hog(1513061) state=D wchan=__mem_cgroup_handle_over_high
+05:29:08.577 server(1509173) state=S wchan=ep_poll | daemon(1509238) state=S wchan=ep_poll | hog(1513061) state=D wchan=__mem_cgroup_handle_over_high
+05:29:08.851 server(1509173) state=S wchan=ep_poll | daemon(1509238) state=S wchan=ep_poll | hog(1513061) state=D wchan=__mem_cgroup_handle_over_high
+05:29:09.124 server(1509173) state=S wchan=ep_poll | daemon(1509238) state=S wchan=ep_poll | hog(1513061) state=D wchan=__mem_cgroup_handle_over_high
+05:29:09.398 server(1509173) state=S wchan=ep_poll | daemon(1509238) state=S wchan=ep_poll | hog(1513061) state=D wchan=__mem_cgroup_handle_over_high
+05:29:09.670 server(1509173) state=S wchan=ep_poll | daemon(1509238) state=S wchan=ep_poll | hog(1513061) state=D wchan=__mem_cgroup_handle_over_high
+05:29:09.943 server(1509173) state=S wchan=ep_poll | daemon(1509238) state=S wchan=ep_poll | hog(1513061) state=D wchan=__mem_cgroup_handle_over_high
+05:29:10.219 server(1509173) state=S wchan=ep_poll | daemon(1509238) state=S wchan=ep_poll | hog(1513061) state=D wchan=__mem_cgroup_handle_over_high
+05:29:10.496 server(1509173) state=S wchan=ep_poll | daemon(1509238) state=S wchan=ep_poll | hog(1513061) state=D wchan=__mem_cgroup_handle_over_high
+...
+05:29:22.865 server(1509173) state=S wchan=ep_poll | daemon(1509238) state=S wchan=ep_poll | hog(1513061) state=D wchan=__mem_cgroup_handle_over_high
+05:29:23.138 server(1509173) state=S wchan=ep_poll | daemon(1509238) state=S wchan=ep_poll | hog(1513061) state=D wchan=__mem_cgroup_handle_over_high
+05:29:23.412 server(1509173) state=S wchan=ep_poll | daemon(1509238) state=S wchan=ep_poll | hog(1513061) state=D wchan=__mem_cgroup_handle_over_high
+05:29:23.687 server(1509173) state=S wchan=ep_poll | daemon(1509238) state=S wchan=ep_poll | hog(1513061) state=D wchan=__mem_cgroup_handle_over_high</pre>
+
+  <h3>Actual — cgroup view and cgroup members (<code>run-in-scope-v2.out</code>, first rounds)</h3>
+<pre>cgroup: /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-p1509151-i1521275.scope
+memory.high=838860800 memory.max=2306867200 memory.swap.max=67108864
+launcher pid 1509159
+server healthy after 2s
+--- baseline processes in the scope
+  1509151	script	bash /tmp/bb-reports/issues/1334/repro/run-in-scope-v2.sh /home/sawyer/projects/bb/.claude/worktrees/wf_debcf606-e4a-18 /tmp/bb-1334-scope-d
+  1509159	launcher	node /home/sawyer/projects/bb/.claude/worktrees/wf_debcf606-e4a-18/packages/bb-app/dist/bb-app.js --data-dir /tmp/bb-1334-scope-data --serve
+  1509173	server	/home/sawyer/.nvm/versions/node/v24.18.0/bin/node /home/sawyer/projects/bb/.claude/worktrees/wf_debcf606-e4a-18/packages/bb-app/server/dist/
+  1509238	daemon	/home/sawyer/.nvm/versions/node/v24.18.0/bin/node /home/sawyer/projects/bb/.claude/worktrees/wf_debcf606-e4a-18/packages/bb-app/host-daemon/
+  1509416	daemon	/home/sawyer/.nvm/versions/node/v24.18.0/bin/node /home/sawyer/projects/bb/.claude/worktrees/wf_debcf606-e4a-18/packages/bb-app/host-daemon/
+  1509430	daemon	/home/sawyer/.nvm/versions/node/v24.18.0/bin/node /home/sawyer/projects/bb/.claude/worktrees/wf_debcf606-e4a-18/packages/bb-app/host-daemon/
+  1513002	other	
+--- baseline memory.current=572182528 events: low 0 high 0 max 0 oom 0 oom_kill 0 oom_group_kill 0 sock_throttled 0 
+--- baseline latency
+server /health           -&gt; 200 in 0.001352s
+server /health           -&gt; 200 in 0.000803s
+server /health           -&gt; 200 in 0.000921s
+server /api/v1/threads   -&gt; 200 in 0.002189s
+daemon /                 -&gt; 404 in 0.002121s
+--- starting 3 light API load loops (what an open browser tab / CLI does)
+--- starting memhog (1024 MiB, hold 200s) inside the same cgroup at 05:19:27
+=== 05:19:40 t+10s memory.current=894570496 high=838860800 swap.current=66985984
+memory.events: low 0 high 15631 max 0 oom 0 oom_kill 0 oom_group_kill 0 sock_throttled 72 
+memory.pressure: some avg10=39.72 avg60=11.07 avg300=2.51 total=7889790 full avg10=39.62 avg60=11.04 avg300=2.50 total=7854699 
+server  /health         -&gt; 200 in 0.002564s
+server  /api/v1/threads -&gt; 200 in 0.001976s
+daemon  /               -&gt; 404 in 0.001620s
+  pid 1509151  role=script        state=S wchan=anon_pipe_read
+  pid 1509159  role=launcher      state=S wchan=ep_poll
+  pid 1509173  role=server        state=D wchan=ep_poll
+  pid 1509238  role=daemon        state=S wchan=ep_poll
+  pid 1509416  role=daemon        state=S wchan=ep_poll
+  pid 1509430  role=daemon        state=S wchan=ep_poll
+  pid 1513054  role=script        state=S wchan=do_wait
+  pid 1513055  role=script        state=S wchan=do_wait
+  pid 1513057  role=script        state=S wchan=do_wait
+  pid 1513061  role=MEMHOG        state=D wchan=__mem_cgroup_handle_over_high
+=== 05:21:19 t+20s memory.current=920174592 high=838860800 swap.current=66883584
+memory.events: low 0 high 46073 max 0 oom 0 oom_kill 0 oom_group_kill 0 sock_throttled 90 
+memory.pressure: some avg10=67.98 avg60=56.92 avg300=22.13 total=80680309 full avg10=67.83 avg60=56.86 avg300=22.10 total=80554369 
+server  /health         -&gt; 200 in 0.000906s
+server  /api/v1/threads -&gt; 200 in 0.002889s
+daemon  /               -&gt; 404 in 0.001216s
+  pid 1509151  role=script        state=S wchan=anon_pipe_read
+  pid 1509159  role=launcher      state=S wchan=ep_poll
+  pid 1509173  role=server        state=D wchan=ep_poll
+  pid 1509238  role=daemon        state=S wchan=ep_poll
+  pid 1509416  role=daemon        state=S wchan=ep_poll
+  pid 1509430  role=other         state=S wchan=ep_poll
+  pid 1513054  role=script        state=S wchan=do_wait
+  pid 1513055  role=script        state=S wchan=do_wait
+  pid 1513057  role=script        state=S wchan=do_wait
+  pid 1513061  role=MEMHOG        state=D wchan=__mem_cgroup_handle_over_high
+=== 05:27:27 t+30s memory.current=976719872 high=838860800 swap.current=66850816</pre>
+  <p>Note the wall-clock gaps between rounds (t+10 s printed at 05:19:40, t+20 s at 05:21:19, t+30 s at 05:27:27): the probing <em>bash script itself</em>, being in the same cgroup, was throttled on every <code>fork()</code>. That is what happens to anything bb spawns (git, provider CLIs, tool commands) inside a pressured cgroup. After the hog was killed:</p>
+<pre>  pid 1513055  role=script        state=S wchan=do_wait
+  pid 1513057  role=script        state=S wchan=do_wait
+  pid 1736336  role=daemon        state=S wchan=ep_poll
+--- 05:36:08 after hog exit
+memory.current=703053824 events: low 0 high 109119 max 0 oom 0 oom_kill 0 oom_group_kill 0 sock_throttled 731 
+server  /health         -&gt; 200 in 0.000611s
+daemon  /               -&gt; 404 in 0.000878s
+launcher exited</pre>
+
+  <h3>Actual — what the server and daemon logged (<code>launcher.out</code>, excerpt)</h3>
+<pre>[05:33:04] INFO: [server] Event loop stalled {&quot;intervalMs&quot;:5000,&quot;maxDelayMs&quot;:10242.5,&quot;meanDelayMs&quot;:10238.3,&quot;p99DelayMs&quot;:10242.5,&quot;resolutionMs&quot;:20,&quot;thresholdMs&quot;:500,&quot;currentWork&quot;:null,&quot;lastWork&quot;:&quot;GET /api/v1/threads&quot;,&quot;lastWorkMs&quot;:0.4,&quot;slowestWork&quot;:&quot;GET /api/v1/hosts&quot;,&quot;slowestWorkMs&quot;:0.5}
+[05:33:06] INFO: [server] Slow DB query {&quot;bindingArgumentCount&quot;:3,&quot;durationMs&quot;:2045.1,&quot;operation&quot;:&quot;get&quot;,&quot;sql&quot;:&quot;update \&quot;host_daemon_sessions\&quot; set \&quot;lease_expires_at\&quot; = ?, \&quot;updated_at\&quot; = ? where \&quot;host_daemon_sessions\&quot;.\&quot;id\&quot; = ? returning \&quot;id\&quot;, \&quot;host_id\&quot;, \&quot;instance_id\&quot;, \&quot;host_name\&quot;, \&quot;host_type\&quot;, \&quot;data_dir\&quot;, \&quot;protocol_version\&quot;, \&quot;heartbeat_interval_ms\&quot;, \&quot;lease_timeout_ms\&quot;, \&quot;status\&quot;, \&quot;lease_expires_at\&quot;, \&quot;closed_at\&quot;, \&quot;close_reason\&quot;, \&quot;created_at\&quot;, \&quot;updated_at\&quot;&quot;,&quot;thresholdMs&quot;:100}
+[05:33:10] INFO: [server] Event loop stalled {&quot;intervalMs&quot;:5000,&quot;maxDelayMs&quot;:2047.9,&quot;meanDelayMs&quot;:2046.8,&quot;p99DelayMs&quot;:2047.9,&quot;resolutionMs&quot;:20,&quot;thresholdMs&quot;:500,&quot;currentWork&quot;:&quot;GET /api/v1/system/version&quot;,&quot;lastWork&quot;:&quot;GET /api/v1/threads&quot;,&quot;lastWorkMs&quot;:1.1,&quot;slowestWork&quot;:&quot;GET /api/v1/system/version&quot;,&quot;slowestWorkMs&quot;:4084.4}
+[05:33:17] INFO: [server] Event loop stalled {&quot;intervalMs&quot;:5000,&quot;maxDelayMs&quot;:2050,&quot;meanDelayMs&quot;:2049.4,&quot;p99DelayMs&quot;:2050,&quot;resolutionMs&quot;:20,&quot;thresholdMs&quot;:500,&quot;currentWork&quot;:&quot;GET /api/v1/hosts/host_zgj5r8yyt9/provider-clis/status&quot;,&quot;lastWork&quot;:&quot;GET /api/v1/threads&quot;,&quot;lastWorkMs&quot;:0.6,&quot;slowestWork&quot;:&quot;GET /api/v1/hosts/host_zgj5r8yyt9/provider-clis/status&quot;,&quot;slowestWorkMs&quot;:6145.4}
+[05:33:25] INFO: [server] Event loop stalled {&quot;intervalMs&quot;:5000,&quot;maxDelayMs&quot;:4095.7,&quot;meanDelayMs&quot;:2721.4,&quot;p99DelayMs&quot;:4095.7,&quot;resolutionMs&quot;:20,&quot;thresholdMs&quot;:500,&quot;currentWork&quot;:&quot;GET /api/v1/hosts/host_zgj5r8yyt9/provider-clis/status | GET /api/v1/system/execution-options | GET /api/v1/system/onboarding/agents | GET /api/v1/plugins/automations/assets/app.js | GET /api/v1/plugins/connect/assets/app.js | GET /api/v1/plugins/custom-instructions/assets/app.js&quot;,&quot;lastWork&quot;:&quot;GET /api/v1/threads&quot;,&quot;lastWorkMs&quot;:0.8,&quot;slowestWork&quot;:&quot;GET /api/v1/hosts/host_zgj5r8yyt9/provider-clis/status&quot;,&quot;slowestWorkMs&quot;:14332.7}
+[05:33:31] INFO: [server] Event loop stalled {&quot;intervalMs&quot;:5000,&quot;maxDelayMs&quot;:2048.9,&quot;meanDelayMs&quot;:2048.4,&quot;p99DelayMs&quot;:2048.9,&quot;resolutionMs&quot;:20,&quot;thresholdMs&quot;:500,&quot;currentWork&quot;:&quot;GET /api/v1/hosts/host_zgj5r8yyt9/provider-clis/status | GET /api/v1/system/execution-options | GET /api/v1/system/onboarding/agents | GET /api/v1/plugins/automations/assets/app.js | GET /api/v1/plugins/connect/assets/app.js | GET /api/v1/plugins/custom-instructions/assets/app.js&quot;,&quot;lastWork&quot;:&quot;GET /api/v1/threads&quot;,&quot;lastWorkMs&quot;:0.8,&quot;slowestWork&quot;:&quot;GET /api/v1/hosts/host_zgj5r8yyt9/provider-clis/status&quot;,&quot;slowestWorkMs&quot;:20478.4}
+[05:33:37] INFO: [server] Event loop stalled {&quot;intervalMs&quot;:5000,&quot;maxDelayMs&quot;:2048.9,&quot;meanDelayMs&quot;:1531.1,&quot;p99DelayMs&quot;:2048.9,&quot;resolutionMs&quot;:20,&quot;thresholdMs&quot;:500,&quot;currentWork&quot;:&quot;GET /api/v1/hosts/host_zgj5r8yyt9/provider-clis/status | GET /api/v1/system/execution-options | GET /api/v1/system/onboarding/agents | GET /api/v1/plugins/automations/assets/app.js | GET /api/v1/plugins/connect/assets/app.js | GET /api/v1/plugins/custom-instructions/assets/app.js&quot;,&quot;lastWork&quot;:&quot;GET /api/v1/projects&quot;,&quot;lastWorkMs&quot;:0.4,&quot;slowestWork&quot;:&quot;GET /api/v1/hosts/host_zgj5r8yyt9/provider-clis/status&quot;,&quot;slowestWorkMs&quot;:26622.4}
+[05:33:45] INFO: [server] Event loop stalled {&quot;intervalMs&quot;:5000,&quot;maxDelayMs&quot;:4097.8,&quot;meanDelayMs&quot;:4096.8,&quot;p99DelayMs&quot;:4097.8,&quot;resolutionMs&quot;:20,&quot;thresholdMs&quot;:500,&quot;currentWork&quot;:&quot;GET /api/v1/system/execution-options | GET /api/v1/system/onboarding/agents | GET /api/v1/plugins/automations/assets/app.js | GET /api/v1/plugins/connect/assets/app.js | GET /api/v1/plugins/custom-instructions/assets/app.js | GET /api/v1/plugins/inline-vis/assets/app.js&quot;,&quot;lastWork&quot;:&quot;GET /api/v1/providers&quot;,&quot;lastWorkMs&quot;:0.1,&quot;slowestWork&quot;:&quot;GET /api/v1/hosts/host_zgj5r8yyt9/provider-clis/status&quot;,&quot;slowestWorkMs&quot;:30719.4}
+[05:33:47] WARN: [server] Failed to resolve known ACP agent status {&quot;errorCode&quot;:&quot;command_timeout&quot;,&quot;errorMessage&quot;:&quot;Timed out waiting for command result&quot;,&quot;errorStatus&quot;:504,&quot;hostId&quot;:&quot;host_zgj5r8yyt9&quot;}
+[05:33:53] INFO: [server] Event loop stalled {&quot;intervalMs&quot;:5000,&quot;maxDelayMs&quot;:4093.6,&quot;meanDelayMs&quot;:3071,&quot;p99DelayMs&quot;:4093.6,&quot;resolutionMs&quot;:20,&quot;thresholdMs&quot;:500,&quot;currentWork&quot;:&quot;GET /api/v1/system/execution-options | GET /api/v1/plugins/automations/assets/app.js | GET /api/v1/plugins/connect/assets/app.js | GET /api/v1/plugins/custom-instructions/assets/app.js | GET /api/v1/plugins/inline-vis/assets/app.js&quot;,&quot;lastWork&quot;:&quot;GET /api/v1/providers&quot;,&quot;lastWorkMs&quot;:0.2,&quot;slowestWork&quot;:&quot;GET /api/v1/system/execution-options&quot;,&quot;slowestWorkMs&quot;:36856.5}
+[05:34:02] INFO: [server] Event loop stalled {&quot;intervalMs&quot;:5000,&quot;maxDelayMs&quot;:4108.3,&quot;meanDelayMs&quot;:1551.8,&quot;p99DelayMs&quot;:4108.3,&quot;resolutionMs&quot;:20,&quot;thresholdMs&quot;:500,&quot;currentWork&quot;:&quot;GET /api/v1/system/execution-options | GET /api/v1/plugins/automations/assets/app.js | GET /api/v1/plugins/connect/assets/app.js | GET /api/v1/plugins/inline-vis/assets/app.js | GET /api/v1/plugins/keep-awake/assets/app.js | GET /api/v1/plugins/provider-acp/assets/app.js&quot;,&quot;lastWork&quot;:&quot;GET /api/v1/hosts&quot;,&quot;lastWorkMs&quot;:0.7,&quot;slowestWork&quot;:&quot;GET /api/v1/system/execution-options&quot;,&quot;slowestWorkMs&quot;:45112.9}
+[05:33:45] WARN: [host-daemon] Host daemon event loop stalled {&quot;serverUrl&quot;:&quot;http://127.0.0.1:48861&quot;,&quot;intervalMs&quot;:5000,&quot;maxDelayMs&quot;:34863.1,&quot;meanDelayMs&quot;:830,&quot;p99DelayMs&quot;:34863.1,&quot;resolutionMs&quot;:20,&quot;thresholdMs&quot;:500}
+[05:33:45] WARN: [host-daemon] Host daemon heartbeat timer delayed {&quot;serverUrl&quot;:&quot;http://127.0.0.1:48861&quot;,&quot;gapMs&quot;:35688,&quot;heartbeatIntervalMs&quot;:5000,&quot;leaseTimeoutMs&quot;:30000,&quot;sessionId&quot;:&quot;hses_5pyrgux2sv&quot;,&quot;websocketReadyState&quot;:1}
+[05:34:02] WARN: [host-daemon] Host daemon heartbeat timer delayed {&quot;serverUrl&quot;:&quot;http://127.0.0.1:48861&quot;,&quot;gapMs&quot;:16572,&quot;heartbeatIntervalMs&quot;:5000,&quot;leaseTimeoutMs&quot;:30000,&quot;sessionId&quot;:&quot;hses_5pyrgux2sv&quot;,&quot;websocketReadyState&quot;:1}</pre>
+  <p>Totals for the run: 72 <code>Event loop stalled</code> lines in <code>server.log</code>, 20 <code>Slow DB query</code> lines (a one-row <code>update host_daemon_sessions</code> heartbeat took 2045 ms), 17 daemon warnings in <code>host-daemon.log</code> (15 <code>Host daemon event loop stalled</code> + 2 <code>heartbeat timer delayed</code>, only one of which — <code>gapMs 35688</code> — exceeded the 30 s lease), one provider RPC <code>command_timeout</code>. The maximum per-stall delay clusters at 2048 ms and multiples of it because the kernel caps each over-high penalty at 2 s (<code>MEMCG_MAX_HIGH_DELAY_JIFFIES</code>).</p>
+  <p>The hog itself was throttled hardest: it reached only 512 MiB in 782 s (<code>memhog.out</code>), so the cgroup only ever exceeded <code>memory.high</code> by ~100–170 MiB. Even that modest, sustained overage was enough for the effects above; the reporter's cgroup was ~300 MiB over for a long time with far more allocating processes.</p>
+<pre>memhog: resident ~32 MiB after 0.0s
+memhog: resident ~64 MiB after 0.0s
+memhog: resident ~96 MiB after 0.0s
+memhog: resident ~128 MiB after 0.0s
+memhog: resident ~160 MiB after 0.1s
+memhog: resident ~192 MiB after 0.1s
+memhog: resident ~224 MiB after 0.1s
+memhog: resident ~256 MiB after 0.1s
+memhog: resident ~288 MiB after 0.2s
+memhog: resident ~320 MiB after 0.9s
+memhog: resident ~352 MiB after 17.4s
+memhog: resident ~384 MiB after 45.4s
+memhog: resident ~416 MiB after 121.0s
+memhog: resident ~448 MiB after 267.3s
+memhog: resident ~480 MiB after 464.3s
+memhog: resident ~512 MiB after 782.1s
+</pre>
+
+  <h3>Visual: web UI served by the throttled server</h3>
+  <figure><img src="assets/1334-app-under-pressure-a.png" alt="bb web app showing sidebar loading skeleton and empty main pane"><figcaption>Screenshot A — <code>http://127.0.0.1:48861/</code> in headless Chromium while the hog ran (external load loops active). <code>page.goto</code> took 6.6 s to DOMContentLoaded; 4 s later the sidebar still shows the grey loading skeleton and the main pane is blank. There is no message about the host being under pressure.</figcaption></figure>
+  <figure><img src="assets/1334-app-under-pressure-b.png" alt="bb web app finally rendered home screen"><figcaption>Screenshot B — the same tab about 30 s later. At my (mild) pressure level the requests eventually completed and the home screen rendered; at the reporter's pressure level (199 s timeline query) the skeleton simply never resolves.</figcaption></figure>
+
+  <h3>Unit-level repro of the liveness gap (passes on main; documents current behaviour)</h3>
+  <p><code>apps/server/test/hosts/issue-1334/frozen-daemon-liveness.repro.test.ts</code> (copy at <a href="1334/repro/frozen-daemon-liveness.repro.test.ts">1334/repro/frozen-daemon-liveness.repro.test.ts</a>). Run from <code>apps/server</code>: <code>pnpm exec vitest run test/hosts/issue-1334/</code> → <code>2 passed | 1 expected fail</code>. The two passing tests assert what the server does today (host <code>connected</code>, thread <code>active</code> with <code>hostReconnectGraceExpiresAt: null</code>) for a daemon whose lease expired 5 minutes ago but whose socket is still registered; the <code>it.fails</code> case states the desired behaviour.</p>
+<pre>/**
+ * Repro for get-bb/bb#1334 (control-plane view of the failure).
+ *
+ * A host daemon that is throttled by cgroup memory reclaim (or otherwise
+ * frozen) keeps its TCP/WebSocket connection open — the kernel still ACKs —
+ * but stops sending `heartbeat` messages, so `lease_expires_at` goes stale.
+ *
+ * Since #421 the server derives host liveness ONLY from the in-memory socket
+ * registration in NotificationHub and never looks at the lease. As a result a
+ * frozen daemon is reported &quot;connected&quot;, its active threads stay `active`
+ * with no reconnect deadline, and nothing ever fails or pauses the turn. The
+ * UI therefore spins indefinitely with no actionable state.
+ *
+ * Every assertion below documents CURRENT behavior (they pass on main). The
+ * `.fails` variants state what a resource-exhaustion-aware server should do.
+ */
+import { randomUUID } from &quot;node:crypto&quot;;
+import { eq } from &quot;drizzle-orm&quot;;
+import { describe, expect, it } from &quot;vitest&quot;;
+import {
+  createConnection,
+  hostDaemonSessions,
+  migrate,
+  noopNotifier,
+  openSession,
+  upsertHost,
+} from &quot;@bb/db&quot;;
+import { LEASE_TIMEOUT_MS } from &quot;../../../src/constants.js&quot;;
+import { listPublicHostsWithStatus } from &quot;../../../src/services/lib/entity-lookup.js&quot;;
+import { resolveThreadRuntimeState } from &quot;../../../src/services/threads/thread-runtime-display.js&quot;;
+import { NotificationHub } from &quot;../../../src/ws/hub.js&quot;;
+
+function setupFrozenDaemon(args: { frozenForMs: number }) {
+  const db = createConnection(&quot;:memory:&quot;);
+  migrate(db);
+  const hub = new NotificationHub();
+  const host = upsertHost(db, noopNotifier, {
+    id: &quot;host-frozen&quot;,
+    name: &quot;Frozen Host&quot;,
+    type: &quot;persistent&quot;,
+  });
+  const now = 10 * 60_000;
+  const session = openSession(db, noopNotifier, {
+    hostId: host.id,
+    instanceId: `instance-${randomUUID()}`,
+    hostName: &quot;Frozen Host&quot;,
+    hostType: &quot;persistent&quot;,
+    dataDir: &quot;/tmp/host-frozen&quot;,
+    protocolVersion: 1,
+    heartbeatIntervalMs: 5_000,
+    leaseTimeoutMs: LEASE_TIMEOUT_MS,
+  });
+  // The daemon last heart-beat `frozenForMs` ago; the lease is long expired.
+  db.update(hostDaemonSessions)
+    .set({ leaseExpiresAt: now - args.frozenForMs + LEASE_TIMEOUT_MS })
+    .where(eq(hostDaemonSessions.id, session.id))
+    .run();
+  // ...but its socket is still registered: a throttled process does not
+  // close its TCP connections.
+  hub.registerDaemon(session.id, host.id, { close() {}, send() {} });
+  return { db, hub, hostId: host.id, now, session };
+}
+
+describe(&quot;#1334 frozen (throttled) daemon is indistinguishable from a healthy one&quot;, () =&gt; {
+  const frozenForMs = 5 * 60_000; // 5 minutes without a heartbeat (lease is 30s)
+
+  it(&quot;reports the host as connected although no heartbeat arrived for 5 minutes&quot;, () =&gt; {
+    const { db, hub, hostId } = setupFrozenDaemon({ frozenForMs });
+    const host = listPublicHostsWithStatus({ db, hub }).find((h) =&gt; h.id === hostId);
+    expect(host?.status).toBe(&quot;connected&quot;); // current behavior
+  });
+
+  it(&quot;keeps the thread `active` with no reconnect/failure deadline&quot;, () =&gt; {
+    const { db, hub, hostId, now } = setupFrozenDaemon({ frozenForMs });
+    expect(
+      resolveThreadRuntimeState(
+        { db, hub },
+        { environmentHostId: hostId, now, status: &quot;active&quot; },
+      ),
+    ).toEqual({ displayStatus: &quot;active&quot;, hostReconnectGraceExpiresAt: null }); // spinner forever
+  });
+
+  it.fails(&quot;SHOULD surface a stale/unresponsive host state after the lease expires&quot;, () =&gt; {
+    const { db, hub, hostId, now } = setupFrozenDaemon({ frozenForMs });
+    const state = resolveThreadRuntimeState(
+      { db, hub },
+      { environmentHostId: hostId, now, status: &quot;active&quot; },
+    );
+    // Desired: some non-&quot;active&quot; display status (e.g. waiting-for-host /
+    // host-unresponsive) or a deadline after which the turn is failed.
+    expect(state.displayStatus).not.toBe(&quot;active&quot;);
+  });
+});
+</pre>
+
+  <h2>Root cause</h2>
+  <h3>1. One process tree, one cgroup: no containment boundary between control and execution planes</h3>
+  <p>The full-stack path of the launcher spawns the server and daemon with a plain <code>child_process.spawn</code>:</p>
+<pre>function spawnManagedProcess(args: ManagedSpawnArgs): ChildProcess {
+  const child = spawn(args.command, args.args, {
+    cwd: process.cwd(),
+    env: args.env,
+    stdio: [&quot;ignore&quot;, &quot;pipe&quot;, &quot;inherit&quot;],
+  });</pre>
+  <p><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/bb-app/src/launcher.ts#L2264-L2270"><code>packages/bb-app/src/launcher.ts#L2264-L2270</code></a>, used by <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/bb-app/src/launcher.ts#L2898-L2966"><code>packages/bb-app/src/launcher.ts#L2898-L2966</code></a>. The daemon in turn spawns provider bridges (e.g. <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/provider-codex/src/bridge/app-server-connection.ts#L111"><code>plugins/provider-codex/src/bridge/app-server-connection.ts#L111</code></a>) and, through them, agent tool commands. On Linux a child inherits its parent's cgroup unconditionally, and cgroup membership survives reparenting, so <b>anything the agent starts is billed to the same <code>memory.high</code> as the server</b>. cgroup v2's <code>memory.high</code> is enforced by making each allocating task in the cgroup reclaim and then sleep in <code>mem_cgroup_handle_over_high</code> (penalty proportional to the square of the overage, capped at 2 s per allocation batch). The server allocates on every request (JSON, SQLite result rows, WebSocket frames), so it is throttled in lock-step with the runaway workload. That is exactly the <code>state=D wchan=__mem_cgroup_handle_over_high</code> and the 2048 ms-quantised event-loop stalls observed. Kernel <code>MemoryMax</code> would instead OOM-kill the largest task — often the server, whose V8 heap is sized from host RAM (#1748) — so neither knob gives containment.</p>
+  <p>The launcher's command set (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/bb-app/src/launcher.ts#L1397-L1446"><code>packages/bb-app/src/launcher.ts#L1397-L1446</code></a>) has <code>host-daemon</code> (daemon-only) but no server-only mode; the help text (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/bb-app/src/launcher.ts#L2868-L2884"><code>packages/bb-app/src/launcher.ts#L2868-L2884</code></a>) never mentions the packaged <code>bb-server</code> bin. So an operator following the docs has no way to put the daemon in its own systemd unit/slice on the same machine, and the reporter's escape was a second machine.</p>
+  <p><b>Correction (after independent verification):</b> the split is <em>technically</em> possible today, it is just undocumented and unsupported. The packaged <code>bb-server</code> bin (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/bb-app/src/launcher.ts#L2626-L2680"><code>packages/bb-app/src/launcher.ts#L2626-L2680</code></a>) spawns only the server, and <code>bb-app host-daemon join --server-url http://127.0.0.1:&lt;port&gt;</code> (the documented multi-machine path from <code>docs/multiple-devices.md</code>, which even shows a systemd unit for it) enrolls a daemon against a loopback server. I re-ran that combination on the base commit (<a href="1334/repro/split-deploy-check.out">split-deploy-check.out</a>):</p>
+<pre>bb-server pid 1854082
+--- /health after server-only start
+{"ok":true}
+--- /api/v1/hosts with only bb-server running (expect [] : no daemon was spawned)
+[]
+--- process tree of bb-server (no host-daemon child expected)
+    PID    PPID CMD
+1854082 1854078 node .../packages/bb-app/dist/bb-server.js --data-dir /tmp/bb-1334-split/server-data -
+1854097 1854082 /home/sawyer/.nvm/versions/node/v24.18.0/bin/node .../packages/bb-app/server/dist/inde
+bb-app host-daemon join pid 1854124
+--- /api/v1/hosts after host-daemon join
+[{"id":"host_imcwxd3gzq","name":"bee","type":"persistent","status":"connected",...}]
+[05:57:59] INFO: [host-daemon] Connected to server {"serverUrl":"http://127.0.0.1:48881","sessionId":"hses_uqynnqkny5"}
+[05:57:59] INFO: [host-daemon] Host daemon started {"serverUrl":"http://127.0.0.1:48881","identity":{"hostId":"host_imcwxd3gzq","hostName":"bee",...}}</pre>
+  <p>Because the two are independent top-level processes, an operator can already run them under two systemd units with different <code>MemoryHigh</code>/<code>MemoryMax</code>, which is exactly the containment this issue asks for — as an <em>interim workaround</em>. What is missing is product support: <code>bb-server</code> has no help entry in <code>bb-app --help</code>, is mentioned in no doc, and the installer/service generator only ever produces the combined launcher; primary-host resolution silently falls back to "the single connected host" when the server's data dir has no <code>host-id</code> file (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/hosts/primary-host.ts#L70-L76"><code>apps/server/src/services/hosts/primary-host.ts#L70-L76</code></a> — sharing one data dir between the two, as in <a href="1334/repro/split-deploy-check-shared.out">split-deploy-check-shared.out</a>, makes <code>primaryHostId</code> resolve deterministically); <code>bb-app host-daemon</code> without <code>join</code> refuses to start un-enrolled and ignores <code>--server-port</code>; and the <code>bb-server</code> wrapper does not forward SIGTERM to its child server (killing the wrapper orphaned the server in my first run — harmless under systemd's <code>KillMode=control-group</code>, surprising in a shell). None of this is tested. So the accurate statement is: <b>the deployment split exists as an unadvertised side effect of the multi-machine feature, not as a supported single-machine isolation mode.</b></p>
+
+  <h3>2. The server cannot tell a frozen daemon from a healthy one</h3>
+  <p>#421 (<code>0461d6bbd</code>) deliberately made process-local socket registration the sole liveness authority and removed the lease-expiry sweep, to survive laptop sleep. Consequences on this code path:</p>
+<pre>// thread-runtime-display.ts
+function hasOpenDaemonSessionForHost(deps, hostId): boolean {
+  const sessionId = deps.hub.getDaemonSessionIdForHost(hostId);
+  if (!sessionId) return false;
+  const session = getSessionById(deps.db, { sessionId });
+  return session?.hostId === hostId &amp;&amp; session.status === &quot;active&quot;;
+}
+// entity-lookup.ts
+getOpenDaemonSessionForHost(deps, row.id) ? &quot;connected&quot; : &quot;disconnected&quot;</pre>
+  <p><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/thread-runtime-display.ts#L143-L153"><code>apps/server/src/services/threads/thread-runtime-display.ts#L143-L153</code></a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/lib/entity-lookup.ts#L104-L113"><code>apps/server/src/services/lib/entity-lookup.ts#L104-L113</code></a>. Daemon messages still renew <code>lease_expires_at</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/ws/daemon-protocol.ts#L110-L121"><code>apps/server/src/ws/daemon-protocol.ts#L110-L121</code></a>) but the only readers are shared-port bookkeeping (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/ws/host-shared-ports.ts#L263"><code>host-shared-ports.ts#L263</code></a>) and the read-only internal diagnostic in <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/internal/session-state.ts#L104-L107"><code>internal/session-state.ts#L104-L107</code></a> (<code>leaseStaleByMs</code>), neither of which feeds host status or thread state. A throttled daemon keeps its TCP connection (the kernel ACKs on its behalf) while its heartbeat timer slips — in the repro the daemon logged <code>heartbeat timer delayed gapMs 35688</code> against <code>leaseTimeoutMs 30000</code> — and the server kept reporting <code>connected</code>. Threads therefore stay <code>active</code> with <code>hostReconnectGraceExpiresAt: null</code>, and neither the daemon-disconnect grace (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/constants.ts#L1-L5"><code>apps/server/src/constants.ts#L1-L5</code></a>) nor any turn deadline ever fires. That is the "spinner without explanation".</p>
+  <p><b>How strong is the lease signal for this failure mode?</b> Weaker than the unit test suggests. Reclaim throttling <em>slows</em> the daemon rather than freezing it: in my run 15 daemon stalls but only one heartbeat gap above the 30 s lease (35.7 s), and in the verifier's run the daemon never missed the lease (max stall 1.9 s) while external clients were already hitting 5 s timeouts against the server. So "socket alive AND lease stale" catches only the severe end (a fully wedged daemon, or the reporter's 199 s-query regime); most throttling episodes would pass it. The primary signal must come from elsewhere: the server observing itself (its own event-loop stall monitor already measures exactly this and only logs), and the daemon reporting raw cgroup <code>memory.pressure</code>/<code>memory.events</code> for its own cgroup. The lease check is a cheap secondary that costs nothing to add.</p>
+
+  <h3>3. Nobody measures pressure</h3>
+  <p>Both processes have event-loop stall monitors (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/system/event-loop-stall-monitor.ts#L34-L60"><code>apps/server/src/services/system/event-loop-stall-monitor.ts#L34-L60</code></a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/event-loop-stall-monitor.ts#L50"><code>apps/host-daemon/src/event-loop-stall-monitor.ts#L50</code></a>) that only <em>log</em>. There is no reading of <code>memory.pressure</code>/PSI or <code>memory.events</code>, no admission control on new turns (see #1393), and no host-health field in the API/UI beyond connected/disconnected. The daemon's idle provider reaper runs every 5 min with a 30 min idle threshold (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/app.ts#L66-L67"><code>apps/host-daemon/src/app.ts#L66-L67</code></a>), so up to dozens of idle app-servers can sit resident (comment 2's 17 Codex app-servers for 4 threads).</p>
+
+  <h2>Proposed fix (first principles)</h2>
+  <p>This is architectural; there is no one-line fix. In order of leverage:</p>
+  <ol>
+    <li><b>Make the split deployment supported instead of accidental.</b> The pieces exist (<code>bb-server</code> bin + <code>bb-app host-daemon join</code>, verified above); what is missing is: expose <code>bb-server</code> as <code>bb-app server</code> in the CLI help, document the pair in <code>docs/</code> (and the CLI guide/skill per AGENTS.md), have the installer/service generator optionally emit two units (server unit with modest limits; daemon unit with the big <code>MemoryHigh</code>/<code>MemoryMax</code>, sharing the data dir so <code>host-id</code>-based primary-host resolution stays deterministic), make <code>bb-app host-daemon</code> honour <code>--server-port</code>/auto-enroll against a loopback server without the <code>join</code> dance, forward signals in the <code>bb-server</code> wrapper, and add a test that the split boots and enrolls. <em>Interim workaround for operators today:</em> <code>node …/bb-app/dist/bb-server.js --data-dir D --server-port P</code> in one unit and <code>bb-app --data-dir D host-daemon join --server-url http://127.0.0.1:P</code> in another (the join is one-time; afterwards <code>bb-app --data-dir D host-daemon</code> starts from the persisted config).</li>
+    <li><b>Isolate the daemon on Linux even in the single-launcher path.</b> When <code>systemd-run --user</code> is available, start the daemon (or at least its provider/agent process tree) via <code>systemd-run --user --scope --collect -p MemoryHigh=… </code> or by moving its PID into a child cgroup created under the launcher's own cgroup (write to <code>cgroup.procs</code> of a new subdirectory; requires the delegated cgroup that user-services already have). Then agent descendants inherit the <em>daemon's</em> sub-cgroup and the server keeps its own budget. Fallback silently when unavailable (macOS, containers without delegation). Risk: cgroup delegation edge cases; must not break the existing "kill the whole tree on stop" logic.</li>
+    <li><b>Make the control plane pressure-aware without regressing sleep/wake.</b> Primary signals, in order: (a) the server's own event-loop stall monitor (already measures the stalls; today it only logs) should flip a server-side <code>degraded</code> flag that the UI shows as a banner and that gates new-turn admission (#1393); (b) the daemon samples its cgroup's <code>memory.pressure</code> (PSI) and <code>memory.events</code> and ships the raw numbers in its heartbeat (raw data only, per the server/daemon boundary) so the server can mark the host <code>under-pressure</code> and refuse or queue new turns — this changes the heartbeat wire shape → bump <code>HOST_DAEMON_PROTOCOL_VERSION</code>. Secondary: keep socket registration as the liveness authority but treat "socket registered AND lease stale by &gt; N × lease" as an <code>unresponsive</code> host status in <code>/api/v1/hosts</code>, thread <code>displayStatus</code>, and the UI ("host bee is not responding"). As shown above, the lease check alone catches only the severe end, so it must not be the only detector. Risk: false positives after sleep — mitigated by requiring the socket to be alive <em>and</em> stale for well over the lease.</li>
+    <li>Smaller mitigations that reduce the blast radius: cap V8 heap from the cgroup limit (#1748), shorten/idle-reap provider processes more aggressively (#1604), and give provider RPCs an explicit failure when the host is unresponsive rather than a bare 504 <code>command_timeout</code>.</li>
+  </ol>
+
+  <h2>PR review</h2>
+  <p>No linked open PRs.</p>
+
+  <h2>Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/1748">#1748</a> Server heap is sized from host RAM, not the cgroup limit — same deployment, explains why the server is the natural OOM victim and why <code>MemoryHigh</code> is breached so often.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1393">#1393</a> Host lacks global admission control across work sources — the "reject or pause new turns under pressure" half of the ask.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1604">#1604</a> Idle agent processes are never reclaimed for non-Codex providers — resident provider processes inflate the shared budget.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1660">#1660</a> bb host process grew to 77 GB RSS and froze the machine — the un-limited variant of the same failure.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1131">#1131</a>, <a href="https://github.com/get-bb/bb/issues/1207">#1207</a> synchronous SQLite on the event loop — makes each throttling penalty stall the whole server.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1320">#1320</a> (closed) daemon-event batch poisoning — reporter correctly distinguishes it; no rejected batches were seen here either.</li>
+    <li><a href="https://github.com/get-bb/bb/pull/421">#421</a> Harden host session liveness after sleep — the change that removed lease-based liveness (intentional; interacts with this issue).</li>
+  </ul>
+
+  <h2>Appendix</h2>
+  <h3>Commands run</h3>
+<pre>gh issue view 1334 --comments
+pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build
+systemd-run --user --scope --quiet -p MemoryHigh=800M -p MemoryMax=2200M -p MemorySwapMax=64M \
+  /tmp/bb-reports/issues/1334/repro/run-in-scope-v2.sh /home/sawyer/projects/bb/.claude/worktrees/wf_debcf606-e4a-18 \
+  /tmp/bb-1334-scope-data 48861 48862 1024 200 | tee /tmp/bb-reports/issues/1334/repro/run-in-scope-v2.out
+/tmp/bb-reports/issues/1334/repro/external-probe.sh 48861 48862 60 6   # run1
+/tmp/bb-reports/issues/1334/repro/wchan-sample.sh 1509173 1509238 1513061 60
+/tmp/bb-reports/issues/1334/repro/external-probe.sh 48861 48862 90 6   # run2
+curl -s --max-time 20 http://127.0.0.1:48861/api/v1/hosts             # &quot;status&quot;:&quot;connected&quot; during the freeze
+dev-browser --browser bb1334 --headless run screenshot-app.js         # screenshot A (external-probe run3 in background)
+dev-browser --browser bb1334 --headless run screenshot-app-b.js       # screenshot B (run4 in background)
+kill 1513061                                                          # hog; script then stopped the launcher cleanly
+cd apps/server &amp;&amp; pnpm exec vitest run test/hosts/issue-1334/         # 2 passed | 1 expected fail
+# revision (split-deployment cross-check, separate worktree at the same base commit)
+/tmp/bb-reports/issues/1334/repro/split-deploy-check.sh &lt;worktree&gt; 48881 48882 /tmp/bb-1334-split
+/tmp/bb-reports/issues/1334/repro/split-deploy-check-shared.sh &lt;worktree&gt; 48881 48882 /tmp/bb-1334-split-shared</pre>
+  <h3>Files</h3>
+  <ul>
+    <li><a href="1334/repro/run-in-scope-v2.sh">run-in-scope-v2.sh</a>, <a href="1334/repro/memhog.mjs">memhog.mjs</a>, <a href="1334/repro/external-probe.sh">external-probe.sh</a>, <a href="1334/repro/wchan-sample.sh">wchan-sample.sh</a>, <a href="1334/repro/screenshot-app.js">screenshot-app.js</a>, <a href="1334/repro/screenshot-app-b.js">screenshot-app-b.js</a>, <a href="1334/repro/split-deploy-check.sh">split-deploy-check.sh</a>, <a href="1334/repro/split-deploy-check-shared.sh">split-deploy-check-shared.sh</a></li>
+    <li>Outputs: <a href="1334/repro/run-in-scope-v2.out">run-in-scope-v2.out</a>, <a href="1334/repro/external-probe.run1.out">run1</a> / <a href="1334/repro/external-probe.run2.out">run2</a> / <a href="1334/repro/external-probe.run3.out">run3</a> / <a href="1334/repro/external-probe.run4.out">run4</a>, <a href="1334/repro/wchan-sample.out">wchan-sample.out</a>, <a href="1334/repro/launcher.out">launcher.out</a>, <a href="1334/repro/server.log">server.log</a>, <a href="1334/repro/host-daemon.log">host-daemon.log</a>, <a href="1334/repro/memhog.out">memhog.out</a>, <a href="1334/repro/split-deploy-check.out">split-deploy-check.out</a>, <a href="1334/repro/split-deploy-check-shared.out">split-deploy-check-shared.out</a></li>
+    <li>Earlier calibration attempts (milder limits, cut short): <a href="1334/repro/run-in-scope.sh">run-in-scope.sh</a>, <a href="1334/repro/run-in-scope.attempt1-mild.out">attempt1 (MemoryHigh=1200M, hog 768: no throttling, control plane fine)</a>, <a href="1334/repro/run-in-scope.out">attempt2 (MemoryHigh=1000M, hog 1024: pressure 88 %, in-cgroup probes still fast in the first 35 s)</a>. Lesson: without an external client hitting the server it barely allocates and is rarely throttled; the reporter's real UI/CLI traffic is what turns pressure into timeouts.</li>
+  </ul>
+  <h3>Repro scripts (inline)</h3>
+<pre>#!/usr/bin/env bash
+# Repro for get-bb/bb#1334: run the packaged bb-app launcher (server + primary
+# host daemon, exactly what `npx bb-app` / a bb.service unit runs) inside ONE
+# systemd user scope with cgroup-v2 memory limits, then start a memory hog in
+# the SAME cgroup (stand-in for an agent-launched descendant such as a browser
+# automation daemon) and probe the control-plane endpoints.
+#
+# Invoke through systemd-run so everything lands in one cgroup:
+#   systemd-run --user --scope -p MemoryHigh=800M -p MemoryMax=2200M -p MemorySwapMax=64M \
+#     run-in-scope-v2.sh &lt;worktree&gt; &lt;dataDir&gt; &lt;serverPort&gt; &lt;daemonPort&gt; &lt;hogMiB&gt; &lt;holdSeconds&gt;
+set -u
+WT=$1; DATA=$2; SPORT=$3; DPORT=$4; HOG=$5; HOLD=$6
+CG=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)
+echo &quot;cgroup: $CG&quot;
+echo &quot;memory.high=$(cat $CG/memory.high) memory.max=$(cat $CG/memory.max) memory.swap.max=$(cat $CG/memory.swap.max)&quot;
+mkdir -p &quot;$DATA&quot;
+node &quot;$WT/packages/bb-app/dist/bb-app.js&quot; --data-dir &quot;$DATA&quot; --server-port &quot;$SPORT&quot; --host-daemon-port &quot;$DPORT&quot; &gt; &quot;$DATA/launcher.out&quot; 2&gt;&amp;1 &amp;
+LAUNCHER=$!
+echo &quot;launcher pid $LAUNCHER&quot;
+for i in $(seq 1 90); do
+  if curl -fs --max-time 2 &quot;http://127.0.0.1:$SPORT/health&quot; &gt;/dev/null; then echo &quot;server healthy after ${i}s&quot;; break; fi
+  sleep 1
+done
+sleep 10
+role() { # pid -&gt; role label
+  local c; c=$(tr &#x27;\0&#x27; &#x27; &#x27; &lt; /proc/$1/cmdline 2&gt;/dev/null)
+  case &quot;$c&quot; in
+    *bb-app.js*) echo launcher;; *apps/server*|*server-bundle*|*server/dist*) echo server;;
+    *daemon-bundle*|*host-daemon*) echo daemon;; *plugin-host*|*worker*) echo plugin-worker;;
+    *memhog*) echo MEMHOG;; *run-in-scope*) echo script;; *curl*) echo curl;; *) echo &quot;other&quot;;;
+  esac
+}
+dump_procs() {
+  for p in $(cat $CG/cgroup.procs); do
+    st=$(awk &#x27;{print $3}&#x27; /proc/$p/stat 2&gt;/dev/null); wc=$(cat /proc/$p/wchan 2&gt;/dev/null)
+    [ -z &quot;$st&quot; ] &amp;&amp; continue
+    printf &#x27;  pid %-8s role=%-13s state=%s wchan=%s\n&#x27; &quot;$p&quot; &quot;$(role $p)&quot; &quot;$st&quot; &quot;$wc&quot;
+  done
+}
+echo &quot;--- baseline processes in the scope&quot;
+for p in $(cat $CG/cgroup.procs); do printf &#x27;  %s\t%s\t%s\n&#x27; &quot;$p&quot; &quot;$(role $p)&quot; &quot;$(tr &#x27;\0&#x27; &#x27; &#x27; &lt; /proc/$p/cmdline 2&gt;/dev/null | cut -c1-140)&quot;; done
+echo &quot;--- baseline memory.current=$(cat $CG/memory.current) events: $(tr &#x27;\n&#x27; &#x27; &#x27; &lt; $CG/memory.events)&quot;
+echo &quot;--- baseline latency&quot;
+for i in 1 2 3; do curl -s -o /dev/null -w &quot;server /health           -&gt; %{http_code} in %{time_total}s\n&quot; --max-time 5 &quot;http://127.0.0.1:$SPORT/health&quot;; done
+curl -s -o /dev/null -w &quot;server /api/v1/threads   -&gt; %{http_code} in %{time_total}s\n&quot; --max-time 5 &quot;http://127.0.0.1:$SPORT/api/v1/threads&quot;
+curl -s -o /dev/null -w &quot;daemon /                 -&gt; %{http_code} in %{time_total}s\n&quot; --max-time 5 &quot;http://127.0.0.1:$DPORT/&quot;
+echo &quot;--- starting 3 light API load loops (what an open browser tab / CLI does)&quot;
+for n in 1 2 3; do
+  ( while :; do curl -s -o /dev/null --max-time 10 &quot;http://127.0.0.1:$SPORT/api/v1/threads&quot;; curl -s -o /dev/null --max-time 10 &quot;http://127.0.0.1:$SPORT/api/v1/projects&quot;; curl -s -o /dev/null --max-time 10 &quot;http://127.0.0.1:$SPORT/api/v1/hosts&quot;; sleep 0.1; done ) &amp;
+  LOADPIDS[$n]=$!
+done
+echo &quot;--- starting memhog ($HOG MiB, hold ${HOLD}s) inside the same cgroup at $(date +%T)&quot;
+node &quot;$(dirname &quot;$0&quot;)/memhog.mjs&quot; &quot;$HOG&quot; &quot;$HOLD&quot; &gt; &quot;$DATA/memhog.out&quot; 2&gt;&amp;1 &amp;
+HOGPID=$!
+sleep 10
+for round in $(seq 1 14); do
+  echo &quot;=== $(date +%T) t+$((10 + (round-1)*10))s memory.current=$(cat $CG/memory.current) high=$(cat $CG/memory.high) swap.current=$(cat $CG/memory.swap.current)&quot;
+  echo &quot;memory.events: $(tr &#x27;\n&#x27; &#x27; &#x27; &lt; $CG/memory.events)&quot;
+  echo &quot;memory.pressure: $(head -2 $CG/memory.pressure | tr &#x27;\n&#x27; &#x27; &#x27;)&quot;
+  curl -s -o /dev/null -w &quot;server  /health         -&gt; %{http_code} in %{time_total}s\n&quot; --max-time 5 &quot;http://127.0.0.1:$SPORT/health&quot; || echo &quot;server  /health         -&gt; TIMEOUT/ERR after 5s (curl exit $?)&quot;
+  curl -s -o /dev/null -w &quot;server  /api/v1/threads -&gt; %{http_code} in %{time_total}s\n&quot; --max-time 5 &quot;http://127.0.0.1:$SPORT/api/v1/threads&quot; || echo &quot;server  /api/v1/threads -&gt; TIMEOUT/ERR after 5s (curl exit $?)&quot;
+  curl -s -o /dev/null -w &quot;daemon  /               -&gt; %{http_code} in %{time_total}s\n&quot; --max-time 5 &quot;http://127.0.0.1:$DPORT/&quot; || echo &quot;daemon  /               -&gt; TIMEOUT/ERR after 5s (curl exit $?)&quot;
+  dump_procs
+  sleep 10
+done
+kill $HOGPID 2&gt;/dev/null; wait $HOGPID 2&gt;/dev/null
+for n in 1 2 3; do kill ${LOADPIDS[$n]} 2&gt;/dev/null; done
+echo &quot;--- $(date +%T) after hog exit&quot;
+sleep 5
+echo &quot;memory.current=$(cat $CG/memory.current) events: $(tr &#x27;\n&#x27; &#x27; &#x27; &lt; $CG/memory.events)&quot;
+curl -s -o /dev/null -w &quot;server  /health         -&gt; %{http_code} in %{time_total}s\n&quot; --max-time 10 &quot;http://127.0.0.1:$SPORT/health&quot; || echo &quot;server /health still failing&quot;
+curl -s -o /dev/null -w &quot;daemon  /               -&gt; %{http_code} in %{time_total}s\n&quot; --max-time 10 &quot;http://127.0.0.1:$DPORT/&quot; || echo &quot;daemon / still failing&quot;
+kill -INT $LAUNCHER; wait $LAUNCHER
+echo &quot;launcher exited&quot;
+</pre>
+<pre>// Simulates an agent-launched descendant (e.g. a browser automation daemon)
+// that keeps a working set resident inside the bb-app service cgroup.
+// Usage: node memhog.mjs &lt;targetMiB&gt; [holdSeconds]
+const targetMiB = Number(process.argv[2] ?? &quot;1024&quot;);
+const holdSeconds = Number(process.argv[3] ?? &quot;120&quot;);
+const chunkMiB = 32;
+const chunks = [];
+const start = Date.now();
+while (chunks.length * chunkMiB &lt; targetMiB) {
+  const b = Buffer.allocUnsafe(chunkMiB * 1024 * 1024);
+  b.fill(chunks.length &amp; 0xff); // touch every page so it is really resident
+  chunks.push(b);
+  process.stdout.write(
+    `memhog: resident ~${chunks.length * chunkMiB} MiB after ${((Date.now() - start) / 1000).toFixed(1)}s\n`,
+  );
+}
+process.stdout.write(
+  `memhog: holding ${chunks.length * chunkMiB} MiB for ${holdSeconds}s, re-touching pages\n`,
+);
+const end = Date.now() + holdSeconds * 1000;
+let i = 0;
+while (Date.now() &lt; end) {
+  // Keep the working set hot so reclaim cannot push the cgroup back under memory.high.
+  const b = chunks[i % chunks.length];
+  for (let off = 0; off &lt; b.length; off += 4096) b[off] = (b[off] + 1) &amp; 0xff;
+  i++;
+}
+process.stdout.write(&quot;memhog: done\n&quot;);
+</pre>
+<pre>#!/usr/bin/env bash
+# Probe the bb server/daemon from OUTSIDE the limited cgroup (like a browser tab
+# or CLI on the same machine would) while the in-cgroup memory hog runs.
+# usage: external-probe.sh &lt;serverPort&gt; &lt;daemonPort&gt; &lt;seconds&gt; &lt;parallel-load-loops&gt;
+SPORT=$1; DPORT=$2; SECS=$3; PAR=${4:-4}
+END=$((SECONDS + SECS))
+for n in $(seq 1 $PAR); do
+  ( while [ $SECONDS -lt $END ]; do
+      curl -s -o /dev/null --max-time 10 &quot;http://127.0.0.1:$SPORT/api/v1/threads&quot;
+      curl -s -o /dev/null --max-time 10 &quot;http://127.0.0.1:$SPORT/api/v1/projects&quot;
+      curl -s -o /dev/null --max-time 10 &quot;http://127.0.0.1:$SPORT/api/v1/hosts&quot;
+      curl -s -o /dev/null --max-time 10 &quot;http://127.0.0.1:$SPORT/api/v1/providers&quot;
+    done ) &amp;
+done
+while [ $SECONDS -lt $END ]; do
+  printf &#x27;%s &#x27; &quot;$(date +%T)&quot;
+  curl -s -o /dev/null -w &quot;server /health -&gt; %{http_code} in %{time_total}s | &quot; --max-time 5 &quot;http://127.0.0.1:$SPORT/health&quot; || printf &quot;server /health -&gt; TIMEOUT(5s) | &quot;
+  curl -s -o /dev/null -w &quot;server /api/v1/threads -&gt; %{http_code} in %{time_total}s | &quot; --max-time 5 &quot;http://127.0.0.1:$SPORT/api/v1/threads&quot; || printf &quot;server /api/v1/threads -&gt; TIMEOUT(5s) | &quot;
+  curl -s -o /dev/null -w &quot;daemon / -&gt; %{http_code} in %{time_total}s\n&quot; --max-time 5 &quot;http://127.0.0.1:$DPORT/&quot; || printf &quot;daemon / -&gt; TIMEOUT(5s)\n&quot;
+  sleep 2
+done
+wait
+</pre>
+  <h3>Probe run 1</h3>
+<pre>05:27:44 server /health -&gt; 200 in 1.852901s | server /api/v1/threads -&gt; 200 in 0.002444s | daemon / -&gt; 404 in 0.001282s
+05:27:47 server /health -&gt; 000 in 5.002596s | server /health -&gt; TIMEOUT(5s) | server /api/v1/threads -&gt; 000 in 5.002838s | server /api/v1/threads -&gt; TIMEOUT(5s) | daemon / -&gt; 404 in 1.896832s
+05:28:01 server /health -&gt; 200 in 0.816756s | server /api/v1/threads -&gt; 200 in 0.001331s | daemon / -&gt; 404 in 0.001278s
+05:28:04 server /health -&gt; 200 in 1.679663s | server /api/v1/threads -&gt; 200 in 0.002448s | daemon / -&gt; 404 in 0.000914s
+05:28:08 server /health -&gt; 200 in 1.815522s | server /api/v1/threads -&gt; 200 in 0.000951s | daemon / -&gt; 404 in 0.000930s
+05:28:12 server /health -&gt; 200 in 3.861250s | server /api/v1/threads -&gt; 200 in 1.911434s | daemon / -&gt; 404 in 0.000950s
+05:28:20 server /health -&gt; 000 in 5.002121s | server /health -&gt; TIMEOUT(5s) | server /api/v1/threads -&gt; 200 in 0.845656s | daemon / -&gt; 404 in 0.001756s
+05:28:27 server /health -&gt; 000 in 5.002323s | server /health -&gt; TIMEOUT(5s) | server /api/v1/threads -&gt; 000 in 5.002203s | server /api/v1/threads -&gt; TIMEOUT(5s) | daemon / -&gt; 404 in 0.001191s
+05:28:39 server /health -&gt; 200 in 2.387026s | server /api/v1/threads -&gt; 200 in 0.002326s | daemon / -&gt; 404 in 0.000694s
+</pre>
+
+  <h2>Verification</h2>
+  <p>An independent verifier followed the "Minimal reproduction" literally in a fresh worktree at the same base commit and fresh data dir. Confirmed: launcher, server, daemon and plugin workers all landed in one <code>run-*.scope</code> cgroup with the memhog; <code>/health</code> and <code>/api/v1/threads</code> hit 5 s <code>TIMEOUT</code>s (6 in a 240 s probe started ~5 min after the hog); server in <code>state=D wchan=__mem_cgroup_handle_over_high</code> in 48/60 samples; 79 server <code>Event loop stalled</code> lines (max 8.1 s); <code>oom_kill 0</code> throughout; <code>/api/v1/hosts</code> reported <code>connected</code> during the freeze; recovery to &lt;1 ms within ~4 s of killing the hog; unit test <code>2 passed | 1 expected fail</code>; all cited code excerpts match the base commit. Difference from my run: the verifier's daemon never missed the 30 s lease (max stall 1.9 s), whereas mine had one 35.7 s gap.</p>
+  <p>Findings and what changed in this revision:</p>
+  <ul>
+    <li><b>Major — "no server-only mode" was overstated.</b> The verifier ran the packaged <code>bb-server</code> bin plus <code>bb-app host-daemon join --server-url http://127.0.0.1:…</code> and the daemon enrolled and connected. I re-ran that (<code>split-deploy-check.sh</code>, and a shared-data-dir variant <code>split-deploy-check-shared.sh</code>) on the base commit and pasted the output in Root cause §1. TL;DR, the claims-table row (now "Partially refuted"), Root cause §1 and Proposed fix (1) were rewritten: the split is technically possible today but undocumented, untested and unsupported (no help entry, no doc mention, installer emits only the combined launcher, primary-host resolution falls back heuristically when data dirs differ, <code>bb-server</code> wrapper does not forward signals). Proposed fix (1) is now "expose, document, ship reference units, test" plus an interim workaround.</li>
+    <li><b>Minor — repro step 3 timing.</b> Added when to start the external probe (after the hog passes ~450 MiB / several minutes in), the ~15–20 min total duration, and the fresh-data-dir / free-ports note.</li>
+    <li><b>Minor — lease staleness is a weak detector for throttling.</b> Added a paragraph to Root cause §2 and reordered Proposed fix (3): server self-observation and daemon-reported cgroup pressure are primary; lease staleness is secondary.</li>
+    <li><b>Minor — counts.</b> Daemon log has 15 stall lines + 2 heartbeat-delay warnings (17 total; the earlier "15 daemon stall/heartbeat-delay warnings" was wrong); <code>apps/server/src/internal/session-state.ts</code> is now listed as the other (read-only diagnostic) reader of the lease.</li>
+  </ul>
+  <p>Not re-run in this revision: the full cgroup scope run (the verifier reproduced it independently; original artifacts retained). The unit test was re-run in the revision worktree: <code>2 passed | 1 expected fail</code>.</p>
+</main></body></html>

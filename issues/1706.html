@@ -5,59 +5,414 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Report · #1706 queued thread messages can silently vanish</title>
 <style>
-  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; }
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
   body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
-  main { max-width:860px; margin:0 auto; padding:40px 24px 80px; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
   h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
   h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
-  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
   .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
   .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
-  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; background:#fff; }
-  figcaption { font-size:13px; color:var(--muted); margin-top:6px; }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
   table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
   code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
   a { color:var(--accent); }
-  .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; } @media (max-width:700px){ .grid{grid-template-columns:1fr;} }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
 </style>
 </head>
 <body><main>
   <p class="meta"><a href="../">← reports</a></p>
-  <h1>#1706 · queued thread messages can silently vanish</h1>
+  <h1>#1706 · queued thread messages can silently vanish: reported accepted, never delivered, no longer queued</h1>
   <p class="meta">
     <span class="pill">Bug</span> <span class="pill high">High</span> <span class="pill">Effort: Medium</span>
     <span class="pill">threads</span>
     <a href="https://github.com/get-bb/bb/issues/1706">open on GitHub</a>
-    <span>test report · 2026-08-18</span>
+    <span>2026-08-18</span>
+    <span>base <code>16ceb3a540f81c1189efaffb27a39b1d9443abf5</code> (main)</span>
+  </p>
+  <p class="meta">
+    <span class="verdict v-partial">Verdict: PARTIALLY REPRODUCED</span>
+    <span>· root-cause confidence: <b>medium</b></span>
+    <span>· linked open PRs: none</span>
   </p>
 
-  <h2>Summary</h2>
-  <p><code>bb thread tell --mode queue</code> reports success, but the message is neither delivered nor left in the target's queue. Steer mode is unaffected. Agent fleets that coordinate through queue mode deadlock silently.</p>
+  <h2>TL;DR</h2>
+  <p><b>Plain-language framing.</b> When you <code>bb thread tell … --mode queue</code> a thread that is busy, the server stores the message in a small "queued messages" table. When the busy turn ends, a background job (the <em>drain worker</em>) <em>reserves</em> the stored row (sets <code>claimed_at</code>/<code>claim_token</code>; the code calls this a <em>claim</em>), does some slow preparation with the machine that runs the agent (host RPCs), and only then turns the row into a real turn on the thread. <code>bb thread queue list</code> hides reserved rows, and a reservation that is interrupted (for example by a server restart) is only cleaned up by a periodic job (the <em>stale-claim sweep</em>, every 10&nbsp;s) after it is 5&nbsp;minutes old. <code>client/turn/requested</code> is the event that appears in the thread's log once a message becomes a turn.</p>
+  <p>The reporter ran <code>bb thread tell &lt;id&gt; "…" --mode queue</code>, got <code>Thread … updated</code>, and later found the message neither in <code>bb thread log</code> nor in <code>bb thread queue list</code>. I could not find or provoke a code path on main that <em>permanently</em> discards an accepted queue-mode message: every accepting path either appends a <code>client/turn/requested</code> event or inserts a <code>queued_thread_messages</code> row in the same SQLite transaction that returns success, and every consuming path deletes the row in the same transaction that appends the turn event. Idle target, active target, three concurrent senders, and queue-then-<code>stop</code> all delivered on my instance.</p>
+  <p>What I <em>can</em> reproduce is the exact observable state the reporter describes, from two independent gaps: (1) <code>bb thread queue list</code> lists only <b>unclaimed</b> rows, so a message claimed by the drain worker (for the whole duration of an in-flight send, which awaits several host RPCs with 30&nbsp;s timeouts, or for up to 5 minutes after a server restart mid-drain, which I exercised for real in exp. H) is invisible while still being stored; and (2) <code>bb thread log</code> is a window: the default view is the newest 20 user-message segments (1500-event budget) and <code>--format json</code> returns the <b>oldest</b> 100 events, so grep-based verification on a busy thread yields false negatives. Neither the send nor the queue API returns anything a sender could use as a delivery receipt (send returns <code>{ok:true}</code> without a request or queued-message id), so a sender cannot distinguish "in flight" from "lost". The reporter's third bullet (a queue-mode STOP "sat undelivered while the worker continued") is expected queue semantics: queue mode waits for the current turn to finish; steer mode is what interrupts.</p>
 
-  <h2>Images (test)</h2>
-  <div class="grid">
-    <figure><img src="assets/issues-by-area.png" alt="Bar chart of open issues by area label" width="640" height="360"><figcaption>PNG generated at build time (raw PNG encoder in Node, no dependencies).</figcaption></figure>
-    <figure><img src="assets/priority.svg" alt="Open issues by priority: High 28, Medium 64, Low 48"><figcaption>SVG asset, same folder.</figcaption></figure>
-  </div>
-  <figure><img src="https://github.com/get-bb.png?size=120" alt="get-bb org avatar" width="120" height="120"><figcaption>Remote image (org avatar) to confirm external images render.</figcaption></figure>
-
-  <h2>Reproduction (from the issue)</h2>
+  <h2>Claims vs findings</h2>
   <table>
-    <tr><th>Step</th><th>Observed</th></tr>
-    <tr><td>Send ~600-char queue-mode message to an idle thread</td><td>CLI: <code>Thread thr_5q7mvrmsyi updated</code></td></tr>
-    <tr><td><code>bb thread log</code> on target</td><td>Message absent</td></tr>
-    <tr><td><code>bb thread queue list</code> on target</td><td>Empty</td></tr>
-    <tr><td>Two other queue-mode messages, same hour</td><td>Delivered</td></tr>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td><code>tell --mode queue</code> reports "Thread … updated" on success</td><td class="ok">Verified</td><td>The CLI prints <code>updated</code> for both queue and auto modes; the server returns <code>{ok:true}</code> with no request id (tell action in <code>apps/cli/src/commands/thread/actions.ts</code>; send route in <code>apps/server/src/routes/threads/actions.ts</code>). See outputs below.</td></tr>
+    <tr><td>Message accepted but absent from target's event log</td><td class="unv">Could not reproduce as loss</td><td>All accepting paths persist inside a transaction before responding (Root cause). Reproduced the <em>observation</em> only via a claimed row (exp. F simulated, exp. H real restart mid-drain) and via log windowing (<code>--format json</code> default omitted the newest event on a 110-event thread, exp. G).</td></tr>
+    <tr><td>Message absent from <code>bb thread queue list</code></td><td class="ok">Verified as possible while still stored</td><td><code>listQueuedThreadMessages</code> = <code>listUnclaimedQueuedThreadMessages</code>; claimed rows are hidden. Exp. F, exp. H and the unit test.</td></tr>
+    <tr><td>Message was "neither delivered nor pending"</td><td class="no">Refuted for the state I reproduced</td><td>In exp. F (simulated claim) and exp. H (real server restart mid-drain) the row sat in SQLite the whole time and was delivered by the stale-claim sweep about 5 minutes later. No evidence of a permanent drop was found.</td></tr>
+    <tr><td>Target thread was idle at send time</td><td class="unv">Unverifiable</td><td>If truly idle, <code>queue-if-active</code> resolves to <code>start</code> and behaves exactly like steer mode (which the reporter calls reliable). The empty-queue observation only makes sense if the target was active (row created) at accept time.</td></tr>
+    <tr><td>Steer mode unaffected</td><td class="ok">Consistent with code</td><td>Steer never creates a queue row; the claim lifecycle is the only queue-specific state.</td></tr>
+    <tr><td>Queue-mode STOP "sat undelivered while the worker continued"</td><td class="no">Not a bug</td><td>By design: <code>queue-if-active</code> on an active thread waits for the turn to end; only steer/auto interrupts (<code>resolveSendMode</code> in <code>thread-send.ts</code>).</td></tr>
+    <tr><td>Two amendments "never arrived; worker log still showed original brief"</td><td class="unv">Unverifiable</td><td>Consistent with messages queued behind a long turn (or invisible while claimed) at the time the log was read.</td></tr>
   </table>
 
-  <h2>Where to look</h2>
-  <pre>apps/server/src/services/threads/   # queuedMessages.create + drain on turn boundary
-packages/server-contract/            # queue-mode accept semantics</pre>
-  <p>Hypothesis: the queue drain runs on the idle→busy transition and drops entries when the target is already idle at accept time. Needs a repro that pins the target state at send.</p>
-
-  <h2>Related</h2>
+  <h2>Environment</h2>
   <ul>
-    <li><a href="https://github.com/get-bb/bb/issues/1650">#1650</a> messages dropped while blocked on AskUserQuestion</li>
-    <li><a href="https://github.com/get-bb/bb/issues/1655">#1655</a> awaiting-interaction threads invisible to CLI</li>
+    <li>bb <code>16ceb3a54</code> (main, 2026-08-18). Original run: dev instance from worktree <code>wf_debcf606-e4a-5</code> (app <code>:17606</code>, server <code>:25606</code>, daemon <code>:33606</code>). Revision run (exp. F re-run and exp. H): worktree <code>/home/sawyer/projects/bb/.claude/worktrees/wf_debcf606-e4a-38</code>, app <code>:14889</code>, server <code>:22889</code>, daemon <code>:30889</code>, data dir <code>/home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-38-144c59319504</code>. Independent verification: server <code>:26397</code>.</li>
+    <li>Linux 7.0.0-29-generic, node v24.18.0, codex-cli 0.147.0 (provider <code>codex</code>, model gpt-5.6-sol)</li>
+    <li>Projects <code>proj_peuzy9zhn9</code> (original) / <code>proj_iaw7pxfexi</code> (revision), both local path <code>/tmp/1706-qa</code>. Target threads <code>thr_p4k2xuzmqk</code>, <code>thr_m2agvswnpb</code> (original), <code>thr_u2867dqs2y</code> (exp. F re-run), <code>thr_nyediyxgy6</code> (exp. H).</li>
+    <li>CLI wrapper used everywhere: <a href="1706/repro/1706-bb.sh">1706/repro/1706-bb.sh</a>. It takes <code>BB_REPO=&lt;your bb worktree root&gt;</code>, evaluates <code>scripts/bb-dev-app env</code> from that worktree (so <code>BB_SERVER_URL</code> points at <em>your</em> dev instance) and runs <code>packages/scripts/dist/commands/run-cli.js</code>. In the transcripts below <code>bb</code> means this wrapper.</li>
   </ul>
+
+  <h2>Minimal reproduction</h2>
+  <p>Precondition (all scripts read their environment from these three values; nothing else is hardcoded):</p>
+  <ol>
+    <li>Build the worktree and start your dev instance once: <code>pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build &amp;&amp; scripts/bb-dev-app current</code>. Note the printed <code>Data dir</code>. Do <b>not</b> run <code>scripts/bb-dev-app current</code> again afterwards: it restarts the instance (my first re-run of exp. F did that from inside the script and the target thread ended in <code>error: host daemon disconnected</code>; the scripts now call <code>scripts/bb-dev-app status</code>, which is read-only).</li>
+    <li><code>export BB_REPO=/abs/path/to/your/bb/worktree</code>. The wrapper <a href="1706/repro/1706-bb.sh">1706-bb.sh</a> and the experiment scripts derive <code>BB_SERVER_URL</code> and the SQLite path <code>&lt;Data dir&gt;/bb.db</code> from it (override with <code>BB=</code>/<code>DB=</code> if needed). <code>sqlite3</code> must be on <code>PATH</code>.</li>
+    <li>Create a project (<code>curl -s -X POST $BB_SERVER_URL/api/v1/projects … </code> as in the Appendix) and spawn an idle codex thread; pass its id as the first argument: <code>bb thread spawn --project &lt;proj id&gt; --provider codex --permission-mode accept-edits --prompt "Reply only with ok." --json | grep '"id"'</code>.</li>
+  </ol>
+
+  <h3>F. The reported observation: accepted, not in log, not in queue, while the row is stored (claimed)</h3>
+  <p>Script: <a href="1706/repro/1706-expF.sh">1706/repro/1706-expF.sh</a> (usage: <code>BB_REPO=… ./1706-expF.sh &lt;thread id&gt;</code>). It (1) makes the target active with a 45&nbsp;s turn, (2) sends a queue-mode tell, (3) marks the row claimed via sqlite exactly as <code>claimNextQueuedThreadMessageGroup</code> does when the drain worker picks it up (a <em>simulation</em> of the claimed state; exp. H below produces the same state for real), then (4) shows what the CLI reports. Output of the re-run on the revision instance (<a href="1706/repro/1706-expF.out">1706-expF.out</a>; the original run on <code>thr_m2agvswnpb</code> produced the same lines):</p>
+  <pre>$ export BB_REPO=/home/sawyer/projects/bb/.claude/worktrees/wf_debcf606-e4a-38
+$ /tmp/bb-reports/issues/1706/repro/1706-expF.sh thr_u2867dqs2y
+--- using thread=thr_u2867dqs2y db=/home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-38-144c59319504/bb.db
+Thread thr_u2867dqs2y steered
+--- target status:
+    "status": "active",
+Thread thr_u2867dqs2y updated
+--- queue list (unclaimed row visible):
+        "type": "text",
+        "text": "MARKER_F_CLAIMED reply only with ok",
+--- sqlite row still present:
+qmsg_ckva4564t4|1|[{"type":"text","text":"MARKER_F_CLAIMED reply only with ok"
+--- bb thread queue list:
+[]
+--- bb thread log | grep MARKER_F:
+0
+--- target idle now (05:35:26); queue list:
+[]
+--- log grep MARKER_F:
+0
+--- sqlite:
+qmsg_ckva4564t4|1787031280000|tok_simulated
+--- now wait ~5 min for the stale-claim sweep, then run:  /tmp/bb-reports/issues/1706/repro/1706-bb.sh thread log thr_u2867dqs2y | tail -6</pre>
+  <p><b>Expected</b> (issue's "Expected" section): the message is visible either in the queue or in the log. <b>Actual</b>: <code>bb thread queue list</code> prints <code>[]</code>, <code>bb thread log</code> has no <code>MARKER_F</code>, the target reads <code>idle</code>, and the CLI had said <code>Thread thr_u2867dqs2y updated</code>. The row is in SQLite the whole time (<code>claimed_at</code> = 1787031280000 = 05:34:40Z). About five minutes later (05:39:52Z, i.e. 5&nbsp;min threshold + up to one 10&nbsp;s sweep tick) the stale-claim sweep released it and it was delivered (<a href="1706/repro/1706-wait-marker.sh">1706-wait-marker.sh</a> polls for that; output <a href="1706/repro/1706-expF-after-5min.out">1706-expF-after-5min.out</a>):</p>
+  <pre>$ /tmp/bb-reports/issues/1706/repro/1706-wait-marker.sh thr_u2867dqs2y MARKER_F
+Tue Aug 18 05:39:52 AM UTC 2026
+--- queue list:
+[]
+--- sqlite:
+--- log tail:
+
+── User ────────────────────────────────────────────────────
+MARKER_F_CLAIMED reply only with ok
+
+── Assistant ───────────────────────────────────────────────
+ok</pre>
+
+  <h3>H. Real server restart mid-drain (no simulation): the claim survives the restart</h3>
+  <p>Script: <a href="1706/repro/1706-expH.sh">1706/repro/1706-expH.sh</a> (usage: <code>BB_REPO=… SERVER_PID=&lt;pid&gt; ./1706-expH.sh &lt;thread id&gt;</code>; find the pid with <code>pgrep -af "tsx src/index.ts"</code> and pick the one whose <code>readlink /proc/&lt;pid&gt;/cwd</code> is <code>$BB_REPO/apps/server</code>). It queues a message on an active thread, then polls SQLite every 20&nbsp;ms and <code>kill -9</code>s the server the instant <code>claimed_at</code> is set. The dev supervisor restarts the server in 1&nbsp;s. Output (<a href="1706/repro/1706-expH.out">1706-expH.out</a>):</p>
+  <pre>$ SERVER_PID=1677854 /tmp/bb-reports/issues/1706/repro/1706-expH.sh thr_nyediyxgy6
+--- using thread=thr_nyediyxgy6 db=/home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-38-144c59319504/bb.db server_pid=1677854
+Thread thr_nyediyxgy6 steered
+--- target status:
+    "status": "active",
+Thread thr_nyediyxgy6 updated
+--- queue list (unclaimed row visible):
+        "type": "text",
+        "text": "MARKER_H_RESTART reply only with ok",
+--- polling sqlite for claimed_at (drain worker picks the row up when the turn ends) ...
+--- 05:40:36.229 row claimed -&gt; kill -9 1677854 (server)
+--- sqlite right after kill:
+qmsg_bqrwu2sehj|1787031636219|qclaim_s55amuww52|[{"type":"text","text":"MARKER_H_RESTART reply onl
+--- waiting for the dev supervisor to restart the server ...
+--- server back at 05:40:39
+--- target status:
+    "status": "idle",
+--- bb thread queue list:
+[]
+--- bb thread log | grep -c MARKER_H:
+0
+--- sqlite:
+qmsg_bqrwu2sehj|1787031636219|qclaim_s55amuww52</pre>
+  <p>The claim (<code>qclaim_s55amuww52</code>, set at 05:40:36.219Z) was written by the real drain worker; the server was killed 10&nbsp;ms later, before the consuming transaction. dev.log shows <code>[dev-supervisor:server] Child exited unexpectedly with signal SIGKILL. Restarting in 1s.</code> and <code>Server listening</code> at 05:40:38. After the restart the thread is <code>idle</code>, the queue list is empty, the log has no <code>MARKER_H</code>, and the row is still claimed. The new server process has an empty <code>activeQueuedMessageClaimTokens</code> set and no startup release, so nothing touches the row until it is 5 minutes old (<a href="1706/repro/1706-expH-after-5min.out">1706-expH-after-5min.out</a>):</p>
+  <pre>$ /tmp/bb-reports/issues/1706/repro/1706-wait-marker.sh thr_nyediyxgy6 MARKER_H
+Tue Aug 18 05:45:42 AM UTC 2026
+--- queue list:
+[]
+--- sqlite:
+--- log tail:
+
+── User ────────────────────────────────────────────────────
+MARKER_H_RESTART reply only with ok
+
+── Assistant ───────────────────────────────────────────────
+ok</pre>
+  <p>Delivered at 05:45:42Z, 5&nbsp;min&nbsp;06&nbsp;s after the claim; the first host RPC of the drained turn appears in dev.log at 05:45:38. During those five minutes a sender or the reporter's checker would have observed exactly the issue's state: <code>updated</code> from the CLI, thread <code>idle</code>, <code>queue list</code> empty, nothing in the log. No log line is emitted when the sweep releases the orphaned claim.</p>
+
+  <h3>Unit-level repro of the queue-list gap</h3>
+  <p>File: <a href="1706/repro/issue-1706-claimed-queue-visibility.test.ts">1706/repro/issue-1706-claimed-queue-visibility.test.ts</a> (copy it to <code>packages/db/test/data/</code> in your worktree). It passes on main, i.e. it documents current behavior: a claimed row is stored (<code>hasQueuedThreadMessages</code> = true) but hidden from <code>listQueuedThreadMessages</code>, and a stale release restores it only once the claim is older than the 5-minute threshold. Run with <code>cd packages/db &amp;&amp; pnpm exec vitest run test/data/issue-1706-claimed-queue-visibility.test.ts</code>.</p>
+  <pre>import { describe, expect, it } from "vitest";
+import type { PromptInput } from "@bb/domain";
+import { createConnection } from "../../src/connection.js";
+import { migrate } from "../../src/migrate.js";
+import { noopNotifier } from "../../src/notifier.js";
+import {
+  claimNextQueuedThreadMessageGroup,
+  createQueuedThreadMessage,
+  hasQueuedThreadMessages,
+  listQueuedThreadMessages,
+  releaseStaleQueuedMessageClaims,
+} from "../../src/data/queued-thread-messages.js";
+import { createProject } from "../../src/data/projects.js";
+import { createThread } from "../../src/data/threads.js";
+import { upsertHost } from "../../src/data/hosts.js";
+
+// Issue #1706: a queued message that is *claimed* by the drain worker (or
+// orphaned by a server restart mid-drain) is still stored, but the public
+// queue listing (`GET /threads/:id/queued-messages`, `bb thread queue list`)
+// hides it. To an observer the message is "accepted, not delivered, not
+// queued" until the claim is consumed or released (stale after 5 minutes).
+
+function textInput(text: string): PromptInput[] {
+  return [{ type: "text", text, mentions: [] }];
+}
+
+function setup() {
+  const db = createConnection(":memory:");
+  migrate(db);
+  const host = upsertHost(db, noopNotifier, {
+    name: "test-host",
+    type: "persistent",
+  });
+  const { project } = createProject(db, noopNotifier, {
+    name: "test-project",
+    source: { type: "local_path", hostId: host.id, path: "/tmp/test" },
+  });
+  const thread = createThread(db, noopNotifier, {
+    projectId: project.id,
+    providerId: "codex",
+  });
+  return { db, thread };
+}
+
+describe("issue #1706: claimed queued messages disappear from the queue listing", () =&gt; {
+  it("hides a claimed (in-flight or orphaned) message from listQueuedThreadMessages", () =&gt; {
+    const { db, thread } = setup();
+    createQueuedThreadMessage(db, noopNotifier, {
+      threadId: thread.id,
+      content: textInput("MARKER queued while target was active"),
+      model: "gpt-5",
+      reasoningLevel: "medium",
+      permissionMode: "accept-edits",
+      serviceTier: "default",
+      senderThreadId: null,
+    });
+    expect(listQueuedThreadMessages(db, thread.id)).toHaveLength(1);
+
+    // The auto-send worker claims the message before dispatching it.
+    const claimed = claimNextQueuedThreadMessageGroup(
+      db,
+      noopNotifier,
+      thread.id,
+    );
+    expect(claimed).not.toBeNull();
+
+    // The row is still durably stored ...
+    expect(hasQueuedThreadMessages(db, thread.id)).toBe(true);
+    // ... but the public listing (what `bb thread queue list` shows) is empty.
+    // This is the "not queued" observation from the issue.
+    expect(listQueuedThreadMessages(db, thread.id)).toEqual([]);
+
+    // A stale-claim release younger than the 5 minute threshold does not
+    // bring it back either (claimedBefore = now - 5min in the sweep).
+    releaseStaleQueuedMessageClaims(db, noopNotifier, {
+      claimedBefore: Date.now() - 5 * 60 * 1000,
+      protectedClaimTokens: [],
+    });
+    expect(listQueuedThreadMessages(db, thread.id)).toEqual([]);
+
+    // Only once the claim is considered stale does the message reappear.
+    releaseStaleQueuedMessageClaims(db, noopNotifier, {
+      claimedBefore: Date.now() + 1,
+      protectedClaimTokens: [],
+    });
+    expect(listQueuedThreadMessages(db, thread.id)).toHaveLength(1);
+  });
+});</pre>
+  <pre>$ cd packages/db &amp;&amp; pnpm exec vitest run test/data/issue-1706-claimed-queue-visibility.test.ts
+ Test Files  1 passed (1)
+      Tests  1 passed (1)</pre>
+
+  <h3>G. <code>bb thread log</code> is a window, so grep is not proof of absence</h3>
+  <pre>$ bb thread log thr_p4k2xuzmqk --format json | jq 'length, .[-1].seq'
+100
+101
+$ bb thread log thr_p4k2xuzmqk --format json | grep -c MARKER_E      # newest message, seq 103
+0
+$ bb thread log thr_p4k2xuzmqk --format json --limit 500 | jq length
+109
+$ curl -s "$BB_SERVER_URL/api/v1/threads/thr_p4k2xuzmqk/timeline" | jq .timelinePage
+{ "kind": "latest", "segmentLimit": 20, "returnedSegmentCount": 9, "hasOlderRows": false, "olderCursor": null }</pre>
+  <p><code>--format json</code> lists the <em>oldest</em> 100 events (<code>afterSeq</code> defaults to 0), and the default minimal view is the newest 20 user-message segments under a 1500-event budget. On a long-running fleet thread either form can miss a delivered message; the CLI offers no way to page the minimal view.</p>
+
+  <h3>Control experiments that did deliver</h3>
+  <ul>
+    <li>A: queue-mode tell to an <b>idle</b> thread → immediate new turn (<a href="1706/repro/1706-expA.out">expA.out</a>).</li>
+    <li>B: queue-mode tell to an <b>active</b> thread → row visible in <code>queue list</code>, drained after <code>turn/completed</code> (<a href="1706/repro/1706-expB.out">expB.out</a>, below).</li>
+    <li>C: three <b>concurrent</b> queue-mode tells to an idle thread → one starts, two are queued and drained in order; all three CLIs printed <code>updated</code>, exit 0 (<a href="1706/repro/1706-expC.out">expC.out</a>).</li>
+    <li>E: queue while active, then <code>bb thread stop</code> → row stays visible, delivered by the 10&nbsp;s periodic sweep after <code>stop.settled</code> (<a href="1706/repro/1706-target1-events-summary.txt">events-summary.txt</a>).</li>
+  </ul>
+  <pre>$ 1706/repro/1706-expB.sh thr_p4k2xuzmqk        # original run
+Thread thr_p4k2xuzmqk steered
+    "status": "active",
+Thread thr_p4k2xuzmqk updated
+=== queue after tell ===
+[
+  {
+    "id": "qmsg_jimz5qvscx",
+    "content": [ { "type": "text", "text": "MARKER_B_ACTIVE_QUEUE reply only with ok", "mentions": [] } ],
+    "model": "gpt-5.6-sol", "reasoningLevel": "medium", "permissionMode": "accept-edits",
+    "serviceTier": "default", "groupWithNext": false,
+    "createdAt": 1787028058532, "updatedAt": 1787028058532
+  }
+]
+=== log ===
+…
+── User ────────────────────────────────────────────────────
+Run the shell command 'sleep 40' and then reply only with ok.
+
+── Worked for (48s) ────────────────────────────────────────
+
+── Assistant ───────────────────────────────────────────────
+ok
+
+── User ────────────────────────────────────────────────────
+MARKER_B_ACTIVE_QUEUE reply only with ok
+
+── Assistant ───────────────────────────────────────────────
+ok
+=== queue ===
+[]</pre>
+
+  <h2>Root cause</h2>
+  <p><b>What the accept path actually does.</b> <code>bb thread tell --mode queue</code> calls <code>threads.send</code> with <code>mode: "queue-if-active"</code>, not <code>queuedMessages.create</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/cli/src/commands/thread/actions.ts#L560-L590">actions.ts#L560-L590</a>). The route queues only when the target is <code>active</code>; otherwise it starts a turn right away (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/routes/threads/actions.ts#L319-L341">routes/threads/actions.ts#L319-L341</a>):</p>
+  <pre>const shouldQueue =
+  thread.status === "active" &amp;&amp;
+  (payload.mode === "queue-if-active" ||
+    (payload.mode !== "start" &amp;&amp; isManualCompactionActive(deps, thread)));
+if (shouldQueue) {
+  ensureThreadIsNotAwaitingUserInteraction(deps, thread.id);
+  await createQueuedMessageForThread(deps, { payload: queuedMessagePayloadFromSendRequest(payload), thread });
+  return context.json({ ok: true });
+}
+…
+await sendThreadMessage(deps, { environment, payload, thread, trigger: "user" });
+return context.json({ ok: true });</pre>
+  <p>Both branches persist before responding: <code>createQueuedThreadMessage</code> inserts the row; <code>sendThreadMessage</code> appends <code>client/turn/requested</code> and applies <code>run.started</code> inside one <code>db.transaction(…, {behavior:"immediate"})</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/thread-send.ts#L327-L385">thread-send.ts#L327-L385</a>). Consumption is atomic too: <code>deleteClaimedQueuedThreadMessageBatchInTransaction</code> runs in the same transaction as the event append in both drain paths (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/queued-messages.ts#L323-L376">queued-messages.ts#L323-L376</a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/queued-messages.ts#L400-L437">#L400-L437</a>). The only other deletes are the explicit <code>DELETE /queued-messages/:id</code> route and the FK cascade on thread deletion. I found no path that removes a row without appending the turn event.</p>
+
+  <p><b>Gap 1: claimed rows are invisible.</b> The public list is <code>listUnclaimedQueuedThreadMessages</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/db/src/data/queued-thread-messages.ts#L565-L570">queued-thread-messages.ts#L565-L570</a>). The drain worker claims the group first (<code>claimNextQueuedThreadMessageGroup</code> in <code>sendNextQueuedMessageIfPresent</code>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/queued-messages.ts#L513-L519">queued-messages.ts#L513-L519</a>), then awaits <code>requireReadyQueuedMessageEnvironment</code>, <code>buildExecutionOptions</code>, <code>ensureHostSessionReadyForWork</code>, and <code>prepareTurnSubmitCommandPayload</code>, which fans out host RPCs (project skills, shared skills, workspace instructions via <code>resolveThreadRuntimeCommandConfig</code>) each bounded by <code>COMMAND_TIMEOUT_MS = 30_000</code>, before the consuming transaction. During that window, and for up to <code>STALE_QUEUED_MESSAGE_CLAIM_MS = 5 min</code> after a server restart orphans the claim (constant at <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/queued-messages.ts#L125">#L125</a>; the sweep that releases claims older than that, protecting only the tokens in the in-memory <code>activeQueuedMessageClaimTokens</code> set, at <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/queued-messages.ts#L601-L607">#L601-L607</a>, run from a 10&nbsp;s <code>setInterval</code> in <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/start-server.ts#L255-L258">start-server.ts#L255-L258</a>; there is no release-on-startup, which exp. H confirms), the message is stored but reported nowhere: not in the queue list, not in the log, while the thread may already read <code>idle</code>. On a starved host (cf. #1334) or after a host RPC timeout the claim is released and retried on the next 10&nbsp;s sweep, so the message flickers in and out of the listing.</p>
+
+  <p><b>Gap 2: no delivery receipt.</b> <code>POST /threads/:id/messages</code> returns <code>{ok:true}</code> in both branches, and the CLI prints the same <code>updated</code> line whether a turn started or a row was queued. The sender receives neither a request id nor a queued-message id, so it cannot poll for delivered / still queued / claimed / rejected. Drain failures are only server-side log lines (<code>"Queued message auto-send failed"</code>).</p>
+
+  <p><b>Gap 3: the log is windowed.</b> <code>GET /threads/:id/timeline</code> defaults to the latest page of <code>THREAD_TIMELINE_DEFAULT_SEGMENT_LIMIT = 20</code> segments (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/timeline.ts#L169">timeline.ts#L169</a>) under a 1500-event budget (<code>timelineWindowEventBudget</code>); <code>bb thread log --format json</code> calls <code>events.list</code> with <code>limit=100</code> from sequence 0 (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/cli/src/commands/thread/show.ts#L455-L463">show.ts#L455-L463</a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/routes/threads/data.ts#L479-L488">data.ts#L479-L488</a>). An agent that greps either output for a unique string will conclude "absent" on a long thread.</p>
+
+  <p><b>Why the symptom follows.</b> A fleet sender tells an active worker in queue mode → row created → sender is told <code>updated</code>. Some seconds or minutes later the worker's turn ends; the drain claims the row and starts awaiting host RPCs (slow on a busy fleet host); a checker now sees <code>status: idle</code>, an empty <code>queue list</code>, and no message in the (windowed) log. If the drain then times out the row is released and retried; if the server restarted it sits for 5 minutes. From outside this is indistinguishable from a drop, and no API can tell the sender otherwise. I could not demonstrate a permanent drop; if one exists it is not in the queue storage layer.</p>
+
+  <h2>Proposed fix (first principles)</h2>
+  <ol>
+    <li><b>Return a receipt from send/queue.</b> Make <code>POST /threads/:id/messages</code> return <code>{ok:true, outcome:"started"|"queued", requestId?, queuedMessageId?}</code> and have <code>bb thread tell</code> print which happened (and expose it in <code>--json</code>). Server ↔ client only, no daemon protocol bump. Additive fields keep old SDK clients working; update <code>packages/server-contract</code>, <code>packages/sdk</code>, CLI docs.</li>
+    <li><b>Make claimed rows visible.</b> Have <code>listQueuedThreadMessages</code> return all rows with a <code>state: "queued"|"sending"</code> field (and <code>bb thread queue list</code> render it) instead of filtering claimed rows out; keep the claim filter only for the drain's own selection. The app's optimistic reorder/edit code assumes unclaimed rows (<code>apps/app/src/lib/queued-message-reorder.ts</code>, queued-message actions), so treat <code>sending</code> rows as read-only there.</li>
+    <li><b>Give the CLI an exhaustive log path.</b> Make <code>bb thread log --format json</code> default to the newest events (or add <code>--all</code>) and print the timeline page metadata (<code>returnedSegmentCount</code>, <code>hasOlderRows</code>) so agents know they saw a window.</li>
+    <li>Optional: on the receiver side, surface a system row when a drain attempt fails or is deferred, so the target agent is not blind (same asymmetry #1650 raises).</li>
+  </ol>
+  <p>Not confident about a permanent-loss code path; the experiment that would settle it is instrumenting the reporter's fleet: record the receipt id from fix 1, then query <code>queued_thread_messages</code> and <code>events</code> for that id/text at the moment of the "vanished" observation.</p>
+
+  <h2>PR review</h2>
+  <p>No open PRs are linked to this issue.</p>
+
+  <h2>Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/1650">#1650</a>: messages to a thread blocked on AskUserQuestion are dropped, only the sender is told (409; loud, not silent).</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1655">#1655</a>: awaiting-interaction threads invisible to CLI; programmatic steering blocked with 409.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1334">#1334</a>: co-located workload can starve the bb server (long claim windows on a starved host).</li>
+    <li><a href="https://github.com/get-bb/bb/issues/814">#814</a>: subagent tells to parents are queued but should be instant (queue-vs-steer semantics).</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1185">#1185</a>: "Send all now" action for queued messages.</li>
+  </ul>
+
+  <h2>Appendix</h2>
+  <h3>Commands run</h3>
+  <pre># original run (worktree wf_debcf606-e4a-5; app :17606, server :25606, daemon :33606). `bb` = 1706/repro/1706-bb.sh
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+scripts/bb-dev-app current
+export BB_REPO=$PWD
+curl -s -X POST $BB_SERVER_URL/api/v1/projects -H 'content-type: application/json' \
+  -d '{"name":"qa","source":{"type":"local_path","path":"/tmp/1706-qa","hostId":"host_3xq9fvix2q"}}'   # hostId from `bb machine list --json`
+bb thread spawn --project proj_peuzy9zhn9 --provider codex --permission-mode accept-edits --title "1706 target" --prompt "Reply only with ok." --json
+1706/repro/1706-expA.sh thr_p4k2xuzmqk ; 1706/repro/1706-expB.sh thr_p4k2xuzmqk ; 1706/repro/1706-expC.sh thr_p4k2xuzmqk   # control experiments
+bb thread tell thr_p4k2xuzmqk "MARKER_D_BOGUS_MODEL reply only with ok" --mode queue --model totally-bogus-model-xyz
+bb thread tell thr_p4k2xuzmqk "MARKER_E_QUEUED_THEN_STOP reply only with ok" --mode queue ; bb thread stop thr_p4k2xuzmqk
+1706/repro/1706-expF.sh thr_m2agvswnpb
+cp 1706/repro/issue-1706-claimed-queue-visibility.test.ts packages/db/test/data/ &amp;&amp; cd packages/db &amp;&amp; pnpm exec vitest run test/data/issue-1706-claimed-queue-visibility.test.ts
+pnpm dev:stop
+
+# revision run (worktree wf_debcf606-e4a-38 at 16ceb3a54; app :14889, server :22889, daemon :30889)
+scripts/bb-dev-app current
+export BB_REPO=/home/sawyer/projects/bb/.claude/worktrees/wf_debcf606-e4a-38
+curl -s -X POST http://localhost:22889/api/v1/projects -H 'content-type: application/json' \
+  -d '{"name":"qa","source":{"type":"local_path","path":"/tmp/1706-qa","hostId":"host_j5wc27bxsu"}}'      # -&gt; proj_iaw7pxfexi
+bb thread spawn --project proj_iaw7pxfexi --provider codex --permission-mode accept-edits --title "1706 target 2" --prompt "Reply only with ok." --json   # thr_u2867dqs2y
+1706/repro/1706-expF.sh thr_u2867dqs2y &gt; 1706/repro/1706-expF.out
+1706/repro/1706-wait-marker.sh thr_u2867dqs2y MARKER_F &gt; 1706/repro/1706-expF-after-5min.out
+bb thread spawn --project proj_iaw7pxfexi --provider codex --permission-mode accept-edits --title "1706 target 3" --prompt "Reply only with ok." --json   # thr_nyediyxgy6
+pgrep -af "tsx src/index.ts"; readlink /proc/1677854/cwd        # server pid of this instance
+SERVER_PID=1677854 1706/repro/1706-expH.sh thr_nyediyxgy6 &gt; 1706/repro/1706-expH.out
+1706/repro/1706-wait-marker.sh thr_nyediyxgy6 MARKER_H &gt; 1706/repro/1706-expH-after-5min.out
+pnpm dev:stop</pre>
+  <h3>Event summary of target thread thr_p4k2xuzmqk (every accepted send has its client/turn/requested)</h3>
+  <pre>1 client/turn/requested thread-start Reply only with ok.
+18 turn/completed
+19 client/turn/requested new-turn MARKER_A_IDLE_QUEUE reply only with ok
+28 turn/completed
+29 client/turn/requested new-turn Run the shell command 'sleep 40' and then reply on
+55 turn/completed
+56 client/turn/requested new-turn MARKER_B_ACTIVE_QUEUE reply only with ok
+65 turn/completed
+66 client/turn/requested new-turn MARKER_C3 concurrent queue send; reply only with o
+75 turn/completed
+76 client/turn/requested new-turn MARKER_C2 concurrent queue send; reply only with o
+86 turn/completed
+87 client/turn/requested new-turn MARKER_C1 concurrent queue send; reply only with o
+96 turn/completed
+97 client/turn/requested new-turn MARKER_D_BOGUS_MODEL reply only with ok
+101 system/thread/interrupted manual-stop
+102 turn/completed
+103 client/turn/requested new-turn MARKER_E_QUEUED_THEN_STOP reply only with ok
+110 turn/completed</pre>
+  <h3>Concurrent-send experiment (C) output</h3>
+  <pre>--- sender 1 --- Thread thr_p4k2xuzmqk updated exit=0
+--- sender 2 --- Thread thr_p4k2xuzmqk updated exit=0
+--- sender 3 --- Thread thr_p4k2xuzmqk updated exit=0
+=== queue right after === [ MARKER_C1 ]        # C3 started the turn; C2 and C1 were queued
+=== log (45 s later) === MARKER_C3 … ok / MARKER_C2 … ok / MARKER_C1 … ok
+=== queue === []</pre>
+  <h3>Things checked and ruled out</h3>
+  <ul>
+    <li>Concurrent starts on an idle thread cannot double-dispatch: the second transaction re-reads status and <code>requireThreadLifecycleEventApplied(run.started)</code> throws on <code>active</code> (no cell in <code>THREAD_LIFECYCLE</code>), rolling back and returning an error. In practice (exp. C) the later senders saw <code>active</code> and were queued.</li>
+    <li>Threads in <code>error</code> status never drain (<code>listIdleThreadsWithQueuedMessages</code> filters <code>idle</code> only) but their rows remain visible in <code>queue list</code>, so that is a different symptom.</li>
+    <li>Daemon rejection of a drained turn appends <code>client/turn/rejected</code> plus <code>system/error</code>; the projection renders the message with a rejected status rather than hiding it.</li>
+    <li>Server logs during all experiments contained no "Queued message auto-send" warnings.</li>
+  </ul>
+
+  <h2>Verification</h2>
+  <p>An independent verifier re-ran the report on their own dev instance at <code>16ceb3a54</code> (server <code>:26397</code>, codex thread <code>thr_6j7semtv5a</code>). Exp. F reproduced line-for-line (queue list <code>[]</code>, <code>grep -c MARKER_F</code> = 0 while active and after idle, row still claimed in SQLite; consumed 5m09s after the simulated claim with the assistant reply <code>ok</code>), the unit test passed on main, exp. G's mechanism was confirmed by code (events route default limit 100 ascending from seq 0, CLI passes 100, timeline default 20 segments) and the 10&nbsp;s sweep interval was confirmed in <code>start-server.ts</code>. Their findings and what changed in this revision:</p>
+  <ul>
+    <li><b>Major: repro not copy-paste runnable</b> (thread id, wrapper path, DB path, worktree path and ports were hardcoded). Fixed: <code>1706-bb.sh</code> now takes <code>BB_REPO</code> and reads <code>scripts/bb-dev-app env</code>; <code>1706-expF.sh</code> takes the thread id as argument and discovers <code>bb.db</code> from <code>scripts/bb-dev-app status</code>. Both were re-run on a fresh instance/thread and the outputs above are from that run. The Appendix command list now uses the artifact paths. (While doing this I found that calling <code>scripts/bb-dev-app current</code> from a script restarts the instance and killed my first target thread; the scripts use <code>status</code>.)</li>
+    <li><b>Minor: wrong permalinks</b> in <code>queued-messages.ts</code>. Fixed against the file at <code>16ceb3a54</code>: claim call → <code>#L513-L519</code>; <code>STALE_QUEUED_MESSAGE_CLAIM_MS</code> → <code>#L125</code>; stale sweep → <code>#L601-L607</code>; plus the <code>setInterval</code> in <code>start-server.ts#L255-L258</code>.</li>
+    <li><b>Minor: "persists after a server restart" was inferred, not exercised.</b> Now exercised for real in exp. H: the drain worker's own claim (<code>qclaim_s55amuww52</code>) was caught 10&nbsp;ms after it was written, the server was <code>kill -9</code>ed, the supervisor restarted it, and the row stayed claimed/hidden until the stale sweep delivered it ~5 minutes later.</li>
+    <li><b>Minor: jargon.</b> Added a plain-language framing paragraph at the top of the TL;DR defining claim, drain worker, stale-claim sweep, host RPC and <code>client/turn/requested</code>.</li>
+  </ul>
+  <p>Verdict and root-cause confidence are unchanged (PARTIALLY REPRODUCED, medium): still no permanent-loss path found; the "accepted, not in log, not in queue" observation is reproduced both by simulation and by a real restart mid-drain.</p>
 </main></body></html>

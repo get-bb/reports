@@ -1,0 +1,10 @@
+const page = await browser.getPage("main");
+await page.setViewportSize({ width: 1280, height: 900 });
+await page.goto("http://localhost:11498/projects/proj_953iq6k6vv/threads/thr_g28r4itw8a", { waitUntil: "load" });
+await new Promise(r => setTimeout(r, 5000));
+const worked = page.getByText(/^Worked for/).first();
+console.log("worked rows:", await page.getByText(/^Worked for/).count());
+await worked.click();
+await new Promise(r => setTimeout(r, 1500));
+const p = await saveScreenshot(await page.screenshot({ fullPage: false }), "1355-b-expanded.png");
+console.log(p);

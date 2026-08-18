@@ -1,0 +1,75 @@
+# Revision run (same base commit 16ceb3a54, fresh dev instance for worktree wf_debcf606-e4a-33)
+# Linux x86_64, node v24.18.0, claude-code 2.1.234
+# Server http://localhost:23803, host daemon 127.0.0.1:31803, host id host_jkzcgxjdxs, daemon PID 1582592.
+# `bb` below = `pnpm bb:dev` with BB_SERVER_URL/BB_HOST_DAEMON_PORT from `scripts/bb-dev-app env`.
+# find-worktree-procs.sh now also prints pgid/sid.
+
+$ pnpm bb:dev machine list
+Name  ID               Status     Last seen
+bee   host_jkzcgxjdxs  connected  just now
+
+$ curl -s -X POST $BB_SERVER_URL/api/v1/projects -H 'content-type: application/json' \
+    -d '{"name":"qa1660r","source":{"type":"local_path","path":"/tmp/bb1660r-repo","hostId":"host_jkzcgxjdxs"}}'
+{"id":"proj_46fcadffg4", ...}
+
+$ pnpm bb:dev thread spawn --project proj_46fcadffg4 --new-environment worktree --provider claude-code \
+    --permission-mode full --title "orphan repro 1660 (revision)" \
+    --prompt "Run exactly this shell command and nothing else: nohup sleep 100000 >/dev/null 2>&1 & disown ; then reply only with ok." --json
+{ "id": "thr_g3xmvwtd84", ..., "status": "starting" }
+
+$ sqlite3 <data>/bb.db "select id,status,environment_id from threads where id='thr_g3xmvwtd84'; select id,status,path from environments order by created_at desc limit 1;"
+thr_g3xmvwtd84|idle|env_ig2nscwucq
+env_ig2nscwucq|ready|/home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-33-4322b8038a31/worktrees/env_ig2nscwucq/bb1660r-repo
+
+$ ./find-worktree-procs.sh <data>/worktrees/env_ig2nscwucq
+pid=1591658 ppid=1582592 pgid=1581708 sid=1581708 cwd=.../env_ig2nscwucq/bb1660r-repo cmd=node ... (provider bridge, child of host daemon 1582592)
+pid=1591676 ppid=1591658 pgid=1581708 sid=1581708 cwd=.../env_ig2nscwucq/bb1660r-repo cmd=/home/sawyer/.local/bin/claude --output-format stream-json --verbose --input-format stream-json ...
+pid=1593823 ppid=1       pgid=1593823 sid=1593772 cwd=.../env_ig2nscwucq/bb1660r-repo cmd=sleep 100000
+
+$ ps -o pid,ppid,pgid,sid,etime,cmd -p 1582592,1591658,1591676,1593823
+    PID    PPID    PGID     SID     ELAPSED CMD
+1582592 1581867 1581708 1581708       01:10 node ... apps/host-daemon (host daemon)
+1591658 1582592 1581708 1581708       00:17 node ... (provider bridge)
+1591676 1591658 1581708 1581708       00:16 /home/sawyer/.local/bin/claude --output-format stream-json ...
+1593823       1 1593823 1593772       00:11 sleep 100000
+# NOTE: the orphan is in its own process group (1593823) and its own session (1593772, whose
+# leader -- Claude Code's Bash-tool shell -- has already exited). The bridge and claude share the
+# daemon's group/session. A kill(-pgid) aimed at the bridge's group can never reach the orphan.
+
+$ pnpm bb:dev thread archive thr_g3xmvwtd84
+Thread thr_g3xmvwtd84 archived
+$ sqlite3 <data>/bb.db "select id,status,retire_requested_at from environments where id='env_ig2nscwucq';"
+env_ig2nscwucq|retiring|1787030673745
+
+# ~1m40s into the retiring window: bridge and claude are still alive (nothing stops them on archive)
+$ ps -o pid,ppid,pgid,sid,stat,etime,cmd -p 1591658,1591676,1593823
+    PID    PPID    PGID     SID STAT     ELAPSED CMD
+1591658 1582592 1581708 1581708 Sl         01:42 node ... (provider bridge)
+1591676 1591658 1581708 1581708 Sl         01:42 /home/sawyer/.local/bin/claude ...
+1593823       1 1593823 1593772 S          01:37 sleep 100000
+
+# poll until status = destroyed (wait-destroy.sh); destroyed at epoch 1787030985 (~5m12s after archive)
+$ sqlite3 <data>/bb.db "select id,status,path,retire_requested_at from environments where id='env_ig2nscwucq';"
+env_ig2nscwucq|destroyed||
+$ ls <data>/worktrees/env_ig2nscwucq
+ls: cannot access '.../worktrees/env_ig2nscwucq': No such file or directory
+$ ./find-worktree-procs.sh <data>/worktrees/env_ig2nscwucq
+pid=1593823 ppid=1 pgid=1593823 sid=1593772 cwd=/home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-33-4322b8038a31/worktrees/env_ig2nscwucq/bb1660r-repo (deleted) cmd=sleep 100000
+$ ps -o pid,ppid,pgid,sid,stat,etime,cmd -p 1591658,1591676,1593823
+    PID    PPID    PGID     SID STAT     ELAPSED CMD
+1593823       1 1593823 1593772 S          05:38 sleep 100000
+# bridge 1591658 and claude 1591676 are gone (RuntimeManager.destroyEnvironment -> runtime.shutdown()
+# before workspace.destroy(), code from b04593eb87 / 2026-03-24 -- NOT PR #1584, which only affects
+# threads.stop). The agent's background process survives with a deleted cwd.
+
+# Why the orphan has its own session: Claude Code's Bash tool spawns its shell with detached:true
+$ strings -n 8 ~/.local/share/claude/versions/2.1.234 | grep -o '.\{60\}type:"bash",shellPath:e,detached:!0.\{20\}'
+!t?.skipSnapshot)KDp(e).catch(()=>{});let o,i=!1;return{type:"bash",shellPath:e,detached:!0,stdin:"pipe",
+
+$ git blame -L 1126,1129 --date=short apps/host-daemon/src/runtime-manager.ts
+b04593eb87 (OpenAI Codex 2026-03-24 1126)     this.entries.delete(environmentId);
+7a6f3dffbd (OpenAI Codex 2026-05-29 1127)     await this.stopWatchingStatus(entry);
+b04593eb87 (OpenAI Codex 2026-03-24 1128)     await entry.runtime.shutdown();
+b04593eb87 (OpenAI Codex 2026-03-24 1129)     await entry.workspace.destroy();
+$ gh pr view 1584 --json title,mergedAt -q '.title + " | " + .mergedAt'
+Release agent runtimes on thread stop | 2026-08-14T15:52:23Z
