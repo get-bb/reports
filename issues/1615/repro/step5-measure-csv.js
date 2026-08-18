@@ -3,8 +3,8 @@
 // Long Tasks API and JS heap size (Chromium only).
 // Runs at 1x then 4x; each run opens its own anonymous page.
 // ---- edit these for your instance ----
-const APP = "http://localhost:18434";   // Vite dev build
-const THREAD_URL = `${APP}/projects/proj_t95uiuqjap/threads/thr_79bfrk39ug`;
+const APP = "http://localhost:17792";   // Vite dev build
+const THREAD_URL = `${APP}/projects/proj_uzvv6df4kw/threads/thr_6isgdy7qwz`;
 // --------------------------------------
 async function measure(rate) {
   const page = await browser.newPage();
@@ -32,7 +32,13 @@ async function measure(rate) {
     window.__t0 = performance.now();
   });
   await search.press("Enter");
-  await page.waitForSelector("table[aria-label$='CSV preview']", { timeout: 60000 });
+  try {
+    await page.waitForSelector("table[aria-label$='CSV preview']", { timeout: 8000 });
+  } catch {
+    // panel kept the info tab active; activate the new big.csv tab (see step4)
+    await page.getByText("big.csv", { exact: true }).first().click();
+    await page.waitForSelector("table[aria-label$='CSV preview']", { timeout: 60000 });
+  }
   await page.waitForTimeout(3000);
   const r = await page.evaluate(() => ({
     longTasksMs: window.__longTasks,

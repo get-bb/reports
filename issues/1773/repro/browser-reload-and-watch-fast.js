@@ -8,11 +8,17 @@
 // Run with a longer timeout than dev-browser's 30 s default:
 //   dev-browser --browser bb1773 --headless --timeout 120 run browser-reload-and-watch-fast.js
 //
-// EDIT THESE for your instance (App URL from `scripts/bb-dev-app current`):
-const APP_URL = "http://localhost:17786";
-const PROJECT_ID = "proj_w6z9wi4egw";
-const THREAD_ID = "thr_eic8xpsxa2";
-const PRESS_DIFF_FIRST = false; // false = leave a fresh thread at revision 0
+// Configure for your instance by writing ~/.dev-browser/tmp/1773-config.json:
+//   {"appUrl":"http://localhost:<app port>","projectId":"proj_x","threadId":"thr_x","pressDiffFirst":false}
+// (pressDiffFirst=true opens the Diff panel first so the server list is persisted at revision >= 1;
+//  false leaves a fresh thread at revision 0). Defaults below are the author's instance.
+let cfg = {};
+try { cfg = JSON.parse(await readFile("1773-config.json")); } catch {}
+const APP_URL = cfg.appUrl ?? "http://localhost:15908";
+const PROJECT_ID = cfg.projectId ?? "proj_wvzf62vtzk";
+const THREAD_ID = cfg.threadId ?? "thr_c2k6ff5udf";
+const PRESS_DIFF_FIRST = cfg.pressDiffFirst ?? false;
+console.log("CONFIG:", JSON.stringify({ APP_URL, PROJECT_ID, THREAD_ID, PRESS_DIFF_FIRST }));
 
 const page = await browser.getPage("main");
 await page.setViewportSize({ width: 1400, height: 900 });
@@ -29,7 +35,15 @@ page.on("response", async (r) => {
 await page.goto(`${APP_URL}/projects/${PROJECT_ID}/threads/${THREAD_ID}`);
 await page.waitForTimeout(6000);
 if (PRESS_DIFF_FIRST) {
-  await page.locator('button[aria-label="Show diff panel (Ctrl + D)"]').click();
+  // Ctrl+D toggles the Diff panel (its toolbar button can be off-screen when the
+  // right panel is collapsed, so use the keyboard shortcut).
+  await page.locator("body").click({ position: { x: 600, y: 300 } });
+  // Press Ctrl+D until the Diff panel is showing (aria-pressed on its toolbar button).
+  const diffBtn = page.locator('button[aria-label="Show diff panel (Ctrl + D)"]');
+  for (let i = 0; i < 4 && (await diffBtn.getAttribute("aria-pressed").catch(() => null)) !== "true"; i++) {
+    await page.keyboard.press("Control+d");
+    await page.waitForTimeout(1500);
+  }
   await page.waitForTimeout(3000);
   const strip0 = await page.locator("[data-tab-pill-close]").evaluateAll((els) => els.map((e) => e.getAttribute("aria-label")));
   console.log("PRECONDITION strip after Ctrl+D:", JSON.stringify(strip0));

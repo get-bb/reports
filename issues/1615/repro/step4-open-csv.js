@@ -2,13 +2,17 @@
 // secondary-panel file preview and count the table cells the CSV preview
 // creates for a panel that shows ~35 rows.
 // ---- edit these for your instance ----
-const APP = "http://localhost:18434";                       // App URL printed by `scripts/bb-dev-app current`
-const THREAD_URL = `${APP}/projects/proj_t95uiuqjap/threads/thr_79bfrk39ug`;
+const APP = "http://localhost:17792";                       // App URL printed by `scripts/bb-dev-app current`
+const THREAD_URL = `${APP}/projects/proj_uzvv6df4kw/threads/thr_6isgdy7qwz`;
 // --------------------------------------
 const page = await browser.getPage("csv");   // own named page (the 50k-cell tab stays open in it afterwards)
 await page.setViewportSize({ width: 1400, height: 900 });
 await page.goto(THREAD_URL, { waitUntil: "load" });
-await page.waitForTimeout(2000);
+// Start from a clean secondary-panel tab layout (it is persisted in localStorage per thread).
+await page.evaluate(() => localStorage.clear());
+await page.reload({ waitUntil: "load" });
+await page.getByRole("button", { name: /Untracked/ }).first().waitFor({ timeout: 90000 });
+await page.waitForTimeout(2500);
 if (!(await page.getByRole("button", { name: /Hide right panel/ }).count())) {
   await page.getByRole("button", { name: /Show right panel/ }).click();
   await page.waitForTimeout(800);
@@ -23,8 +27,20 @@ const before = await page.evaluate(() => ({ nodes: document.querySelectorAll("*"
 console.log("before opening csv:", JSON.stringify(before));
 const t0 = Date.now();
 await search.press("Enter");
-await page.waitForSelector("table[aria-label$='CSV preview']", { timeout: 30000 });
-const t1 = Date.now();
+// Enter opens a "big.csv" tab. Sometimes the panel keeps the info tab active (seen with the persisted
+// panel layout); in that case click the new tab so the preview actually mounts.
+let t1;
+try {
+  await page.waitForSelector("table[aria-label$='CSV preview']", { timeout: 8000 });
+  t1 = Date.now();
+} catch {
+  console.log("note: tab opened but info tab stayed active; clicking the big.csv tab");
+  const t0b = Date.now();
+  await page.getByText("big.csv", { exact: true }).first().click();
+  await page.waitForSelector("table[aria-label$='CSV preview']", { timeout: 60000 });
+  t1 = Date.now();
+  console.log("ms from tab click to table in DOM:", t1 - t0b);
+}
 await page.waitForTimeout(1500);
 const stats = await page.evaluate(() => {
   const table = document.querySelector("table[aria-label$='CSV preview']");

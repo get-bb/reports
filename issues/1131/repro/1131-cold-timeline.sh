@@ -25,6 +25,33 @@ done
 sleep 3
 echo "--- server back"
 
+# 1b. let the startup sweeps settle. Right after a (re)start on this seeded db
+#     the periodic sweeps (every 10 s) run synchronously too: the
+#     destroyed-environment prune deletes 1,543 stale environments (SET NULL
+#     over ~297k event rows; 5-27 s observed) and the output-truncation sweep
+#     UPDATE takes 0.1-4 s per tick cold. Those stall /health as well and are
+#     NOT the timeline; wait until they are quiet so the measurement below is
+#     attributable to the timeline request alone.
+STALE_ENVS=$(sqlite3 "$DB" "select count(*) from environments where status='destroyed' and updated_at < (strftime('%s','now')*1000 - 7*86400000);")
+echo "--- $(date +%H:%M:%S) waiting for startup sweeps to settle (stale destroyed environments left: $STALE_ENVS)"
+for i in $(seq 1 60); do
+  STALE_ENVS=$(sqlite3 "$DB" "select count(*) from environments where status='destroyed' and updated_at < (strftime('%s','now')*1000 - 7*86400000);")
+  [ "$STALE_ENVS" = "0" ] && break
+  sleep 5
+done
+QUIET=0
+for i in $(seq 1 30); do
+  SLOW=0
+  for j in $(seq 1 60); do
+    T=$(curl -s -o /dev/null -w "%{time_starttransfer}" "$BB_SERVER_URL/health")
+    awk -v t="$T" 'BEGIN{exit !(t+0 > 0.05)}' && SLOW=$((SLOW+1))
+    sleep 0.2
+  done
+  if [ "$SLOW" = "0" ]; then QUIET=1; break; fi
+  echo "    $(date +%H:%M:%S) still noisy ($SLOW /health samples > 50 ms in a 12 s window); waiting"
+done
+echo "--- $(date +%H:%M:%S) sweeps quiet (stale destroyed environments: $STALE_ENVS, quiet window: $QUIET)"
+
 # 2. evict the OS page cache for the database files (no root needed).
 python3 - "$DB" <<'PY'
 import os, sys
@@ -66,3 +93,5 @@ rm -f "$PROBE"
 echo "--- server log lines:"
 LOG=$(ls -t "$HOME/.bb-dev/launchers/"*"$(basename "$BB_REPO")"*/dev.log 2>/dev/null | head -1)
 grep -a "timeline build blocked\|Event loop stalled" "$LOG" | tail -3 | cut -c1-1500
+echo "--- server log: sweep work (Slow DB query) since the restart, for attribution of any other stall:"
+grep -a "Slow DB query" "$LOG" | tail -6 | sed -E 's/"sql":"(.{0,110}).*/"sql":"\1…}/' | cut -c1-300

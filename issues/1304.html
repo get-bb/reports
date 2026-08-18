@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1304 Composer keystroke cost scales with the mounted timeline size</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; --low:#0e8a16; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:960px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.low { background:var(--low); color:#fff; border-color:var(--low); }
+  .verdict { font-weight:600; } .v-repro { color:var(--ok); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:4px; }
+  .num td:nth-child(n+2) { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1304 · Composer keystroke cost scales with the mounted timeline size</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill low">Low</span> <span class="pill">Effort: Medium</span> <span class="pill">perf</span>
+    <a href="https://github.com/get-bb/bb/issues/1304">open on GitHub</a>
+    <span>2026-08-18</span>
+    <span>base <code>16ceb3a540f81c1189efaffb27a39b1d9443abf5</code> (main)</span>
+  </p>
+  <p class="meta">
+    <span class="verdict v-repro">Verdict: REPRODUCED</span>
+    <span>· root-cause confidence: <b>high</b></span>
+    <span>· linked open PRs: none</span>
+    <span>· not fixed on origin/main as of a108fa7ef (no commit after the base touches the draft-store / open-targets / ThreadDetailView paths)</span>
+  </p>
+
+  <h2>TL;DR</h2>
+  <p><b>What the user sees.</b> On a thread whose history has been scrolled into view (a few hundred timeline rows mounted), every character typed into the bottom composer costs noticeably more main-thread time than on a short thread. Typing 71 characters at a 25 ms cadence into a fully mounted 2,304-event seeded thread (197 rows, ~5.9k DOM nodes) took a median of <b>26.8 ms of overhead per keystroke</b> versus <b>19.8 ms</b> on a 13-row thread on the same dev build (the issue reported ~19 ms/key on a 2.6k-event thread).</p>
+  <p><b>What is actually wrong.</b> Two things in <code>ThreadDetailViewInternal</code> (the ~3,000-line component that hosts the whole thread page: header, timeline, side panel and composer):</p>
+  <ol>
+    <li>It subscribes to the composer draft store with <code>usePromptDraftStorage(threadScope)</code> although it only uses <code>addQuote</code> (a stable callback) and <code>storageKey</code>. That hook is a <code>useSyncExternalStore</code> subscription; the composer writes the draft on every keystroke (<code>setTextAndMentions</code>), so <b>the entire thread view re-renders once per keystroke</b> (verified: 142 renders for 71 keystrokes under StrictMode = 1 real render per keystroke; 0 with the fix).</li>
+    <li>On each of those renders it rebuilds <code>threadOpenContext</code> via <code>resolveEnvironmentOpenContext</code> (a fresh <code>{ kind: "local" }</code> object) and passes it to <code>useLocalOpenTargets</code>, whose memo chain is keyed on the object's identity, so <code>openPathInFileTarget</code> is a new function every render; that is a dependency of <code>getLocalFileContextMenuItems</code>, which is the <b>value of <code>MarkdownLocalFileContextMenuContext.Provider</code> wrapped around the whole timeline</b>. A changed context value forces React to walk the provider's entire subtree looking for consumers on every keystroke: 1,535 fibers on the small thread, <b>17,943 fibers</b> on the fully mounted big thread. That walk (<code>propagateParentContextChanges</code>) is what makes the per-keystroke cost scale with the mounted timeline (0.17 ms/key -> 1.8 ms/key of pure React self time), on top of the render of the un-memoized ancestors (<code>ThreadTimelineSurface</code>, <code>ThreadDetailSecondaryContentBody</code>, <code>ThreadTimelinePane</code>, ...) which is size independent.</li>
+  </ol>
+  <p><b>Why the fix is small.</b> Stop subscribing (use <code>getPromptDraftAccessor</code>, extended with <code>addQuote</code>/<code>storageKey</code>) and memoize the open context structurally in <code>useLocalOpenTargets</code>. With that 54-line diff, per-keystroke re-rendering of the thread view disappears (rendered React fibers per keystroke 180 -> 81, <code>propagateParentContextChanges</code> 127 ms -> 3 ms per 71 keystrokes, script time 20.0 -> 12.8 ms/key on the big thread) and the big thread types as fast as the small one (median 20.2 vs 19.8 ms/key overhead). The timeline rows themselves are already memoized (they did not re-render in any run); the remaining ~20 ms/key is composer-local (PromptBox/ProseMirror, plugin composer providers, dev-mode <code>jsxDEV</code>) and out of scope here.</p>
+
+  <h2>Claims vs findings</h2>
+  <table>
+    <tr><th>Claim (issue)</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Typing cost has ~19 ms/keystroke main-thread overhead on a fully loaded 2.6k-event thread</td><td class="ok">Verified (order of magnitude)</td><td>Median 26.8 ms/key wall overhead on a fully mounted 2,304-event thread vs 19.8 ms/key on a 13-row thread, dev build, headless Chromium, 71 keys @ 25 ms (<a href="#runs">all runs</a>). Absolute values are machine dependent and noisy (shared box); the deltas and the deterministic counters are not.</td></tr>
+    <tr><td>Cost scales with the mounted timeline size (a "re-render amplifier" survives #1269/#1285)</td><td class="ok">Verified</td><td><code>ThreadDetailViewInternal</code> and its non-memoized descendants (<code>ThreadDetailSecondaryContentBody</code>, <code>ThreadTimelinePane</code>, <code>ThreadTimelineSurface</code>, <code>EmbeddedThreadChatHostedFooter</code>) render once per keystroke regardless of thread size; on top, a context value that wraps the timeline changes per keystroke, so React scans 1.5k (small) vs 17.9k (big) fibers per keystroke (<code>propagateParentContextChanges</code> 12 ms vs 127 ms per 71 keys). Rendered fibers per key: 156 (small) vs 180 (big); with the fix 81.</td></tr>
+    <tr><td>A ~94 ms long task mid-sentence</td><td class="unv">Partially</td><td>Long tasks of 122 ms (hooked base-big run), 59 ms (base-big-clean3), 64/54 ms (base-small-clean2) appeared sporadically; none in any of the fixed runs. Sporadic on this shared machine, so not attributed with confidence.</td></tr>
+    <tr><td>(implicit) Timeline rows re-render per keystroke</td><td class="no">Refuted</td><td><code>TimelineRowView</code>/<code>TimelineExpandableRowView</code> probes stayed at 0 in every run. The rows are memoized; the cost is the ancestors' renders + the context-consumer scan over the row subtree, not row renders.</td></tr>
+    <tr><td>Suggested approach: isolate composer draft state from the timeline tree</td><td class="ok">Confirmed as the right direction</td><td>The draft state is already isolated in the composer's own components; the leak is <code>ThreadDetailViewInternal</code>'s unnecessary draft subscription. Fixing that plus the context-value identity removes the timeline-size dependence.</td></tr>
+  </table>
+
+  <h2>Environment</h2>
+  <ul>
+    <li>bb <code>16ceb3a54</code> (main, 2026-08-18), worktree <code>/home/sawyer/projects/bb/.claude/worktrees/wf_570fde41-63f-2</code>; dev instance from <code>scripts/bb-dev-app current</code>: app <code>:16950</code>, server <code>:24950</code>, host daemon <code>:32950</code>, data dir <code>/home/sawyer/.bb-dev/projects-bb-.claude-worktrees-wf_570fde41-63f-2-2b1f84feebda</code> (deleted at cleanup).</li>
+    <li>Linux 7.0.0-29-generic, node v24.18.0, Vite dev build (React StrictMode on, so every component render function is invoked twice; the counters below read "142 for 71 keys" = 1 real render per key). Headless Chromium via <code>dev-browser</code>, viewport 1280x900, CDP CPU profiler at 200 us sampling.</li>
+    <li>Seed: <code>pnpm seed:perf -- --projects 2 --threads 100 --events 60000</code> (60,166 events). Big thread <code>thr_e5upw3jres</code> (project <code>proj_rgsz9s6cf9</code>, 2,304 events, 197 rows / 5,925 DOM nodes when fully mounted); small thread <code>thr_in7agg4344</code> (project <code>proj_n2izyamrfz</code>, 77 events, 13 rows / 840 nodes as initially rendered). Seeded threads contain no markdown links, so the context scan finds zero consumers; the scan itself is the cost.</li>
+    <li>No providers were run (typing only; no turns sent).</li>
+  </ul>
+
+  <h2>Minimal reproduction</h2>
+  <h3>A. Unit-level (fails on main, passes with the fix)</h3>
+  <p>File: <a href="1304/repro/threadDetailView.keystroke-rerender.repro.test.tsx">1304/repro/threadDetailView.keystroke-rerender.repro.test.tsx</a> (copy to <code>apps/app/src/views/thread-detail/</code>). It models the two mechanisms at the hook level with the exact composition ThreadDetailView uses.</p>
+  <pre>$ cd apps/app &amp;&amp; pnpm exec vitest run src/views/thread-detail/threadDetailView.keystroke-rerender.repro.test.tsx</pre>
+  <p><b>Expected:</b> 2 passed. <b>Actual on 16ceb3a54</b> (<a href="1304/repro/repro-test-base.log">log</a>):</p>
+  <pre>x a view that only needs addQuote must not re-render on every composer keystroke
+    TypeError: accessor.addQuote is not a function
+    (the subscribed view had re-rendered 19 times for 19 keystrokes - asserted toBe(19) passes - but the non-subscribing alternative does not exist yet)
+x threadOpenContext -&gt; useLocalOpenTargets must yield a stable openPathInFileTarget across renders
+    AssertionError: expected [AsyncFunction] to be [AsyncFunction] // Object.is equality
+Tests  2 failed (2)</pre>
+  <p>With <a href="1304/repro/fix.diff">fix.diff</a> applied (<a href="1304/repro/repro-test-fixed.log">log</a>): <code>Tests 22 passed (22)</code> (this file + <code>usePromptDraftStorage.test.tsx</code> + <code>threadWorkspaceOpenPath.test.ts</code>). Caveat: this test pins the mechanism (a draft-store subscriber re-renders per keystroke; the open-context memo is identity keyed), not <code>ThreadDetailView</code> itself, which the app test suite only renders mocked.</p>
+  <pre>// @vitest-environment jsdom
+//
+// Repro for get-bb/bb#1304 (&quot;Composer keystroke cost scales with the mounted
+// timeline size&quot;). Both tests model, at the hook level, the exact composition
+// ThreadDetailViewInternal uses (apps/app/src/views/thread-detail/ThreadDetailView.tsx):
+//
+//  (1) It calls `usePromptDraftStorage(threadScope)` but only reads the stable
+//      `addQuote` / `storageKey` members. `usePromptDraftStorage` is a
+//      `useSyncExternalStore` subscription, so every keystroke the composer
+//      writes with `setTextAndMentions` re-renders the whole ~3k-line view.
+//  (2) On every one of those renders it calls `resolveEnvironmentOpenContext`
+//      (a fresh `{ kind: &quot;local&quot; }` object) and feeds it to `useLocalOpenTargets`,
+//      whose `openPathInFileTarget` callback therefore changes identity every
+//      render; that callback is a dependency of `getLocalFileContextMenuItems`,
+//      which is the value of `MarkdownLocalFileContextMenuContext.Provider`
+//      wrapped around the entire timeline. React then has to scan the whole
+//      timeline subtree (~18k fibers for a fully mounted 2.3k-event thread)
+//      for context consumers on every keystroke.
+//
+// On main (16ceb3a54) both tests FAIL. With the fix in
+// /tmp/bb-reports/issues/1304/repro/fix.diff (getPromptDraftAccessor.addQuote used
+// by ThreadDetailView; structural memo of openContext in useLocalOpenTargets)
+// both pass.
+
+import { act, cleanup, render, renderHook } from &quot;@testing-library/react&quot;;
+import { afterEach, beforeEach, describe, expect, it } from &quot;vitest&quot;;
+import type { Environment } from &quot;@bb/domain&quot;;
+import {
+  getPromptDraftAccessor,
+  usePromptDraftStorage,
+} from &quot;@/hooks/usePromptDraftStorage&quot;;
+import { useLocalOpenTargets } from &quot;@/hooks/useLocalOpenTargets&quot;;
+import { resolveEnvironmentOpenContext } from &quot;./threadWorkspaceOpenPath&quot;;
+
+const scope = {
+  kind: &quot;thread&quot; as const,
+  projectId: &quot;proj-1304&quot;,
+  threadId: &quot;thr-1304&quot;,
+};
+
+beforeEach(() =&gt; {
+  window.localStorage.clear();
+});
+afterEach(() =&gt; {
+  cleanup();
+});
+
+describe(&quot;#1304 composer keystrokes re-render the thread view&quot;, () =&gt; {
+  it(&quot;a view that only needs addQuote must not re-render on every composer keystroke&quot;, () =&gt; {
+    let subscribedRenders = 0;
+    let accessorRenders = 0;
+    // What ThreadDetailViewInternal does on main: subscribes to the draft
+    // store, but only uses `addQuote` (a stable callback) and `storageKey`.
+    function SubscribedViewLike() {
+      subscribedRenders += 1;
+      const selectionPromptDraft = usePromptDraftStorage(scope);
+      void selectionPromptDraft.addQuote;
+      void selectionPromptDraft.storageKey;
+      return null;
+    }
+    // What it should do: event-time access without a subscription. On main
+    // `getPromptDraftAccessor` has no `addQuote`, so this view cannot be
+    // written this way yet (the assertion below throws a TypeError).
+    let accessor: ReturnType&lt;typeof getPromptDraftAccessor&gt; | null = null;
+    function AccessorViewLike() {
+      accessorRenders += 1;
+      accessor = getPromptDraftAccessor(scope);
+      return null;
+    }
+    render(
+      &lt;&gt;
+        &lt;SubscribedViewLike /&gt;
+        &lt;AccessorViewLike /&gt;
+      &lt;/&gt;,
+    );
+    const subscribedBefore = subscribedRenders;
+    const accessorBefore = accessorRenders;
+
+    // The composer&#x27;s per-keystroke write path (PromptBox -&gt; setTextAndMentions).
+    const composer = renderHook(() =&gt; usePromptDraftStorage(scope));
+    const typed = &quot;The quick brown fox&quot;;
+    for (let index = 1; index &lt;= typed.length; index += 1) {
+      act(() =&gt; {
+        composer.result.current.setTextAndMentions(typed.slice(0, index), []);
+      });
+    }
+
+    // Sanity: the draft store itself works.
+    expect(getPromptDraftAccessor(scope).getCurrent().text).toBe(typed);
+    // The amplifier, by construction: one extra render of the subscribed view
+    // per keystroke (this is what ThreadDetailViewInternal pays on main).
+    expect(subscribedRenders - subscribedBefore).toBe(typed.length);
+    // The accessor-based view renders zero extra times...
+    expect(accessorRenders - accessorBefore).toBe(0);
+    // ...and can still perform the only draft mutation the thread view needs.
+    // FAILS on main: `accessor.addQuote is not a function`.
+    act(() =&gt; {
+      (accessor as unknown as { addQuote: (text: string) =&gt; void }).addQuote(
+        &quot;quoted selection&quot;,
+      );
+    });
+    expect(getPromptDraftAccessor(scope).getCurrent().text).toContain(
+      &quot;&gt; quoted selection&quot;,
+    );
+  });
+
+  it(&quot;threadOpenContext -&gt; useLocalOpenTargets must yield a stable openPathInFileTarget across renders&quot;, () =&gt; {
+    const environment: Environment = {
+      baseBranch: null,
+      branchName: &quot;main&quot;,
+      createdAt: 1,
+      defaultBranch: &quot;main&quot;,
+      hostId: &quot;host_local&quot;,
+      id: &quot;env-1304&quot;,
+      name: null,
+      isGitRepo: true,
+      isWorktree: false,
+      managed: false,
+      mergeBaseBranch: null,
+      path: &quot;/tmp/repo&quot;,
+      projectId: &quot;proj-1304&quot;,
+      status: &quot;ready&quot;,
+      updatedAt: 1,
+      workspaceProvisionType: &quot;personal&quot;,
+    };
+    // Exactly what ThreadDetailViewInternal does on every render (l.1874-1892).
+    const { result, rerender } = renderHook(() =&gt; {
+      const threadOpenContext = resolveEnvironmentOpenContext({
+        environment,
+        serverOrigin: &quot;http://localhost&quot;,
+        threadEnvironmentIsLocal: true,
+      });
+      return useLocalOpenTargets({
+        enabled: threadOpenContext !== null,
+        ...(threadOpenContext ? { openContext: threadOpenContext } : {}),
+      });
+    });
+    const first = result.current.openPathInFileTarget;
+    rerender();
+    const second = result.current.openPathInFileTarget;
+    // BUG on main: a fresh `{ kind: &quot;local&quot; }` object per render busts the
+    // memo chain in useLocalOpenTargets, so this callback (and with it the
+    // MarkdownLocalFileContextMenuContext value) changes identity every render.
+    expect(second).toBe(first);
+  });
+});
+</pre>
+
+  <h3>B. In the app (deterministic counters + timings)</h3>
+  <ol>
+    <li>Build and start your dev instance: <code>pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build &amp;&amp; scripts/bb-dev-app current</code>. Note the App URL and Data dir.</li>
+    <li>Seed: <code>pnpm seed:perf -- --projects 2 --threads 100 --events 60000</code>. Pick a big non-archived thread: <code>sqlite3 "&lt;Data dir&gt;/bb.db" "select t.id,t.project_id,count(*) c from threads t join events e on e.thread_id=t.id where t.archived_at is null group by t.id order by c desc limit 1"</code> and a small one (<code>order by c asc</code>). Archived threads have no composer.</li>
+    <li>Optional, makes the render counters visible: copy <a href="1304/repro/render-probe.ts">render-probe.ts</a> to <code>apps/app/src/lib/</code> and apply <a href="1304/repro/instrumentation.diff">instrumentation.diff</a> (adds one <code>renderProbe("Name")</code> line to 8 components; the Vite dev server hot-reloads).</li>
+    <li>Run <a href="1304/repro/run-all.sh">run-all.sh</a> (needs <code>dev-browser</code> on PATH; it drives <a href="1304/repro/db-all.js">db-all.js</a>): <pre>$ /tmp/bb-reports/issues/1304/repro/run-all.sh base-small http://localhost:&lt;app&gt;/projects/&lt;proj&gt;/threads/&lt;small thr&gt; false
+$ /tmp/bb-reports/issues/1304/repro/run-all.sh base-big   http://localhost:&lt;app&gt;/projects/&lt;proj&gt;/threads/&lt;big thr&gt;   true    # true = scroll to top until all rows are mounted
+$ # timing-only variants without the fiber-walking hook (its own overhead is ~5 ms/key on the big thread):
+$ /tmp/bb-reports/issues/1304/repro/run-all.sh base-big-clean &lt;url&gt; true false</pre></li>
+  </ol>
+  <p><b>Expected:</b> per-keystroke work independent of how much timeline is mounted; only composer components render. <b>Actual</b> (verbatim summary lines printed by run-all.sh):</p>
+  <pre>1304-all-base-small.json {&#x27;rows&#x27;: 13, &#x27;nodes&#x27;: 838} commits 142 rendered/key 156 cpu/key 25.2 overhead/key 20.1 long []
+ named: {&#x27;propagateParentContextChanges&#x27;: 14.7, &#x27;ThreadDetailViewInternal&#x27;: 8.9, &#x27;PromptBoxInternal&#x27;: 5.2, &#x27;ThreadDetailPromptArea&#x27;: 4.5, &#x27;caretPositionFromPoint&#x27;: 5.9}
+ probes: {&#x27;ThreadDetailViewInternal&#x27;: 142, &#x27;ThreadDetailSecondaryContentBody&#x27;: 284, &#x27;ThreadTimelinePane&#x27;: 142, &#x27;EmbeddedThreadChatHostedFooter&#x27;: 142, &#x27;ThreadTimelineSurface&#x27;: 142, &#x27;ThreadDetailPromptArea&#x27;: 142, &#x27;PromptBoxInternal&#x27;: 284}
+ providers: [(&#x27;Provider under PluginThreadPanelNavigationProvider &lt; ThreadDetailViewInternal &lt; ThreadDetailView&#x27;, 71, 1535), (&#x27;Provider under Dialog &lt; ThreadGitActionDialog &lt; UrlOpenRoutingProvider&#x27;, 71, 9), (&#x27;Provider under PluginComposerViewProvider &lt; FollowUpPromptBoxWithComposer &lt; FollowUpPromptBox&#x27;, 71, 256), (&#x27;Provider under PluginComposerHostProvider &lt; PluginComposerViewProvider &lt; FollowUpPromptBoxWithComposer&#x27;, 71, 254), (&#x27;Provider under PluginComposerViewProvider &lt; PromptBoxInternal &lt; PromptBoxWithScrollAnchor&#x27;, 71, 94)]
+
+1304-all-base-big.json {&#x27;rows&#x27;: 197, &#x27;nodes&#x27;: 5924} commits 142 rendered/key 180.1 cpu/key 38.7 overhead/key 32.1 long [122]
+ named: {&#x27;ThreadDetailViewInternal&#x27;: 7.8, &#x27;propagateParentContextChanges&#x27;: 132.9, &#x27;caretPositionFromPoint&#x27;: 21.6, &#x27;ThreadDetailPromptArea&#x27;: 4.7, &#x27;PromptBoxInternal&#x27;: 3.4}
+ probes: {&#x27;ThreadDetailViewInternal&#x27;: 142, &#x27;ThreadDetailSecondaryContentBody&#x27;: 284, &#x27;ThreadTimelinePane&#x27;: 142, &#x27;EmbeddedThreadChatHostedFooter&#x27;: 142, &#x27;ThreadTimelineSurface&#x27;: 142, &#x27;ThreadDetailPromptArea&#x27;: 142, &#x27;PromptBoxInternal&#x27;: 284}
+ providers: [(&#x27;Provider under PluginThreadPanelNavigationProvider &lt; ThreadDetailViewInternal &lt; ThreadDetailView&#x27;, 71, 17943), (&#x27;Provider under Dialog &lt; ThreadGitActionDialog &lt; UrlOpenRoutingProvider&#x27;, 71, 9), (&#x27;Provider under PluginComposerViewProvider &lt; FollowUpPromptBoxWithComposer &lt; FollowUpPromptBox&#x27;, 71, 272), (&#x27;Provider under PluginComposerHostProvider &lt; PluginComposerViewProvider &lt; FollowUpPromptBoxWithComposer&#x27;, 71, 270), (&#x27;Provider under PluginComposerViewProvider &lt; PromptBoxInternal &lt; PromptBoxWithScrollAnchor&#x27;, 71, 94), ...]
+
+1304-all-fixfinal-big.json {&#x27;rows&#x27;: 197, &#x27;nodes&#x27;: 5925} commits 143 rendered/key 81 cpu/key 29.7 overhead/key 24.8 long []
+ named: {&#x27;caretPositionFromPoint&#x27;: 23.7, &#x27;ThreadDetailPromptArea&#x27;: 3.7, &#x27;propagateParentContextChanges&#x27;: 4.2, &#x27;PromptBoxInternal&#x27;: 1}
+ probes: {&#x27;ThreadDetailPromptArea&#x27;: 142, &#x27;PromptBoxInternal&#x27;: 284, &#x27;ThreadDetailSecondaryContentBody&#x27;: 142}
+ providers: [(&#x27;Provider under PluginComposerViewProvider &lt; FollowUpPromptBoxWithComposer &lt; FollowUpPromptBox&#x27;, 71, 272), (&#x27;Provider under PluginComposerHostProvider &lt; PluginComposerViewProvider &lt; FollowUpPromptBoxWithComposer&#x27;, 71, 270), (&#x27;Provider under PluginComposerViewProvider &lt; PromptBoxInternal &lt; PromptBoxWithScrollAnchor&#x27;, 71, 94)]</pre>
+  <p>Reading the counters: "probes: ThreadDetailViewInternal 142" = the whole thread view rendered once per keystroke (x2 StrictMode). "providers: ... 71, 17943" = a context provider directly under <code>ThreadDetailViewInternal</code>'s <code>PluginThreadPanelNavigationProvider</code> got a new value on all 71 keystrokes and React had to scan a 17,943-fiber subtree for consumers each time. After the fix that provider never changes and the view never renders; only the composer's own providers (subtree &lt;= 272 fibers) still change per keystroke, which is expected since they carry the draft.</p>
+  <figure><img src="assets/1304-metrics.svg" alt="metrics chart"><figcaption>Medians of the hook-less ("clean") runs. Left to right: base small thread, base big thread fully mounted, big thread with the fix. Blue = wall-clock overhead per keystroke beyond the 25 ms cadence; light blue = CDP ScriptDuration per keystroke; red = React's <code>propagateParentContextChanges</code> self time per keystroke (x10 for visibility). Rendered-fibers-per-key are from the hooked runs.</figcaption></figure>
+  <figure><img src="assets/1304-base-big.png" alt="big thread after typing"><figcaption>Screenshot at the end of the base-big run: the fully mounted 197-row seeded thread with the 71-character sentence typed into the composer. This is the moment being measured; the defect is timing, there is no visual defect. (<a href="assets/1304-base-small.png">small-thread</a> and <a href="assets/1304-fixfinal-big.png">fixed big-thread</a> counterparts.)</figcaption></figure>
+  <p>Which dependency churns (probe patched into ThreadDetailView by <a href="1304/repro/apply-depprobe.py">apply-depprobe.py</a>, driven by <a href="1304/repro/run-depprobe.sh">run-depprobe.sh</a>; output <a href="1304/repro/1304-depprobe.out">1304-depprobe.out</a>), 25 keystrokes on the small thread:</p>
+  <pre># base (16ceb3a54 + probes), small thread thr_in7agg4344, 25 keystrokes (StrictMode dev =&gt; 2 renders per keystroke):
+{&quot;dep&quot;:{&quot;threadOpenContext&quot;:50,&quot;openPathInFileTarget&quot;:50,&quot;getLocalFileContextMenuItems&quot;:50},&quot;renders&quot;:{&quot;ThreadDetailViewInternal&quot;:50,&quot;ThreadDetailSecondaryContentBody&quot;:100,&quot;ThreadTimelinePane&quot;:50,&quot;EmbeddedThreadChatHostedFooter&quot;:50,&quot;ThreadTimelineSurface&quot;:50,&quot;ThreadDetailPromptArea&quot;:50,&quot;PromptBoxInternal&quot;:100}}
+# with fix.diff applied, same thread, same 25 keystrokes:
+{&quot;dep&quot;:{},&quot;renders&quot;:{&quot;ThreadDetailPromptArea&quot;:50,&quot;PromptBoxInternal&quot;:100,&quot;ThreadDetailSecondaryContentBody&quot;:50}}
+</pre>
+  <p>Only <code>threadOpenContext</code>, <code>openPathInFileTarget</code> and <code>getLocalFileContextMenuItems</code> change identity, exactly once per render; <code>fileOpenTargets</code>, <code>pluginFileOpeners</code>, <code>handleOpenTimelineLocalFileLink</code> are stable.</p>
+
+  <h3 id="runs">All measurement runs</h3>
+  <table class="num">
+    <tr><th>run</th><th>rows</th><th>DOM nodes</th><th>fiber hook</th><th>overhead ms/key</th><th>CPU busy ms/key</th><th>ScriptDuration ms (71 keys)</th><th>propagateParentContextChanges self ms</th><th>rendered fibers/key</th><th>ThreadDetailViewInternal renders</th><th>long tasks ms</th></tr>
+    <tr><td><a href='1304/repro/1304-all-base-big-clean.json'>base-big-clean</a></td><td>197</td><td>5925</td><td>no</td><td>23.5</td><td>30.3</td><td>-</td><td>119.1</td><td>-</td><td>142</td><td>-</td></tr>
+<tr><td><a href='1304/repro/1304-all-base-big-clean2.json'>base-big-clean2</a></td><td>197</td><td>5925</td><td>no</td><td>27.3</td><td>31.5</td><td>1419</td><td>136.6</td><td>-</td><td>142</td><td>-</td></tr>
+<tr><td><a href='1304/repro/1304-all-base-big-clean3.json'>base-big-clean3</a></td><td>197</td><td>5925</td><td>no</td><td>32.9</td><td>34.6</td><td>1604</td><td>135.2</td><td>-</td><td>142</td><td>59</td></tr>
+<tr><td><a href='1304/repro/1304-all-base-big-clean4.json'>base-big-clean4</a></td><td>197</td><td>5925</td><td>no</td><td>26.2</td><td>31.9</td><td>1360</td><td>114.6</td><td>-</td><td>142</td><td>-</td></tr>
+<tr><td><a href='1304/repro/1304-all-base-big.json'>base-big</a></td><td>197</td><td>5924</td><td>yes</td><td>32.1</td><td>38.7</td><td>-</td><td>132.9</td><td>180.1</td><td>142</td><td>122</td></tr>
+<tr><td><a href='1304/repro/1304-all-base-small-clean.json'>base-small-clean</a></td><td>13</td><td>840</td><td>no</td><td>18.7</td><td>24.2</td><td>-</td><td>10.4</td><td>-</td><td>142</td><td>-</td></tr>
+<tr><td><a href='1304/repro/1304-all-base-small-clean2.json'>base-small-clean2</a></td><td>13</td><td>840</td><td>no</td><td>25.8</td><td>29.4</td><td>1433</td><td>15</td><td>-</td><td>142</td><td>64,54</td></tr>
+<tr><td><a href='1304/repro/1304-all-base-small-clean3.json'>base-small-clean3</a></td><td>13</td><td>840</td><td>no</td><td>19.8</td><td>23.8</td><td>1078</td><td>11.9</td><td>-</td><td>142</td><td>-</td></tr>
+<tr><td><a href='1304/repro/1304-all-base-small.json'>base-small</a></td><td>13</td><td>838</td><td>yes</td><td>20.1</td><td>25.2</td><td>-</td><td>14.7</td><td>156</td><td>142</td><td>-</td></tr>
+<tr><td><a href='1304/repro/1304-all-fix-big-clean.json'>fix-big-clean</a></td><td>197</td><td>5925</td><td>no</td><td>20.2</td><td>25.4</td><td>939</td><td>4.9</td><td>-</td><td>0</td><td>-</td></tr>
+<tr><td><a href='1304/repro/1304-all-fix-big-clean2.json'>fix-big-clean2</a></td><td>197</td><td>5925</td><td>no</td><td>18.5</td><td>23.7</td><td>854</td><td>3.6</td><td>-</td><td>0</td><td>-</td></tr>
+<tr><td><a href='1304/repro/1304-all-fix-big-clean3.json'>fix-big-clean3</a></td><td>197</td><td>5925</td><td>no</td><td>20.1</td><td>24.9</td><td>880</td><td>2.3</td><td>-</td><td>0</td><td>-</td></tr>
+<tr><td><a href='1304/repro/1304-all-fix-big.json'>fix-big</a></td><td>197</td><td>5925</td><td>yes</td><td>26.7</td><td>31.9</td><td>1373</td><td>4.2</td><td>81</td><td>0</td><td>-</td></tr>
+<tr><td><a href='1304/repro/1304-all-fix-small-clean.json'>fix-small-clean</a></td><td>13</td><td>840</td><td>no</td><td>23.1</td><td>27.4</td><td>1063</td><td>3.6</td><td>-</td><td>0</td><td>-</td></tr>
+<tr><td><a href='1304/repro/1304-all-fixfinal-big-clean.json'>fixfinal-big-clean</a></td><td>197</td><td>5925</td><td>no</td><td>20.4</td><td>25.4</td><td>974</td><td>2.6</td><td>-</td><td>0</td><td>-</td></tr>
+<tr><td><a href='1304/repro/1304-all-fixfinal-big.json'>fixfinal-big</a></td><td>197</td><td>5925</td><td>yes</td><td>24.8</td><td>29.7</td><td>1257</td><td>4.2</td><td>81</td><td>0</td><td>-</td></tr>
+  </table>
+  <p>"fix-*" runs used an earlier variant of part B (memoizing <code>threadOpenContext</code> in ThreadDetailView); "fixfinal-*" is the diff shipped below (memo inside <code>useLocalOpenTargets</code>). Same effect. Wall/CPU numbers vary +-5 ms between runs because the machine hosts other agents; the counters (renders, changed providers, subtree sizes) and the <code>propagateParentContextChanges</code> self time are the reliable signals. The first two "clean" runs predate the ScriptDuration column.</p>
+
+  <h2>Root cause</h2>
+  <h3>1. The thread view subscribes to the draft store it never renders</h3>
+  <p><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/views/thread-detail/ThreadDetailView.tsx#L960-L970">ThreadDetailView.tsx L960-970</a>:</p>
+  <pre>  // Same scope (`projectId` + `thread.id`) the composer&#x27;s `ThreadDetailPromptArea`
+  // uses, so the timeline &quot;Add to chat&quot; action and the composer share one
+  // localStorage-backed draft ...
+  const selectionPromptDraft = usePromptDraftStorage({
+    kind: &quot;thread&quot;,
+    projectId: thread?.projectId ?? projectId ?? &quot;&quot;,
+    threadId: thread?.id ?? &quot;&quot;,
+  });
+  const addQuoteToComposer = selectionPromptDraft.addQuote;</pre>
+  <p>The only other use is <code>selectionPromptDraft.storageKey</code> (L1148). <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/hooks/usePromptDraftStorage.ts#L264-L272">usePromptDraftStorage</a> is a <code>useSyncExternalStore</code> over the module-level draft store; the doc comment on <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/hooks/usePromptDraftStorage.ts#L243-L262">getPromptDraftAccessor</a> already warns: "<em>usePromptDraftStorage is a useSyncExternalStore subscription, so it re-renders its caller on every keystroke a mounted composer writes - pure waste when the caller never renders the draft.</em>" The composer writes on every keystroke: <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/views/thread-detail/ThreadDetailPromptArea.tsx#L976">ThreadDetailPromptArea L976</a> <code>onChangeMessage: promptDraft.setTextAndMentions</code> -> <code>writePromptDraft</code> -> <code>emitPromptDraftChange</code> -> every subscriber, including the 3k-line view. So one keystroke = one full render of <code>ThreadDetailViewInternal</code>: hundreds of hooks, a huge JSX tree (dev-mode <code>jsxDEV</code> is the top self-time frame in every profile), and every non-memoized child (<code>ThreadDetailSecondaryContentBody</code>, <code>ThreadTimelinePane</code>, <code>ThreadTimelineSurface</code>, <code>EmbeddedThreadChatHostedFooter</code> all render 1x/key in the probes). Introduced with the "Add to chat" quote action in <code>a6bec2089</code> (#498).</p>
+
+  <h3>2. Each of those renders changes a context value that wraps the whole timeline</h3>
+  <p><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/views/thread-detail/ThreadDetailView.tsx#L1874-L1892">ThreadDetailView.tsx L1874-1892</a> builds the open context every render and hands it to <code>useLocalOpenTargets</code>:</p>
+  <pre>  const threadOpenContext = resolveEnvironmentOpenContext({   // returns a fresh { kind: &quot;local&quot; } (or remote-ssh) object
+    environment,
+    serverOrigin: window.location.origin,
+    threadEnvironmentIsLocal,
+  });
+  const { ..., fileOpenTargets, openPathInFileTarget, ... } = useLocalOpenTargets({
+    enabled: threadOpenContext !== null,
+    ...(threadOpenContext ? { openContext: threadOpenContext } : {}),
+  });</pre>
+  <p><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/hooks/useLocalOpenTargets.ts#L214-L217">useLocalOpenTargets.ts L214-217</a> memoizes on identity: <code>useMemo(() =&gt; args.openContext ?? { kind: "local" }, [args.openContext])</code>, and <code>openContext</code> is a dep of <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/hooks/useLocalOpenTargets.ts#L264-L308">openPathInAvailableTarget</a> -> <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/hooks/useLocalOpenTargets.ts#L336-L360">openPathInFileTarget</a>. That callback is a dep of <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/views/thread-detail/ThreadDetailView.tsx#L2281-L2370">getLocalFileContextMenuItems</a> (deps <code>[fileOpenTargets, handleOpenTimelineLocalFileLink, openPathInFileTarget, pluginFileOpeners]</code>), which is rendered as the value of <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/views/thread-detail/ThreadDetailView.tsx#L2766-L2768">MarkdownLocalFileContextMenuContext.Provider</a> around <code>ThreadDetailSecondaryContent</code> (timeline + side panel) and again inside <code>renderHostedPanel</code>. The consumer is <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/components/ui/markdown-preview.tsx#L638">MarkdownAnchor</a>, i.e. every markdown link in every rendered message.</p>
+  <p>React's contract for a changed context value: it must find all consumers under the provider, and it does so by walking the provider's whole fiber subtree (<code>propagateParentContextChanges</code>/<code>propagateContextChanges</code>), memo boundaries notwithstanding. That walk is O(mounted timeline): 1,535 fibers on the 13-row thread, 17,943 fibers on the 197-row thread, once per keystroke, and it is the biggest single React frame in the big-thread profiles (115-137 ms self time per 71 keys, versus 10-15 ms on the small thread and 2-5 ms with the fix). If the messages contain local file links, every one of those <code>MarkdownAnchor</code>s additionally re-renders per keystroke (the seed corpus has none, so this run shows the floor).</p>
+  <p><b>Deeper issue.</b> Both problems are instances of one pattern: <code>ThreadDetailViewInternal</code> is a very large component that owns state for unrelated concerns, so any subscription it holds re-runs everything under it and any un-memoized derived value it publishes via context invalidates the whole subtree. The size scaling in the issue title is specifically the context-propagation scan; the fixed per-keystroke tax (render of the view + non-memoized ancestors) is size independent but is what the subscription buys for nothing. Both go away together.</p>
+
+  <h2>Proposed fix (first principles)</h2>
+  <p>Diff: <a href="1304/repro/fix.diff">1304/repro/fix.diff</a> (applies to 16ceb3a54; 3 files, +54/-8; <code>turbo typecheck --filter=@bb/app</code> passes; app hooks + thread-detail + plugin composer test suites pass: 66 files / 427 tests + 12). Applied by <a href="1304/repro/apply-fix.py">apply-fix.py</a>, reverted by <a href="1304/repro/revert-fix.py">revert-fix.py</a>. Left applied in the worktree together with the repro test.</p>
+  <ol>
+    <li><b>Part A</b> - <code>usePromptDraftStorage.ts</code>: give <code>getPromptDraftAccessor</code> the two members the view needs (<code>storageKey</code>, <code>addQuote</code>) using the same <code>appendQuoteAndAttachmentsToDraft</code> path; <code>ThreadDetailView.tsx</code>: replace <code>usePromptDraftStorage(...)</code> with <code>useMemo(() =&gt; getPromptDraftAccessor(...), [projectId, threadId])</code>. "Add to chat" behavior is unchanged (the accessor writes to the same store; the composer, which does subscribe, re-renders and shows the quote). Cleaner follow-up: dedupe <code>addQuote</code> by having the hook delegate to the accessor.</li>
+    <li><b>Part B</b> - <code>useLocalOpenTargets.ts</code>: memoize <code>openContext</code> on its fields (<code>kind</code>, <code>hostId</code>, <code>serverOrigin</code>) rather than on object identity, so any caller can rebuild an equal context per render without churning the callbacks. (Alternative: memoize <code>threadOpenContext</code> in ThreadDetailView on <code>[environment, threadEnvironmentIsLocal]</code>; measured both, same result. The hook-side fix is more robust and is what the repro test checks.)</li>
+  </ol>
+  <p>Part A alone removes the keystroke-triggered render (and therefore the context churn on keystrokes); part B alone would still leave the view rendering per keystroke. Part B additionally protects every <em>other</em> reason the view renders (timeline events streaming in, query refetches, resize) from re-scanning the timeline subtree, so it should ship too. Risk: none observable; the only semantic change is that the thread view no longer re-renders when the draft changes, and nothing in it reads the draft (grep: only <code>addQuote</code> and <code>storageKey</code>). A guard test that renders the real <code>ThreadDetailView</code> would be better than the hook-level test, but the app suite currently only renders it mocked.</p>
+  <p>Beyond this issue, the remaining ~20 ms/key on the dev build is composer-local (two <code>PromptBoxInternal</code> renders per keystroke, the plugin composer providers <code>PluginComposerViewProvider</code>/<code>PluginComposerHostProvider</code> republishing the draft to a ~270-fiber subtree, ProseMirror <code>caretPositionFromPoint</code>) plus dev-only element-creation cost; measure on a production build before optimizing that.</p>
+  <pre>diff --git a/apps/app/src/hooks/useLocalOpenTargets.ts b/apps/app/src/hooks/useLocalOpenTargets.ts
+index ba573bd1c..1481e97c0 100644
+--- a/apps/app/src/hooks/useLocalOpenTargets.ts
++++ b/apps/app/src/hooks/useLocalOpenTargets.ts
+@@ -211,9 +211,29 @@ function useOpenTargetResolution(
+ export function useLocalOpenTargets(
+   args: UseLocalOpenTargetsArgs,
+ ): UseLocalOpenTargetsResult {
++  // FIX (#1304 part B): memoize structurally. Callers (ThreadDetailView)
++  // rebuild an equal context object on every render; keying on identity made
++  // every callback below — and the timeline-wide context value built from
++  // them — change identity per render.
++  const openContextKind = args.openContext?.kind ?? &quot;local&quot;;
++  const openContextHostId =
++    args.openContext?.kind === &quot;remote-ssh&quot; ? args.openContext.hostId : null;
++  const openContextServerOrigin =
++    args.openContext?.kind === &quot;remote-ssh&quot;
++      ? args.openContext.serverOrigin
++      : null;
+   const openContext = useMemo&lt;OpenInTargetContext&gt;(
+-    () =&gt; args.openContext ?? { kind: &quot;local&quot; },
+-    [args.openContext],
++    () =&gt;
++      openContextKind === &quot;remote-ssh&quot; &amp;&amp;
++      openContextHostId !== null &amp;&amp;
++      openContextServerOrigin !== null
++        ? {
++            kind: &quot;remote-ssh&quot;,
++            hostId: openContextHostId,
++            serverOrigin: openContextServerOrigin,
++          }
++        : { kind: &quot;local&quot; },
++    [openContextHostId, openContextKind, openContextServerOrigin],
+   );
+   const contextKind = openContext.kind;
+   const { hasDaemon } = useHostDaemon();
+diff --git a/apps/app/src/hooks/usePromptDraftStorage.ts b/apps/app/src/hooks/usePromptDraftStorage.ts
+index a040f7da2..33073d107 100644
+--- a/apps/app/src/hooks/usePromptDraftStorage.ts
++++ b/apps/app/src/hooks/usePromptDraftStorage.ts
+@@ -251,13 +251,30 @@ function getPromptDraftStorageKey(scope: PromptDraftScope): string {
+  * renders the draft.
+  */
+ export function getPromptDraftAccessor(scope: PromptDraftScope): {
++  storageKey: string;
+   getCurrent: () =&gt; PromptDraftState;
+   setDraft: (draft: PromptDraftState) =&gt; void;
++  addQuote: (
++    text: string,
++    attachments?: readonly PromptDraftAttachment[],
++  ) =&gt; void;
+ } {
+   const storageKey = getPromptDraftStorageKey(scope);
+   return {
++    storageKey,
+     getCurrent: () =&gt; readPromptDraft(storageKey),
+     setDraft: (draft) =&gt; writePromptDraft(storageKey, draft),
++    addQuote: (text, attachments = []) =&gt; {
++      const currentDraft = readPromptDraft(storageKey);
++      const nextDraft = appendQuoteAndAttachmentsToDraft(
++        currentDraft,
++        text,
++        attachments,
++      );
++      // Whitespace-only text with no new attachments is a no-op.
++      if (nextDraft === currentDraft) return;
++      writePromptDraft(storageKey, nextDraft);
++    },
+   };
+ }
+ 
+diff --git a/apps/app/src/views/thread-detail/ThreadDetailView.tsx b/apps/app/src/views/thread-detail/ThreadDetailView.tsx
+index a2a4724bd..8893b677f 100644
+--- a/apps/app/src/views/thread-detail/ThreadDetailView.tsx
++++ b/apps/app/src/views/thread-detail/ThreadDetailView.tsx
+@@ -74,7 +74,7 @@ import {
+   type ProjectThreadSubsetFilters,
+ } from &quot;../../hooks/queries/thread-queries&quot;;
+ import { isTransientReadError } from &quot;@/hooks/queries/query-helpers&quot;;
+-import { usePromptDraftStorage } from &quot;@/hooks/usePromptDraftStorage&quot;;
++import { getPromptDraftAccessor } from &quot;@/hooks/usePromptDraftStorage&quot;;
+ import { subscribeComposerFocusRequests } from &quot;@/lib/composer-focus-requests&quot;;
+ import { ThreadGitActionDialog } from &quot;@/components/dialogs/ThreadGitActionDialog&quot;;
+ import { PageShell } from &quot;@/components/ui/page-shell.js&quot;;
+@@ -962,11 +962,20 @@ function ThreadDetailViewInternal(props: ThreadDetailViewInternalProps) {
+   // localStorage-backed draft — the quoted text is appended to the draft as a
+   // `&gt; ` blockquote block and renders inline in the composer immediately, with
+   // no duplicated draft state.
+-  const selectionPromptDraft = usePromptDraftStorage({
+-    kind: &quot;thread&quot;,
+-    projectId: thread?.projectId ?? projectId ?? &quot;&quot;,
+-    threadId: thread?.id ?? &quot;&quot;,
+-  });
++  // FIX (#1304 part A): this view never renders the draft; it only needs
++  // event-time access (addQuote) and the storage key. Subscribing via
++  // usePromptDraftStorage re-rendered the whole thread view on every keystroke.
++  const selectionPromptDraftProjectId = thread?.projectId ?? projectId ?? &quot;&quot;;
++  const selectionPromptDraftThreadId = thread?.id ?? &quot;&quot;;
++  const selectionPromptDraft = useMemo(
++    () =&gt;
++      getPromptDraftAccessor({
++        kind: &quot;thread&quot;,
++        projectId: selectionPromptDraftProjectId,
++        threadId: selectionPromptDraftThreadId,
++      }),
++    [selectionPromptDraftProjectId, selectionPromptDraftThreadId],
++  );
+   const addQuoteToComposer = selectionPromptDraft.addQuote;
+   // Desktop quote actions keep their existing focus handoff. Mobile web does
+   // not focus inputs programmatically; see PromptBoxInternal.
+</pre>
+
+  <h2>Related issues</h2>
+  <ul>
+    <li>#1300 (seed:perf fixture used here), #1269 / #1285 (tap-freeze work this is a follow-up to), the timeline-virtualization issue referenced by the report (virtualization would shrink the scanned subtree, but the fix above removes the per-keystroke scan altogether).</li>
+    <li>#498 (<code>a6bec2089</code>) introduced the <code>usePromptDraftStorage</code> call in ThreadDetailView for the "Add to chat" quote action.</li>
+  </ul>
+
+  <h2>Appendix</h2>
+  <h3>Top self-time frames, base big vs fixed big (hook-less runs)</h3>
+  <pre>base-big-clean2:
+  2318.6 ms  (idle) @ 
+   775.0 ms  (program) @ 
+   473.7 ms  exports.jsxDEV @ react_jsx-dev-runtime.js
+   136.6 ms  propagateParentContextChanges @ react-dom_client.js
+   109.0 ms  exports.jsx @ react_jsx-runtime.js
+    52.6 ms  run @ 
+    52.1 ms  (garbage collector) @ 
+    27.6 ms  jsxDEVImpl @ react_jsx-dev-runtime.js
+    23.3 ms  renderWithHooks @ react-dom_client.js
+    20.6 ms  createTask @ 
+    20.6 ms  caretPositionFromPoint @ 
+    18.7 ms  addEventListener @ 
+    16.1 ms  exports.createElement @ react.js
+    15.7 ms  prepareFreshStack @ react-dom_client.js
+
+fixfinal-big-clean:
+  2271.9 ms  (idle) @ 
+   788.7 ms  (program) @ 
+   429.9 ms  exports.jsxDEV @ react_jsx-dev-runtime.js
+    59.8 ms  exports.jsx @ react_jsx-runtime.js
+    44.4 ms  (garbage collector) @ 
+    42.2 ms  run @ 
+    20.6 ms  caretPositionFromPoint @ 
+    17.9 ms  addEventListener @ 
+    17.1 ms  prepareFreshStack @ react-dom_client.js
+    16.6 ms  jsxDEVImpl @ react_jsx-dev-runtime.js
+    15.7 ms  createTask @ 
+    10.9 ms  measure @ 
+    10.3 ms  renderWithHooks @ react-dom_client.js
+     7.0 ms  intersectsNode @ </pre>
+  <h3>Changed context providers per commit (hooked runs; label = nearest function-component ancestors of the Provider fiber)</h3>
+  <pre>base-small:
+ 71x  subtree   1535 fibers  Provider under PluginThreadPanelNavigationProvider &lt; ThreadDetailViewInternal &lt; ThreadDetailView   sample=fn:(link_0) =&gt; { const extension = getFileExtension(link_0.path); cons
+ 71x  subtree      9 fibers  Provider under Dialog &lt; ThreadGitActionDialog &lt; UrlOpenRoutingProvider   sample={isCompactViewport,open,onOpenChange,titleId,descriptionId,registerTit
+ 71x  subtree    256 fibers  Provider under PluginComposerViewProvider &lt; FollowUpPromptBoxWithComposer &lt; FollowUpPromptBox   sample={scope,layout,draft,run}
+ 71x  subtree    254 fibers  Provider under PluginComposerHostProvider &lt; PluginComposerViewProvider &lt; FollowUpPromptBoxWithComposer   sample={scope,textEffectKey,getCurrent,setDraft,focus,draft}
+ 71x  subtree     94 fibers  Provider under PluginComposerViewProvider &lt; PromptBoxInternal &lt; PromptBoxWithScrollAnchor   sample={scope,layout,draft,run}
+
+base-big:
+ 71x  subtree  17943 fibers  Provider under PluginThreadPanelNavigationProvider &lt; ThreadDetailViewInternal &lt; ThreadDetailView   sample=fn:(link_0) =&gt; { const extension = getFileExtension(link_0.path); cons
+ 71x  subtree      9 fibers  Provider under Dialog &lt; ThreadGitActionDialog &lt; UrlOpenRoutingProvider   sample={isCompactViewport,open,onOpenChange,titleId,descriptionId,registerTit
+ 71x  subtree    272 fibers  Provider under PluginComposerViewProvider &lt; FollowUpPromptBoxWithComposer &lt; FollowUpPromptBox   sample={scope,layout,draft,run}
+ 71x  subtree    270 fibers  Provider under PluginComposerHostProvider &lt; PluginComposerViewProvider &lt; FollowUpPromptBoxWithComposer   sample={scope,textEffectKey,getCurrent,setDraft,focus,draft}
+ 71x  subtree     94 fibers  Provider under PluginComposerViewProvider &lt; PromptBoxInternal &lt; PromptBoxWithScrollAnchor   sample={scope,layout,draft,run}
+  2x  subtree     46 fibers  Provider under MenuProvider &lt; MenuProvider &lt; PopperProvider   sample={isCompactViewport,open,onOpenChange}
+  1x  subtree   1184 fibers  Provider under DndContext &lt; SidebarSectionOrderList &lt; ReorderableSidebarSectionOrderList   sample={x,y,scaleX,scaleY}
+  1x  subtree   1182 fibers  Provider under SortableContext &lt; DndContext &lt; SidebarSectionOrderList   sample={activeIndex,containerId,disabled,disableTransforms,items,overIndex,us
+
+fixfinal-big:
+ 71x  subtree    272 fibers  Provider under PluginComposerViewProvider &lt; FollowUpPromptBoxWithComposer &lt; FollowUpPromptBox   sample={scope,layout,draft,run}
+ 71x  subtree    270 fibers  Provider under PluginComposerHostProvider &lt; PluginComposerViewProvider &lt; FollowUpPromptBoxWithComposer   sample={scope,textEffectKey,getCurrent,setDraft,focus,draft}
+ 71x  subtree     94 fibers  Provider under PluginComposerViewProvider &lt; PromptBoxInternal &lt; PromptBoxWithScrollAnchor   sample={scope,layout,draft,run}</pre>
+  <h3>Commands run</h3>
+  <pre>git checkout 16ceb3a54
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+scripts/bb-dev-app current                      # App http://localhost:16950, Server :24950, Host daemon :32950
+pnpm seed:perf -- --projects 2 --threads 100 --events 60000
+sqlite3 &lt;data dir&gt;/bb.db &quot;select t.id,t.project_id,t.status,count(e.id) c from threads t join events e on e.thread_id=t.id where t.archived_at is null and t.deleted_at is null group by t.id order by c desc limit 4&quot;
+# probes
+cp repro/render-probe.ts apps/app/src/lib/render-probe.ts &amp;&amp; git apply repro/instrumentation.diff   (+ renderProbe(&quot;MarkdownAnchor&quot;) in markdown-preview.tsx)
+repro/run-all.sh base-small http://localhost:16950/projects/proj_n2izyamrfz/threads/thr_in7agg4344 false
+repro/run-all.sh base-big   http://localhost:16950/projects/proj_rgsz9s6cf9/threads/thr_e5upw3jres true
+repro/run-all.sh base-{small,big}-clean[2-4] ... false|true false
+python3 repro/apply-depprobe.py &amp;&amp; repro/run-depprobe.sh &lt;small thread url&gt;
+python3 repro/apply-fix.py &amp;&amp; repro/run-depprobe.sh &lt;small thread url&gt;
+repro/run-all.sh fix-big / fix-big-clean{,2,3} / fix-small-clean / fixfinal-big / fixfinal-big-clean ...
+cd apps/app &amp;&amp; pnpm exec vitest run src/views/thread-detail/threadDetailView.keystroke-rerender.repro.test.tsx   # base: 2 failed; fixed: passes
+pnpm exec turbo run typecheck --filter=@bb/app
+cd apps/app &amp;&amp; pnpm exec vitest run src/hooks src/views/thread-detail src/components/plugin/PluginNewThreadComposer.test.tsx
+pnpm dev:stop  (cleanup)</pre>
+  <p>Raw outputs: <a href="1304/repro/">1304/repro/</a> (see <a href="1304/repro/README.txt">README.txt</a>), notably <a href="1304/repro/1304-all-base-big.json">1304-all-base-big.json</a>, <a href="1304/repro/1304-all-fixfinal-big.json">1304-all-fixfinal-big.json</a>, <a href="1304/repro/worktree-full-with-instrumentation.diff">worktree-full-with-instrumentation.diff</a>. Files named <code>db-*.js</code> (other than db-all.js / db-depprobe.js / db-peek.js), <code>1304-big-*.json</code>, <code>1304-small.json</code>, <code>fix-experiment.diff</code> come from an earlier, killed attempt at this issue and are kept for reference; their numbers were taken on a different dev instance and agree with the ones above.</p>
+</main></body></html>

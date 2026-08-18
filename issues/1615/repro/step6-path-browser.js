@@ -2,8 +2,8 @@
 // directory (5000 files) in RemotePathBrowser and count the rows in the h-56 scroll box.
 // Uses a FRESH anonymous page at the app root so it does not depend on step 4's heavy CSV tab.
 // ---- edit these for your instance ----
-const APP = "http://localhost:18434";
-const FIXTURE_DIR = "/home/sawyer/.bb-dev/1615-qa-v3/manyfiles";   // any absolute path readable by your host daemon
+const APP = "http://localhost:17792";
+const FIXTURE_DIR = "/tmp/1615-qa/manyfiles";   // any absolute path readable by your host daemon
 // --------------------------------------
 const page = await browser.newPage();
 await page.setViewportSize({ width: 1400, height: 900 });

@@ -3,7 +3,7 @@
 // state, console errors and page errors. Screenshots at load and after the wait.
 //
 // Usage: node wk-load-and-wait.mjs <appUrl> <outPrefix> [waitMs=15000] [engine=webkit]
-// Run it through /tmp/bb-1603-wk/run-old.sh (old WebKit 16.0 build) or a normal Playwright.
+// Run it through run-old-webkit160.sh (see setup-harness.sh) (old WebKit 16.0 build) or a normal Playwright.
 import { webkit, chromium, devices } from "playwright";
 
 const [appUrl, outPrefix, waitArg = "15000", engine = "webkit"] = process.argv.slice(2);

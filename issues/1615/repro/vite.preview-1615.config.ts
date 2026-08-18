@@ -3,10 +3,10 @@ import { sharedViteConfig } from "./vite.config.js";
 export default defineConfig({
   ...sharedViteConfig,
   preview: {
-    port: 18435,
+    port: 17793,
     proxy: {
-      "/api": { target: "http://localhost:26434", changeOrigin: true, xfwd: true },
-      "/ws": { target: "http://localhost:26434", changeOrigin: true, ws: true, xfwd: true },
+      "/api": { target: "http://localhost:25792", changeOrigin: true, xfwd: true },
+      "/ws": { target: "http://localhost:25792", changeOrigin: true, ws: true, xfwd: true },
     },
   },
 });

@@ -1,8 +1,8 @@
 // dev-browser script: expand the "Untracked · N files" prompt banner and count
 // how many list rows WorkspaceChangesList put in the DOM for a max-h-32 scroll box.
 // ---- edit these for your instance ----
-const APP = "http://localhost:18434";                       // App URL printed by `scripts/bb-dev-app current`
-const THREAD_URL = `${APP}/projects/proj_t95uiuqjap/threads/thr_79bfrk39ug`;
+const APP = "http://localhost:17792";                       // App URL printed by `scripts/bb-dev-app current`
+const THREAD_URL = `${APP}/projects/proj_uzvv6df4kw/threads/thr_6isgdy7qwz`;
 // --------------------------------------
 const page = await browser.getPage("banner");   // own named page; safe to run in any order
 await page.setViewportSize({ width: 1400, height: 900 });

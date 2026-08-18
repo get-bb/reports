@@ -15,7 +15,7 @@ import json,sys
 d=json.load(open(sys.argv[1]))
 s=[e["seq"] for e in d]
 print("  events returned:",len(d),"min seq",min(s),"max seq",max(s))
-print("  contains 'Child thread updates':", any("Child thread updates" in json.dumps(e["data"]) for e in d))
+print("  seqs of [bb system] client/turn/requested IN this window:",[e["seq"] for e in d if e["type"]=="client/turn/requested" and "[bb system]" in json.dumps(e["data"])])
 EOF
 
 echo "== bb thread log $PARENT --json --limit 100000"
@@ -25,7 +25,10 @@ import json,sys
 d=json.load(open(sys.argv[1]))
 print("  total events on thread:",len(d),"max seq",max(e["seq"] for e in d),"(seq gaps are normal: delta/streaming rows are pruned)")
 print("  seqs of events containing 'Child thread updates':",[e["seq"] for e in d if "Child thread updates" in json.dumps(e["data"])])
-print("  seqs of [bb system] client/turn/requested:",[e["seq"] for e in d if e["type"]=="client/turn/requested" and "[bb system]" in json.dumps(e["data"])])
+sys_seqs=[e["seq"] for e in d if e["type"]=="client/turn/requested" and "[bb system]" in json.dumps(e["data"])]
+print("  seqs of ALL [bb system] client/turn/requested:",sys_seqs)
+default_max=max(e["seq"] for e in json.load(open(sys.argv[1].replace("13-parent-log-json-all","12-parent-log-json-default"))))
+print("  => [bb system] messages NOT in the default --json window (seq >",default_max,"):",[q for q in sys_seqs if q>default_max])
 EOF
 
 echo "== bb thread log $PARENT --limit 500   (human format + --limit)"

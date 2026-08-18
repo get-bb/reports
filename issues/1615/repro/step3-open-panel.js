@@ -1,6 +1,6 @@
 const page = await browser.getPage("main");
 await page.setViewportSize({ width: 1400, height: 900 });
-await page.goto("http://localhost:15271/projects/proj_drg6kwky3m/threads/thr_5e4dmaajwp", { waitUntil: "networkidle" });
+await page.goto("http://localhost:17792/projects/proj_uzvv6df4kw/threads/thr_6isgdy7qwz", { waitUntil: "networkidle" });
 await page.waitForTimeout(2000);
 await page.getByRole("button", { name: /Show right panel/ }).click();
 await page.waitForTimeout(1500);

@@ -7,7 +7,7 @@
 # what `scripts/bb-dev-app current` printed; `eval "$(scripts/bb-dev-app env)"`
 # does the same thing).
 unset BB_THREAD_ID BB_ENVIRONMENT_ID BB_THREAD_STORAGE BB_PROJECT_ID BB_CLI
-export BB_SERVER_URL="${BB_SERVER_URL_1768:-http://localhost:20608}"
-export BB_HOST_DAEMON_PORT="${BB_HOST_DAEMON_PORT_1768:-28608}"
+export BB_SERVER_URL="${BB_SERVER_URL_1768:-http://localhost:22672}"
+export BB_HOST_DAEMON_PORT="${BB_HOST_DAEMON_PORT_1768:-30672}"
 export CLI="node $(pwd)/packages/scripts/dist/commands/run-cli.js"
 export OUT_DIR=/tmp/bb-reports/issues/1768/repro

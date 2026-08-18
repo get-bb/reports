@@ -1,0 +1,6 @@
+const page = await browser.getPage("main");
+await page.setViewportSize({ width: 1400, height: 900 });
+await page.goto("http://localhost:15048/projects/proj_eyzm33avat/threads/thr_aqrjgmjtqa");
+await page.waitForTimeout(6000);
+console.log(await saveScreenshot(await page.screenshot(), "1719-write.png"));
+console.log((await page.evaluate(() => document.body.innerText)).slice(0, 1200));
