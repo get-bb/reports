@@ -1,0 +1,786 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1914 A rate-limited workflow call reports only 'Workflow worker failed'</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.med { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .verdict { font-weight:600; }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:4px; }
+  details summary { cursor:pointer; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1914 · A rate-limited workflow call reports only 'Workflow worker failed' — the 429 is hidden in a child thread</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill med">Priority: Medium</span> <span class="pill">Effort: n/a</span> <span class="pill">cli</span> <span class="pill">plugins</span> <span class="pill">workflows</span>
+    <a href="https://github.com/get-bb/bb/issues/1914">open on GitHub</a>
+    <span>2026-08-19 · base <code>d81fee6f</code> (worktree HEAD 0f6759a74, +2 unrelated UI/tasks commits)</span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>When a workflow worker thread dies because the provider rejected the request (here: Claude Code 429 "session limit"), <code>bb workflows status/history</code>, the run record, and the completion notification sent back to the origin agent all say only <code>Workflow worker failed</code>. The 429 details exist, but only as a <code>provider/error</code> event (with <code>errorInfo { category: "rate-limit", providerCode: "rate_limit_event", httpStatusCode: 429 }</code>) inside the hidden child thread.</p>
+  <p>The actual defect is in the server, not in the workflows plugin. The plugin-facing <code>thread.failed</code> event is built by <code>getLastThreadErrorMessage()</code>, which reads <em>only</em> <code>system/error</code> rows. A provider-originated failure is persisted as <code>provider/error</code> + <code>turn/completed status=failed</code> and never writes a <code>system/error</code> row, so <code>thread.failed</code> fires with <code>error: null</code>. The workflows plugin then falls back to <code>error ?? "Workflow worker failed"</code>. A side effect: the workflows plugin's own transient-provider retry classifier (which matches <code>/rate.?limit|429/</code> on the error text) never sees the real text, so it is dead for every provider-originated failure. The automations plugin has the identical problem ("Turn failed").</p>
+  <p>Reproduced end to end on a dev instance by pointing Claude Code at a fake Anthropic endpoint that answers 429 with the unified rate-limit headers: the run fails in ~4 s with <code>"error": "Workflow worker failed"</code> while the child thread holds the full 429. Two failing vitest repros (server seam + workflows plugin) are included, plus a small prototype patch that makes the server test pass.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>A call that dies on a provider 429 surfaces as <code>Workflow worker failed</code> in <code>bb workflows status</code> and <code>history</code></td><td class="ok">Verified</td><td>Live run <code>wfr_4469d4b6…</code>: status JSON <code>"error": "Workflow worker failed"</code>, call record <code>"error": "Workflow worker failed"</code> (section 4, step 6/7).</td></tr>
+    <tr><td>The real cause is present only in the hidden child thread (<code>provider/rateLimits/updated</code> + <code>provider/error</code> with <code>category: rate-limit, providerCode: rate_limit_event, httpStatusCode: 429</code>)</td><td class="ok">Verified</td><td>Child <code>thr_u982areftg</code> (visibility <code>hidden</code>, status <code>error</code>) events 6 and 10 carry exactly those fields; no <code>system/error</code> row exists (section 4, step 8).</td></tr>
+    <tr><td>The call was dead ~3.5 s in</td><td class="ok">Verified (analogous)</td><td>Our call: startedAt 1787153297760 → finishedAt 1787153301251 = 3.49 s.</td></tr>
+    <tr><td>Not a one-off: a second run failed 13 of 29 calls the same way</td><td class="unv">Unverified</td><td>We did not have the reporter's records; but the mechanism is deterministic (any provider-originated failure on any provider takes this path), so it is expected.</td></tr>
+    <tr><td><code>Workflow worker failed</code> is indistinguishable from a bb-side crash</td><td class="ok">Verified</td><td>The identical string is also what a null-error <code>thread.failed</code> yields for any other provider error (auth, bad request, context overflow). Only bb-side <code>system/error</code>s (process exit, watchdog, command failure) propagate text. The origin-thread notification also says just <code>Error: Workflow worker failed</code> and the origin agent spent a turn investigating (section 4, step 9 and screenshot).</td></tr>
+    <tr><td><code>fetch failed</code> comes from a bb server stall</td><td class="unv">Unverified</td><td>Not investigated here; out of scope.</td></tr>
+    <tr><td>Suggested fix: propagate child's <code>provider/error</code> (category/providerCode/httpStatusCode) into the call error</td><td class="ok">Agree, but at the server layer</td><td>The info must reach the <code>thread.failed</code> payload (server), not be dug out by the workflows plugin. See section 6.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb monorepo worktree at <code>0f6759a74</code> (base <code>d81fee6f</code> plus two unrelated commits: #1912 thread TOC breakpoint, #1923 tasks presets); bb-app version 0.39.0; <code>git log d81fee6f..origin/main -- plugins/workflows apps/server/src/services/plugins apps/server/src/services/threads/thread-data.ts</code> is empty → not fixed on main.</li>
+    <li>Linux 7.0.0-29-generic (Ubuntu), node v24.18.0, Claude Code CLI 2.1.235, codex-cli 0.148.0 (origin thread only).</li>
+    <li>Own dev instance: App <code>http://localhost:11386</code>, Server <code>http://localhost:19386</code>, Host daemon <code>127.0.0.1:27386</code>, data dir <code>~/.bb-dev/projects-bb-.claude-worktrees-wf_d5c47f31-487-6-484bd182cef1</code> (deleted at cleanup).</li>
+    <li>Fake Anthropic API: <code>node fake-429.mjs 45929</code>, injected with <code>ANTHROPIC_BASE_URL=http://127.0.0.1:45929</code> exported before <code>scripts/bb-dev-app current</code> (verified present in the host-daemon process environment).</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <h3>A. Unit-level (fastest, no provider needed)</h3>
+  <ol>
+    <li>Copy <a href="1914/repro/issue-1914-thread-failed-provider-error.test.ts">issue-1914-thread-failed-provider-error.test.ts</a> to <code>apps/server/test/services/plugins/</code> and run it from <code>apps/server</code>: <code>pnpm exec vitest run test/services/plugins/issue-1914-thread-failed-provider-error.test.ts</code>. It installs an observer plugin, seeds an active claude-code thread, and POSTs the exact four events the claude-code provider emits for a hard rate-limit rejection through the real <code>/internal/session/events</code> seam.
+<pre>expected: thread.failed payload.error describes the 429
+actual:
+
+ RUN  v4.1.1 /home/sawyer/projects/bb/.claude/worktrees/wf_d5c47f31-487-6/apps/server
+
+ ❯ |@bb/server| test/services/plugins/issue-1914-thread-failed-provider-error.test.ts (1 test | 1 failed) 264ms
+     × carries the provider/error (429 rate limit) detail to plugin thread.failed handlers 263ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |@bb/server| test/services/plugins/issue-1914-thread-failed-provider-error.test.ts &gt; issue #1914: thread.failed error for provider-originated failures &gt; carries the provider/error (429 rate limit) detail to plugin thread.failed handlers
+AssertionError: expected null not to be null
+ ❯ test/services/plugins/issue-1914-thread-failed-provider-error.test.ts:158:38
+    156|       // ... but `error` must describe the 429. On main it is `null`, …
+    157|       // workflows plugin shows &quot;Workflow worker failed&quot;.
+    158|       expect(recorded[0]?.error).not.toBeNull();
+       |                                      ^
+    159|       expect(recorded[0]?.error).toMatch(/rate.?limit|429|session limi…
+    160|     } finally {
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed (1)
+   Start at  15:32:06
+   Duration  2.84s (transform 1.43s, setup 0ms, import 2.49s, tests 264ms, environment 0ms)
+
+</pre>
+The thread does reach status <code>error</code> and <code>thread.failed</code> fires, but <code>error</code> is <code>null</code>.</li>
+    <li>Copy <a href="1914/repro/issue-1914-worker-failed.test.ts">issue-1914-worker-failed.test.ts</a> to <code>plugins/workflows/src/</code> and run <code>pnpm exec vitest run src/issue-1914-worker-failed.test.ts</code> from <code>plugins/workflows</code>. It feeds that <code>null</code> into the service exactly as <code>server.ts</code> does:
+<pre>
+ RUN  v4.1.1 /home/sawyer/projects/bb/.claude/worktrees/wf_d5c47f31-487-6/plugins/workflows
+
+stdout | src/issue-1914-worker-failed.test.ts &gt; issue #1914: workflow call error for a rate-limited worker &gt; surfaces the provider failure instead of &#x27;Workflow worker failed&#x27;
+[issue-1914] call.error = &quot;Workflow worker failed&quot;
+[issue-1914] run.error  = &quot;Workflow worker failed&quot;
+[issue-1914] retries    = 0
+
+ ❯ src/issue-1914-worker-failed.test.ts (1 test | 1 failed) 289ms
+     × surfaces the provider failure instead of &#x27;Workflow worker failed&#x27; 289ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/issue-1914-worker-failed.test.ts &gt; issue #1914: workflow call error for a rate-limited worker &gt; surfaces the provider failure instead of &#x27;Workflow worker failed&#x27;
+AssertionError: expected &#x27;Workflow worker failed&#x27; not to be &#x27;Workflow worker failed&#x27; // Object.is equality
+ ❯ src/issue-1914-worker-failed.test.ts:146:29
+    144|
+    145|     // Expected: the call error names the rate limit (category/429/mes…
+    146|     expect(call?.error).not.toBe(&quot;Workflow worker failed&quot;);
+       |                             ^
+    147|     expect(call?.error ?? &quot;&quot;).toMatch(/rate.?limit|429/i);
+    148|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed (1)
+   Start at  15:32:09
+   Duration  621ms (transform 134ms, setup 0ms, import 249ms, tests 289ms, environment 0ms)
+
+</pre></li>
+  </ol>
+
+  <h3>B. Live end-to-end (real claude-code process, real 429)</h3>
+  <ol>
+    <li>Start a fake Anthropic API that answers every call with HTTP 429 and the unified rate-limit headers (<a href="1914/repro/fake-429.mjs">fake-429.mjs</a>): <code>node fake-429.mjs 45929</code>. Sanity check: <code>ANTHROPIC_BASE_URL=http://127.0.0.1:45929 claude -p "Reply only with ok." --output-format stream-json --verbose</code> prints a <code>rate_limit_event</code> with <code>status: "rejected"</code> immediately (no retries).</li>
+    <li>Start a dev instance with the override in its environment: <code>export ANTHROPIC_BASE_URL=http://127.0.0.1:45929; scripts/bb-dev-app current</code>. Enable the workflows plugin: <code>curl -X POST $BB_SERVER_URL/api/v1/plugins/workflows/enable</code>.</li>
+    <li>Create a scratch git repo and a project (<code>POST /api/v1/projects</code> with a <code>local_path</code> source), then spawn an origin thread with a cheap provider: <code>bb thread spawn --project &lt;proj&gt; --environment /tmp/bb-1914/qa-repo --provider codex --prompt "Reply only with ok." --title "1914 origin"</code> → <code>thr_4nt62zknyn</code> (idle, env <code>env_wbxyk8aus8</code>).</li>
+    <li>Put this workflow inside the workspace (<a href="1914/repro/collect.workflow.js">collect.workflow.js</a>):<pre>export const meta = {
+  name: &quot;collect-1914&quot;,
+  description: &quot;Issue 1914 repro: one claude-code worker that hits a 429&quot;,
+  phases: [{ title: &quot;Collect&quot;, detail: &quot;Single worker&quot; }],
+};
+phase(&quot;Collect&quot;);
+const out = await agent(&quot;Reply only with ok.&quot;, {
+  provider: &quot;claude-code&quot;,
+  model: &quot;claude-opus-5[1m]&quot;,
+  reasoningLevel: &quot;low&quot;,
+  title: &quot;1914 worker&quot;,
+});
+return out;
+</pre></li>
+    <li>From the origin thread context (<code>BB_THREAD_ID=thr_4nt62zknyn BB_PROJECT_ID=&lt;proj&gt; BB_ENVIRONMENT_ID=env_wbxyk8aus8</code>), run <code>bb workflows run --file /tmp/bb-1914/qa-repo/collect.workflow.js</code>:
+<pre>{"runId":"wfr_4469d4b6-7bef-4f17-ad96-430190dc103f","name":"collect-1914","status":"queued"}</pre></li>
+    <li><code>bb workflows status wfr_4469d4b6-7bef-4f17-ad96-430190dc103f</code> a few seconds later:
+<pre>expected: something like  "error": "rate limited (429): You've hit your session limit · resets 6:24pm (UTC)"
+actual (excerpt; full JSON in appendix):
+  "status": "failed",
+  "phase": "Collect",
+  "error": "Workflow worker failed",
+  "calls": { "total": 1, "queued": 0, "running": 0, "succeeded": 0, "failed": 1, "cancelled": 0 },
+  "startedAt": 1787153296809,
+  "finishedAt": 1787153301255</pre></li>
+    <li><code>bb workflows history wfr_4469d4b6-…</code> call record (excerpt):<pre>{
+  &quot;id&quot;: &quot;wfc_50c38b22-9297-4105-ba8c-9628efaad62a&quot;,
+  &quot;callIndex&quot;: 0,
+  &quot;resolvedProvider&quot;: &quot;claude-code&quot;,
+  &quot;resolvedModel&quot;: &quot;claude-opus-5[1m]&quot;,
+  &quot;status&quot;: &quot;failed&quot;,
+  &quot;childThreadId&quot;: &quot;thr_u982areftg&quot;,
+  &quot;providerRetryAttempts&quot;: 0,
+  &quot;error&quot;: &quot;Workflow worker failed&quot;,
+  &quot;startedAt&quot;: 1787153297760,
+  &quot;finishedAt&quot;: 1787153301251
+}</pre></li>
+    <li>The hidden child thread holds the real cause. <code>sqlite3 bb.db "select sequence,type from events where thread_id='thr_u982areftg' order by sequence"</code>:<pre>1|client/turn/requested
+2|client/thread/start
+3|thread/identity
+4|turn/started
+5|turn/input/accepted
+6|provider/rateLimits/updated
+7|item/completed
+8|thread/contextWindowUsage/updated
+9|thread/tokenUsage/updated
+10|provider/error
+11|turn/completed
+</pre>No <code>system/error</code> row. <code>bb thread log thr_u982areftg --json</code> (relevant events):<pre>provider/rateLimits/updated  {&quot;providerThreadId&quot;: &quot;3f6e15b2-0592-499a-a9db-6c66c0613e8a&quot;, &quot;rateLimits&quot;: {&quot;providerId&quot;: &quot;claude-code&quot;, &quot;status&quot;: &quot;blocked&quot;, &quot;kind&quot;: &quot;subscription-window&quot;, &quot;windows&quot;: [{&quot;providerKey&quot;: &quot;five_hour&quot;, &quot;label&quot;: &quot;Five-hour limit&quot;, &quot;status&quot;: &quot;blocked&quot;, &quot;resetsAtMs&quot;: 1787163875000}], &quot;reachedReason&quot;: &quot;five_hour&quot;, &quot;overageStatus&quot;: &quot;rejected&quot;, &quot;overageReason&quot;: &quot;org_level_disabled&quot;}}
+item/completed  {&quot;providerThreadId&quot;: &quot;3f6e15b2-0592-499a-a9db-6c66c0613e8a&quot;, &quot;item&quot;: {&quot;type&quot;: &quot;agentMessage&quot;, &quot;id&quot;: &quot;454199c6-e204-4fcd-ab42-34ba257aa607&quot;, &quot;text&quot;: &quot;You&#x27;ve hit your session limit \u00b7 resets 6:24pm (UTC)&quot;}}
+provider/error  {&quot;providerThreadId&quot;: &quot;3f6e15b2-0592-499a-a9db-6c66c0613e8a&quot;, &quot;message&quot;: &quot;Provider error&quot;, &quot;detail&quot;: &quot;You&#x27;ve hit your session limit \u00b7 resets 6:24pm (UTC)&quot;, &quot;errorInfo&quot;: {&quot;category&quot;: &quot;rate-limit&quot;, &quot;providerCode&quot;: &quot;rate_limit_event&quot;, &quot;httpStatusCode&quot;: 429}}
+turn/completed  {&quot;providerThreadId&quot;: &quot;3f6e15b2-0592-499a-a9db-6c66c0613e8a&quot;, &quot;status&quot;: &quot;failed&quot;, &quot;providerCheckpointId&quot;: &quot;3b923597-4608-4c0e-83e2-d65ba47b2716&quot;}</pre></li>
+    <li>The notification the workflows plugin sent back to the origin agent is equally opaque (event 19 on the origin thread):<pre>1|client/turn/requested|{&quot;direction&quot;:&quot;outbound&quot;,&quot;source&quot;:&quot;spawn&quot;,&quot;initiator&quot;:&quot;user&quot;,&quot;request&quot;:{&quot;method&quot;:&quot;thread/start&quot;,&quot;params&quot;:{}},&quot;requestId&quot;:&quot;creq_4bqp7awiab&quot;,&quot;senderThreadId&quot;:null,&quot;input&quot;:[{&quot;type&quot;:&quot;text&quot;,&quot;text&quot;:&quot;Reply only with ok.&quot;,&quot;mentions&quot;:[]}],&quot;target&quot;:{&quot;kind&quot;:&quot;thread-start&quot;},&quot;execution&quot;:{&quot;model&quot;:&quot;gpt-5.6-sol&quot;,&quot;permissionMode&quot;:&quot;auto&quot;,&quot;reasoningLevel&quot;:&quot;medium&quot;,&quot;serviceTier&quot;:&quot;default&quot;,&quot;source&quot;:&quot;client/turn/requested&quot;}}
+19|client/turn/requested|{&quot;direction&quot;:&quot;outbound&quot;,&quot;source&quot;:&quot;tell&quot;,&quot;initiator&quot;:&quot;user&quot;,&quot;request&quot;:{&quot;method&quot;:&quot;turn/start&quot;,&quot;params&quot;:{}},&quot;requestId&quot;:&quot;creq_aqsy3q2ufk&quot;,&quot;senderThreadId&quot;:null,&quot;input&quot;:[{&quot;type&quot;:&quot;text&quot;,&quot;text&quot;:&quot;[BB workflow finished · wfr_4469d4b6-7bef-4f17-ad96-430190dc103f]\n\nRun wfr_4469d4b6-7bef-4f17-ad96-430190dc103f (collect-1914) failed.\nError: Workflow worker failed\nRun `bb workflows status wfr_4469d4b6-7bef-4f17-ad96-430190dc103f` for authoritative details.&quot;,&quot;mentions&quot;:[],&quot;visibility&quot;:&quot;agent-only&quot;}],&quot;target&quot;:{&quot;kind&quot;:&quot;new-turn&quot;},&quot;execution&quot;:{&quot;model&quot;:&quot;gpt-5.6-sol&quot;,&quot;permissionMode&quot;:&quot;auto&quot;,&quot;reasoningLevel&quot;:&quot;medium&quot;,&quot;serviceTier&quot;:&quot;default&quot;,&quot;source&quot;:&quot;client/turn/requested&quot;}}
+</pre>The origin (codex) agent then spent a turn investigating ("Worked for 1m 3s" in the screenshot) — the exact cost the issue describes.</li>
+  </ol>
+  <figure><img src="assets/1914-child-thread.png" alt="Hidden worker thread showing Provider rate limit reached / error and the session-limit text"><figcaption>The hidden worker thread <code>thr_u982areftg</code> in the app: "Provider rate limit reached · error — You've hit your session limit · resets 6:24pm (UTC)". This is the only place the 429 is visible.</figcaption></figure>
+  <figure><img src="assets/1914-origin-thread.png" alt="Origin thread after receiving the 'Workflow worker failed' notification"><figcaption>The origin thread <code>thr_4nt62zknyn</code> after the workflow notification ("Error: Workflow worker failed"); the agent had to go digging before it could say the worker was rate limited.</figcaption></figure>
+  <p>Repro files: <a href="1914/repro/">1914/repro/</a> (tests, fake API, workflow, helper scripts, raw outputs, prototype patch).</p>
+
+  <h2>5. Root cause</h2>
+  <p><strong>Chain:</strong></p>
+  <ol>
+    <li>The claude-code provider plugin translates a hard rate-limit rejection into <code>provider/rateLimits/updated</code>, a <code>provider/error</code> carrying <code>errorInfo</code>, and a <code>turn/completed status: "failed"</code> (no error text on the turn/completed): <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/plugins/provider-claude-code/src/event-translation.ts#L1466-L1515"><code>plugins/provider-claude-code/src/event-translation.ts:1466</code></a> and the <code>rate_limit_event</code> case at <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/plugins/provider-claude-code/src/event-translation.ts#L1526-L1560"><code>plugins/provider-claude-code/src/event-translation.ts:1526</code></a>. Nothing on this path emits <code>system/error</code>; that event type is reserved for bb-side failures (provider process exit <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/apps/host-daemon/src/runtime-manager.ts#L1282-L1312"><code>apps/host-daemon/src/runtime-manager.ts:1282</code></a>, turn-start watchdog <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/packages/agent-runtime/src/runtime.ts#L392-L398"><code>packages/agent-runtime/src/runtime.ts:392</code></a>, command failures <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/apps/server/src/services/threads/thread-lifecycle.ts#L1712-L1720"><code>apps/server/src/services/threads/thread-lifecycle.ts:1712</code></a>).</li>
+    <li>The server turns <code>turn/completed failed</code> into the lifecycle event <code>run.failed</code> → thread status <code>error</code>: <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/apps/server/src/internal/turn-completed-events.ts#L21-L30"><code>apps/server/src/internal/turn-completed-events.ts:21</code></a>.</li>
+    <li>Entering <code>error</code> emits the plugin event <code>thread.failed</code>: <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/apps/server/src/services/plugins/plugin-thread-events.ts#L44-L54"><code>apps/server/src/services/plugins/plugin-thread-events.ts:44</code></a> → <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/apps/server/src/services/plugins/plugin-service.ts#L1473-L1478"><code>apps/server/src/services/plugins/plugin-service.ts:1473</code></a>, whose <code>error</code> field is <code>getLastThreadErrorMessage(db, thread.id)</code>.</li>
+    <li><code>getLastThreadErrorMessage</code> only looks at <code>system/error</code> rows: <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/apps/server/src/services/threads/thread-data.ts#L167-L176"><code>apps/server/src/services/threads/thread-data.ts:167</code></a> via <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/packages/db/src/data/events.ts#L3049-L3064"><code>packages/db/src/data/events.ts:3049</code></a> (<code>eq(events.type, "system/error")</code>). The contract even documents this: <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/packages/plugin-sdk/src/backend-contract.ts#L149-L151"><code>packages/plugin-sdk/src/backend-contract.ts:149</code></a> — "error is the latest system/error event message, when one exists". So for every provider-originated failure the payload is <code>error: null</code>.</li>
+    <li>The workflows plugin maps <code>null</code> to the generic string: <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/plugins/workflows/src/server.ts#L233-L235"><code>plugins/workflows/src/server.ts:233</code></a> → <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/plugins/workflows/src/service.ts#L1519-L1520"><code>plugins/workflows/src/service.ts:1519</code></a> <code>failThreadCall(threadId, error ?? "Workflow worker failed")</code>. That string becomes the call error, the run error (<code>wakeCall</code> rejects with it, <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/plugins/workflows/src/service.ts#L900"><code>plugins/workflows/src/service.ts:900</code></a>), the status/history output, and the origin notification.</li>
+  </ol>
+  <p><strong>Deeper consequence:</strong> the workflows plugin already contains a transient-provider retry path keyed on the error text — <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/plugins/workflows/src/service.ts#L104-L131"><code>plugins/workflows/src/service.ts:104</code></a> matches <code>/rate.?limit/</code>, <code>429</code>, overload, etc., and <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/plugins/workflows/src/service.ts#L866-L881"><code>plugins/workflows/src/service.ts:866</code></a> retries up to two times. Because the text never arrives for provider-originated failures, that classifier only ever sees <code>"Workflow worker failed"</code>, so it is effectively dead for the cases it was written for (our call shows <code>providerRetryAttempts: 0</code>). The same null reaches the automations plugin, which records <code>"Turn failed"</code> (<a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/plugins/automations/src/run.ts#L325"><code>plugins/automations/src/run.ts:325</code></a>).</p>
+  <p><strong>Why the report's two cases look alike:</strong> a bb-side stall/crash writes <code>system/error</code> and therefore propagates real text (e.g. "Provider process exited…"), while a provider 429 propagates nothing; the workflows fallback string is what makes them look alike, but the missing data is upstream of it.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>Fix at the server boundary, where the data already lives, so every plugin consumer (workflows, automations, third-party) benefits:</p>
+  <ol>
+    <li><strong>packages/db</strong>: add a query that returns the latest failure-describing row for a thread across <code>system/error</code> <em>and</em> <code>provider/error</code> (ideally restricted to events at/after the last root <code>turn/started</code> so a stale <code>willRetry: true</code> provider error from an earlier, recovered turn cannot leak into a later unrelated failure).</li>
+    <li><strong>apps/server <code>getLastThreadErrorMessage</code></strong>: format <code>provider/error</code> as <code>detail ?? message</code> plus <code>(category, HTTP nnn, providerCode)</code>. Optionally extend the <code>thread.failed</code> payload with a structured <code>errorInfo: ProviderErrorInfo | null</code> (and the rate-limit <code>resetsAtMs</code> from the latest <code>provider/rateLimits/updated</code>) so plugins can render "rate limited (429), resets HH:MM" without parsing text. A new payload field is new public plugin API → follow the AGENTS.md <code>experimental_</code>/<code>docs/api_to_audit.md</code> rule, and update the doc comment in <code>backend-contract.ts</code>. No host-daemon wire change is involved (server-internal), so no <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump.</li>
+    <li><strong>plugins/workflows</strong>: keep <code>error ?? "Workflow worker failed"</code> as the last-resort fallback, but also decide retry policy from the structured category: a 429 with a blocked subscription window resetting hours away should <em>not</em> burn the two 1 s/4 s retries (and should probably fail the call immediately with a clear "rate limited, resets …" message), whereas overload/5xx should.</li>
+  </ol>
+  <p>A minimal prototype of steps 1–2 (<a href="1914/repro/prototype-fix.patch">prototype-fix.patch</a>, 84 lines) makes the server repro test pass together with the existing <code>plugin-thread-events.test.ts</code> (12/12) and typechecks <code>@bb/server</code>; it is not scoped to the failing turn yet, which is the one thing to add before shipping:</p>
+  <pre>diff --git a/apps/server/src/services/threads/thread-data.ts b/apps/server/src/services/threads/thread-data.ts
+index 9cc53bc57..59394b3ea 100644
+--- a/apps/server/src/services/threads/thread-data.ts
++++ b/apps/server/src/services/threads/thread-data.ts
+@@ -1,7 +1,7 @@
+ import {
+   findStoredEventRow as findStoredEventRowRecord,
+   getLatestThreadOutputEventRow,
+-  getLatestThreadSystemErrorEventRow,
++  getLatestThreadFailureEventRow,
+   listStoredEventRows as listStoredEventRowRecords,
+ } from &quot;@bb/db&quot;;
+ import type { DbConnection, StoredEventRow } from &quot;@bb/db&quot;;
+@@ -169,8 +169,20 @@ export function getLastThreadErrorMessage(
+   db: DbConnection,
+   threadId: string,
+ ): string | null {
+-  const row = getLatestThreadSystemErrorEventRow(db, { threadId });
++  const row = getLatestThreadFailureEventRow(db, { threadId });
+   if (!row) return null;
+   const eventRow = parseStoredEventRow(row);
+-  return eventRow.type === &quot;system/error&quot; ? eventRow.data.message : null;
++  if (eventRow.type === &quot;system/error&quot;) return eventRow.data.message;
++  if (eventRow.type === &quot;provider/error&quot;) {
++    const { message, detail, errorInfo } = eventRow.data;
++    const text = detail &amp;&amp; detail.length &gt; 0 ? detail : message;
++    if (!errorInfo) return text;
++    const parts: string[] = [errorInfo.category];
++    if (errorInfo.httpStatusCode !== null) {
++      parts.push(`HTTP ${errorInfo.httpStatusCode}`);
++    }
++    if (errorInfo.providerCode !== null) parts.push(errorInfo.providerCode);
++    return `${text} (${parts.join(&quot;, &quot;)})`;
++  }
++  return null;
+ }
+diff --git a/packages/db/src/data/events.ts b/packages/db/src/data/events.ts
+index e7de63b63..1f5c55eea 100644
+--- a/packages/db/src/data/events.ts
++++ b/packages/db/src/data/events.ts
+@@ -3063,6 +3063,31 @@ export function getLatestThreadSystemErrorEventRow(
+   );
+ }
+ 
++/**
++ * Latest failure-describing event for a thread: either a bb-side
++ * `system/error` or a provider-originated `provider/error` (for example a
++ * 429 rate limit), whichever was stored last.
++ */
++export function getLatestThreadFailureEventRow(
++  db: DbConnection,
++  args: GetLatestThreadSystemErrorEventRowArgs,
++): StoredEventRow | null {
++  return (
++    db
++      .select(storedEventRowFields)
++      .from(events)
++      .where(
++        and(
++          eq(events.threadId, args.threadId),
++          inArray(events.type, [&quot;system/error&quot;, &quot;provider/error&quot;]),
++        ),
++      )
++      .orderBy(desc(events.sequence))
++      .limit(1)
++      .get() ?? null
++  );
++}
++
+ export function getLatestThreadSequence(
+   db: DbConnection,
+   args: GetLatestThreadSequenceArgs,
+diff --git a/packages/db/src/data/index.ts b/packages/db/src/data/index.ts
+index 6e599d718..c14ca5415 100644
+--- a/packages/db/src/data/index.ts
++++ b/packages/db/src/data/index.ts
+@@ -339,6 +339,7 @@ export {
+   getStoredTurnRequestEventForTurn,
+   getLatestThreadOutputEventRow,
+   getLatestThreadSystemErrorEventRow,
++  getLatestThreadFailureEventRow,
+   getLatestThreadSequence,
+   getLatestStoredEventRowByType,
+   insertEvents,
+</pre>
+  <p>Risk: the workflows retry classifier will start matching rate-limit text and retry twice (5 s total) before failing; harmless but wasteful, hence step 3.</p>
+
+  <h2>7. PR review</h2>
+  <p>No open PRs are linked to this issue.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li>Automations plugin shows the same <code>"Turn failed"</code> for provider-originated failures (same <code>thread.failed</code> payload) — not filed separately; fixing the server path fixes both.</li>
+    <li>Workflows transient-provider retry (#733 introduced <code>isRetryableProviderFailure</code>) is dead for provider-originated failures for the same reason.</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <details><summary>Full <code>bb workflows status</code> output</summary><pre>{
+  &quot;id&quot;: &quot;wfr_4469d4b6-7bef-4f17-ad96-430190dc103f&quot;,
+  &quot;projectId&quot;: &quot;proj_wqncx5cr2y&quot;,
+  &quot;originThreadId&quot;: &quot;thr_4nt62zknyn&quot;,
+  &quot;environmentId&quot;: &quot;env_wbxyk8aus8&quot;,
+  &quot;originProvider&quot;: &quot;codex&quot;,
+  &quot;originProviderTruncated&quot;: false,
+  &quot;originModel&quot;: &quot;gpt-5.6-sol&quot;,
+  &quot;originModelTruncated&quot;: false,
+  &quot;originReasoningLevel&quot;: &quot;medium&quot;,
+  &quot;originReasoningLevelTruncated&quot;: false,
+  &quot;originPermissionMode&quot;: &quot;auto&quot;,
+  &quot;originPermissionModeTruncated&quot;: false,
+  &quot;name&quot;: &quot;collect-1914&quot;,
+  &quot;nameTruncated&quot;: false,
+  &quot;sourceHash&quot;: &quot;a372a4af11f824d5cee34119b02be145fe918dcb47847cc8020b6b77f6a552b9&quot;,
+  &quot;sourceBytes&quot;: 372,
+  &quot;settings&quot;: {
+    &quot;maxActiveRuns&quot;: 4,
+    &quot;maxConcurrentAgents&quot;: 8,
+    &quot;maxAgentCalls&quot;: 100,
+    &quot;totalRunTimeoutMs&quot;: 86400000,
+    &quot;retentionDays&quot;: 30,
+    &quot;maxNotificationBytes&quot;: 16384
+  },
+  &quot;status&quot;: &quot;failed&quot;,
+  &quot;phase&quot;: &quot;Collect&quot;,
+  &quot;phaseTruncated&quot;: false,
+  &quot;resumedFromRunId&quot;: null,
+  &quot;result&quot;: null,
+  &quot;resultAvailable&quot;: false,
+  &quot;resultOmitted&quot;: false,
+  &quot;error&quot;: &quot;Workflow worker failed&quot;,
+  &quot;errorTruncated&quot;: false,
+  &quot;calls&quot;: {
+    &quot;total&quot;: 1,
+    &quot;queued&quot;: 0,
+    &quot;running&quot;: 0,
+    &quot;succeeded&quot;: 0,
+    &quot;failed&quot;: 1,
+    &quot;cancelled&quot;: 0
+  },
+  &quot;notification&quot;: {
+    &quot;outcome&quot;: &quot;delivered&quot;,
+    &quot;attemptCount&quot;: 1,
+    &quot;nextAttemptAt&quot;: null,
+    &quot;error&quot;: null,
+    &quot;errorTruncated&quot;: false
+  },
+  &quot;createdAt&quot;: 1787153296600,
+  &quot;startedAt&quot;: 1787153296809,
+  &quot;finishedAt&quot;: 1787153301255,
+  &quot;history&quot;: {
+    &quot;format&quot;: &quot;jsonl&quot;,
+    &quot;pageUsage&quot;: &quot;bb workflows history wfr_4469d4b6-7bef-4f17-ad96-430190dc103f --cursor 0 --limit 10&quot;,
+    &quot;fileUsage&quot;: &quot;mkdir -p \&quot;$BB_THREAD_STORAGE/workflows\&quot; &amp;&amp; bb workflows history wfr_4469d4b6-7bef-4f17-ad96-430190dc103f --cursor 0 --limit 10 &gt; \&quot;$BB_THREAD_STORAGE/workflows/wfr_4469d4b6-7bef-4f17-ad96-430190dc103f.jsonl\&quot;&quot;
+  }
+}</pre></details>
+  <details><summary>Fake 429 server log (the extra POSTs after the first are from the claude-code process's own retries/housekeeping; the worker turn itself failed on the first rejected response)</summary><pre>[fake-429] listening on 45929
+[fake-429] #1 HEAD /api/hello (0 bytes)
+[fake-429] #2 POST /v1/messages?beta=true (111264 bytes)
+[fake-429] #3 HEAD /api/hello (0 bytes)
+[fake-429] #4 POST /v1/messages?beta=true (99102 bytes)
+[fake-429] #5 HEAD /api/hello (0 bytes)
+[fake-429] #6 POST /v1/messages?beta=true (99102 bytes)
+[fake-429] #7 HEAD /api/hello (0 bytes)
+[fake-429] #8 POST /v1/messages?beta=true (99102 bytes)
+[fake-429] #9 HEAD /api/hello (0 bytes)
+[fake-429] #10 POST /v1/messages?beta=true (99102 bytes)
+[fake-429] #11 HEAD /api/hello (0 bytes)
+[fake-429] #12 HEAD /api/hello (0 bytes)
+[fake-429] #13 POST /v1/messages?beta=true (99965 bytes)
+[fake-429] #14 POST /v1/messages?beta=true (136716 bytes)
+[fake-429] #15 HEAD /api/hello (0 bytes)
+[fake-429] #16 HEAD /api/hello (0 bytes)
+[fake-429] #17 HEAD /api/hello (0 bytes)
+[fake-429] #18 HEAD /api/hello (0 bytes)
+[fake-429] #19 HEAD /api/hello (0 bytes)
+[fake-429] #20 HEAD /api/hello (0 bytes)
+[fake-429] #21 HEAD /api/hello (0 bytes)
+[fake-429] #22 HEAD /api/hello (0 bytes)
+[fake-429] #23 POST /v1/messages?beta=true (99102 bytes)
+[fake-429] #24 POST /v1/messages?beta=true (99965 bytes)
+</pre></details>
+  <details><summary>Server repro test source</summary><pre>/**
+ * Repro for get-bb/bb#1914.
+ *
+ * A provider-originated failure (Claude Code 429 &quot;rate_limit_event&quot;) is
+ * persisted as `provider/rateLimits/updated` + `provider/error` (with
+ * errorInfo) + `turn/completed status=failed`. No `system/error` row is ever
+ * written on that path. The plugin `thread.failed` payload builds its `error`
+ * field ONLY from the latest `system/error` row, so plugin consumers such as
+ * the workflows plugin receive `error: null` and fall back to the opaque
+ * &quot;Workflow worker failed&quot; string.
+ *
+ * Events are ingested through the REAL host-daemon seam
+ * (POST /internal/session/events), which is what applies `run.failed` and
+ * fires the plugin event.
+ */
+import { mkdir, mkdtemp, rm, writeFile } from &quot;node:fs/promises&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { getThread } from &quot;@bb/db&quot;;
+import { threadScope, turnScope } from &quot;@bb/domain&quot;;
+import { groupHostDaemonEvents } from &quot;@bb/host-daemon-contract&quot;;
+import { describe, expect, it, vi } from &quot;vitest&quot;;
+import {
+  createTestDaemonEventEnvelope,
+  internalAuthHeaders,
+} from &quot;../../helpers/commands.js&quot;;
+import { seedThreadFixture } from &quot;../../helpers/seed.js&quot;;
+import { createTestAppHarness } from &quot;../../helpers/test-app.js&quot;;
+
+interface RecordedFailedPayload {
+  thread: { id: string; status: string };
+  error: string | null;
+}
+
+const globals = globalThis as Record&lt;string, unknown&gt;;
+
+describe(&quot;issue #1914: thread.failed error for provider-originated failures&quot;, () =&gt; {
+  it(&quot;carries the provider/error (429 rate limit) detail to plugin thread.failed handlers&quot;, async () =&gt; {
+    const recorded: RecordedFailedPayload[] = [];
+    globals.__issue1914Failed = recorded;
+    const harness = await createTestAppHarness();
+    const workDir = await mkdtemp(join(tmpdir(), &quot;bb-issue-1914-&quot;));
+    const rootDir = join(workDir, &quot;bb-plugin-observer&quot;);
+    await mkdir(rootDir, { recursive: true });
+    await writeFile(
+      join(rootDir, &quot;package.json&quot;),
+      JSON.stringify({
+        name: &quot;bb-plugin-observer&quot;,
+        version: &quot;0.1.0&quot;,
+        bb: {
+          name: &quot;Observer fixture&quot;,
+          description: &quot;Thread events plugin fixture.&quot;,
+          branding: { icon: &quot;Zap&quot; },
+          server: &quot;./server.ts&quot;,
+        },
+      }),
+    );
+    await writeFile(
+      join(rootDir, &quot;server.ts&quot;),
+      `
+      export default function plugin(bb: any) {
+        bb.events.on(&quot;thread.failed&quot;, (payload: any) =&gt; {
+          (globalThis as any).__issue1914Failed.push(payload);
+        });
+      }
+    `,
+    );
+    const entry = await harness.pluginService.installPath(rootDir);
+    expect(entry.status).toBe(&quot;running&quot;);
+    try {
+      const { host, session, thread } = seedThreadFixture(harness, {
+        thread: { status: &quot;active&quot;, providerId: &quot;claude-code&quot; },
+      });
+      const turnId = &quot;turn-1914&quot;;
+      // Exactly the event shapes the claude-code provider plugin emits for a
+      // hard rate-limit rejection (plugins/provider-claude-code/src/event-translation.ts
+      // `case &quot;rate_limit_event&quot;` + the following `result` message).
+      const response = await harness.app.request(&quot;/internal/session/events&quot;, {
+        method: &quot;POST&quot;,
+        headers: internalAuthHeaders(harness, { hostId: host.id }),
+        body: JSON.stringify({
+          sessionId: session.id,
+          eventGroups: groupHostDaemonEvents([
+            createTestDaemonEventEnvelope({
+              threadId: thread.id,
+              event: {
+                type: &quot;turn/started&quot;,
+                threadId: thread.id,
+                providerThreadId: &quot;claude-session-1&quot;,
+                scope: turnScope(turnId),
+              },
+            }),
+            createTestDaemonEventEnvelope({
+              threadId: thread.id,
+              event: {
+                type: &quot;provider/rateLimits/updated&quot;,
+                threadId: thread.id,
+                providerThreadId: &quot;claude-session-1&quot;,
+                scope: threadScope(),
+                rateLimits: {
+                  providerId: &quot;claude-code&quot;,
+                  status: &quot;blocked&quot;,
+                  kind: &quot;subscription-window&quot;,
+                  windows: [
+                    {
+                      providerKey: &quot;five_hour&quot;,
+                      label: &quot;5h&quot;,
+                      status: &quot;blocked&quot;,
+                      resetsAtMs: 1_800_000_000_000,
+                    },
+                  ],
+                  reachedReason: &quot;five_hour&quot;,
+                  overageStatus: &quot;rejected&quot;,
+                  overageReason: &quot;org_level_disabled&quot;,
+                },
+              },
+            }),
+            createTestDaemonEventEnvelope({
+              threadId: thread.id,
+              event: {
+                type: &quot;provider/error&quot;,
+                threadId: thread.id,
+                providerThreadId: &quot;claude-session-1&quot;,
+                scope: turnScope(turnId),
+                message: &quot;Provider error&quot;,
+                detail:
+                  &quot;You&#x27;ve hit your session limit - resets 2:40pm (rate_limit_event, HTTP 429)&quot;,
+                errorInfo: {
+                  category: &quot;rate-limit&quot;,
+                  providerCode: &quot;rate_limit_event&quot;,
+                  httpStatusCode: 429,
+                },
+              },
+            }),
+            createTestDaemonEventEnvelope({
+              threadId: thread.id,
+              event: {
+                type: &quot;turn/completed&quot;,
+                threadId: thread.id,
+                providerThreadId: &quot;claude-session-1&quot;,
+                scope: turnScope(turnId),
+                status: &quot;failed&quot;,
+              },
+            }),
+          ]),
+        }),
+      });
+      expect(response.status).toBe(200);
+
+      // The thread really did land in `error` ...
+      expect(getThread(harness.db, thread.id)?.status).toBe(&quot;error&quot;);
+      // ... and the plugin got a thread.failed ...
+      await vi.waitFor(() =&gt; expect(recorded).toHaveLength(1));
+      expect(recorded[0]?.thread.id).toBe(thread.id);
+      expect(recorded[0]?.thread.status).toBe(&quot;error&quot;);
+      // ... but `error` must describe the 429. On main it is `null`, so the
+      // workflows plugin shows &quot;Workflow worker failed&quot;.
+      expect(recorded[0]?.error).not.toBeNull();
+      expect(recorded[0]?.error).toMatch(/rate.?limit|429|session limit/i);
+    } finally {
+      delete globals.__issue1914Failed;
+      await harness.pluginService.stop();
+      await rm(workDir, { recursive: true, force: true });
+      await harness.cleanup();
+    }
+  });
+});
+</pre></details>
+  <details><summary>Workflows repro test source</summary><pre>/**
+ * Repro for get-bb/bb#1914 (workflows plugin side).
+ *
+ * The server fires `thread.failed` with `error: null` for provider-originated
+ * failures (see apps/server/test/services/plugins/issue-1914-*.test.ts). The
+ * workflows plugin then settles the call with the opaque string
+ * &quot;Workflow worker failed&quot;, and its transient-provider retry path (which
+ * matches /rate.?limit|429/ on the error text) never fires.
+ */
+import { createFakePluginHost } from &quot;@get-bb/plugin-sdk/testing&quot;;
+import { afterEach, describe, expect, it } from &quot;vitest&quot;;
+import { getCall, getRunRequired, migrations } from &quot;./data.js&quot;;
+import { createWorkflowService } from &quot;./service.js&quot;;
+
+async function eventually(
+  assertion: () =&gt; void | Promise&lt;void&gt;,
+  timeoutMs = 3_000,
+): Promise&lt;void&gt; {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      await assertion();
+      return;
+    } catch (error) {
+      if (Date.now() &gt;= deadline) throw error;
+      await new Promise((resolve) =&gt; setTimeout(resolve, 10));
+    }
+  }
+}
+
+function availableModel(model: string) {
+  return {
+    id: model,
+    model,
+    displayName: model,
+    description: &quot;test&quot;,
+    supportedReasoningEfforts: [
+      { reasoningEffort: &quot;medium&quot;, description: &quot;test&quot; },
+    ],
+    defaultReasoningEffort: &quot;medium&quot;,
+    isDefault: true,
+  };
+}
+
+describe(&quot;issue #1914: workflow call error for a rate-limited worker&quot;, () =&gt; {
+  const hosts: Array&lt;ReturnType&lt;typeof createFakePluginHost&gt;[&quot;harness&quot;]&gt; = [];
+  afterEach(async () =&gt; {
+    await Promise.all(hosts.map((host) =&gt; host.dispose()));
+    hosts.length = 0;
+  });
+
+  function setup() {
+    let childCount = 0;
+    const { bb, harness } = createFakePluginHost({
+      pluginId: &quot;workflows&quot;,
+      sdk: {
+        threads: {
+          get: async ({ threadId }) =&gt;
+            ({
+              id: threadId,
+              environmentId: &quot;environment-1&quot;,
+              providerId: &quot;claude-code&quot;,
+              status: threadId === &quot;origin&quot; ? &quot;idle&quot; : &quot;working&quot;,
+            }) as never,
+          defaultExecutionOptions: async () =&gt; ({
+            model: &quot;model-a&quot;,
+            reasoningLevel: &quot;medium&quot;,
+            permissionMode: &quot;accept-edits&quot;,
+            serviceTier: &quot;default&quot;,
+            source: &quot;default&quot;,
+          }),
+          spawn: async () =&gt; {
+            childCount += 1;
+            return { id: `child-${childCount}` } as never;
+          },
+          send: async () =&gt; ({ ok: true }),
+          stop: async () =&gt; ({ ok: true }),
+        },
+        providers: {
+          list: async () =&gt; [
+            {
+              id: &quot;claude-code&quot;,
+              displayName: &quot;Claude Code&quot;,
+              logoUrl: null,
+              available: true,
+              capabilities: {
+                supportsThreadArchive: true,
+                supportsThreadRename: true,
+                supportsServiceTier: true,
+                supportsNativeUserQuestion: false,
+                supportsFork: true,
+                permissionModes: [&quot;accept-edits&quot;, &quot;auto&quot;, &quot;full&quot;],
+              },
+              composerActions: [],
+            },
+          ],
+          models: async () =&gt; ({
+            providers: [],
+            models: [availableModel(&quot;model-a&quot;)],
+            selectedOnlyModels: [],
+            modelLoadError: null,
+          }),
+        },
+      },
+    });
+    hosts.push(harness);
+    const db = bb.storage.database();
+    bb.storage.migrate(db, migrations);
+    const service = createWorkflowService(bb, db);
+    return { bb, db, service, harness, childCount: () =&gt; childCount };
+  }
+
+  it(&quot;surfaces the provider failure instead of &#x27;Workflow worker failed&#x27;&quot;, async () =&gt; {
+    const test = setup();
+    const controller = new AbortController();
+    const worker = test.service.runWorker(controller.signal);
+    const run = await test.service.start({
+      projectId: &quot;project-test&quot;,
+      originThreadId: &quot;origin&quot;,
+      source: `export const meta = { name: &quot;collect&quot;, description: &quot;t&quot; };
+        return await agent(&quot;Collect&quot;);`,
+      args: null,
+      resumedFromRunId: null,
+    });
+    await eventually(() =&gt; expect(test.childCount()).toBe(1));
+
+    // This is exactly what plugins/workflows/src/server.ts receives from
+    // bb.events.on(&quot;thread.failed&quot;) when the child hit a Claude 429:
+    // the server&#x27;s payload has `error: null`.
+    test.service.onThreadFailed(&quot;child-1&quot;, null);
+
+    await eventually(() =&gt; {
+      expect(getRunRequired(test.db, run.id).status).toBe(&quot;failed&quot;);
+    });
+    const call = getCall(test.db, run.id, 0);
+    const runRow = getRunRequired(test.db, run.id);
+    // Document what main produces today:
+    // eslint-disable-next-line no-console
+    console.log(&quot;[issue-1914] call.error =&quot;, JSON.stringify(call?.error));
+    // eslint-disable-next-line no-console
+    console.log(&quot;[issue-1914] run.error  =&quot;, JSON.stringify(runRow.error));
+    // eslint-disable-next-line no-console
+    console.log(&quot;[issue-1914] retries    =&quot;, call?.providerRetryAttempts);
+
+    // Expected: the call error names the rate limit (category/429/message).
+    expect(call?.error).not.toBe(&quot;Workflow worker failed&quot;);
+    expect(call?.error ?? &quot;&quot;).toMatch(/rate.?limit|429/i);
+
+    controller.abort();
+    await worker;
+  });
+});
+</pre></details>
+  <details><summary>Fake Anthropic 429 server</summary><pre>// Fake Anthropic API that answers every request with HTTP 429 + the unified
+// rate-limit headers Claude Code turns into a `rate_limit_event` (status
+// &quot;rejected&quot;). Point Claude Code at it with ANTHROPIC_BASE_URL.
+//   node fake-429.mjs &lt;port&gt;
+import http from &quot;node:http&quot;;
+const port = Number(process.argv[2] ?? 45929);
+const resetsAt = Math.floor(Date.now() / 1000) + 3 * 3600;
+let n = 0;
+http
+  .createServer((req, res) =&gt; {
+    let body = &quot;&quot;;
+    req.on(&quot;data&quot;, (c) =&gt; (body += c));
+    req.on(&quot;end&quot;, () =&gt; {
+      n += 1;
+      console.log(`[fake-429] #${n} ${req.method} ${req.url} (${body.length} bytes)`);
+      res.writeHead(429, {
+        &quot;content-type&quot;: &quot;application/json&quot;,
+        &quot;anthropic-ratelimit-unified-status&quot;: &quot;rejected&quot;,
+        &quot;anthropic-ratelimit-unified-reset&quot;: String(resetsAt),
+        &quot;anthropic-ratelimit-unified-5h-status&quot;: &quot;rejected&quot;,
+        &quot;anthropic-ratelimit-unified-5h-reset&quot;: String(resetsAt),
+        &quot;anthropic-ratelimit-unified-representative-claim&quot;: &quot;five_hour&quot;,
+        &quot;anthropic-ratelimit-unified-overage-status&quot;: &quot;rejected&quot;,
+        &quot;anthropic-ratelimit-unified-overage-disabled-reason&quot;: &quot;org_level_disabled&quot;,
+        &quot;retry-after&quot;: &quot;10800&quot;,
+        &quot;request-id&quot;: `req_fake_${n}`,
+      });
+      res.end(
+        JSON.stringify({
+          type: &quot;error&quot;,
+          error: {
+            type: &quot;rate_limit_error&quot;,
+            message: &quot;You&#x27;ve hit your session limit - resets 2:40pm&quot;,
+          },
+          request_id: `req_fake_${n}`,
+        }),
+      );
+    });
+  })
+  .listen(port, &quot;127.0.0.1&quot;, () =&gt;
+    console.log(`[fake-429] listening on ${port}`),
+  );
+</pre></details>
+  <details><summary>Commands run (abridged)</summary><pre>gh issue view 1914 --repo get-bb/bb --comments
+pnpm install --frozen-lockfile --prefer-offline; pnpm exec turbo run build
+git fetch origin main; git log d81fee6f..origin/main --oneline      # 2 unrelated commits
+# code trace
+grep -rn "Workflow worker failed" plugins/workflows/src
+grep -rn "thread.failed" apps/server/src packages/plugin-sdk/src plugins/*/src
+# unit repros
+cd apps/server && pnpm exec vitest run test/services/plugins/issue-1914-thread-failed-provider-error.test.ts
+cd plugins/workflows && pnpm exec vitest run src/issue-1914-worker-failed.test.ts
+# live repro
+node /tmp/bb-reports/issues/1914/repro/fake-429.mjs 45929 &
+ANTHROPIC_BASE_URL=http://127.0.0.1:45929 claude -p "Reply only with ok." --output-format stream-json --verbose
+export ANTHROPIC_BASE_URL=http://127.0.0.1:45929; scripts/bb-dev-app current
+curl -X POST http://localhost:19386/api/v1/plugins/workflows/enable
+curl -X POST http://localhost:19386/api/v1/projects -d '{"name":"qa","source":{"type":"local_path","path":"/tmp/bb-1914/qa-repo","hostId":"host_nccjkbdw72"}}'
+bb thread spawn --project proj_wqncx5cr2y --environment /tmp/bb-1914/qa-repo --provider codex --prompt "Reply only with ok." --title "1914 origin" --json
+bb workflows validate --file /tmp/bb-1914/qa-repo/collect.workflow.js
+bb workflows run --file /tmp/bb-1914/qa-repo/collect.workflow.js
+bb workflows status wfr_4469d4b6-7bef-4f17-ad96-430190dc103f
+bb workflows history wfr_4469d4b6-7bef-4f17-ad96-430190dc103f
+bb thread show thr_u982areftg; bb thread log thr_u982areftg --json
+sqlite3 &lt;data-dir&gt;/bb.db "select sequence,type from events where thread_id='thr_u982areftg' order by sequence"
+# prototype fix
+git apply /tmp/bb-reports/issues/1914/repro/prototype-fix.patch; pnpm exec turbo run typecheck --filter=@bb/server; (tests) ; git checkout -- .
+# cleanup
+pnpm dev:stop; rm -rf ~/.bb-dev/projects-bb-.claude-worktrees-wf_d5c47f31-487-6-484bd182cef1 /tmp/bb-1914</pre></details>
+</main></body></html>

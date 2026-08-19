@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1918 internal error when use omp Agent</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:4px; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1918 · internal error when use omp Agent</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill high">Urgent</span> <span class="pill">Effort: n/a</span> <span class="pill">omp · providers · provider-acp</span>
+    <a href="https://github.com/get-bb/bb/issues/1918">open on GitHub</a>
+    <span>2026-08-19 · base <code>d81fee6f</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict no">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>Starting any thread with the <code>acp-omp</code> provider in bb 0.39.0 fails immediately with <em>"Command thread.start failed — Internal error"</em>. The reporter's diagnosis is correct and I reproduced it end to end on Linux against the base commit: when the ACP bridge builds the <code>bb-bridge</code> MCP server config it hands to the agent in <code>session/new</code>, it uses <code>process.argv[1]</code> as the entry point to re-execute itself with <code>--mcp-stdio</code>. Since PR #1640 (shipped in 0.39.0) every provider bridge is launched through the generic bootstrap <code>bb-provider-bridge-worker.mjs</code> (<code>bridge-worker-entry.ts</code> from source), so <code>argv[1]</code> is the bootstrap, not the ACP bridge module. The spawned "MCP server" is therefore <code>node &lt;bootstrap&gt; --mcp-stdio</code>, which exits 1 with <code>provider bridge bootstrap usage: &lt;bridgeModulePath&gt; &lt;pluginId&gt; &lt;pluginDataDir&gt;</code>. omp treats a dead MCP transport as fatal and rejects <code>session/new</code> with <code>{"message":"Internal error","data":{"details":"bb-bridge: Transport closed"}}</code>; bb drops <code>error.data</code> and shows only "Internal error". Every ACP thread carries at least one dynamic tool (<code>update_environment_directory</code>), so every ACP agent receives the broken MCP config; Cursor and Grok tolerate the dead server (thread starts, but the dynamic tool silently never works), omp does not. A one-line fix (use <code>import.meta.url</code>) makes the repro test pass and lets omp threads start on my dev instance.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Starting an <code>acp-omp</code> thread fails at <code>thread.start</code> with "Internal error"</td><td class="no">Verified</td><td>Dev instance at d81fee6f, omp 17.3.8: thread <code>thr_tbww7d7myk</code> ends in status <code>error</code> with event <code>{"code":"thread_command_failed","message":"Command thread.start failed","detail":"Internal error"}</code> (<a href="1918/repro/thread-events-thr_tbww7d7myk.jsonl">events</a>, <a href="assets/1918-thread-error.png">screenshot</a>).</td></tr>
+    <tr><td><code>resolveBridgeProcessArgsForMcpServer()</code> uses <code>process.argv[1]</code>, which is now the worker script</td><td class="no">Verified</td><td><code>plugins/provider-acp/src/bridge/bridge.ts:328-333</code>; live bridge argv captured from <code>/proc</code>: <code>node --conditions=source --import tsx …/bridge-worker-entry.ts …/plugin-host-artifacts/provider-acp/&lt;digest&gt;/host.js provider-acp …/bridge-data</code> (<a href="1918/repro/live-bridge-argv.txt">live-bridge-argv.txt</a>).</td></tr>
+    <tr><td>The advertised MCP server is <code>[worker, "--mcp-stdio"]</code> and exits immediately</td><td class="no">Verified</td><td>Repro test prints the advertised config with <code>args[3] = …/bridge-worker-entry.ts</code>; running it yields exit code 1, stderr <code>provider bridge bootstrap usage: …</code>, no MCP response (<a href="1918/repro/vitest-main.log">vitest-main.log</a>).</td></tr>
+    <tr><td>omp rejects <code>session/new</code> with <code>bb-bridge: Transport closed</code></td><td class="no">Verified</td><td>Driving <code>omp acp</code> directly with the worker as MCP entry: <code>{"code":-32603,"message":"Internal error","data":{"details":"bb-bridge: Transport closed"}}</code>; same drive with the bridge module as entry: <code>session/new OK</code> (<a href="1918/repro/omp-drive-worker-entry.log">worker log</a>, <a href="1918/repro/omp-drive-bridge-entry.log">bridge log</a>).</td></tr>
+    <tr><td>Regression from the bridge-worker refactor, new in 0.39.0</td><td class="no">Verified</td><td>Bootstrap introduced in c5b53caab (#1640, 2026-08-17); <code>git merge-base --is-ancestor</code>: not in <code>desktop-v0.38.0</code>, in <code>desktop-v0.39.0</code>. Before #1640 the bridge was executed directly so <code>argv[1]</code> was the bridge artifact.</td></tr>
+    <tr><td>Affects every <code>acp-*</code> provider, not just omp</td><td class="unv">Partially verified</td><td>The broken config is sent for every ACP session (the server always contributes <code>update_environment_directory</code>, see <code>thread-runtime-config.ts:118-133</code>). Whether the thread fails depends on the agent: <code>cursor-agent acp</code> and <code>grok agent stdio</code> both answered <code>session/new OK</code> with the dead MCP server, so they start but lose the dynamic tool silently; omp fails hard.</td></tr>
+    <tr><td>bb drops <code>error.data.details</code>; UI and daemon log show only "Internal error"</td><td class="no">Verified</td><td><code>plugins/provider-acp/src/bridge/agent-connection.ts:141-147</code> builds <code>new Error(message.error.message)</code> and ignores <code>error.data</code>. Daemon log for the failed start: <code>err.message=Internal error, err.data=None</code> (<a href="1918/repro/host-daemon-thread-start-error.log">log</a>). Also visible after the fix: omp's <code>session/prompt</code> error "No model selected…" surfaces as bare "Internal error" (<a href="assets/1918-thread-fixed.png">screenshot</a>).</td></tr>
+    <tr><td>First session of a bridge process sometimes succeeds (timing dependent)</td><td class="unv">Unverified</td><td>Against omp 17.3.8 on Linux the failure was deterministic in 4/4 direct drives and 1/1 dev-instance thread. I could not reproduce a first-session success; plausible as an omp-side MCP-init race, not a bb code path I can point at.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb source at <code>d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3</code> (origin/main HEAD at time of writing: <code>0f6759a7</code>; no later commit touches <code>plugins/provider-acp</code>, <code>packages/agent-runtime</code>, <code>apps/host-daemon</code> or <code>packages/bb-app</code>).</li>
+    <li>Linux 7.0.0-29-generic (Ubuntu), Node v24.18.0, tsx 4.23.1.</li>
+    <li>omp: <code>@oh-my-pi/pi-coding-agent@17.3.8</code> installed locally under <code>/tmp/bb-1918-omp</code>, run with bun 1.3.14 unpacked under <code>/tmp/bb-1918-bun</code> (omp is not installed on this machine; the issue used 17.3.7 via Homebrew on macOS). Also probed: cursor-agent, grok 1.0.3.</li>
+    <li>Dev instance from this worktree: App <code>http://localhost:12764</code>, Server <code>http://localhost:20764</code>, Host daemon <code>127.0.0.1:28764</code>, data dir <code>~/.bb-dev/projects-bb-.claude-worktrees-wf_d5c47f31-487-1-3590cba46308</code> (deleted at cleanup). Started with omp+bun prepended to <code>PATH</code> so the daemon auto-detected <code>acp-omp</code> (<a href="1918/repro/start-dev-with-omp.sh">start-dev-with-omp.sh</a>).</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <h3>4a. Unit-level (no agent, no credentials needed) — fails on d81fee6f, passes with the fix</h3>
+  <ol>
+    <li>Copy <a href="1918/repro/mcp-server-entry-1918.repro.test.ts">mcp-server-entry-1918.repro.test.ts</a> to <code>plugins/provider-acp/src/bridge/</code>. It spawns the ACP bridge exactly like <code>packages/agent-runtime/src/provider-registry.ts</code> does (<code>node --conditions=source --import tsx bridge-worker-entry.ts bridge.ts provider-acp &lt;dataDir&gt;</code>), starts a thread against the fake ACP agent with one dynamic tool, asks the fake agent to echo the MCP server config it received, then <em>executes that config</em> and sends an MCP <code>initialize</code>.</li>
+    <li>Run: <pre>cd plugins/provider-acp &amp;&amp; pnpm exec vitest run src/bridge/mcp-server-entry-1918.repro.test.ts</pre></li>
+    <li>Actual on d81fee6f (<a href="1918/repro/vitest-main.log">full log</a>):<pre>advertised MCP server: {
+  "name": "bb-bridge",
+  "command": "/home/sawyer/.nvm/versions/node/v24.18.0/bin/node",
+  "args": [
+    "--conditions=source",
+    "--import",
+    "file:///…/node_modules/.pnpm/tsx@4.23.1/node_modules/tsx/dist/loader.mjs",
+    "/…/packages/provider-bridge-protocol/src/bridge-worker-entry.ts",      &lt;-- the bootstrap, not the ACP bridge
+    "--mcp-stdio"
+  ], …
+}
+MCP child exit: {"code":1} stderr: provider bridge bootstrap usage: &lt;bridgeModulePath&gt; &lt;pluginId&gt; &lt;pluginDataDir&gt; (absolute paths)
+ stdout lines: []
+
+AssertionError: expected true to be false   // cfg.args contains "bridge-worker"
+ ❯ src/bridge/mcp-server-entry-1918.repro.test.ts:216:63</pre></li>
+    <li>Expected (and actual with the one-line fix below, <a href="1918/repro/vitest-fixed.log">log</a>):<pre>"args": [ …, "/…/plugins/provider-acp/src/bridge/bridge.ts", "--mcp-stdio" ]
+MCP child exit: undefined stderr:  stdout lines: [
+  '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"bb-bridge","version":"1.0.0"}}}'
+]
+ ✓ advertises an MCP server command that actually answers MCP initialize</pre></li>
+  </ol>
+
+  <h3>4b. Agent-level: omp rejects session/new only when the MCP entry is the worker</h3>
+  <ol>
+    <li><a href="1918/repro/drive-acp-agent.mjs">drive-acp-agent.mjs</a> speaks ACP to an agent directly: <code>initialize</code> → <code>session/new</code> with one <code>bb-bridge</code> MCP server whose entry is given on the command line. <a href="1918/repro/run-omp-drive.sh">run-omp-drive.sh</a> wraps it for the temp omp install.</li>
+    <li>Worker as entry (what bb 0.39.0 sends): <pre>$ run-omp-drive.sh   # default entry = packages/provider-bridge-protocol/src/bridge-worker-entry.ts
+-&gt; session/new mcpServers: [{"command":".../node","args":["--conditions=source","--import","file:///.../tsx/dist/loader.mjs",".../bridge-worker-entry.ts","--mcp-stdio"]}]
+&lt;- {"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"Internal error","data":{"details":"bb-bridge: Transport closed"}}}
+session/new FAILED</pre></li>
+    <li>Bridge module as entry (the fix): <pre>$ run-omp-drive.sh /…/plugins/provider-acp/src/bridge/bridge.ts
+-&gt; session/new mcpServers: [{"command":".../node","args":[…,".../plugins/provider-acp/src/bridge/bridge.ts","--mcp-stdio"]}]
+&lt;- {"jsonrpc":"2.0","id":2,"result":{"sessionId":"01a01a93-a579-7000-acd6-4a81d2ef46ba", …}}
+session/new OK</pre></li>
+    <li>Same worker-entry config against <code>cursor-agent acp</code> and <code>grok agent stdio</code>: both <code>session/new OK</code> — they ignore the dead MCP server, so those providers start but never get <code>update_environment_directory</code>.</li>
+  </ol>
+
+  <h3>4c. End to end on a dev instance (d81fee6f)</h3>
+  <ol>
+    <li>Make omp discoverable and start the dev app: <pre>export PATH=/tmp/bb-1918-omp/node_modules/.bin:/tmp/bb-1918-bun/bun-linux-x64:$PATH
+scripts/bb-dev-app current          # prints App/Server/Host daemon URLs + data dir
+eval "$(scripts/bb-dev-app env)"
+pnpm bb:dev provider list           # shows acp-omp</pre></li>
+    <li>Create a project on a scratch repo and spawn a thread: <pre>curl -s -X POST $BB_SERVER_URL/api/v1/projects -H 'content-type: application/json' \
+  -d '{"name":"qa","source":{"type":"local_path","path":"/tmp/bb-1918-qa-repo","hostId":"&lt;host id from pnpm bb:dev machine list&gt;"}}'
+pnpm bb:dev thread spawn --project &lt;proj id&gt; --provider acp-omp --permission-mode accept-edits --title "1918 repro" --prompt "Reply only with ok." --json</pre></li>
+    <li>Actual: thread status <code>error</code>; last event <pre>{"code":"thread_command_failed","message":"Command thread.start failed","detail":"Internal error"}</pre>
+    Host daemon log (<a href="1918/repro/host-daemon-thread-start-error.log">excerpt</a>): <code>"type":"thread.start","msg":"online host RPC failed" | err.message= Internal error | err.data= None</code>.</li>
+  </ol>
+  <figure><img src="assets/1918-thread-error.png" alt="Thread view showing Command thread.start failed / Internal error"><figcaption>Base commit, provider acp-omp: "Command thread.start failed — Internal error" right after provisioning. No further detail is shown anywhere.</figcaption></figure>
+  <ol start="4">
+    <li>Apply the fix (<a href="1918/repro/proposed-fix.diff">proposed-fix.diff</a>), restart the dev app (the server rebuilds the plugin host artifact), spawn again: <code>thread/start</code> now succeeds (providerThreadId <code>01a01a97-c38c-7000-…</code> assigned, <a href="1918/repro/thread-events-fixed-thr_gub2gecrgu.jsonl">events</a>). The turn then fails with "Internal error" because my sandboxed omp has no model credentials (<code>session/prompt</code> → <code>data.details: "No model selected…"</code>) — which is a second demonstration of the swallowed <code>error.data</code>.</li>
+  </ol>
+  <figure><img src="assets/1918-thread-fixed.png" alt="Thread view after fix: thread started, turn fails with Internal error"><figcaption>With the fix: no more thread.start failure. The remaining "Internal error" is omp's "No model selected" (no credentials in my temp omp home), again displayed without its details.</figcaption></figure>
+  <p>Repro files: <a href="1918/repro/">1918/repro/</a></p>
+  <details><summary>Repro test source (mcp-server-entry-1918.repro.test.ts)</summary><pre>/**
+ * Repro for get-bb/bb#1918: the `bb-bridge` MCP server the ACP bridge hands
+ * to the agent is spawned with the provider-bridge *worker* script as its
+ * entry point (process.argv[1]) instead of the ACP plugin&#x27;s own bridge
+ * module, so the child dies on the worker&#x27;s usage check and the agent sees
+ * &quot;bb-bridge: Transport closed&quot;.
+ *
+ * Unlike bridge.test.ts this spawns the bridge exactly like the agent runtime
+ * does (node &lt;bridge-worker-entry&gt; &lt;bridge module&gt; &lt;pluginId&gt; &lt;dataDir&gt;) so
+ * process.argv[1] inside the bridge is the worker, and then actually executes
+ * the MCP server command the bridge advertised.
+ */
+import { spawn, type ChildProcess } from &quot;node:child_process&quot;;
+import { mkdtempSync, rmSync } from &quot;node:fs&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { dirname, join, resolve } from &quot;node:path&quot;;
+import { fileURLToPath } from &quot;node:url&quot;;
+import { createInterface } from &quot;node:readline&quot;;
+import { afterEach, describe, expect, it } from &quot;vitest&quot;;
+
+const here = dirname(fileURLToPath(import.meta.url));
+const BRIDGE_MODULE = resolve(here, &quot;bridge.ts&quot;);
+const FAKE_AGENT_PATH = resolve(here, &quot;fake-acp-agent.mjs&quot;);
+const WORKER_ENTRY = fileURLToPath(
+  import.meta.resolve(&quot;@bb/provider-bridge-protocol/bridge-worker-entry&quot;),
+);
+const TSX = import.meta.resolve(&quot;tsx&quot;);
+
+interface Msg {
+  id?: number | string;
+  method?: string;
+  params?: Record&lt;string, unknown&gt;;
+  result?: Record&lt;string, unknown&gt;;
+  error?: { message: string };
+}
+
+let bridge: ChildProcess | undefined;
+let dataDir: string;
+let workspaceDir: string;
+const log: Msg[] = [];
+let nextId = 1;
+
+function send(method: string, params: unknown): number {
+  const id = nextId++;
+  bridge!.stdin!.write(
+    `${JSON.stringify({ jsonrpc: &quot;2.0&quot;, id, method, params })}\n`,
+  );
+  return id;
+}
+
+async function waitFor&lt;T&gt;(
+  pick: () =&gt; T | undefined,
+  what: string,
+  ms = 20_000,
+): Promise&lt;T&gt; {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const v = pick();
+    if (v !== undefined) return v;
+    if (Date.now() &gt; deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) =&gt; setTimeout(r, 20));
+  }
+}
+
+function agentTexts(): string[] {
+  const out: string[] = [];
+  for (const m of log) {
+    if (m.method !== &quot;thread/event&quot;) continue;
+    const ev = (m.params as { event?: Record&lt;string, unknown&gt; }).event;
+    if (ev?.type === &quot;item/agentMessage/delta&quot;) out.push(String(ev.delta));
+  }
+  return out;
+}
+
+afterEach(() =&gt; {
+  bridge?.kill(&quot;SIGKILL&quot;);
+  rmSync(dataDir, { recursive: true, force: true });
+  rmSync(workspaceDir, { recursive: true, force: true });
+});
+
+describe(&quot;#1918 bb-bridge MCP server entry point&quot;, () =&gt; {
+  it(&quot;advertises an MCP server command that actually answers MCP initialize&quot;, async () =&gt; {
+    dataDir = mkdtempSync(join(tmpdir(), &quot;bb-1918-data-&quot;));
+    workspaceDir = mkdtempSync(join(tmpdir(), &quot;bb-1918-ws-&quot;));
+
+    // Spawn the bridge the way packages/agent-runtime/src/provider-registry.ts does.
+    const args = [
+      &quot;--conditions=source&quot;,
+      &quot;--import&quot;,
+      TSX,
+      WORKER_ENTRY,
+      BRIDGE_MODULE,
+      &quot;provider-acp&quot;,
+      dataDir,
+    ];
+    bridge = spawn(process.execPath, args, { stdio: [&quot;pipe&quot;, &quot;pipe&quot;, &quot;pipe&quot;] });
+    bridge.stderr!.on(&quot;data&quot;, (d) =&gt; process.stderr.write(`[bridge] ${d}`));
+    createInterface({ input: bridge.stdout! }).on(&quot;line&quot;, (line) =&gt; {
+      try {
+        log.push(JSON.parse(line) as Msg);
+      } catch {
+        /* ignore */
+      }
+    });
+
+    const startId = send(&quot;thread/start&quot;, {
+      threadId: &quot;thread-1918&quot;,
+      cwd: workspaceDir,
+      instructionMode: &quot;append&quot;,
+      options: {
+        permissionMode: &quot;full&quot;,
+        permissionScope: &quot;full&quot;,
+        approvalReviewer: null,
+        permissionEscalation: null,
+        providerOptions: {
+          acpLaunchSpec: {
+            displayName: &quot;Fake ACP&quot;,
+            command: process.execPath,
+            args: [FAKE_AGENT_PATH],
+            env: {},
+          },
+        },
+      },
+      dynamicTools: [
+        {
+          name: &quot;update_environment_directory&quot;,
+          description: &quot;Move this thread to another environment directory.&quot;,
+          inputSchema: {
+            type: &quot;object&quot;,
+            properties: { path: { type: &quot;string&quot; } },
+            required: [&quot;path&quot;],
+          },
+        },
+      ],
+    });
+    const startResp = await waitFor(
+      () =&gt; log.find((m) =&gt; m.id === startId &amp;&amp; m.method === undefined),
+      &quot;thread/start response&quot;,
+    );
+    expect(startResp.error).toBeUndefined();
+    const providerThreadId = String(startResp.result!.providerThreadId);
+
+    send(&quot;turn/start&quot;, {
+      threadId: &quot;thread-1918&quot;,
+      providerThreadId,
+      clientRequestId: &quot;creq_abcdefghjk&quot;,
+      options: {
+        permissionMode: &quot;full&quot;,
+        permissionScope: &quot;full&quot;,
+        approvalReviewer: null,
+        permissionEscalation: null,
+      },
+      input: [{ type: &quot;text&quot;, text: &quot;echo-mcp-server-config&quot;, mentions: [] }],
+    });
+    const configText = await waitFor(
+      () =&gt; agentTexts().find((t) =&gt; t.startsWith(&quot;mcp-server-config:&quot;)),
+      &quot;mcp-server-config echo&quot;,
+    );
+    const [cfg] = JSON.parse(
+      configText.slice(&quot;mcp-server-config:&quot;.length),
+    ) as {
+      name: string;
+      command: string;
+      args: string[];
+      env: { name: string; value: string }[];
+    }[];
+    console.log(&quot;advertised MCP server:&quot;, JSON.stringify(cfg, null, 2));
+    expect(cfg.name).toBe(&quot;bb-bridge&quot;);
+
+    // Now run the advertised MCP server exactly as an ACP agent would.
+    const env = { ...process.env };
+    for (const { name, value } of cfg.env) env[name] = value;
+    const mcp = spawn(cfg.command, cfg.args, {
+      env,
+      stdio: [&quot;pipe&quot;, &quot;pipe&quot;, &quot;pipe&quot;],
+    });
+    let stderr = &quot;&quot;;
+    mcp.stderr!.on(&quot;data&quot;, (d) =&gt; {
+      stderr += String(d);
+    });
+    const lines: string[] = [];
+    createInterface({ input: mcp.stdout! }).on(&quot;line&quot;, (l) =&gt; lines.push(l));
+    let exit: { code: number | null } | undefined;
+    mcp.on(&quot;exit&quot;, (code) =&gt; {
+      exit = { code };
+    });
+    mcp.stdin!.write(
+      `${JSON.stringify({
+        jsonrpc: &quot;2.0&quot;,
+        id: 1,
+        method: &quot;initialize&quot;,
+        params: {
+          protocolVersion: &quot;2024-11-05&quot;,
+          capabilities: {},
+          clientInfo: { name: &quot;repro&quot;, version: &quot;0&quot; },
+        },
+      })}\n`,
+    );
+
+    await waitFor(
+      () =&gt; (lines.length &gt; 0 || exit !== undefined ? true : undefined),
+      &quot;MCP initialize response or exit&quot;,
+      15_000,
+    );
+    mcp.kill(&quot;SIGKILL&quot;);
+    console.log(
+      &quot;MCP child exit:&quot;,
+      JSON.stringify(exit),
+      &quot;stderr:&quot;,
+      stderr,
+      &quot;stdout lines:&quot;,
+      lines,
+    );
+
+    // The bug: args[0] is the worker bootstrap, which exits 1 with a usage error.
+    expect(cfg.args.some((a) =&gt; a.includes(&quot;bridge-worker&quot;))).toBe(false);
+    expect(stderr).not.toMatch(/provider bridge bootstrap usage/);
+    expect(lines[0]).toContain(&#x27;&quot;serverInfo&quot;:{&quot;name&quot;:&quot;bb-bridge&quot;&#x27;);
+  }, 60_000);
+});
+</pre></details>
+
+  <h2>5. Root cause</h2>
+  <p><a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/plugins/provider-acp/src/bridge/bridge.ts#L328-L333"><code>plugins/provider-acp/src/bridge/bridge.ts#L328-L333</code></a>:</p>
+  <pre>function resolveBridgeProcessArgsForMcpServer(): string[] {
+  const entryPoint = process.argv[1]
+    ? resolve(process.argv[1])
+    : fileURLToPath(import.meta.url);
+  return [...process.execArgv, entryPoint, "--mcp-stdio"];
+}</pre>
+  <p>This is used by <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/plugins/provider-acp/src/bridge/bridge.ts#L443-L463"><code>buildSessionMcpServers</code></a> to produce the <code>bb-bridge</code> entry in <code>session/new.mcpServers</code> (command = <code>process.execPath</code>). The bridge expects to re-exec <em>its own artifact</em> with <code>--mcp-stdio</code>, which its top level handles at <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/plugins/provider-acp/src/bridge/bridge.ts#L2483-L2488">L2483-L2488</a> (<code>if (process.argv.includes("--mcp-stdio")) runAcpDynamicToolMcpServer();</code>).</p>
+  <p>Since #1640 the runtime never executes a bridge module directly. <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/packages/agent-runtime/src/provider-registry.ts#L59-L77"><code>provider-registry.ts#L59-L77</code></a> spawns <code>node [bridge-worker args] &lt;bridgeModulePath&gt; &lt;pluginId&gt; &lt;dataDir&gt;</code>, where the worker is <code>bb-provider-bridge-worker.mjs</code> in a packaged daemon or <code>--conditions=source --import tsx bridge-worker-entry.ts</code> from source (<a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/packages/agent-runtime/src/shared/bridge-path.ts#L36-L48"><code>bridge-path.ts#L36-L48</code></a>). The bootstrap <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/packages/provider-bridge-protocol/src/bridge-worker-entry.ts#L31-L47"><code>bridge-worker-entry.ts#L31-L47</code></a> reads <code>process.argv.slice(2)</code> and calls <code>fail("provider bridge bootstrap usage: …")</code> → <code>process.exit(1)</code> when the three positional args are missing — exactly what happens when it is started as <code>&lt;worker&gt; --mcp-stdio</code>. Inside the bridge, <code>process.argv[1]</code> is therefore always the worker path (truthy), so the <code>import.meta.url</code> fallback is dead code and the "MCP server" bb advertises is a process that prints a usage line and exits 1 before reading stdin.</p>
+  <p>Why omp fails and others don't: omp connects to each configured MCP server during <code>session/new</code> and turns a closed transport into a JSON-RPC error (<code>data.details: "bb-bridge: Transport closed"</code>). The bridge's <code>connection.request("session/new")</code> rejects, <code>thread/start</code> fails, and the daemon reports <code>thread.start failed</code>. Cursor and Grok swallow MCP startup failures, so their threads start with a silently missing <code>update_environment_directory</code> tool. Every ACP session receives the MCP entry because the server always contributes that built-in dynamic tool (<a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/apps/server/src/services/threads/thread-runtime-config.ts#L118-L133"><code>thread-runtime-config.ts#L118-L133</code></a>) and <code>buildSessionMcpServers</code> only short-circuits on an empty list.</p>
+  <p><strong>Why no test caught it:</strong> <code>bridge.test.ts</code> imports <code>handleLine</code> in-process (argv[1] = vitest) and its dynamic-tool test (<code>forwards ACP dynamic tool calls…</code>) connects straight to the TCP side channel instead of executing the advertised <code>command</code>/<code>args</code>. The smoke tarball test only checks <code>model/list</code> on the artifact.</p>
+  <p><strong>Secondary defect (error detail loss):</strong> <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/plugins/provider-acp/src/bridge/agent-connection.ts#L141-L147"><code>agent-connection.ts#L141-L147</code></a> rejects with <code>new Error(message.error.message ?? …)</code> and discards <code>message.error.data</code>, so the only thing that reaches the daemon log, the thread error event and the UI is the agent's generic "Internal error".</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>Confident. The bridge's own module URL is the only thing that reliably names the artifact in every launch mode (source via tsx, packaged <code>host.js</code> artifact under the Electron binary with <code>ELECTRON_RUN_AS_NODE</code> restored — that env is already re-added by <code>resolveBridgeProcessEnvForMcpServer</code>). Diff (<a href="1918/repro/proposed-fix.diff">proposed-fix.diff</a>):</p>
+  <pre>-  const entryPoint = process.argv[1]
+-    ? resolve(process.argv[1])
+-    : fileURLToPath(import.meta.url);
+-  return [...process.execArgv, entryPoint, "--mcp-stdio"];
++  // process.argv[1] is the provider-bridge worker bootstrap, not this module:
++  // the bootstrap imports this artifact, so only import.meta.url names it.
++  return [...process.execArgv, fileURLToPath(import.meta.url), "--mcp-stdio"];</pre>
+  <p>Verified: repro test passes, the full <code>bb-plugin-provider-acp</code> suite passes (162 tests, <a href="1918/repro/vitest-acp-suite-with-fix.log">log</a>), typecheck passes, and an <code>acp-omp</code> thread on the dev instance gets past <code>thread/start</code>. No wire shape changes, so no <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump is needed; the fix ships in the plugin host artifact, which the daemon re-downloads by digest. Things to watch: (1) <code>process.execArgv</code> is still forwarded — correct from source (tsx loader is needed to run the <code>.ts</code> entry) and harmless packaged (empty); (2) keep the repro test (or fold it into <code>bridge.test.ts</code>) so the advertised command is actually executed, since that is the gap that let this ship. Separately, propagate <code>error.data</code> in <code>agent-connection.ts</code> (e.g. append <code>details</code> to the Error message) so agent-side failures are diagnosable from the UI and daemon log.</p>
+
+  <h2>7. PR review</h2>
+  <p>No open PR is linked to this issue (searched <code>gh pr list --search "1918 OR mcp-stdio OR resolveBridgeProcessArgsForMcpServer"</code>; only merged #350 and #1102, which introduced/adjusted this code before the worker refactor).</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li>#1640 — "Agent providers as a first-class plugin surface (provider bridge protocol)" (merged c5b53caab): introduced the bootstrap that made <code>argv[1]</code> wrong.</li>
+    <li>#1102 — "Fix ACP plugin tools in packaged Electron builds": earlier fix to the same MCP re-exec path (added <code>ELECTRON_RUN_AS_NODE</code> restoration), shows this code path has no executed-command coverage.</li>
+    <li>#350 — "Add ACP dynamic tool support": origin of <code>resolveBridgeProcessArgsForMcpServer</code>.</li>
+    <li>#1342 — "first class oh my pi integration" (open, omp).</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Commands run</h3>
+  <pre>gh issue view 1918 --comments
+git checkout d81fee6f && pnpm install --frozen-lockfile --prefer-offline && pnpm exec turbo run build
+git log d81fee6f..origin/main --oneline -- plugins/provider-acp packages/agent-runtime apps/host-daemon packages/bb-app   # empty
+git log -S resolveBridgeProcessArgsForMcpServer --oneline -- plugins/provider-acp   # c5b53caab
+git merge-base --is-ancestor c5b53caab desktop-v0.38.0 (no) / desktop-v0.39.0 (yes)
+cd plugins/provider-acp && pnpm exec vitest run src/bridge/mcp-server-entry-1918.repro.test.ts   # fails on base, passes with fix
+mkdir /tmp/bb-1918-omp && npm install @oh-my-pi/pi-coding-agent@17.3.8 ; bun 1.3.14 unzipped to /tmp/bb-1918-bun
+/tmp/bb-reports/issues/1918/repro/run-omp-drive.sh [entry]   # omp session/new with worker vs bridge entry
+node drive-acp-agent.mjs cursor-agent acp -- … bridge-worker-entry.ts --mcp-stdio   # session/new OK
+node drive-acp-agent.mjs grok agent stdio -- … bridge-worker-entry.ts --mcp-stdio   # session/new OK
+/tmp/bb-reports/issues/1918/repro/start-dev-with-omp.sh ; pnpm bb:dev provider list ; pnpm bb:dev thread spawn --provider acp-omp …
+sqlite3 &lt;data dir&gt;/bb.db "select data from events where thread_id='thr_tbww7d7myk' order by rowid"
+tr '\0' '\n' &lt; /proc/&lt;bridge pid&gt;/cmdline   # live bridge argv
+pnpm exec vitest run (plugins/provider-acp, with fix) ; pnpm exec turbo run typecheck --filter=bb-plugin-provider-acp</pre>
+  <h3>Live bridge argv on the dev instance (argv[1] is the bootstrap)</h3>
+  <pre>/home/sawyer/.nvm/versions/node/v24.18.0/bin/node
+--conditions=source
+--import
+file:///…/node_modules/.pnpm/tsx@4.23.1/node_modules/tsx/dist/loader.mjs
+/…/packages/provider-bridge-protocol/src/bridge-worker-entry.ts
+/home/sawyer/.bb-dev/…/plugin-host-artifacts/provider-acp/fac2e342…/host.js
+provider-acp
+/home/sawyer/.bb-dev/…/plugins/provider-acp/bridge-data</pre>
+  <h3>Thread events, failing thread (base)</h3>
+  <pre>{"direction":"outbound","source":"spawn","initiator":"user","request":{"method":"thread/start","params":{}},…}
+{"provisioningId":"tpv_c9ytht45rs","status":"completed","environmentId":"env_3txz9qvu2d","entries":[]}
+{"code":"thread_command_failed","message":"Command thread.start failed","detail":"Internal error"}</pre>
+  <h3>Thread events, same spawn with the fix</h3>
+  <pre>{"providerThreadId":"01a01a97-c38c-7000-88a0-64dec33a8bbb"}
+{"providerThreadId":"01a01a97-c38c-7000-88a0-64dec33a8bbb","clientRequestId":"creq_jzkivkj3ij"}
+{"providerThreadId":"01a01a97-c38c-7000-88a0-64dec33a8bbb","message":"Provider error","detail":"Internal error"}   ← omp "No model selected" (no creds in sandbox); details dropped again
+{"providerThreadId":"01a01a97-c38c-7000-88a0-64dec33a8bbb","status":"failed"}</pre>
+  <h3>Other artifacts</h3>
+  <ul>
+    <li><a href="1918/repro/vitest-main.log">vitest-main.log</a>, <a href="1918/repro/vitest-fixed.log">vitest-fixed.log</a>, <a href="1918/repro/vitest-acp-suite-with-fix.log">vitest-acp-suite-with-fix.log</a></li>
+    <li><a href="1918/repro/omp-drive-worker-entry.log">omp-drive-worker-entry.log</a>, <a href="1918/repro/omp-drive-bridge-entry.log">omp-drive-bridge-entry.log</a></li>
+    <li><a href="1918/repro/host-daemon-thread-start-error.log">host-daemon-thread-start-error.log</a>, <a href="1918/repro/thread-events-thr_tbww7d7myk.jsonl">thread-events-thr_tbww7d7myk.jsonl</a>, <a href="1918/repro/thread-events-fixed-thr_gub2gecrgu.jsonl">thread-events-fixed-thr_gub2gecrgu.jsonl</a>, <a href="1918/repro/live-bridge-argv.txt">live-bridge-argv.txt</a></li>
+    <li><a href="1918/repro/proposed-fix.diff">proposed-fix.diff</a>, <a href="1918/repro/bbdev.sh">bbdev.sh</a>, <a href="1918/repro/screenshot-thread.js">screenshot-thread.js</a></li>
+  </ul>
+</main></body></html>

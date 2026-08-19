@@ -1,0 +1,10 @@
+const page = await browser.getPage("app");
+await page.goto("http://localhost:16560/projects/proj_h6day35d2p/threads/thr_54ezx2a4yb", { waitUntil: "networkidle", timeout: 25000 });
+await new Promise((r) => setTimeout(r, 4000));
+console.log(page.url());
+const snap = await page.snapshotForAI({ track: "thread", timeout: 5000 });
+const txt = snap.full;
+const i = txt.indexOf("main [");
+console.log(txt.slice(i, i + 7000));
+const p = await saveScreenshot(await page.screenshot(), "1860-thread-before.png");
+console.log(p);

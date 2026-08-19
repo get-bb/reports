@@ -1,0 +1,15 @@
+const page = await browser.getPage("app");
+const box = page.getByRole("textbox", { name: /Ask for a follow-up/ });
+await box.click({ timeout: 5000 });
+await box.type("Steer: stop waiting and reply only with steered.", { delay: 5 });
+await new Promise((r) => setTimeout(r, 500));
+const still = await page.getByRole("button", { name: /Stop run/ }).count();
+console.log("turn still active (Stop run visible):", still > 0);
+const p0 = await saveScreenshot(await page.screenshot(), "1860-before-steer.png");
+console.log(p0);
+await page.keyboard.press("Meta+Enter");
+await new Promise((r) => setTimeout(r, 2500));
+const label = await page.getByRole("button", { name: /Provider, model and reasoning/ }).innerText();
+console.log("picker label after steer:", JSON.stringify(label));
+const p1 = await saveScreenshot(await page.screenshot(), "1860-after-steer.png");
+console.log(p1);

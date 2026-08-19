@@ -1,0 +1,10 @@
+const page = await browser.getPage("bb1914");
+await page.setViewportSize({ width: 1400, height: 900 });
+await page.goto("http://localhost:11386/projects/proj_wqncx5cr2y/threads/thr_4nt62zknyn");
+await page.waitForTimeout(7000);
+const p1 = await saveScreenshot(await page.screenshot(), "1914-origin-thread.png");
+console.log(p1);
+await page.goto("http://localhost:11386/projects/proj_wqncx5cr2y/threads/thr_u982areftg");
+await page.waitForTimeout(7000);
+const p2 = await saveScreenshot(await page.screenshot(), "1914-child-thread.png");
+console.log(p2);
