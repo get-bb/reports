@@ -5,8 +5,9 @@
 # still exits 0.
 # Prereqs: fixture installed from /tmp/bb2029-plugin and currently "running".
 set -u
-CLI="${BB_CLI:-node /home/sawyer/projects/bb/.claude/worktrees/wf_926b3193-f6c-4/packages/scripts/dist/commands/run-cli.js}"
-LOG="${BB_DEV_LOG:-/home/sawyer/.bb-dev/launchers/projects-bb-.claude-worktrees-wf_926b3193-f6c-4/dev.log}"
+WORKTREE="${BB_WORKTREE:?set BB_WORKTREE to your bb checkout (see step0-fixture-setup.sh)}"
+CLI="${BB_CLI:-node $WORKTREE/packages/scripts/dist/commands/run-cli.js}"
+LOG="${BB_DEV_LOG:-$("$WORKTREE/scripts/bb-dev-app" status 2>/dev/null | sed -n 's/^Logs: \([^,]*\).*/\1/p')}"
 echo "== before: bb plugin list (collab-fixture) =="
 $CLI plugin list 2>&1 | grep -A3 '^collab-fixture'
 echo "== before: bb collab =="

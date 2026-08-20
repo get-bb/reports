@@ -3,7 +3,8 @@
 # rebuilds dist/app.* inside the deployed checkout.
 # Prereqs: step1 ran (plugin installed from /tmp/bb2029-plugin).
 set -u
-CLI="${BB_CLI:-node /home/sawyer/projects/bb/.claude/worktrees/wf_926b3193-f6c-4/packages/scripts/dist/commands/run-cli.js}"
+WORKTREE="${BB_WORKTREE:?set BB_WORKTREE to your bb checkout (see step0-fixture-setup.sh)}"
+CLI="${BB_CLI:-node $WORKTREE/packages/scripts/dist/commands/run-cli.js}"
 cd /tmp/bb2029-plugin
 git checkout -q -- dist              # restore committed bytes (install rewrote app.meta.json)
 V1=$(git rev-parse --short HEAD)
