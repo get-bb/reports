@@ -17,7 +17,7 @@ def show(f, pat, before, after, n=1, title=None):
 
 M = ".vite/build/main-Cwjv9Ibf.js"; S = ".vite/build/src-PzwkD6WC.js"; W = "webview/assets/app-initial-DAkTNeXg.js"
 show(M, r"isFullReconciliationDue\(e\)\{", 0, 90, title="isFullReconciliationDue")
-show(M, r"requestStartupSync\(\)\{", 0, 330, title="requestStartupSync (only caller that can request a `full` scan)")
+show(M, r"requestStartupSync\(\)\{return this\.setSyncEnabled", 0, 330, title="requestStartupSync (only caller that can request a `full` scan)")
 show(M, r"function d8\(e,t,r\)", 0, 420, title="incremental catalog page source: listThreads({archived:false,...})")
 show(M, r"handleNotification\(e\)\{if\(this\.disposed\)return", 0, 420, title="catalog coordinator handleNotification -> applyAuthoritativeRemoval on thread/archived")
 show(M, r"applyAuthoritativeRemoval\(e\)\{", 0, 420, title="applyAuthoritativeRemoval: DELETE FROM local_thread_catalog")
