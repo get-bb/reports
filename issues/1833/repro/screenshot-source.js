@@ -21,7 +21,7 @@ await page.waitForSelector('button[aria-label="Fork into new thread"]', { timeou
 await page.hover('button[aria-label="Fork into new thread"]');
 await new Promise((r) => setTimeout(r, 900));
 await page.screenshot({
-  path: "/tmp/bb-reports/issues/assets/1833-source-thread-fork-action.png",
+  path: "/tmp/bb-reports/issues/assets/1833-source-thread-after-fix.png",
 });
 const btn = await page.$('button[aria-label="Fork into new thread"]');
 ({ forkButtonPresent: !!btn, disabled: await btn?.evaluate((b) => b.disabled) });
