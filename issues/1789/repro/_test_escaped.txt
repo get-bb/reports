@@ -1,0 +1,125 @@
+import { getThread, listQueuedThreadMessages } from &quot;@bb/db&quot;;
+import {
+  encodeClientTurnRequestIdNumber,
+  threadScope,
+  type EnvironmentStatus,
+} from &quot;@bb/domain&quot;;
+import { describe, expect, it } from &quot;vitest&quot;;
+import { readJson } from &quot;../helpers/json.js&quot;;
+import {
+  seedEnvironment,
+  seedEvent,
+  seedHostSession,
+  seedProjectWithSource,
+  seedThread,
+} from &quot;../helpers/seed.js&quot;;
+import { withTestHarness } from &quot;../helpers/test-app.js&quot;;
+
+/**
+ * Repro for get-bb/bb#1789.
+ *
+ * A direct send into a thread whose environment is destroying/destroyed is
+ * rejected with 409 `thread_environment_unavailable` (see
+ * public-thread-environment-decoupling.test.ts). The queued-message create
+ * route has no such guard: it answers 201 with a queued-message id, the
+ * thread keeps reporting `idle`, and the message can never drain because the
+ * auto-send path throws the very 409 the create route should have returned.
+ */
+describe(&quot;queued message into a thread whose environment is gone (#1789)&quot;, () =&gt; {
+  for (const status of [
+    &quot;destroying&quot;,
+    &quot;destroyed&quot;,
+  ] as const satisfies readonly EnvironmentStatus[]) {
+    it(`rejects queue-create when the environment is ${status} (currently accepts it)`, async () =&gt; {
+      await withTestHarness(async (harness) =&gt; {
+        const { host } = seedHostSession(harness.deps, {
+          id: `host-queue-${status}`,
+        });
+        const { project } = seedProjectWithSource(harness.deps, {
+          hostId: host.id,
+        });
+        const environment = seedEnvironment(harness.deps, {
+          hostId: host.id,
+          managed: true,
+          projectId: project.id,
+          path: null,
+          status,
+          workspaceProvisionType: &quot;managed-worktree&quot;,
+        });
+        const thread = seedThread(harness.deps, {
+          projectId: project.id,
+          environmentId: environment.id,
+          status: &quot;idle&quot;,
+        });
+
+        // A prior accepted turn: the thread has a stored execution model and
+        // a provider thread id, exactly like a real idle thread that ran once.
+        seedEvent(harness.deps, {
+          threadId: thread.id,
+          environmentId: environment.id,
+          sequence: 1,
+          type: &quot;client/turn/requested&quot;,
+          scope: threadScope(),
+          data: {
+            direction: &quot;outbound&quot;,
+            requestId: encodeClientTurnRequestIdNumber({ value: 1 }),
+            input: [{ type: &quot;text&quot;, text: &quot;Earlier work&quot; }],
+            target: { kind: &quot;new-turn&quot; },
+            execution: {
+              model: &quot;gpt-5&quot;,
+              serviceTier: &quot;default&quot;,
+              reasoningLevel: &quot;medium&quot;,
+              permissionMode: &quot;full&quot;,
+              source: &quot;client/turn/requested&quot;,
+            },
+            initiator: &quot;user&quot;,
+            senderThreadId: null,
+            request: { method: &quot;turn/start&quot;, params: {} },
+            source: &quot;tell&quot;,
+          },
+        });
+
+        // Control: the direct send path already refuses.
+        const sendResponse = await harness.app.request(
+          `/api/v1/threads/${thread.id}/send`,
+          {
+            method: &quot;POST&quot;,
+            headers: { &quot;content-type&quot;: &quot;application/json&quot; },
+            body: JSON.stringify({
+              mode: &quot;auto&quot;,
+              input: [{ type: &quot;text&quot;, text: &quot;direct send&quot; }],
+            }),
+          },
+        );
+        expect(sendResponse.status).toBe(409);
+
+        // Bug: the queue-create path accepts the same message.
+        const queueResponse = await harness.app.request(
+          `/api/v1/threads/${thread.id}/queued-messages`,
+          {
+            method: &quot;POST&quot;,
+            headers: { &quot;content-type&quot;: &quot;application/json&quot; },
+            body: JSON.stringify({
+              input: [{ type: &quot;text&quot;, text: &quot;queued into a gone env&quot; }],
+            }),
+          },
+        );
+        const body = await readJson(queueResponse);
+
+        // Thread record still claims to be a healthy idle worker.
+        expect(getThread(harness.db, thread.id)?.status).toBe(&quot;idle&quot;);
+
+        // EXPECTED (after fix): 409 thread_environment_unavailable and no
+        // queued row. ACTUAL on c7c66423d: 201 + queued message id, and the
+        // row sits in the queue forever.
+        expect(
+          queueResponse.status,
+          `queue-create answered ${queueResponse.status} ${JSON.stringify(body)}; queued rows: ${
+            listQueuedThreadMessages(harness.db, thread.id).length
+          }`,
+        ).toBe(409);
+        expect(listQueuedThreadMessages(harness.db, thread.id)).toHaveLength(0);
+      });
+    });
+  }
+});

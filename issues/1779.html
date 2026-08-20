@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1779 Recursive workspace watch can OOM the host for a large environment root</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:4px; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1779 · Recursive workspace watch can OOM the host for a large environment root</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill high">Priority: High</span> <span class="pill">perf</span> <span class="pill">workspaces</span> <span class="pill">host</span>
+    <a href="https://github.com/get-bb/bb/issues/1779">open on GitHub</a>
+    <span>2026-08-20 · base <code>c7c66423d</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>When any UI surface that needs an environment's details (the thread page is enough) is open, the server tells the host daemon to watch that environment's workspace directory recursively. The daemon's watcher child (<code>@parcel/watcher</code>) walks the entire tree and puts one inotify watch on every directory. The only things it skips are the workspace's own top-level <code>.git</code> and the top-level directories that the workspace's own <code>git status --ignored</code> reports. Nothing skips <em>nested</em> <code>node_modules</code>, <code>.git</code>, caches, or the contents of untracked nested checkouts, and a root that is not a git repo gets no ignore list at all. For an "umbrella" directory that contains many repos, that is every directory on disk: on the reporter's machine ~1M watches and tens of GB RSS, which the kernel OOM-kills; the daemon then respawns the child and replays exactly the same subscription, so it loops. I reproduced this end to end on a dev instance with a synthetic 20,084-directory umbrella root: opening the thread page took the watcher child from 1 to 20,077 inotify watches, closing the page dropped it back to 1, and SIGKILLing the child brought a new child back to 20,077. A two-line change to the ignore list (recursive globs <code>**/node_modules</code>, <code>**/.git</code>) takes the same tree from 20,070 watches to 6.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Opening a surface that subscribes to <code>environment-detail</code> (not merely creating the env, not <code>thread-detail</code>) is what triggers the recursive workspace watch.</td><td class="ok">Verified</td><td><code>WatchInterestCoordinator.resolveTarget</code> maps <code>environment-detail</code> + <code>status==="ready"</code> + <code>path</code> to a <code>workspaceTarget</code>; <code>thread-detail</code> only yields a thread-storage target (<a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/ws/watch-interests.ts#L372-L395">watch-interests.ts L372-395</a>). Live: creating the env + thread via CLI left the child at 1 watch; opening the thread page in a browser went to 20,077 (repro step 5).</td></tr>
+    <tr><td>The daemon applies the set via <code>replaceAuthoritativeWatchSet → watchWorkspace</code>; the child calls <code>subscribe(dir, cb, opts)</code> with <code>opts</code> unchanged.</td><td class="ok">Verified</td><td><a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/packages/host-watcher/src/parcel-subprocess/parcel-child-handler.ts#L62-L80">parcel-child-handler.ts L62-80</a> passes <code>message.opts</code> straight to parcel.</td></tr>
+    <tr><td>Workspace-root ignore = hardcoded <code>.git</code> (a path, not a glob) + <code>!! dir/</code> entries from <code>git status --porcelain=v1 -z --ignored=matching --untracked-files=normal</code> (5s/10MB), fallback <code>[".git"]</code>; no options at all for a non-git root.</td><td class="ok">Verified</td><td><a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/packages/host-watcher/src/workspace-status-watcher.ts#L33-L35">L33-35</a>, <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/packages/host-watcher/src/workspace-status-watcher.ts#L58-L118">L58-118</a>, non-git branch <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/packages/host-watcher/src/workspace-status-watcher.ts#L221-L229">L221-229</a>, fallback <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/packages/host-watcher/src/workspace-status-watcher.ts#L263-L278">L263-278</a>. Repro test captured the exact ignore passed for the umbrella root: <code>[".git"]</code>.</td></tr>
+    <tr><td>The git-internal ignore list (<code>hooks/info/logs/modules/objects/worktrees</code>) is only for the separate git-dir watch.</td><td class="ok">Verified</td><td><code>createCommonDirWatchOptions</code> in <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/packages/host-watcher/src/watch-specs.ts#L86-L90">watch-specs.ts L86-90</a>; used only by <code>resolveMetadataWatchSpecs</code>.</td></tr>
+    <tr><td>parcel path ignores are <code>path.resolve(watchRoot, value)</code>, so they never match nested <code>node_modules</code>/<code>.git</code>.</td><td class="ok">Verified</td><td><code>@parcel/watcher@2.5.6 wrapper.js normalizeOptions</code>: non-glob entries become <code>ignorePaths.push(path.resolve(dir, value))</code>; glob entries become picomatch regexes. Measured: ignore <code>[".git"]</code> → 20,070 watches; <code>["**/.git","**/node_modules"]</code> → 6 on the same tree.</td></tr>
+    <tr><td>For an umbrella parent, <code>git status --untracked-files=normal</code> does not recurse into untracked nested checkouts, so their trees are fully watched.</td><td class="ok">Verified</td><td>On the synthetic root git status prints only <code>?? apps/</code> (untracked, not ignored) — there are no <code>!!</code> directory records, so the ignore list collapses to <code>[".git"]</code>. See <a href="1779/repro/build-umbrella-output.txt">build-umbrella-output.txt</a>.</td></tr>
+    <tr><td>File listing already skips <code>node_modules</code> and dot-directories, plus <code>target/vendor/dist/build/out/venv/__pycache__</code>.</td><td class="unv">Partially verified</td><td><code>listPathsRecursively</code> skips dot-prefixed names, <code>node_modules</code> and symlinks (<a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/host-daemon/src/command-handlers/file-list.ts#L137-L146">file-list.ts L137-146</a>). I found no <code>target/vendor/dist/build/out/venv</code> skip list anywhere in the daemon; that part of the claim is not accurate for this commit.</td></tr>
+    <tr><td>No directory-count/depth/inotify budget; a doomed watch set is re-pushed on every child session.</td><td class="ok">Verified</td><td>No cap anywhere in <code>packages/host-watcher</code>. <code>ParcelWatcherProxy</code> keeps the subscription registry as source of truth and <code>replaySubscriptions</code> on every child <code>ready</code> (<a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/packages/host-watcher/src/parcel-subprocess/parcel-watcher-proxy.ts#L254-L259">proxy L254-259</a>). Live: SIGKILL of child 2661925 (20,077 watches) → respawned child 2697506 re-registered 20,077 watches within 8 s (<a href="1779/repro/child-respawn-evidence.txt">evidence</a>).</td></tr>
+    <tr><td>~1.2M directories → ~1,004,390 watches, ~30 GB RSS + 25 GB swap, OOM loop.</td><td class="unv">Unverified at that scale</td><td>I did not build a 1.2M-directory tree (it would endanger the shared machine). The mechanism scales linearly: 20,084 dirs → 20,077 watches here, so 1.2M dirs → ~1.2M requested watches (capped by <code>max_user_watches</code>). RSS growth at 1M+ entries is plausible (parcel keeps a full <code>DirTree</code> of every file and directory in the child) but I did not measure it.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb commit <code>c7c66423d55c320bab9103218f0ffef1a8191331</code> (main, 2026-08-20); no later commit on <code>origin/main</code> touches <code>packages/host-watcher</code> or <code>apps/server/src/ws/watch-interests.ts</code> (checked with <code>git fetch origin main; git log c7c66423d..origin/main</code> → empty).</li>
+    <li>Ubuntu 26.04, Linux 7.0.0-29-generic, x86_64, 16 CPU, 57 GB RAM; node v24.18.0; git 2.53.0; <code>@parcel/watcher</code> 2.5.6; <code>fs.inotify.max_user_watches=476690</code> on this machine.</li>
+    <li>Dev instance from this worktree: App <code>http://localhost:14266</code>, Server <code>http://localhost:22266</code>, Host daemon <code>127.0.0.1:30266</code>, data dir <code>~/.bb-dev/projects-bb-.claude-worktrees-wf_926b3193-f6c-3-1db1db4283a2</code> (deleted at cleanup). Provider for the one real turn: codex (codex-cli 0.148.0).</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <h3>A. Unit-level (no running bb): 30 seconds</h3>
+  <ol>
+    <li>Copy <a href="1779/repro/umbrella-workspace-watch-1779.test.ts">umbrella-workspace-watch-1779.test.ts</a> into <code>packages/host-watcher/test/</code> and run, from <code>packages/host-watcher</code>:
+<pre>pnpm exec vitest run test/umbrella-workspace-watch-1779.test.ts</pre>
+    The test builds a tiny umbrella repo (git root, 4 untracked nested git repos, each with 300 <code>node_modules/pkg-N/lib</code> dirs = 2,400 nested dirs), drives the real <code>watchWorkspaceStatus()</code> with the real parcel watcher, and counts <code>inotify wd:</code> lines in <code>/proc/self/fdinfo</code>.
+<pre>expected: the daemon's workspace-root subscribe skips nested node_modules/.git → a handful of watches
+actual (main):
+{
+  "workspaceRootIgnore": [ ".git" ],
+  "nestedDirCount": 2400,
+  "inotifyWatchesAdded": 2486,
+  ...
+}
+ ×  #1779 umbrella workspace watch > watches every nested node_modules/.git directory because the ignore list only covers the root level
+    → expected 2486 to be less than 2400
+ ✓  control: a recursive glob ignore keeps the same tree cheap   (6 watches with ignore ["**/.git","**/node_modules"])</pre>
+    Full output: <a href="1779/repro/vitest-output.txt">vitest-output.txt</a>. The failing assertion is <code>expect(watches).toBeLessThan(nestedDirCount)</code>: bb adds one watch per nested directory.</li>
+  </ol>
+
+  <h3>B. End to end on a dev instance (what the reporter saw)</h3>
+  <ol>
+    <li>Build a synthetic umbrella root (20,084 directories, ~3 s): <a href="1779/repro/build-umbrella.sh">build-umbrella.sh</a>
+<pre>/tmp/bb-reports/issues/1779/repro/build-umbrella.sh /tmp/bb-1779-umbrella-live 4 2500
+dirs under root: 20084
+root-level git status ignored entries (what bb's ignore discovery sees):
+?? apps/</pre></li>
+    <li>Start a dev instance from the worktree (<code>scripts/bb-dev-app current</code>), create a project (<code>POST /api/v1/projects</code> with a scratch repo), and create an unmanaged environment on the umbrella root by spawning a thread there:
+<pre>node packages/scripts/dist/commands/run-cli.js thread spawn --project proj_8nynkqsu6k \
+  --environment /tmp/bb-1779-umbrella-live --provider codex --permission-mode accept-edits \
+  --title "1779 umbrella" --prompt "Reply only with ok." --json
+# → thread thr_fy5k6a4tzp, environment env_b7js8uew87 (status ready)</pre></li>
+    <li>Measure the watcher child before any UI is open (<a href="1779/repro/watcher-child-stats.sh">watcher-child-stats.sh</a> greps your daemon's <code>parcel-child-entry.ts</code> / <code>bb-parcel-watcher-child.mjs</code> process and counts inotify watches in <code>/proc/&lt;pid&gt;/fdinfo</code>):
+<pre>$ watcher-child-stats.sh wf_926b3193-f6c-3
+pid=2661925 inotify_watches=1 rss_mb=86</pre>
+    Creating the environment and running a turn did <em>not</em> start the workspace watch (thread-detail interest only).</li>
+    <li>Open the thread page in a browser (<code>http://localhost:14266/projects/proj_8nynkqsu6k/threads/thr_fy5k6a4tzp</code>). The thread view calls <code>useEnvironment</code>/<code>useEnvironmentWorkStatus</code>, which subscribe to <code>environment-detail</code>.
+    <figure><img src="assets/1779-01-thread-open.png" alt="Thread page open on the umbrella environment"><figcaption>The trigger: the thread page for the environment rooted at /tmp/bb-1779-umbrella-live. Nothing looks wrong in the UI; the damage is in the host daemon's watcher child.</figcaption></figure></li>
+    <li>Measure again:
+<pre>expected: a few watches (root, apps/, apps/child-N, .git metadata)
+actual:
+pid=2661925 inotify_watches=20077 rss_mb=96</pre>
+    Every one of the 20,000 nested <code>node_modules/pkg-N[/lib]</code> directories and every nested <code>.git</code> subdirectory got a watch.</li>
+    <li>Respawn re-applies the same set: SIGKILL the child while the page stays open.
+<pre>$ kill -9 2661925          # 14:18:23
+$ sleep 8; watcher-child-stats.sh wf_926b3193-f6c-3
+pid=2697506 inotify_watches=20077 rss_mb=86</pre></li>
+    <li>Close the browser page (drops the interest): <code>inotify_watches=1</code> (<a href="1779/repro/child-stats-after-close.txt">child-stats-after-close.txt</a>). Matches the reporter's "dropping that environment-detail interest dropped the child to ~1,168 watches".</li>
+    <li>Isolate the ignore semantics with parcel alone (<a href="1779/repro/count-watches.mjs">count-watches.mjs</a>, run from <code>packages/host-watcher</code>):
+<pre>ignore [".git"]  (what bb passes for an umbrella git root)   → inotifyWatches 20070, subscribe 254 ms
+ignore (none)    (what bb passes for a non-git root)          → inotifyWatches 20084, subscribe 255 ms
+ignore ["**/.git","**/node_modules"]                          → inotifyWatches 6,     subscribe 3 ms</pre></li>
+  </ol>
+  <p>Repro files: <a href="1779/repro/">1779/repro/</a></p>
+
+  <h2>5. Root cause</h2>
+  <p><strong>Mechanism.</strong> The workspace-root subscription's ignore list is built only from the workspace's <em>own</em> top-level git-ignored directories:</p>
+<pre>// packages/host-watcher/src/workspace-status-watcher.ts
+const WORKSPACE_ROOT_ALWAYS_IGNORED_PATHS = [".git"];                    // L33
+...
+function collectIgnoredDirectoryPaths(statusOutput) {                    // L89-102: only "!! dir/" records
+function mergeWorkspaceRootIgnores(gitIgnoredPaths) {                    // L104-113: [".git", ...gitIgnored]
+async function createWorkspaceRootWatchSpec(args) {                      // L130-140
+  return { kind: "workspace-root", options: { ignore: await resolveWorkspaceRootIgnores(args.cwd) }, rootPath };
+}
+...
+if (!(await pathExists(path.join(this.args.cwd, ".git")))) {             // L221-229: non-git root
+  this.startWatchSubscription({ kind: "workspace-root", rootPath });     //   → no options at all
+}</pre>
+  <p>(<a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/packages/host-watcher/src/workspace-status-watcher.ts#L33-L140">permalink L33-140</a>, <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/packages/host-watcher/src/workspace-status-watcher.ts#L216-L233">L216-233</a>.) Every entry is a plain path, and <code>@parcel/watcher</code>'s wrapper turns plain paths into <code>path.resolve(dir, value)</code> and only glob-looking entries into recursive picomatch rules. So <code>.git</code> means exactly <code>&lt;root&gt;/.git</code>. <code>git status --untracked-files=normal --ignored=matching</code> on an umbrella root reports nested checkouts as a single untracked entry (<code>?? apps/</code>) and never reports the <code>!!</code> ignored directories <em>inside</em> them, so nested <code>node_modules</code>, nested <code>.git</code>, caches, build outputs etc. are crawled and watched. Parcel's subscribe does a full FTS crawl of everything not ignored, adds one inotify watch per directory, and keeps a <code>DirTree</code> entry for every file and directory in the child process — that is the inotify count and the RSS.</p>
+  <p><strong>Why it loops.</strong> <code>ParcelWatcherProxy</code> treats its subscription registry as authoritative and replays every subscription verbatim whenever a child exits, misses pings, or reports a backend error (<a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/packages/host-watcher/src/parcel-subprocess/parcel-watcher-proxy.ts#L230-L259">proxy L230-259</a>). When the kernel OOM-kills the child, the replacement re-crawls the same root with the same options. There is no size/inotify budget anywhere between the server's watch set and the child's <code>subscribe</code> call, and the server only removes the target when the UI interest goes away.</p>
+  <p><strong>Deeper issue.</strong> The ignore design (PR #105, "Reduce workspace watcher inotify usage") assumed the workspace root is a single repository whose <code>.gitignore</code> describes its heavy directories. Unmanaged environments can point at any directory — umbrella parents, home directories, monorepos with nested untracked clones, or non-git folders — and the design has no floor for those cases. A secondary problem: if the inotify cap is hit mid-crawl, parcel's subscribe fails, the child reports <code>subscribe-failed</code>, and the proxy maps that to a <em>recoverable</em> rescan error (<a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/packages/host-watcher/src/parcel-subprocess/parcel-watcher-proxy.ts#L282-L290">L282-290</a>), so <code>RootSubscription</code> re-subscribes with backoff (cap 30 s) and re-crawls the whole tree forever.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>Layer 1 (confident, small): add a default set of <em>recursive glob</em> ignores to every workspace-root subscribe in <code>workspace-status-watcher.ts</code>, independent of git discovery: <code>**/node_modules</code>, <code>**/.git</code> (nested repos), <code>**/.cache</code>, <code>**/__pycache__</code> (and whatever other well-known heavy names the team agrees on). Parcel picomatch-matches globs against the root-relative path and FTS-skips matching directories during the crawl, which is why <code>**/node_modules</code> costs nothing. Apply it in <code>mergeWorkspaceRootIgnores</code>, in the git-status-failed fallback, and in the non-git branch. For the non-git branch keep <code>&lt;root&gt;/.git</code> watchable so the <code>git init</code> promotion (<code>repositoryCreated</code>, which checks <code>ignore.includes(".git")</code>) still fires — use <code>*/**/.git</code> there. I prototyped exactly this (<a href="1779/repro/prototype-fix.diff">prototype-fix.diff</a>): the repro test goes from 2,486 watches to 10 and passes (<a href="1779/repro/vitest-repro-with-prototype-fix.txt">output</a>). Three existing tests in <code>watch-status.test.ts</code> then fail only on exact-array assertions of the ignore list (<code>toEqual([".git", ".turbo", "coverage"])</code>, <code>toEqual([".git"])</code>, <code>toBeUndefined()</code>) and need updating; the git-init promotion test should be re-verified after that update. What could go wrong: a workspace that legitimately tracks files inside a nested <code>node_modules</code> (rare; PR #105 explicitly avoided pruning dirs containing tracked files) would stop producing content-change events for them; since the watch only drives "something changed, re-read status" this is acceptable, but worth a note in the PR.</p>
+  <p>Layer 2 (recommended): a budget. Before/while crawling, bound the work — e.g. the child counts directories during <code>subscribe</code> (or a cheap pre-walk with the same ignores, capped at N directories) and fails the workspace subscription with a distinct, terminal <code>watch-error</code> when it exceeds a limit (order 100k dirs) or when <code>inotify_add_watch</code> returns ENOSPC. The proxy must not map that to a recoverable rescan (which re-crawls forever) and must not replay it on respawn; the daemon should surface it to the server so the UI can show "live updates disabled for this workspace, too large". Layer 3 (optional UX): warn when attaching an unmanaged environment whose root is an umbrella/huge directory.</p>
+  <p>Wire note: none of the layer-1 change touches server↔daemon messages, so no <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump; layer 2's new error kind probably does.</p>
+
+  <h2>7. PR review</h2>
+  <p>No open PRs are linked to this issue.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li>#1660 — bb host process grew to 77 GB RSS and froze the machine (open; different trigger, same "host daemon eats the machine" family; worth checking whether a big unmanaged root was involved).</li>
+    <li>#1505 — host daemon crashed on EPIPE from the watcher child ping (closed; the ping/respawn machinery that re-applies the doomed set here).</li>
+    <li>#1873 — native addon load order crash (closed; why the in-process parcel import is structured the way it is).</li>
+    <li>PR #105 — introduced the git-status-derived ignore list this issue is about.</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Watcher child measurements</h3>
+<pre>before opening UI:          pid=2661925 inotify_watches=1     rss_mb=86
+after opening thread page:  pid=2661925 inotify_watches=20077 rss_mb=96
+after navigating to /settings (thread pane stays mounted): inotify_watches=20077
+after closing the page:     pid=2661925 inotify_watches=1     rss_mb=95
+reopen page, SIGKILL child: pid=2697506 inotify_watches=20077 rss_mb=86   (respawned, same set)</pre>
+  <h3>Commands run</h3>
+<pre>gh issue view 1779 --repo get-bb/bb --json ...
+pnpm install --frozen-lockfile --prefer-offline; pnpm exec turbo run build
+git fetch origin main; git log c7c66423d..origin/main -- packages/host-watcher apps/server/src/ws/watch-interests.ts apps/host-daemon   # empty
+cd packages/host-watcher && pnpm exec vitest run test/umbrella-workspace-watch-1779.test.ts
+/tmp/bb-reports/issues/1779/repro/build-umbrella.sh /tmp/bb-1779-umbrella-live 4 2500
+scripts/bb-dev-app current
+curl -s -X POST http://localhost:22266/api/v1/projects -H 'content-type: application/json' -d '{"name":"qa","source":{"type":"local_path","path":"/tmp/bb-1779-scratch","hostId":"host_5dsxjekybe"}}'
+node packages/scripts/dist/commands/run-cli.js thread spawn --project proj_8nynkqsu6k --environment /tmp/bb-1779-umbrella-live --provider codex --permission-mode accept-edits --title "1779 umbrella" --prompt "Reply only with ok." --json
+/tmp/bb-reports/issues/1779/repro/watcher-child-stats.sh wf_926b3193-f6c-3
+doobie --headless -e '... goto thread page ... screenshot ...'
+kill -9 &lt;child pid&gt;
+cd packages/host-watcher && node /tmp/bb-1779-count-watches.mjs /tmp/bb-1779-umbrella-live [.git | '' | '**/.git,**/node_modules']
+git diff packages/host-watcher/src/workspace-status-watcher.ts &gt; prototype-fix.diff; pnpm exec vitest run; git checkout packages/host-watcher/src/workspace-status-watcher.ts</pre>
+  <h3>Files</h3>
+  <ul>
+    <li><a href="1779/repro/umbrella-workspace-watch-1779.test.ts">umbrella-workspace-watch-1779.test.ts</a> — failing-on-main vitest repro + passing control</li>
+    <li><a href="1779/repro/vitest-output.txt">vitest-output.txt</a>, <a href="1779/repro/vitest-repro-with-prototype-fix.txt">vitest-repro-with-prototype-fix.txt</a>, <a href="1779/repro/vitest-with-prototype-fix.txt">vitest-with-prototype-fix.txt</a> (full suite with prototype: 3 assertion-only failures)</li>
+    <li><a href="1779/repro/build-umbrella.sh">build-umbrella.sh</a>, <a href="1779/repro/build-umbrella-output.txt">output</a></li>
+    <li><a href="1779/repro/watcher-child-stats.sh">watcher-child-stats.sh</a>, <a href="1779/repro/child-stats-before-open.txt">before</a>, <a href="1779/repro/child-stats-after-open.txt">after open</a>, <a href="1779/repro/child-stats-after-navigate-away.txt">after navigate away</a>, <a href="1779/repro/child-stats-after-close.txt">after close</a>, <a href="1779/repro/child-respawn-evidence.txt">respawn</a></li>
+    <li><a href="1779/repro/count-watches.mjs">count-watches.mjs</a>, <a href="1779/repro/count-watches-output.txt">output</a></li>
+    <li><a href="1779/repro/prototype-fix.diff">prototype-fix.diff</a></li>
+    <li><a href="assets/1779-00-home.png">assets/1779-00-home.png</a> (dev app before opening the thread), <a href="assets/1779-01-thread-open.png">assets/1779-01-thread-open.png</a></li>
+  </ul>
+</main></body></html>

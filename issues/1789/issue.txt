@@ -1,0 +1,125 @@
+A thread whose environment no longer exists still reports idle, and the message queue accepts sends into it that can never be delivered OPEN 2026-08-18T17:24:50Z ['threads', 'workspaces']
+A thread whose backing worktree has been removed continues to report `status: idle` with its `environmentId` still attached. The environment is gone from disk; nothing on the thread record says so.
+
+Queueing a message to that thread succeeds. The CLI returns a queued-message id and the sender has every indication of success. The message will never be delivered, because there is no environment in which the thread can run. Messages accumulate indefinitely — we found four — and nothing surfaces the condition to the sender, to the recipient, or to anything reading the thread list.
+
+Attempting to interact with the thread's environment does surface a 409, but only on that path, and only if you already suspect something is wrong. The thread record itself reports health.
+
+## Why this is worse than a lost message
+
+A send that fails tells you to retry or escalate. A send that succeeds and is undeliverable tells you the recipient has your instruction and is working on it. In our case an agent thread had been given work orders it could never receive, while the record showed an idle, healthy worker that had simply not replied yet. The natural reading of that state — worker is fine, worker is thinking — is exactly wrong, and the longer it holds the more confident it looks.
+
+The sender cannot distinguish this from a slow recipient on any current surface. That is what makes it indefinite rather than merely wrong.
+
+The general form: delivery confirmation without delivery is worse than refusal, because it converts a detectable failure into an indefinite silent one.
+
+## What would resolve it
+
+In rough order of how much it helps:
+
+1. Reflect missing-environment state on the thread record, so `idle` cannot be reported by a thread that cannot run.
+2. Reject queue sends to a thread whose environment is unavailable, rather than accepting them.
+3. Surface a queue depth that is not draining.
+
+Related: execution-profile observability, #1787.
+===== pixexid 2026-08-18T20:30:00Z
+A second consequence, observed today: the dangling `environmentId` does not only mislead a reader — it disables unrelated machinery.
+
+A scheduled maintenance task in our plugin iterates a project's unarchived threads and asks each one's environment for its pull request. Nine of thirty-six threads reference environments that no longer exist. The first such call returns `HTTP 409: Environment unavailable` and the whole pass aborts.
+
+The self-sustaining part is what makes it worth reporting: that task is thread archiving. Archiving is how those threads would leave the unarchived set, so the condition blocks the only mechanism that would clear it. It has been failing every hour, on schedule, since the environments were removed.
+
+Per-thread error isolation on our side would let the pass continue over the healthy threads, and we will do that. It does not address the underlying shape — a thread record that reports `idle` while pointing at an environment that cannot be resolved, with no field indicating which of those is true.
+===== pixexid 2026-08-18T21:21:55Z
+A third form of the same defect, observed today alongside the other two.
+
+Earlier we reported the queue accepting sends into a thread that cannot receive them, and separately reported messages that were delivered and consumed while still listed as pending. Today a message was accepted, listed as pending, and never delivered at all — while the recipient was `active`, its environment present on disk, and the sender saw a successful enqueue with a message id returned.
+
+The sequence is worth stating because it shows what a sender can and cannot learn:
+
+- an agent asked its coordinator a bounded question and confirmed delivery at the coordinator's own log
+- the coordinator replied twice; neither reply reached the agent
+- the agent, following a rule that requires confirming at the recipient's log rather than at one's own send, correctly established that no answer had arrived, re-asked once, and then applied its stated default rather than looping
+- the coordinator, checking the queue, found its first reply still listed as pending with the full text intact
+
+So across three observations the queue's pending state has been wrong in both directions and, in this case, wrong while the transport silently dropped a message between two live threads. The practical consequence for anyone building on this: queue depth and enqueue success carry no information about delivery, and the only reliable check is reading the recipient's own event log — which works, and which is a lot of machinery to require for every message.
+
+The agent's handling is the mitigation we would recommend to others in the meantime, and it is not cheap: confirm at the recipient's log, re-ask exactly once, state a default, apply it, and record that the question went unanswered so the absence is attributable later.
+===== pixexid 2026-08-18T22:13:28Z
+A fourth form, and the most expensive one so far because it is silent on both ends.
+
+`bb thread spawn --prompt "$(cat brief.md)"` returned success and a thread id for two threads. Neither thread ever received the prompt. Both sat until we noticed, then went `idle` having done no work.
+
+What each did instead is worth recording, because neither looks like a failure from the outside:
+
+- one replied "WAITING — no frozen work order or deliverable was provided"
+- the other, given nothing to do, began exploring unrelated files on disk and produced a summary of them
+
+So the failure presents as an agent that is alive, `idle`, and has produced output. Nothing about the thread's status distinguishes it from one that finished its job. We only caught it because we went to read verdicts that should have arrived and found neither had.
+
+The controls: the brief files existed and were non-empty (2316 bytes each, verified after the fact), the same command shape spawned a third review minutes later on a different provider and that one received its prompt and produced a complete review, and all three threads were created against the same base ref with the same flags.
+
+This is distinct from the three forms already reported here. Those were message-delivery failures between existing threads. This is prompt loss at spawn, which means the very first instruction an agent would ever receive is the one that can vanish — there is no prior context for it to notice the gap against.
+
+The mitigation we have adopted, which we would suggest to anyone spawning agents programmatically: after spawn, read the new thread's own event log and confirm the order text is present before treating the spawn as done. Checking the spawn's return value is not sufficient; it was successful in both failing cases. Re-spawning fresh is also preferable to re-sending into the idle thread, since an agent that spent its startup exploring the filesystem is no longer a clean context for a cold review.
+
+Cumulative picture across the four forms: enqueue success, queue depth, thread status, and the presence of agent output are each individually consistent with both success and total failure. The only signal that has been reliable is the recipient's own event log.
+===== pixexid 2026-08-18T23:18:34Z
+A fifth form, and this one has a diagnosed root cause rather than only symptoms — which we think makes it the most actionable report in this thread.
+
+A long-running agent thread errored three times over roughly half an hour. The failures are `turn.submit` calls rejected by the pi-bridge with `JsonRpcResponseError: Missing input text` (timestamps 22:33:03.960Z, 22:46:12.737Z, 23:01:01.652Z, from the host daemon log).
+
+The correlation: messages sent into a thread that is **active** queue rather than deliver, and are submitted at the next turn boundary. It is that boundary submit which arrives with an empty or missing text payload. So the failure is not random — it is specific to inbound messages landing while a thread is mid-turn, which for a coordinating agent is most of the time.
+
+Why we think this belongs with the other four forms rather than as its own issue: every one of them is the same class, a message that the sending side believes it delivered arriving as nothing. Prompt loss at spawn drops the first instruction. Queue-pending-forever drops a later one. This drops the text of a queued message at the moment it is finally submitted, and takes the recipient thread into an error state as it goes.
+
+The practical consequence is worse than a lost message. The thread does not merely miss the input — it errors, and stays errored until something recovers it. In our case an hourly watchdog recovered the seat automatically (14 minutes end to end, which we can confirm works), but any coordinator without that recovery path would simply stop, having last appeared healthy.
+
+Two things that might help whoever picks this up:
+
+- The three failures are cleanly reproducible in shape if not on demand: send into an active thread, wait for the turn boundary, watch the submit.
+- The recipient's own event log is, again, the only place the truth is visible. The sender saw success on all three.
+
+We have no fix to offer — this is below the plugin boundary. But of the five forms reported here, this is the one where the error is named, logged, and attributable to a specific call.
+===== pixexid 2026-08-19T06:58:31Z
+## Retested on 0.39.0: the `Missing input text` form appears fixed
+
+Scoped update on the fifth form reported in this thread (the one where input sent to an active recipient waits for the turn boundary, and the boundary `turn.submit` reached the bridge with empty or absent text). **The other forms in this issue are not addressed here and the issue should stay open for them.**
+
+### The historical failure, for comparison
+
+Exactly three `turn.submit` / `Missing input text` records exist in the host history, at `1787092383960`, `1787093172737`, and `1787094061652` — matching the timestamps originally filed. Those are the baseline.
+
+### Retest
+
+Substrate: bb 0.39.0. Six paths, all on disposable throwaway recipients, all requiring `client/turn/requested` **plus** a matching `turn/input/accepted` carrying the same `clientRequestId` — delivery confirmed at the recipient, not at the sender.
+
+| # | path | result |
+|---|---|---|
+| 1 | filed shape — send to an **active** recipient, auto mode | requested → accepted in 43 ms, same id; token consumed and echoed after 32.0 s at the end of the deliberately-active turn |
+| 2 | queue-create alone while **active**, no explicit send | after the in-flight turn completed, requested 31 ms later → accepted in 70 ms, same id; queue returned to 0 |
+| 3 | queue-create alone while **idle** | requested 17 ms after create → accepted in 153 ms, same id |
+| 4 | `tell --mode auto`, idle | 286 ms send→request, 56 ms request→accept, same id |
+| 5 | plain `tell`, idle | 252 ms send→request, 58 ms request→accept, same id |
+| 6 | explicit queue-send, auto | request → matching acceptance in 68 ms |
+
+**Zero `Missing input text`, system, or provider errors** across all six. A host and server log sweep found zero occurrences at or after the first probe timestamp.
+
+Both active-boundary variants — the ones matching the filed reproduction — were consumed with non-empty input.
+
+### Control, because a green run proves nothing on its own
+
+The correlation validator was itself tested: it exits 0 for the real request id and exits **1** for a deliberately corrupted one. So a missing or mismatched acceptance cannot pass as a success. Without that, "all six passed" would be equally consistent with a validator that always passes.
+
+### One correction to an earlier observation in this thread
+
+A prior note estimated queued-message drain at roughly 36 seconds. That conflated two different things. Measured here: **idle auto-drain was 17 ms**. The long figure is residence time waiting for an active turn to end, which is the recipient's remaining work rather than any delay in the delivery mechanism — in run 2 the 86 s create-to-request was an imposed 60 s turn plus one unrelated retry, and drain began 31 ms after the boundary arrived.
+
+### Deliberately excluded
+
+Two separately-characterised behaviours were **not** folded into this result, because conflating them would make the verdict unreadable:
+
+- default steer mode returning `HTTP 409: Thread is not active` against a thread in `status=error`
+- default steer mode being silently dropped when the target is mid-turn — the send returns success while the message lands in neither the event log nor the queue
+
+Those are distinct from `Missing input text` and remain as filed.
