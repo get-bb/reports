@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1789 A thread whose environment no longer exists still reports idle, and the message queue accepts sends into it</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:4px; }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1789 · A thread whose environment no longer exists still reports idle, and the message queue accepts sends into it that can never be delivered</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill high">Priority: High</span> <span class="pill">Effort: n/a</span> <span class="pill">threads</span> <span class="pill">workspaces</span>
+    <a href="https://github.com/get-bb/bb/issues/1789">open on GitHub</a>
+    <span>2026-08-20 · base <code>c7c66423d</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict v-partial">PARTIALLY REPRODUCED</span> — the headline defect (idle thread + gone environment + queue accepts undeliverable messages, and the 409 on the environment pull-request route) is reproduced end-to-end and at the unit level; the three later comment "forms" (pending-but-undelivered between live threads, prompt loss at <code>spawn</code>, <code>Missing input text</code>) were not reproducible here and the reporter retracted the last one. · <strong>Root-cause confidence:</strong> high (for the reproduced part)</p>
+
+  <h2>1. TL;DR</h2>
+  <p>When a thread's managed worktree is gone — the normal way to get there is: archive the thread, wait past the 5-minute grace window so the worktree is destroyed, then un-archive the thread — the thread record keeps <code>status: "idle"</code> and its <code>environmentId</code> still points at an environment row whose <code>status</code> is <code>destroyed</code> and whose <code>path</code> is <code>null</code>. bb's product decision (comment on the unarchive route) is that such a thread is read-only and is never reprovisioned: the direct send path (<code>POST /threads/:id/send</code>, <code>bb thread tell</code>) correctly answers <code>409 thread_environment_unavailable</code>. But the queued-message create path (<code>POST /threads/:id/queued-messages</code>, <code>bb thread queue create</code>) only checks archived/deleted/stopping and never looks at the environment, so it answers <code>201</code> with a queued-message id. The server then tries to auto-send the message, hits the same 409 internally, logs a warning, leaves the row in the queue, and the periodic sweep retries every 10 s forever. Nothing on the thread record (<code>bb thread show</code>, <code>bb thread list</code>, <code>GET /threads/:id</code>) says the thread cannot run; the CLI even labels the destroyed environment "Provisioning". Separately, every environment workspace route (pull-request, status, diff) answers <code>409 environment_not_ready "Environment unavailable"</code> for a destroyed environment, which is the error the reporter's hourly archiving job trips over.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>A thread whose backing worktree has been removed still reports <code>status: idle</code> with <code>environmentId</code> attached; nothing on the thread record says the environment is gone.</td><td class="ok">Verified</td><td>Archive → grace elapsed → destroyed → unarchive. <code>GET /threads/thr_4ntcmbky7w</code> returns <code>status:"idle"</code>, <code>runtime.displayStatus:"idle"</code>, <code>environmentId:"env_aifhcw4p6x"</code> while <code>GET /environments/env_aifhcw4p6x</code> is <code>status:"destroyed", path:null</code>. <code>bb thread show</code> prints <code>Status: idle</code> and <code>Environment: Provisioning (env_…)</code>. Repro files: <a href="1789/repro/thread-get.json">thread-get.json</a>, <a href="1789/repro/env-after-destroy.json">env-after-destroy.json</a>, <a href="1789/repro/thread-show-after-unarchive.txt">thread-show-after-unarchive.txt</a>. Note: <code>GET /threads/:id?include=environment</code> does embed the environment row, and the web app uses it to show an "Environment archived" banner — so the information exists, but not on the thread record itself and not in the CLI default output.</td></tr>
+    <tr><td>Queueing a message to that thread succeeds (CLI returns a queued-message id) and the message is never delivered; messages accumulate.</td><td class="ok">Verified</td><td><code>bb thread queue create</code> → exit 0, id <code>qmsg_f8pm9kaxpn</code>; a second curl → <code>201</code>; <code>bb thread queue list</code> shows both still pending minutes later; server log has 86 "Queued message auto-send … failed: Thread environment is unavailable" lines at 10 s cadence. Unit test <a href="1789/repro/public-thread-queue-gone-environment.test.ts">public-thread-queue-gone-environment.test.ts</a> fails on main with <code>expected 201 to be 409</code>.</td></tr>
+    <tr><td>Interacting with the thread's environment surfaces a 409, but only on that path.</td><td class="ok">Verified</td><td><code>bb thread tell</code> and <code>bb thread queue send</code> → <code>HTTP 409: Thread environment is unavailable</code>. <code>GET /environments/:id/pull-request</code> → <code>409 environment_not_ready "Environment unavailable" details.environmentStatus:"destroyed"</code>.</td></tr>
+    <tr><td>(Comment 2) An hourly plugin job asking each unarchived thread's environment for its PR gets <code>HTTP 409: Environment unavailable</code> on threads pointing at removed environments.</td><td class="ok">Verified</td><td>Same route, same error text: <a href="1789/repro/env-pull-request.txt">env-pull-request.txt</a>. The reporter's "environments that no longer exist" are environment rows in <code>destroyed</code> status (rows are only pruned after 7 days, and then the FK sets <code>thread.environmentId</code> to NULL — see #1924).</td></tr>
+    <tr><td>(Comment 3) A message queued to an <em>active</em> thread with a healthy environment stayed pending and was never delivered.</td><td class="unv">Unverified</td><td>Not reproduced. No mechanism found in the queue drain for a healthy idle thread; auto-send only runs when the thread is idle and has a provider thread id (so a thread that never finishes a turn, or errored, would hold messages). Would need the reporter's host/server logs around the timestamps.</td></tr>
+    <tr><td>(Comment 4) <code>bb thread spawn --prompt</code> returned success but the thread never received the prompt.</td><td class="unv">Unverified</td><td>Both spawns in this repro (<code>--prompt "Reply only with ok."</code>, codex) delivered the prompt and got "ok". Not reproduced; likely a different bug (provider/bridge specific) and should be its own issue with the event log of the affected thread.</td></tr>
+    <tr><td>(Comment 5) pi-bridge <code>turn.submit</code> rejected with <code>Missing input text</code> for boundary submits of queued messages.</td><td class="unv">Unverified / retracted</td><td>Reporter's own retest on 0.39.0 (last comment) found it fixed. No code at c7c66423d emits that string server-side; <code>git log -S</code> shows no recent change mentioning it in this repo, so the fix (if any) is in the pi bridge/provider plugin. Out of scope here.</td></tr>
+    <tr><td>Reporter's bb version not stated for the first report; 0.39.0 for the retest.</td><td class="unv">Unverified</td><td>Base c7c66423d (main, 2026-08-20) still has the queue-create gap, so the headline bug is present at HEAD.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb commit <code>c7c66423d55c320bab9103218f0ffef1a8191331</code> (main, 2026-08-20); origin/main had no newer commits at investigation time.</li>
+    <li>Linux 7.0.0-29-generic x86_64, node v24.18.0, codex-cli 0.148.0 (provider <code>codex</code>, model gpt-5.6-sol).</li>
+    <li>Dev instance from <code>scripts/bb-dev-app current</code> in worktree <code>/home/sawyer/projects/bb/.claude/worktrees/wf_926b3193-f6c-2</code>: App :16895, Server :24895, Host daemon :32895, data dir <code>~/.bb-dev/projects-bb-.claude-worktrees-wf_926b3193-f6c-2-79164247b8a6</code> (deleted at cleanup). Host id <code>host_rriau729fg</code>, project <code>proj_mufw9k2pk4</code> on scratch repo <code>/tmp/bb-1789-repo</code>.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <h3>4a. Live (CLI + HTTP)</h3>
+  <ol>
+    <li>Start a dev instance and create a project on a scratch git repo:
+<pre>scripts/bb-dev-app current        # prints Server URL; export BB_SERVER_URL=http://localhost:24895
+mkdir /tmp/bb-1789-repo &amp;&amp; git -C /tmp/bb-1789-repo init -q -b main &amp;&amp; echo hi &gt; /tmp/bb-1789-repo/README.md &amp;&amp; git -C /tmp/bb-1789-repo add . &amp;&amp; git -C /tmp/bb-1789-repo commit -qm init
+curl -s -X POST $BB_SERVER_URL/api/v1/projects -H 'content-type: application/json' \
+  -d '{"name":"qa1789","source":{"type":"local_path","path":"/tmp/bb-1789-repo","hostId":"&lt;host id from: pnpm bb:dev machine list&gt;"}}'
+# → {"id":"proj_mufw9k2pk4", ...}</pre></li>
+    <li>Spawn a thread in a new managed worktree and let it finish one tiny turn (it needs a provider thread id to be "idle with history"):
+<pre>pnpm bb:dev thread spawn --project proj_mufw9k2pk4 --new-environment worktree --machine host_rriau729fg --provider codex --prompt "Reply only with ok." --json
+# → "id": "thr_4ntcmbky7w"; after ~30 s:
+pnpm bb:dev thread show thr_4ntcmbky7w
+#   Status: idle
+#   Environment: Worktree (env_aifhcw4p6x)</pre></li>
+    <li>Archive the thread, wait past the 5-minute managed-worktree grace window (<code>MANAGED_ENVIRONMENT_RETIRE_GRACE_MS</code>), then un-archive:
+<pre>pnpm bb:dev thread archive thr_4ntcmbky7w          # env goes retiring
+# ... wait ≥ 5 min; the 10 s sweep then destroys the worktree ...
+curl -s $BB_SERVER_URL/api/v1/environments/env_aifhcw4p6x
+# → "status":"destroyed","path":null
+pnpm bb:dev thread unarchive thr_4ntcmbky7w</pre></li>
+    <li>Observe the thread record. <strong>Expected:</strong> something on the thread says it cannot run. <strong>Actual:</strong>
+<pre>$ pnpm bb:dev thread show thr_4ntcmbky7w
+Thread: thr_4ntcmbky7w
+  Status: idle
+  Project: proj_mufw9k2pk4
+  Environment: Provisioning (env_aifhcw4p6x)
+    Pull request: unavailable
+      HTTP 409: Environment unavailable
+
+$ curl -s $BB_SERVER_URL/api/v1/threads/thr_4ntcmbky7w | jq '{status, environmentId, runtime}'
+{ "status": "idle", "environmentId": "env_aifhcw4p6x", "runtime": { "displayStatus": "idle", ... } }
+
+$ pnpm bb:dev thread list --project proj_mufw9k2pk4
+ID              Title                Project  Status
+thr_4ntcmbky7w  Reply only with ok.  qa1789   idle</pre></li>
+    <li>Queue a message. <strong>Expected:</strong> 409 like the direct send path. <strong>Actual:</strong> 201 + id, and it never drains:
+<pre>$ pnpm bb:dev thread queue create thr_4ntcmbky7w "Reply only with ok." --json ; echo exit=$?
+{ "id": "qmsg_f8pm9kaxpn", "content": [ { "type": "text", "text": "Reply only with ok.", "mentions": [] } ], "model": "gpt-5.6-sol", ... }
+exit=0
+
+$ curl -s -X POST $BB_SERVER_URL/api/v1/threads/thr_4ntcmbky7w/queued-messages -H 'content-type: application/json' \
+    -d '{"input":[{"type":"text","text":"second queued message"}]}' -w '\nHTTP %{http_code}\n'
+{"id":"qmsg_rg9zznbku7", ...}
+HTTP 201
+
+# 30 s later, still pending, thread still idle:
+$ pnpm bb:dev thread queue list thr_4ntcmbky7w | grep -c '"id"'
+2
+$ pnpm bb:dev thread show thr_4ntcmbky7w | head -2
+Thread: thr_4ntcmbky7w
+  Status: idle</pre></li>
+    <li>Compare with the direct-send paths, which do refuse:
+<pre>$ pnpm bb:dev thread tell thr_4ntcmbky7w "Reply only with ok."
+Error: HTTP 409: Thread environment is unavailable
+$ pnpm bb:dev thread queue send thr_4ntcmbky7w qmsg_f8pm9kaxpn
+Error: HTTP 409: Thread environment is unavailable
+$ curl -s $BB_SERVER_URL/api/v1/environments/env_aifhcw4p6x/pull-request -w '\nHTTP %{http_code}\n'
+{"code":"environment_not_ready","message":"Environment unavailable","details":{"environmentStatus":"destroyed","hasPath":false}}
+HTTP 409</pre></li>
+    <li>Server log (<a href="1789/repro/server.log">server.log</a>) shows the queue trying and failing every 10 s, forever:
+<pre>1787235603384 qmsg_f8pm9kaxpn thr_4ntcmbky7w Thread environment is unavailable | Queued message auto-send failed
+1787235603385 qmsg_f8pm9kaxpn thr_4ntcmbky7w Thread environment is unavailable | Queued message auto-send request failed
+... (43 × "Queued message auto-send failed", 40 × "Queued message auto-send sweep failed" in ~7 minutes)</pre></li>
+  </ol>
+  <figure><img src="assets/1789-thread-destroyed-env-queue.png" alt="Web app view of thr_4ntcmbky7w after unarchive: transcript with one turn, composer replaced by an 'Environment archived' banner"><figcaption>The web app for the same thread after step 5: the composer is replaced by an "Environment archived" banner (the app reads the embedded environment status), and the two pending queued messages are not shown anywhere. The API/CLI surfaces, by contrast, still report <code>idle</code>/"Provisioning" and accepted the queued messages.</figcaption></figure>
+
+  <h3>4b. Unit test (fails on main)</h3>
+  <p>Saved at <a href="1789/repro/public-thread-queue-gone-environment.test.ts">1789/repro/public-thread-queue-gone-environment.test.ts</a>; put it in <code>apps/server/test/public/</code> and run <code>cd apps/server &amp;&amp; pnpm exec vitest run test/public/public-thread-queue-gone-environment.test.ts</code>. On c7c66423d the assertion at the end fails for both <code>destroying</code> and <code>destroyed</code> (<a href="1789/repro/vitest-main.txt">vitest-main.txt</a>):</p>
+<pre>AssertionError: queue-create answered 201 {"id":"qmsg_pigge4de3h","content":[{"type":"text","text":"queued into a gone env","mentions":[]}],...}; queued rows: 1: expected 201 to be 409</pre>
+<pre>import { getThread, listQueuedThreadMessages } from &quot;@bb/db&quot;;
+import {
+  encodeClientTurnRequestIdNumber,
+  threadScope,
+  type EnvironmentStatus,
+} from &quot;@bb/domain&quot;;
+import { describe, expect, it } from &quot;vitest&quot;;
+import { readJson } from &quot;../helpers/json.js&quot;;
+import {
+  seedEnvironment,
+  seedEvent,
+  seedHostSession,
+  seedProjectWithSource,
+  seedThread,
+} from &quot;../helpers/seed.js&quot;;
+import { withTestHarness } from &quot;../helpers/test-app.js&quot;;
+
+/**
+ * Repro for get-bb/bb#1789.
+ *
+ * A direct send into a thread whose environment is destroying/destroyed is
+ * rejected with 409 `thread_environment_unavailable` (see
+ * public-thread-environment-decoupling.test.ts). The queued-message create
+ * route has no such guard: it answers 201 with a queued-message id, the
+ * thread keeps reporting `idle`, and the message can never drain because the
+ * auto-send path throws the very 409 the create route should have returned.
+ */
+describe(&quot;queued message into a thread whose environment is gone (#1789)&quot;, () =&gt; {
+  for (const status of [
+    &quot;destroying&quot;,
+    &quot;destroyed&quot;,
+  ] as const satisfies readonly EnvironmentStatus[]) {
+    it(`rejects queue-create when the environment is ${status} (currently accepts it)`, async () =&gt; {
+      await withTestHarness(async (harness) =&gt; {
+        const { host } = seedHostSession(harness.deps, {
+          id: `host-queue-${status}`,
+        });
+        const { project } = seedProjectWithSource(harness.deps, {
+          hostId: host.id,
+        });
+        const environment = seedEnvironment(harness.deps, {
+          hostId: host.id,
+          managed: true,
+          projectId: project.id,
+          path: null,
+          status,
+          workspaceProvisionType: &quot;managed-worktree&quot;,
+        });
+        const thread = seedThread(harness.deps, {
+          projectId: project.id,
+          environmentId: environment.id,
+          status: &quot;idle&quot;,
+        });
+
+        // A prior accepted turn: the thread has a stored execution model and
+        // a provider thread id, exactly like a real idle thread that ran once.
+        seedEvent(harness.deps, {
+          threadId: thread.id,
+          environmentId: environment.id,
+          sequence: 1,
+          type: &quot;client/turn/requested&quot;,
+          scope: threadScope(),
+          data: {
+            direction: &quot;outbound&quot;,
+            requestId: encodeClientTurnRequestIdNumber({ value: 1 }),
+            input: [{ type: &quot;text&quot;, text: &quot;Earlier work&quot; }],
+            target: { kind: &quot;new-turn&quot; },
+            execution: {
+              model: &quot;gpt-5&quot;,
+              serviceTier: &quot;default&quot;,
+              reasoningLevel: &quot;medium&quot;,
+              permissionMode: &quot;full&quot;,
+              source: &quot;client/turn/requested&quot;,
+            },
+            initiator: &quot;user&quot;,
+            senderThreadId: null,
+            request: { method: &quot;turn/start&quot;, params: {} },
+            source: &quot;tell&quot;,
+          },
+        });
+
+        // Control: the direct send path already refuses.
+        const sendResponse = await harness.app.request(
+          `/api/v1/threads/${thread.id}/send`,
+          {
+            method: &quot;POST&quot;,
+            headers: { &quot;content-type&quot;: &quot;application/json&quot; },
+            body: JSON.stringify({
+              mode: &quot;auto&quot;,
+              input: [{ type: &quot;text&quot;, text: &quot;direct send&quot; }],
+            }),
+          },
+        );
+        expect(sendResponse.status).toBe(409);
+
+        // Bug: the queue-create path accepts the same message.
+        const queueResponse = await harness.app.request(
+          `/api/v1/threads/${thread.id}/queued-messages`,
+          {
+            method: &quot;POST&quot;,
+            headers: { &quot;content-type&quot;: &quot;application/json&quot; },
+            body: JSON.stringify({
+              input: [{ type: &quot;text&quot;, text: &quot;queued into a gone env&quot; }],
+            }),
+          },
+        );
+        const body = await readJson(queueResponse);
+
+        // Thread record still claims to be a healthy idle worker.
+        expect(getThread(harness.db, thread.id)?.status).toBe(&quot;idle&quot;);
+
+        // EXPECTED (after fix): 409 thread_environment_unavailable and no
+        // queued row. ACTUAL on c7c66423d: 201 + queued message id, and the
+        // row sits in the queue forever.
+        expect(
+          queueResponse.status,
+          `queue-create answered ${queueResponse.status} ${JSON.stringify(body)}; queued rows: ${
+            listQueuedThreadMessages(harness.db, thread.id).length
+          }`,
+        ).toBe(409);
+        expect(listQueuedThreadMessages(harness.db, thread.id)).toHaveLength(0);
+      });
+    });
+  }
+});
+</pre>
+  <p>Repro files: <a href="1789/repro/">1789/repro/</a></p>
+
+  <h2>5. Root cause</h2>
+  <p><strong>Mechanism.</strong> bb already has a single definition of "the environment is gone" — <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/lib/lifecycle-api-errors.ts#L66-L87"><code>goneThreadEnvironmentDetails</code></a> (status <code>destroying</code>/<code>destroyed</code>) — and the direct send path applies it before doing anything: <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/threads/thread-command-environment.ts#L43-L63"><code>requireThreadCommandEnvironment</code></a> throws <code>409 thread_environment_unavailable</code>. The queued-message create route does not. <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/routes/threads/actions.ts#L255-L307"><code>createQueuedMessageForThread</code></a> only calls <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/threads/thread-send.ts#L162-L172"><code>ensureThreadIsWritable</code></a> (archived / stopping / deleted), validates attachments, resolves execution options, inserts the row, and — if the thread is idle and has a provider thread id (lines 297-304) — schedules an auto-send. The auto-send, <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/threads/queued-messages.ts#L269-L286"><code>sendClaimedQueuedMessageForIdleProviderThread</code></a>, is where the environment is finally checked via <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/threads/queued-messages.ts#L88-L102"><code>requireReadyQueuedMessageEnvironment</code></a> → <code>requireThreadCommandEnvironment</code> → 409. That exception is caught in <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/threads/queued-messages.ts#L505-L567"><code>sendNextQueuedMessageIfPresent</code></a>, logged as a warning, and the claim is released so the row stays queued. <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/threads/queued-messages.ts#L601-L635"><code>runQueuedMessageAutoSendSweep</code></a> runs every 10 s (<code>setInterval(..., 10_000)</code> in <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/start-server.ts#L261-L264"><code>start-server.ts</code></a>), picks the thread up again through <code>listIdleThreadsWithQueuedMessages</code>, and repeats. So the 201 the client saw is a promise the server already knows it can never keep.</p>
+  <p><strong>Why the thread says idle.</strong> Thread <code>status</code> is the provider-runtime state; the environment lifecycle is deliberately decoupled (see the comment above <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/routes/threads/actions.ts#L688-L713"><code>routes.unarchive</code></a>: after the grace window the environment is destroyed, <code>retire.cancelled</code> is a no-op, and "the thread remains read-only"). Nothing writes that read-only-ness onto the thread: <code>GET /threads/:id</code> has no environment-status field (only <code>include=environment</code> embeds the row), <code>bb thread show</code>/<code>list</code> print only <code>status</code>, and the CLI/app label helper <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/packages/core-ui/src/environment-display.ts#L65-L76"><code>formatEnvironmentDisplay</code></a> maps "managed-worktree with <code>path === null</code>" to <strong>"Provisioning"</strong>, which is exactly wrong for a destroyed worktree. The web app independently reads the embedded environment and shows "Environment archived", so the product knows — only the API/CLI consumers are left guessing.</p>
+  <p><strong>Why the environment routes 409.</strong> <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/environments/workspace-command-target.ts#L34-L40"><code>requireWorkspaceCommandTarget</code></a> rejects any non-<code>ready</code>/pathless environment with <code>environment_not_ready "Environment unavailable"</code>; the pull-request route at <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/routes/environments.ts#L381-L390"><code>routes.pullRequest</code></a> uses it. That is correct behaviour, but callers iterating threads have no cheaper signal than calling it.</p>
+  <p><strong>Deeper issue.</strong> After 7 days the destroyed row is pruned (<a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/packages/db/src/data/sweeps.ts#L365-L397"><code>pruneDestroyedEnvironments</code></a>) and the FK sets <code>thread.environmentId</code> to NULL, at which point direct sends say <code>never_attached</code> and archive itself 409s (#1924). The queue path would still accept messages for such a thread, because it never looks at the environment at all. Any fix should cover "environment gone" and "environment row gone" the same way.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>Confident for the queue-accept part; implemented and verified locally (<a href="1789/repro/proposed-fix.diff">proposed-fix.diff</a>): in <code>apps/server/src/routes/threads/actions.ts</code>, make <code>createQueuedMessageForThread</code> apply the existing gone-environment rule right after <code>ensureThreadIsWritable</code>, so queue-create answers the same <code>409 thread_environment_unavailable</code> as send. With this diff the repro test passes, the rest of <code>apps/server/test/public</code> + <code>test/threads</code> still pass (558/562, the 4 failures were 5 s timeouts under load that pass on rerun), and the live instance answered <code>HTTP 409 {"code":"thread_environment_unavailable","details":{"reason":"destroyed",...}}</code> to the same curl after restart (<a href="1789/repro/queue-create-after-fix.txt">queue-create-after-fix.txt</a>).</p>
+<pre>diff --git a/apps/server/src/routes/threads/actions.ts b/apps/server/src/routes/threads/actions.ts
+index a59673fa2..154e9982d 100644
+--- a/apps/server/src/routes/threads/actions.ts
++++ b/apps/server/src/routes/threads/actions.ts
+@@ -40,6 +40,10 @@ import {
+ } from &quot;../../services/environments/environment-cleanup-internal.js&quot;;
+ import { applyLoggedEnvironmentLifecycleEvent } from &quot;../../services/environments/lifecycle-outcome.js&quot;;
+ import { requirePublicThread } from &quot;../../services/lib/entity-lookup.js&quot;;
++import {
++  goneThreadEnvironmentDetails,
++  throwThreadEnvironmentUnavailable,
++} from &quot;../../services/lib/lifecycle-api-errors.js&quot;;
+ import { parseSafeRelativeRoutePath } from &quot;../relative-route-path.js&quot;;
+ import { validatePromptAttachmentReferences } from &quot;../../services/projects/attachments.js&quot;;
+ import {
+@@ -252,12 +256,33 @@ function queuedMessagePayloadFromSendRequest(
+   };
+ }
+ 
++/**
++ * A queued message can only ever drain into the thread&#x27;s environment. A gone
++ * environment (destroying/destroyed) is never reprovisioned, so accepting the
++ * message would park it in the queue forever while the thread keeps reporting
++ * `idle` (#1789). Refuse with the same 409 the direct send path returns.
++ */
++function ensureThreadEnvironmentIsNotGone(deps: AppDeps, thread: Thread): void {
++  if (thread.environmentId === null) {
++    return;
++  }
++  const environment = getEnvironment(deps.db, thread.environmentId);
++  if (!environment) {
++    return;
++  }
++  const goneDetails = goneThreadEnvironmentDetails(environment);
++  if (goneDetails) {
++    throwThreadEnvironmentUnavailable(goneDetails);
++  }
++}
++
+ async function createQueuedMessageForThread(
+   deps: AppDeps,
+   args: CreateQueuedMessageForThreadArgs,
+ ): Promise&lt;ThreadQueuedMessage&gt; {
+   const { payload, thread } = args;
+   ensureThreadIsWritable(thread);
++  ensureThreadEnvironmentIsNotGone(deps, thread);
+   await validatePromptAttachmentReferences({
+     dataDir: deps.config.dataDir,
+     input: payload.input,
+</pre>
+  <p>What could go wrong: the <code>send</code> route also funnels into <code>createQueuedMessageForThread</code> when the thread is <em>active</em> (queue-if-active / manual compaction); an active thread cannot have a destroying/destroyed environment (destroy marks live threads errored), so the new check is a no-op there. Threads with <code>environmentId === null</code> are intentionally left alone by this diff because <code>starting</code> threads legitimately have no environment yet; to close the post-prune hole, reject when <code>environmentId === null &amp;&amp; getLastProviderThreadId(...) !== null</code> (a thread that has run before but lost its environment), or better, stop pruning rows that live threads still reference.</p>
+  <p>For the "thread reports idle" half (the reporter's item 1), the least invasive product change is to expose the environment condition on the thread response — e.g. a <code>runtime.environmentStatus</code> / <code>canRun:false</code> computed at the server boundary from <code>goneThreadEnvironmentDetails</code> — and have <code>bb thread show</code>/<code>list</code> print it; plus fix <code>formatEnvironmentDisplay</code> to say "Destroyed"/"Archived" instead of "Provisioning" when <code>status</code> is <code>destroying</code>/<code>destroyed</code>. Until then, API consumers can already do <code>GET /threads/:id?include=environment</code> (or <code>/threads?include=environment</code>) and check <code>environment.status</code> before touching workspace routes — that is a one-call workaround for the comment-2 archiving job.</p>
+
+  <h2>7. PR review</h2>
+  <p>No open PRs are linked to this issue.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/1924">#1924</a> — Archiving a thread fails with 409 once its environment row has been pruned (the 7-day follow-on state of the same dangling <code>environmentId</code>).</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1710">#1710</a> — Archived threads cannot resume in the original chat (the "Environment archived" read-only state users hit after the grace window).</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1787">#1787</a> — execution-profile observability, linked by the reporter.</li>
+    <li>Comments 3–5 (undelivered message between live threads, prompt loss at spawn, <code>Missing input text</code>) are distinct mechanisms and deserve their own issues with the recipient thread's event log attached; the last one is reported fixed on 0.39.0 by the reporter.</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Files</h3>
+  <ul>
+    <li><a href="1789/repro/server.log">server.log</a>, <a href="1789/repro/host-daemon.log">host-daemon.log</a> — full dev-instance logs for the session; <a href="1789/repro/server-log-autosend-failures.txt">server-log-autosend-failures.txt</a> — first two failure lines decoded.</li>
+    <li><a href="1789/repro/spawn.json">spawn.json</a>, <a href="1789/repro/project.json">project.json</a>, <a href="1789/repro/queue-create.json">queue-create.json</a>, <a href="1789/repro/queue-create-curl.txt">queue-create-curl.txt</a>, <a href="1789/repro/queue-list.txt">queue-list.txt</a>, <a href="1789/repro/tell.txt">tell.txt</a>, <a href="1789/repro/queue-send.txt">queue-send.txt</a>, <a href="1789/repro/env-pull-request.txt">env-pull-request.txt</a>, <a href="1789/repro/thread-get.json">thread-get.json</a>, <a href="1789/repro/env-after-destroy.json">env-after-destroy.json</a>.</li>
+    <li><a href="1789/repro/vitest-main.txt">vitest-main.txt</a> (fails on base), <a href="1789/repro/vitest-fixed.txt">vitest-fixed.txt</a> (passes with diff), <a href="1789/repro/vitest-fixed-broad.txt">vitest-fixed-broad.txt</a> + <a href="1789/repro/vitest-rerun.txt">vitest-rerun.txt</a> (broader suites).</li>
+    <li><a href="1789/repro/shot4.js">shot4.js</a> — doobie script for the screenshot.</li>
+  </ul>
+  <h3>Side experiment (not the reported bug)</h3>
+  <p>A second thread (<code>thr_wgwc3u4vrg</code>) had its worktree directory removed out from under a <em>ready</em> environment with <code>git worktree remove --force</code>. Because the codex session process was still alive, a queued message was still delivered and answered ("ok") — the server never checks the path on disk, and the environment stayed <code>ready</code>. So "worktree removed on disk while the env row says ready" is a third possible origin of the reporter's state but is not what produces the 409s; the destroyed-after-archive path above is.</p>
+  <h3>Commands run</h3>
+<pre>git rev-parse HEAD; pnpm install --frozen-lockfile --prefer-offline; pnpm exec turbo run build
+scripts/bb-dev-app current; scripts/bb-dev-app env
+curl -s -X POST $BB_SERVER_URL/api/v1/projects ... (see step 1)
+node packages/scripts/dist/commands/run-cli.js thread spawn --project proj_mufw9k2pk4 --new-environment worktree --machine host_rriau729fg --provider codex --prompt "Reply only with ok." --json
+node packages/scripts/dist/commands/run-cli.js thread show thr_4ntcmbky7w
+node packages/scripts/dist/commands/run-cli.js thread archive thr_4ntcmbky7w        # 14:14:31
+curl -s $BB_SERVER_URL/api/v1/environments/env_aifhcw4p6x                             # retiring → destroyed at ~14:19:40
+node packages/scripts/dist/commands/run-cli.js thread unarchive thr_4ntcmbky7w
+node packages/scripts/dist/commands/run-cli.js thread queue create thr_4ntcmbky7w "Reply only with ok." --json
+node packages/scripts/dist/commands/run-cli.js thread queue list thr_4ntcmbky7w
+node packages/scripts/dist/commands/run-cli.js thread tell thr_4ntcmbky7w "Reply only with ok."
+node packages/scripts/dist/commands/run-cli.js thread queue send thr_4ntcmbky7w qmsg_f8pm9kaxpn
+curl -s $BB_SERVER_URL/api/v1/environments/env_aifhcw4p6x/pull-request
+cd apps/server &amp;&amp; pnpm exec vitest run test/public/public-thread-queue-gone-environment.test.ts
+(apply proposed-fix.diff) pnpm exec vitest run test/public test/threads; pnpm dev:stop; scripts/bb-dev-app current; curl ... queued-messages → 409
+doobie --headless run shot4.js</pre>
+</main></body></html>
