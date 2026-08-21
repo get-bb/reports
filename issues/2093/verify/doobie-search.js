@@ -1,0 +1,18 @@
+const page = await browser.getPage("v2093");
+const box = await page.ref("e278");
+await box.click();
+await page.type("ref/e278", "AGENTS.md");
+await new Promise((r) => setTimeout(r, 2500));
+await page.screenshot({ path: "/tmp/bb-reports/issues/2093/verify/ui-search-agents-md.png" });
+let snap = await page.snapshot({ interactive: true });
+let s = typeof snap === "string" ? snap : JSON.stringify(snap);
+const control = s.slice(s.indexOf("Search files"), s.indexOf("Search files") + 600);
+await box.click({ clickCount: 3 });
+await page.keyboard.press("Backspace");
+await page.type("ref/e278", "ci.yml");
+await new Promise((r) => setTimeout(r, 2500));
+await page.screenshot({ path: "/tmp/bb-reports/issues/2093/verify/ui-search-ci-yml.png" });
+snap = await page.snapshot({ interactive: true });
+s = typeof snap === "string" ? snap : JSON.stringify(snap);
+const bug = s.slice(s.indexOf("Search files"), s.indexOf("Search files") + 600);
+({ control, bug });

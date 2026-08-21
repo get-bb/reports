@@ -1,0 +1,13 @@
+const page = await browser.getPage("bb2130");
+let s = await page.snapshot({ interactive: true, track: "pp" });
+let line = s.full.split("\n").find((l) => /No project/.test(l) && /ref=/.test(l));
+if (!line) throw new Error("no project button: " + s.full.slice(0, 2000));
+await page.click("ref/" + line.match(/ref=(e\d+)/)[1]);
+await new Promise((r) => setTimeout(r, 1500));
+s = await page.snapshot({ interactive: true, track: "pp2" });
+line = s.full.split("\n").find((l) => /option|menuitem/.test(l) && /\bqa\b/.test(l));
+if (!line) throw new Error("no qa option: " + s.full.split("\n").filter((l) => /option|menuitem/.test(l)).join("\n"));
+await page.click("ref/" + line.match(/ref=(e\d+)/)[1]);
+await new Promise((r) => setTimeout(r, 3000));
+s = await page.snapshot({ interactive: true, track: "pp3" });
+({ lines: s.full.split("\n").filter((l) => /search|file|tab|status|NOTES/i.test(l)).slice(0, 30) });

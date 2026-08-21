@@ -1,0 +1,13 @@
+const page = await browser.getPage("bb2130");
+let s = await page.snapshot({ interactive: true, track: "sf" });
+let line = s.full.split("\n").find((l) => /Search files/.test(l) && /ref=/.test(l));
+await page.click("ref/" + line.match(/ref=(e\d+)/)[1]);
+await page.type("ref/" + line.match(/ref=(e\d+)/)[1], "status");
+await new Promise((r) => setTimeout(r, 2500));
+s = await page.snapshot({ interactive: true, track: "sf2" });
+line = s.full.split("\n").find((l) => /option/.test(l) && /status\.txt/.test(l));
+if (!line) throw new Error("no result: " + s.full.split("\n").filter((l) => /option|status/.test(l)).join("\n"));
+await page.click("ref/" + line.match(/ref=(e\d+)/)[1]);
+await new Promise((r) => setTimeout(r, 3500));
+s = await page.snapshot({ interactive: true, track: "sf3" });
+({ url: page.url(), lines: s.full.split("\n").filter((l) => /status|tab/i.test(l)).slice(0, 20) });

@@ -1,0 +1,11 @@
+const page = await browser.getPage("v2093");
+const box = await page.ref("e278");
+await box.click();
+await page.keyboard.down("Meta"); await page.keyboard.press("KeyA"); await page.keyboard.up("Meta");
+await page.keyboard.press("Backspace");
+await page.type("ref/e278", "ci.yml");
+await new Promise((r) => setTimeout(r, 2500));
+await page.screenshot({ path: "/tmp/bb-reports/issues/2093/verify/ui-search-ci-yml.png" });
+const snap = await page.snapshot({ interactive: true });
+const s = typeof snap === "string" ? snap : JSON.stringify(snap);
+s.slice(s.indexOf("Search files"), s.indexOf("Search files") + 600);

@@ -1,0 +1,1005 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2190 SQLite db silently reverted to a 2-week-old state while the server was running</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  .callout { border-left:4px solid var(--warn); background:#fff8e6; padding:10px 14px; margin:14px 0; }
+  details summary { cursor:pointer; color:var(--accent); }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2190 · SQLite db silently reverted to a 2-week-old state while the server was running (post-Aug-9 projects/threads lost; auto-update in progress)</h1>
+  <p class="meta">
+    <span class="pill">Bug (data loss)</span> <span class="pill high">Priority: Urgent</span> <span class="pill">Effort: not set</span> <span class="pill">desktop</span> <span class="pill">host</span>
+    <a href="https://github.com/get-bb/bb/issues/2190">open on GitHub</a>
+    <span>2026-08-21 · base <code>fcada5a3b</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict v-partial">PARTIALLY REPRODUCED</span> · <strong>Root-cause confidence:</strong> medium (mechanism and bb's contribution: high; the external trigger on the reporter's machine: not identified)</p>
+
+  <h2>1. TL;DR</h2>
+  <p>The reporter's server process stayed up, yet every project and thread created after ~Aug 9 vanished and three threads deleted before Aug 9 came back. That is exactly what a SQLite database in WAL mode looks like when the write-ahead log is <em>discarded</em>: the main <code>bb.db</code> file holds the state at the last completed checkpoint, and everything newer lived only in <code>bb.db-wal</code>. bb makes this window enormous: the server opens <code>bb.db</code> once with WAL mode and the SQLite default of a checkpoint only after 1000 WAL pages, and it never closes the handle at shutdown, so on a real dev instance the main file is still a single empty 4096-byte page after startup, after creating a project, and after a SIGTERM shutdown; all data is in the WAL. A single long-lived reader on the file (a DB GUI, a stuck <code>sqlite3</code> shell, any process holding a read transaction) pins checkpoints indefinitely; I show the main file frozen at the "Aug 9" state while the WAL grows to 34 MB. When the WAL header / wal-index then becomes unreadable for any reason, SQLite's recovery treats the WAL as empty <em>without returning an error</em>, and the very same open handle starts serving the old snapshot; the next commit rewrites the WAL from frame 1 so "replaying the WAL on a copy" can no longer show the lost rows, even though most of them are physically still in the file. I reproduce these symptoms (open handle reverts, no restart, no log line, WAL keeps its size, replay on a copy fails) and provide a forensic tool that recovers the discarded frames; in the simulated case it brings back 100% of the lost rows with <code>integrity_check = ok</code>. Two things I could <strong>not</strong> reproduce: the spontaneous trigger (no code path in bb writes, copies, closes or reopens <code>bb.db</code>, and the server is the only process that opens it), and the reporter's <code>bb.db</code> <em>mtime</em> at 15:10. In WAL mode only a checkpoint writes the main file, the simulated revert does not touch it (walkthrough step 6: <code>bb.db mtime changed: false</code>), and bb on its own would need ~1000 further WAL pages (195 commits in the walkthrough) before SQLite's auto-checkpoint writes it. So something else wrote <code>bb.db</code> in the same minute as the event, which favours an external in-place rewrite of the files over a pure WAL-invalidation. The reporter's cold copy of <code>bb.db{,-wal,-shm}</code> can settle this in one command (section 4F).</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Server process never restarted, same pid since Aug 16, one listener on 38886</td><td class="unv">Unverified (accepted)</td><td>Cannot be checked remotely. Consistent with the mechanism: a WAL-discard is visible through the already-open handle without any restart (section 4, step 5).</td></tr>
+    <tr><td>Database "silently reverted" to a ~Aug 9 state; deleted Aug 6–9 threads reappeared</td><td class="ok">Verified as a mechanism</td><td>Reproduced with bb's own <code>createConnection()</code>: after the WAL becomes unreadable the open handle returns the last-checkpoint snapshot, including a row that had been deleted after the checkpoint. No exception, no log line (walkthrough step 5).</td></tr>
+    <tr><td><code>bb.db</code> mtime rewritten at ~15:10–15:11</td><td class="no">Not explained by the simulated mechanism</td><td>In WAL mode only a checkpoint writes the main file. The revert itself and the next commit do not touch <code>bb.db</code> (walkthrough step 6: <code>bb.db mtime changed: false</code>); bb issues no checkpoint of its own until SQLite's 1000-page auto-checkpoint (step 9: 195 one-row commits later) or the hourly sweep with a freelist ≥ 1024 pages. Only an explicit checkpoint (step 10, induced) changes the mtime, and a SQLite checkpoint carries the WAL's committed frames <em>into</em> <code>bb.db</code>, so it cannot be what lost the data. An mtime in the same minute as the event therefore points at an actor that wrote <code>bb.db</code> directly (in-place restore/copy/sync), see 5.3. An earlier draft of this report claimed the mtime was reproduced; that came from a <code>wal_checkpoint(PASSIVE)</code> the harness ran itself, which the verifier caught and which has been removed.</td></tr>
+    <tr><td>The WAL was ~7 MB and replaying it on a copy does not surface the lost rows</td><td class="ok">Verified as a consequence</td><td>The WAL keeps its size; only the new generation is "live". Copying <code>bb.db</code>+<code>-wal</code>+<code>-shm</code> and opening the copy shows the reverted state (walkthrough step 7). The old frames are still in the file as stale frames (step 8 recovers them).</td></tr>
+    <tr><td>No migration/reset/checkpoint entries in <code>server.7.log</code></td><td class="ok">Verified (expected)</td><td>bb logs nothing about WAL state. SQLite's auto-checkpoint and recovery produce no log output, and recovery of an invalid WAL header is not an error (<code>goto finished</code> in <code>walIndexRecover</code>, section 5).</td></tr>
+    <tr><td>First failing call was <code>bb automation create</code> (first use of the automations plugin); "correlation only"</td><td class="no">Refuted as a cause</td><td>The automations plugin opens its own <code>~/.bb/plugins/automations/data.db</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/services/plugins/plugin-api.ts#L654-L661"><code>apps/server/src/services/plugins/plugin-api.ts L654-L661</code></a>); it never touches <code>bb.db</code>. The 404 is the first <em>observation</em> of the already-reverted state.</td></tr>
+    <tr><td>Squirrel/ShipIt auto-update may be related</td><td class="unv">Unverified / unlikely</td><td>Electron/Squirrel replaces the app bundle only at quit (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/desktop/src/desktop-auto-update.ts#L359-L364"><code>apps/desktop/src/desktop-auto-update.ts L359-L364</code></a> sets <code>autoInstallOnAppQuit</code>); nothing in the updater touches <code>~/.bb</code>. The <code>--root</code>/<code>--path</code> mismatch is a new CLI talking to the old server and is unrelated to the database.</td></tr>
+    <tr><td>Hypothesis: "a large never-checkpointed WAL was discarded (rollback instead of replay)"</td><td class="unv">Plausible; matches every symptom except the <code>bb.db</code> mtime</td><td>Two halves demonstrated separately: (a) bb never checkpoints on its own at shutdown and a pinned reader freezes the main file for as long as it lives (pinned-reader experiment); (b) an unreadable WAL header is silently treated as an empty WAL (walkthrough). Neither half writes <code>bb.db</code>, so the 15:10 mtime needs an additional actor; an in-place rewrite of the three files from an older copy explains all symptoms including the mtime (5.3). Which actor it was on the reporter's machine is unknown.</td></tr>
+    <tr><td>Recreated data survived quit/relaunch and the 0.38.0 → 0.39.0 update</td><td class="unv">Unverified (mechanism consistent)</td><td>The reporter's observation itself cannot be checked remotely. The mechanism is consistent with it: a writer process that <code>process.exit(0)</code>s without <code>close()</code> leaves everything visible to the next process (exit-durability run below, 11/51/201 rows), so a plain restart is not the trigger.</td></tr>
+    <tr><td>Not reproducible on demand</td><td class="ok">Verified</td><td>No bb code path can produce it; I could only induce the SQLite half by corrupting the WAL header from a second process.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb base commit <code>fcada5a3b88302acb9944aa74b11db4ecaa215a0</code> (branch main as of 2026-08-21); <code>origin/main</code> at <code>15f21ade7</code> has no changes to <code>packages/db</code>, <code>apps/server/src/start-server.ts</code>, <code>apps/desktop</code> or <code>packages/bb-app</code> since the base, so nothing on main fixes this.</li>
+    <li>macOS 26.5.2 (Darwin 25.5.0) arm64, Node v22.23.1, better-sqlite3 12.10.0 bundling SQLite 3.53.1. This is the identical pin of the 0.38.0 desktop build (<code>git show desktop-v0.38.0:packages/db/package.json</code> → <code>"better-sqlite3": "12.10.0"</code>), so the SQLite code paths tested here are the ones the reporter ran.</li>
+    <li>Reporter: bb.app 0.38.0 (tag <code>desktop-v0.38.0</code> = <code>45145e51a</code>, 2026-08-14) which includes <a href="https://github.com/get-bb/bb/pull/1438">#1438</a> (<code>mmap_size</code>, <code>synchronous=NORMAL</code>, 2026-08-12). Neither pragma is implicated: <code>NORMAL</code> only matters on power loss and the machine did not lose power.</li>
+    <li>My isolated dev instance (revised run): <code>scripts/bb-dev-app current</code> → App :16667, Server :24667, Host daemon :32667, data dir <code>~/.bb-dev/bb-machines-bee.getbb.app-checkouts-bb-.claude-worktrees-wf_21e66a79-f02-14-8efb3c6392be</code> (deleted at cleanup). Ports and data dir are derived from the worktree path, so yours will differ; every command below derives them. Scratch project repo <code>/tmp/bb2190-qa-repo</code>. The independent verifier's run used ports 16384/24384/32384 and matched.</li>
+    <li>Unit-level repros run from <code>packages/db</code> with <code>pnpm exec vitest run</code> / <code>pnpm exec tsx</code>; they use bb's real <code>createConnection()</code> + <code>migrate()</code> on temp directories.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <p>All files are in <a href="2190/repro/">2190/repro/</a>. Copy <code>issue-2190-wal-tool.mjs</code>, <code>issue-2190-walkthrough.ts</code>, <code>issue-2190-pinned-reader.ts</code>, <code>issue-2190-exit-durability.ts</code> and <code>issue-2190-wal-revert.test.ts</code> into <code>packages/db/test/</code> of a checkout at <code>fcada5a3b</code>.</p>
+
+  <h3>A. Product-level: the main file is empty; nothing is checkpointed at shutdown</h3>
+  <p>Ports and the data dir are derived from your worktree, so every value below is computed rather than pasted. The whole sequence is <a href="2190/repro/issue-2190-part-a.sh">issue-2190-part-a.sh</a> (run from the repo root after step 1); the verbatim transcript of my run is <a href="2190/repro/part-a-transcript.txt">part-a-transcript.txt</a>.</p>
+  <ol>
+    <li>Start an isolated instance, load its URLs and find its data dir: <pre>scripts/bb-dev-app current                      # prints App/Server/Host daemon URLs and "Data dir:"
+eval "$(scripts/bb-dev-app env)"                # sets BB_SERVER_URL etc.
+DATA=$(scripts/bb-dev-app status | sed -n 's/^Data dir: //p')
+until curl -sf "$BB_SERVER_URL/api/v1/projects" &gt;/dev/null; do sleep 1; done</pre></li>
+    <li>Look at the database files: <pre>$ ls -la "$DATA"/bb.db*
+4096 bb.db          &lt;-- one empty page
+32768 bb.db-shm
+1133032 bb.db-wal   &lt;-- schema, Personal project, plugin rows: everything</pre></li>
+    <li>Create a scratch repo and a project through the real server (host id from the API), then inspect a copy of the main file alone plus the WAL:
+<pre>HOST_ID=$(curl -s "$BB_SERVER_URL/api/v1/hosts" | node -e 'let s="";process.stdin.on("data",d=&gt;s+=d).on("end",()=&gt;console.log(JSON.parse(s)[0].id))')
+mkdir -p /tmp/bb2190-qa-repo &amp;&amp; git -C /tmp/bb2190-qa-repo init -q
+curl -s -X POST "$BB_SERVER_URL/api/v1/projects" -H 'content-type: application/json'   -d '{"name":"qa-2190","source":{"type":"local_path","path":"/tmp/bb2190-qa-repo","hostId":"'"$HOST_ID"'"}}'
+# -&gt; {"id":"proj_44jarbwsr6","kind":"standard","name":"qa-2190",...}
+cp 2190/repro/issue-2190-live-inspect.mjs 2190/repro/issue-2190-wal-tool.mjs packages/db/test/
+node packages/db/test/issue-2190-live-inspect.mjs "$DATA"</pre>
+<pre>{
+  "dataDir": "/Users/sawyerhood/.bb-dev/bb-machines-bee.getbb.app-checkouts-bb-.claude-worktrees-wf_21e66a79-f02-14-8efb3c6392be",
+  "files": {
+    "bb.db": 4096,
+    "bb.db-wal": 1194832,
+    "bb.db-shm": 32768
+  },
+  "mainFileOnly": {
+    "tableCount": 0,
+    "projects": "(no projects table)",
+    "threads": "(no threads table)"
+  },
+  "wal": {
+    "fileBytes": 1194832,
+    "totalFrames": 290,
+    "liveFrameCount": 290,
+    "header": {
+      "checkpointSeq": 0,
+      "salt1": 2390608954,
+      "checksumValid": true
+    },
+    "generations": [
+      {
+        "salt1": 2390608954,
+        "salt2": 3724721702,
+        "frameCount": 290,
+        "firstIndex": 1,
+        "lastIndex": 290,
+        "commitFrames": 52,
+        "isLive": true,
+        "distinctPages": 169
+      }
+    ]
+  }
+}
+</pre>
+      <p>Expected (for a durable store): the main file contains the schema and the project. Actual: <code>"tableCount": 0</code>, <code>"projects": "(no projects table)"</code>; all 290 frames / 52 commits are WAL-only.</p></li>
+    <li>Stop the server exactly as the desktop app does: find the single process that has <code>bb.db</code> open and send it SIGTERM.
+<pre>$ lsof -nP -- "$DATA/bb.db" | awk '{print $1, $2}' | sort -u
+COMMAND PID
+node 75548                                      &lt;-- the server is the only opener
+$ SERVER_PID=$(lsof -nP -t -- "$DATA/bb.db" | sort -u | head -1)
+$ kill -TERM "$SERVER_PID"; while kill -0 "$SERVER_PID" 2&gt;/dev/null; do sleep 0.2; done; echo "server exited"
+server exited
+$ ls -la "$DATA"/bb.db*
+4096 bb.db                                      &lt;-- unchanged
+32768 bb.db-shm
+1301952 bb.db-wal                               &lt;-- grew (shutdown writes), never folded into bb.db
+$ node packages/db/test/issue-2190-live-inspect.mjs "$DATA"</pre>
+<pre>{
+  "dataDir": "/Users/sawyerhood/.bb-dev/bb-machines-bee.getbb.app-checkouts-bb-.claude-worktrees-wf_21e66a79-f02-14-8efb3c6392be",
+  "files": {
+    "bb.db": 4096,
+    "bb.db-wal": 1301952,
+    "bb.db-shm": 32768
+  },
+  "mainFileOnly": {
+    "tableCount": 0,
+    "projects": "(no projects table)",
+    "threads": "(no threads table)"
+  },
+  "wal": {
+    "fileBytes": 1301952,
+    "totalFrames": 316,
+    "liveFrameCount": 316,
+    "header": {
+      "checkpointSeq": 0,
+      "salt1": 2390608954,
+      "checksumValid": true
+    },
+    "generations": [
+... (13 more lines, see repro/live-inspect-after-sigterm.json)</pre>
+      <p>Expected: SQLite's close-time checkpoint folds the WAL into <code>bb.db</code>. Actual: <code>bb.db</code> is still 4096 bytes; the WAL grew from 290 to 316 frames. The cause is <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/start-server.ts#L272-L319"><code>start-server.ts runShutdown()</code></a>: it never calls <code>db.$client.close()</code> before <code>process.exit(0)</code>. (In this run the inspection was captured before the dev supervisor restarted the server 1 s later, so <code>lsof</code> listed no opener at that moment; the production desktop app has no such supervisor.)</p></li>
+  </ol>
+
+  <h3>B. Unit-level walkthrough with bb's connection: revert through an open handle, replay failure, recovery</h3>
+  <p><code>cd packages/db &amp;&amp; pnpm exec tsx test/issue-2190-walkthrough.ts</code> (file: <a href="2190/repro/issue-2190-walkthrough.ts">issue-2190-walkthrough.ts</a>). Verbatim output:</p>
+  <pre>
+== 1. open bb.db with bb's createConnection() + migrate() (what apps/server does at start)
+pragmas: journal_mode=wal wal_autocheckpoint=1000 synchronous=1 mmap_size=1073741824
+files: bb.db=4096 bb.db-wal=646872 bb.db-shm=32768
+open handle sees projects: ["Personal"]
+main file alone sees: (no projects table in main file)
+
+== 2. simulate the last checkpoint ('Aug 9'): a project exists, then PRAGMA wal_checkpoint(TRUNCATE)
+files: bb.db=618496 bb.db-wal=0 bb.db-shm=32768
+main file alone sees: ["Personal","old-project-from-aug-9"]
+
+== 3. 'Aug 9 -&gt; Aug 21': delete the old project, create 40 new ones (each its own transaction)
+open handle sees 41 projects: ["Personal","lost-00","lost-01","lost-02"] ...
+main file alone sees: ["Personal","old-project-from-aug-9"]
+files: bb.db=618496 bb.db-wal=844632 bb.db-shm=32768
+WAL before: {"header":{"salt1":966818975,"salt2":1949032780,"checkpointSeq":1,"checksumValid":true},"totalFrames":205,"liveFrameCount":205}
+
+== 4. THE EVENT (from another process): wal-index (-shm) zeroed in place + 1 bit flipped in the WAL header checksum
+done; the server handle was never closed or reopened
+
+== 5. next read on the SAME open handle (no restart, no exception thrown)
+open handle sees projects: ["Personal","old-project-from-aug-9"]
+  -&gt; the 40 projects are gone and the deleted 'Aug 9' project is back
+
+== 6. server keeps running; one more write ('created-after-revert'). NOTE: bb issues no checkpoint here, so bb.db is NOT written
+open handle sees projects: ["Personal","created-after-revert","old-project-from-aug-9"]
+bb.db mtime changed: false (expected false: the commit only restarts the WAL at frame 1)
+files: bb.db=618496 bb.db-wal=844632 bb.db-shm=32768 (WAL keeps its old size)
+WAL after: {
+ "header": {
+  "salt1": 966818975,
+  "salt2": 1949032780,
+  "checkpointSeq": 1,
+  "checksumValid": true
+ },
+ "totalFrames": 205,
+ "liveFrameCount": 5,
+ "generations": [
+  {
+   "salt1": 966818975,
+   "salt2": 1949032780,
+   "frameCount": 5,
+   "firstIndex": 1,
+   "lastIndex": 5,
+   "commitFrames": 1,
+   "isLive": true,
+   "distinctPages": 5
+  },
+  {
+   "salt1": 966818975,
+   "salt2": 1949032780,
+   "frameCount": 200,
+   "firstIndex": 6,
+   "lastIndex": 205,
+   "commitFrames": 40,
+   "isLive": false,
+   "distinctPages": 5
+  }
+ ]
+}
+
+== 7. 'replaying the WAL on a copy' (copy bb.db + -wal + -shm elsewhere and open)
+replay copy sees: ["Personal","created-after-revert","old-project-from-aug-9"]
+
+== 8. forensic recovery: apply the stale frames onto a copy of the main file
+recover result: {"outDb":"/var/folders/k6/m70477s10v77w8fx0nvghbqr0000gn/T/bb-2190-walkthrough-pNTecH/recovered/bb.db","generation":{"salt1":966818975,"salt2":1949032780,"firstIndex":6,"lastIndex":205},"appliedFrames":200,"skippedTrailingFrames":0,"overwrittenPrefixFrames":5}
+integrity_check: ok
+recovered projects: 41 ["Personal","lost-00","lost-01","lost-02"] ... ["lost-38","lost-39"]
+
+== 9. what bb does on its own after the revert: keep committing; bb.db is written only by SQLite's 1000-page auto-checkpoint
+commits (one row each) before bb.db was written by the auto-checkpoint: 195
+WAL at that point: {"totalFrames":1001,"liveFrameCount":1001,"nBackfill":1001,"staleGenerations":0}
+  -&gt; a single commit right after the revert does not touch bb.db; ~1000 WAL pages of later writes are needed, and by then the stale frames holding the lost data have been overwritten
+recovery attempted now: "recovery no longer possible: no stale generation; generations: [{\"salt1\":966818975,\"frames\":1001,\"live\":true}]"
+
+== 10. INDUCED (bb never does this): an explicit PRAGMA wal_checkpoint(PASSIVE) on the server handle
+checkpoint result: [{"busy":0,"log":5,"checkpointed":5}]
+bb.db mtime changed: true (only a checkpoint writes bb.db; bb runs one only via the 1000-page auto-checkpoint or the hourly sweep when the freelist &gt;= 1024 pages)
+
+scratch dir: /var/folders/k6/m70477s10v77w8fx0nvghbqr0000gn/T/bb-2190-walkthrough-pNTecH (tool: /Users/sawyerhood/.bb-machines/bee.getbb.app/checkouts/bb/.claude/worktrees/wf_21e66a79-f02-14/packages/db/test/issue-2190-wal-tool.mjs)
+</pre>
+  <p>What to look at: step 1 shows a fresh bb database has a 4096-byte main file and a 646 KB WAL. Step 3 shows the open handle sees 41 projects while the main file alone still shows the deleted "Aug 9" project. Step 4 is the only induced part: from another process the wal-index is zeroed in place and one bit of the WAL header checksum is flipped. Step 5 is the bug as the reporter saw it: same process, same handle, no restart, no exception, and the database is 12 "days" older. Step 6 is the server's next commit: it restarts the WAL at frame 1 with the same salt (<code>liveFrameCount: 5</code> of 205; the 200 stale frames hold the lost data) and, importantly, does <strong>not</strong> write <code>bb.db</code> (<code>bb.db mtime changed: false</code>). Step 7 reproduces "replaying the WAL on a copy does not surface the lost rows". Step 8 recovers all 41 projects from the stale frames. Step 9 shows what bb does on its own afterwards: 195 further one-row commits (1001 WAL pages) pass before SQLite's auto-checkpoint writes <code>bb.db</code>, and by then the stale frames are overwritten and recovery is impossible. Step 10 is explicitly induced (an explicit <code>PRAGMA wal_checkpoint(PASSIVE)</code> that bb never issues) and is the only thing in the walkthrough that changes the <code>bb.db</code> mtime; it copies the committed frames into the main file, so it is not a data-losing operation.</p>
+
+  <h3>C. Why the main file can be weeks old: a pinned reader</h3>
+  <p><code>pnpm exec tsx test/issue-2190-pinned-reader.ts</code> (file: <a href="2190/repro/issue-2190-pinned-reader.ts">issue-2190-pinned-reader.ts</a>):</p>
+  <pre>== 'Aug 9' state checkpointed: bb.db=618496 bb.db-wal=0 main file sees ["Personal","aug-9"]
+== second process opened bb.db with an open read transaction (pid 74549 )
+== after 40 projects + ~2000 padding pages + deleting 'aug-9': bb.db=618496 bb.db-wal=34253712
+   open bb handle sees 41 projects
+   main file alone sees ["Personal","aug-9"]
+   wal-index: mxFrame=8314 nBackfill=0 aReadMark=[0,8314,4294967295,4294967295,4294967295]
+   explicit PRAGMA wal_checkpoint(PASSIVE) while the reader is alive: [{"busy":0,"log":8314,"checkpointed":0}]
+   main file alone still sees ["Personal","aug-9"] | bb.db=618496 bb.db-wal=34253712
+== reader killed, one more commit: bb.db=8830976 bb.db-wal=34274312
+   main file alone sees ["Personal","after-reader-gone","new-00","new-01","new-02","new-03","new-04","ne ...
+   wal-index: mxFrame=8319 nBackfill=8319 aReadMark=[0,8319,4294967295,4294967295,4294967295]
+   explicit PRAGMA wal_checkpoint(PASSIVE) now: [{"busy":0,"log":8319,"checkpointed":8319}]
+scratch: /var/folders/k6/m70477s10v77w8fx0nvghbqr0000gn/T/bb-2190-pin-JyLQin
+</pre>
+  <p>A second process with an open read transaction holds SQLite read-lock slot 0, so every auto-checkpoint bb's writer attempts after the 1000-page threshold copies nothing (<code>nBackfill=0</code> at <code>mxFrame=8314</code>, 34 MB of WAL). An explicit <code>PRAGMA wal_checkpoint(PASSIVE)</code> issued while the reader is alive returns <code>{"busy":0,"log":8314,"checkpointed":0}</code> and leaves the main file untouched: a periodic passive checkpoint cannot bound the exposure in this state, but its result is exactly the signal a warning can be raised from. The moment the reader dies, one commit checkpoints everything and the main file jumps from 618 KB to 8.8 MB. This is the configuration the reporter describes (main file at Aug 9, multi-MB WAL holding Aug 9–21). Note that the reader alone loses nothing; the loss needs the second event (WAL invalidated) on top.</p>
+
+  <h3>D. Ruling out "restart loses data"</h3>
+  <p><code>pnpm exec tsx test/issue-2190-exit-durability.ts</code> — a writer that commits and then <code>process.exit(0)</code>s without <code>close()</code> (bb's shutdown), followed by a fresh process reading:</p>
+  <pre>rows=10: writer {"committed":11,"walFrames":207} walBytes=852872 -&gt; reader {"visible":11,"shm":{"nBackfill":0,"aReadMark":[0,208,4294967295,4294967295,4294967295],"nBackfillAttempted":207}}
+rows=50: writer {"committed":51,"walFrames":407} walBytes=1676872 -&gt; reader {"visible":51,"shm":{"nBackfill":0,"aReadMark":[0,408,4294967295,4294967295,4294967295],"nBackfillAttempted":407}}
+rows=200: writer {"committed":201,"walFrames":163} walBytes=4128272 -&gt; reader {"visible":201,"shm":{"nBackfill":0,"aReadMark":[0,164,4294967295,4294967295,4294967295],"nBackfillAttempted":163}}
+scratch: /var/folders/k6/m70477s10v77w8fx0nvghbqr0000gn/T/bb-2190-exit-dsHyul
+</pre>
+  <p>All committed rows are visible; SQLite's recovery rebuilds the wal-index from the WAL (<code>nBackfillAttempted = mxFrame</code>). The Aug 16 restart for 0.38.0 cannot have caused the loss.</p>
+
+  <h3>E. Guard test</h3>
+  <p><code>pnpm exec vitest run test/issue-2190-wal-revert.test.ts</code> (file: <a href="2190/repro/issue-2190-wal-revert.test.ts">issue-2190-wal-revert.test.ts</a>) encodes B as assertions, plus the <code>createConnection()</code> defaults. On <code>fcada5a3b</code> all three pass: they document the current behaviour. The first test only checks connection pragmas and that a leaked handle leaves the main file empty; it lives in <code>packages/db</code> and never calls <code>runShutdown()</code> or the sweep, so a fix in <code>apps/server</code> will not change its outcome. A fix PR needs a server-level companion (start the server against a temp data dir, write, run shutdown, assert the main file alone contains the rows). The third test now also asserts that the post-revert commit leaves the <code>bb.db</code> mtime unchanged.</p>
+  <pre>RUN  v4.1.1 /Users/sawyerhood/.bb-machines/bee.getbb.app/checkouts/bb/.claude/worktrees/wf_21e66a79-f02-14/packages/db
+
+
+ Test Files  1 passed (1)
+      Tests  3 passed (3)
+   Start at  08:51:21
+   Duration  809ms (transform 165ms, setup 0ms, import 374ms, tests 280ms, environment 0ms)
+</pre>
+  <details><summary>issue-2190-wal-revert.test.ts (inline)</summary><pre>/**
+ * Reproduction harness for get-bb/bb#2190 ("SQLite db silently reverted to a
+ * 2-week-old state while the server was running").
+ *
+ * bb opens bb.db exactly once (apps/server/src/start-server.ts -&gt; initDb -&gt;
+ * createConnection) in WAL mode and never closes the handle (runShutdown only
+ * closes HTTP/WS and then process.exit()s). The main bb.db file therefore only
+ * advances when SQLite's 1000-page auto-checkpoint fires; everything since the
+ * last checkpoint lives only in bb.db-wal + the wal-index (bb.db-shm).
+ *
+ * These tests show, with bb's real connection settings:
+ *  1. the main file lags the WAL (a copy of bb.db without -wal is a snapshot at
+ *     the last checkpoint),
+ *  2. if the WAL header / wal-index becomes unreadable while the connection is
+ *     OPEN, SQLite runs recovery, finds zero valid frames and silently serves
+ *     the last-checkpoint snapshot from the same open handle (no error, no
+ *     log line, no restart) - the next write restarts the WAL at frame 1 with the
+ *     SAME salt (recovery copies the salt before the checksum check), so
+ *     "replaying the WAL on a copy" cannot surface the lost rows,
+ *  3. the lost pages are physically still in the WAL file as stale-salt frames
+ *     and can be recovered with the forensic tool next to this test.
+ *
+ * All three tests PASS on main (fcada5a3b): they document the current
+ * behaviour. Test 1 only checks createConnection()'s defaults and that a leaked
+ * handle leaves the main file empty; it does not exercise apps/server's
+ * runShutdown() or the periodic sweep, so a fix in apps/server needs its own
+ * server-level test (see the report's "Proposed fix").
+ */
+import { execFileSync } from "node:child_process";
+import {
+  copyFileSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import Database from "better-sqlite3";
+import { sql } from "drizzle-orm";
+import { afterEach, describe, expect, it } from "vitest";
+import { createConnection, type DbConnection } from "../src/connection.js";
+import { ensurePersonalProject } from "../src/data/projects.js";
+import { migrate } from "../src/migrate.js";
+import { projects } from "../src/schema.js";
+// Plain ESM helper (no types): it is the same file a user would run by hand.
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore
+import { inspect, recoverGeneration } from "./issue-2190-wal-tool.mjs";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const WAL_TOOL = join(here, "issue-2190-wal-tool.mjs");
+
+interface WalInspection {
+  exists: boolean;
+  fileBytes: number;
+  header: {
+    salt1: number;
+    salt2: number;
+    checkpointSeq: number;
+    checksumValid: boolean;
+    pageSize: number;
+  } | null;
+  totalFrames: number;
+  liveFrameCount: number;
+  generations: Array&lt;{
+    salt1: number;
+    salt2: number;
+    frameCount: number;
+    firstIndex: number;
+    lastIndex: number;
+    commitFrames: number;
+    isLive: boolean;
+  }&gt;;
+}
+
+interface RecoverResult {
+  outDb: string;
+  appliedFrames: number;
+  overwrittenPrefixFrames: number;
+}
+
+const inspectWal = inspect as (dbPath: string) =&gt; WalInspection;
+const recoverWal = recoverGeneration as (
+  dbPath: string,
+  outDir: string,
+) =&gt; RecoverResult;
+
+const tempDirs: string[] = [];
+const openDbs: DbConnection[] = [];
+
+function makeDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), "bb-2190-"));
+  tempDirs.push(dir);
+  return dir;
+}
+
+function openBbDb(dbPath: string): DbConnection {
+  const db = createConnection(dbPath);
+  openDbs.push(db);
+  return db;
+}
+
+function projectNames(db: DbConnection): string[] {
+  return db
+    .select({ name: projects.name })
+    .from(projects)
+    .orderBy(projects.name)
+    .all()
+    .map((row) =&gt; row.name);
+}
+
+/** Names visible in the main file alone (what a reader gets if the WAL is gone). */
+function mainFileOnlyProjectNames(dbPath: string): string[] {
+  const dir = makeDir();
+  const copyPath = join(dir, "main-only.db");
+  copyFileSync(dbPath, copyPath);
+  const copy = new Database(copyPath, { readonly: true });
+  try {
+    const hasProjectsTable =
+      copy
+        .prepare&lt;[], { n: number }&gt;(
+          "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'projects'",
+        )
+        .get()?.n === 1;
+    if (!hasProjectsTable) {
+      // Not even the schema has reached the main file yet.
+      return ["&lt;main file has no projects table&gt;"];
+    }
+    return copy
+      .prepare&lt;[], { name: string }&gt;("SELECT name FROM projects ORDER BY name")
+      .all()
+      .map((row) =&gt; row.name);
+  } finally {
+    copy.close();
+  }
+}
+
+function insertProject(db: DbConnection, name: string): void {
+  const now = Date.now();
+  db.insert(projects)
+    .values({ id: `proj_${name}`, name, createdAt: now, updatedAt: now })
+    .run();
+}
+
+/** Runs file surgery from ANOTHER process, like any external actor would. */
+function runInChildProcess(script: string): void {
+  execFileSync(process.execPath, ["-e", script], { stdio: "pipe" });
+}
+
+afterEach(() =&gt; {
+  for (const db of openDbs.splice(0)) {
+    try {
+      db.$client.close();
+    } catch {
+      // already closed
+    }
+  }
+  for (const dir of tempDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+describe("issue #2190: WAL-only durability of bb.db", () =&gt; {
+  it("uses WAL with a 1000-page auto-checkpoint and no checkpoint on shutdown", () =&gt; {
+    const dir = makeDir();
+    const dbPath = join(dir, "bb.db");
+    const db = openBbDb(dbPath);
+    migrate(db);
+    ensurePersonalProject(db);
+
+    const pragma = (name: string): unknown =&gt; db.$client.pragma(name, { simple: true });
+    expect(pragma("journal_mode")).toBe("wal");
+    expect(pragma("wal_autocheckpoint")).toBe(1000);
+    expect(pragma("synchronous")).toBe(1); // NORMAL
+    expect(pragma("journal_size_limit")).toBe(-1);
+
+    insertProject(db, "after-checkpoint-a");
+    insertProject(db, "after-checkpoint-b");
+
+    // The rows are committed and visible through the open handle ...
+    expect(projectNames(db)).toEqual(["Personal", "after-checkpoint-a", "after-checkpoint-b"]);
+    // ... but the main file does not contain them - on a fresh install it does
+    // not even contain the schema: migrations, the Personal project and every
+    // later row exist only in -wal until 1000 pages accumulate.
+    expect(mainFileOnlyProjectNames(dbPath)).toEqual(["&lt;main file has no projects table&gt;"]);
+    const wal = inspectWal(dbPath);
+    expect(wal.exists).toBe(true);
+    expect(wal.liveFrameCount).toBeGreaterThan(0);
+
+    // bb's server shutdown path never calls close(); this test mirrors that by
+    // letting the handle leak (afterEach closes it later). The main file stays
+    // empty. NOTE: this is a packages/db-level statement about connection
+    // defaults; it cannot observe a fix made in apps/server/src/start-server.ts.
+    expect(mainFileOnlyProjectNames(dbPath)).toEqual(["&lt;main file has no projects table&gt;"]);
+  });
+
+  it("auto-checkpoints only once the WAL passes 1000 pages", () =&gt; {
+    const dir = makeDir();
+    const dbPath = join(dir, "bb.db");
+    const db = openBbDb(dbPath);
+    migrate(db);
+    ensurePersonalProject(db);
+    insertProject(db, "needle");
+    expect(mainFileOnlyProjectNames(dbPath)).toEqual(["&lt;main file has no projects table&gt;"]);
+
+    // Write &gt;1000 pages of unrelated data; the commit that crosses the
+    // threshold triggers a PASSIVE checkpoint that carries "needle" along.
+    db.run(sql`CREATE TABLE IF NOT EXISTS padding (id INTEGER PRIMARY KEY, blob BLOB)`);
+    const insertPadding = db.$client.prepare("INSERT INTO padding (blob) VALUES (?)");
+    const payload = Buffer.alloc(3_500, 1);
+    for (let index = 0; index &lt; 1_200; index += 1) {
+      insertPadding.run(payload);
+    }
+    expect(mainFileOnlyProjectNames(dbPath)).toEqual(["Personal", "needle"]);
+  });
+
+  it("silently serves the last checkpoint from an OPEN handle once the WAL header is unreadable", () =&gt; {
+    const dir = makeDir();
+    const dbPath = join(dir, "bb.db");
+    const db = openBbDb(dbPath);
+    migrate(db);
+    ensurePersonalProject(db);
+
+    // "Aug 9": force a full checkpoint so the main file holds this state.
+    insertProject(db, "old-project-from-aug-9");
+    db.$client.pragma("wal_checkpoint(TRUNCATE)");
+    expect(mainFileOnlyProjectNames(dbPath)).toEqual(["Personal", "old-project-from-aug-9"]);
+
+    // "Aug 9 -&gt; Aug 21": the user deletes the old project and creates new ones.
+    // Each statement is its own transaction, so each becomes WAL frames.
+    db.delete(projects).where(sql`${projects.id} = 'proj_old-project-from-aug-9'`).run();
+    const lostNames = Array.from({ length: 40 }, (_, index) =&gt; `lost-${String(index).padStart(2, "0")}`);
+    for (const name of lostNames) insertProject(db, name);
+    expect(projectNames(db)).toEqual(["Personal", ...lostNames]);
+    expect(mainFileOnlyProjectNames(dbPath)).toEqual(["Personal", "old-project-from-aug-9"]);
+
+    const before = inspectWal(dbPath);
+    expect(before.header?.checksumValid).toBe(true);
+    expect(before.liveFrameCount).toBe(before.totalFrames);
+    const walBytesBefore = statSync(`${dbPath}-wal`).size;
+
+    // The event: some other actor makes the wal-index + WAL header unreadable.
+    // (Zero the -shm in place and flip one bit of the WAL header checksum.)
+    // Done from a separate process so this test's own fds never touch
+    // SQLite's POSIX locks.
+    runInChildProcess(`
+      const fs = require("node:fs");
+      const shm = ${JSON.stringify(`${dbPath}-shm`)};
+      const wal = ${JSON.stringify(`${dbPath}-wal`)};
+      const shmFd = fs.openSync(shm, "r+");
+      fs.writeSync(shmFd, Buffer.alloc(fs.fstatSync(shmFd).size, 0), 0);
+      fs.closeSync(shmFd);
+      const walFd = fs.openSync(wal, "r+");
+      const header = Buffer.alloc(32);
+      fs.readSync(walFd, header, 0, 32, 0);
+      header[24] ^= 0x01;
+      fs.writeSync(walFd, header, 0, 32, 0);
+      fs.closeSync(walFd);
+    `);
+
+    // Same process, same open handle, no restart, no exception: the next read
+    // runs WAL recovery, finds no valid frames and returns the "Aug 9" world.
+    const afterRevert = projectNames(db);
+    expect(afterRevert).toEqual(["Personal", "old-project-from-aug-9"]);
+
+    // The server keeps working and writing: the next commit restarts the WAL
+    // at frame 1 with the same salt. bb.db itself is NOT written by this
+    // commit (no checkpoint runs); see the walkthrough, steps 6 and 9-10.
+    const mainMtimeBefore = statSync(dbPath).mtimeMs;
+    insertProject(db, "created-after-revert");
+    expect(statSync(dbPath).mtimeMs).toBe(mainMtimeBefore);
+    expect(projectNames(db)).toEqual(["Personal", "created-after-revert", "old-project-from-aug-9"]);
+
+    const after = inspectWal(dbPath);
+    expect(after.header?.checksumValid).toBe(true);
+    // WAL file keeps its old size ("the WAL was ~7 MB") ...
+    expect(statSync(`${dbPath}-wal`).size).toBeGreaterThanOrEqual(walBytesBefore);
+    // ... but only the new, tiny generation is live; the rest is stale-salt.
+    expect(after.liveFrameCount).toBeLessThan(after.totalFrames);
+    const stale = after.generations.filter((generation) =&gt; !generation.isLive);
+    expect(stale.length).toBeGreaterThanOrEqual(1);
+    expect(stale[0]?.frameCount).toBeGreaterThan(after.liveFrameCount);
+
+    // "Replaying the WAL on a copy does not surface the lost rows either":
+    // copying bb.db + -wal (+ -shm) elsewhere and opening only replays the
+    // live generation.
+    const replayDir = makeDir();
+    for (const suffix of ["", "-wal", "-shm"]) {
+      if (existsSync(`${dbPath}${suffix}`)) copyFileSync(`${dbPath}${suffix}`, join(replayDir, `bb.db${suffix}`));
+    }
+    const replay = new Database(join(replayDir, "bb.db"));
+    try {
+      expect(
+        replay.prepare&lt;[], { name: string }&gt;("SELECT name FROM projects ORDER BY name").all().map((row) =&gt; row.name),
+      ).toEqual(["Personal", "created-after-revert", "old-project-from-aug-9"]);
+    } finally {
+      replay.close();
+    }
+
+    // Forensics: the lost pages are still in the file as stale frames. Rebuild
+    // the stale generation onto a copy of the main file.
+    const recovered = recoverWal(dbPath, join(dir, "recovered"));
+    expect(recovered.appliedFrames).toBeGreaterThan(0);
+    const recoveredDb = new Database(recovered.outDb, { readonly: true });
+    try {
+      const integrity = recoveredDb.pragma("integrity_check", { simple: true });
+      const names = recoveredDb
+        .prepare&lt;[], { name: string }&gt;("SELECT name FROM projects ORDER BY name")
+        .all()
+        .map((row) =&gt; row.name);
+      // Frames 1..k of the stale generation were overwritten by the new
+      // generation, so recovery is best-effort; here the hot pages were
+      // rewritten by later transactions and everything comes back.
+      expect(integrity).toBe("ok");
+      expect(names).toEqual(["Personal", ...lostNames]);
+      expect(names).not.toContain("created-after-revert");
+    } finally {
+      recoveredDb.close();
+    }
+
+    // The CLI form of the tool prints the same inspection.
+    const cliOutput = execFileSync(process.execPath, [WAL_TOOL, "inspect", dbPath], { encoding: "utf8" });
+    expect(JSON.parse(cliOutput).generations.length).toBe(after.generations.length);
+    expect(readFileSync(WAL_TOOL, "utf8")).toContain("recoverGeneration");
+  });
+});
+</pre></details>
+  <details><summary>issue-2190-wal-tool.mjs (inline)</summary><pre>// Forensic helper for get-bb/bb#2190: parse a SQLite WAL file, report which
+// frames belong to the live "generation" (salt pair in the WAL header) and
+// which are stale frames from an earlier generation, and optionally rebuild
+// the previous generation onto a copy of the main database file.
+//
+// Usage:
+//   node issue-2190-wal-tool.mjs inspect &lt;path/to/bb.db&gt;
+//   node issue-2190-wal-tool.mjs recover &lt;path/to/bb.db&gt; &lt;out-dir&gt; [--salt1 N]
+//
+// Background (https://www.sqlite.org/fileformat2.html#walformat): every WAL
+// frame carries the salt pair that was in the WAL header when it was written.
+// When SQLite "restarts" the WAL (writes frame 1 again with salt1+1 and a new
+// random salt2), the older frames physically remain in the file but are
+// invisible to recovery because their salts no longer match the header. A
+// database that "reverted to the last checkpoint" therefore usually still has
+// the lost pages sitting in the WAL file as stale-salt frames.
+import { copyFileSync, mkdirSync, openSync, readFileSync, writeSync, closeSync, ftruncateSync, existsSync } from "node:fs";
+import { basename, join } from "node:path";
+
+const WAL_HEADER_SIZE = 32;
+const FRAME_HEADER_SIZE = 24;
+const WAL_MAGIC_LE = 0x377f0682;
+const WAL_MAGIC_BE = 0x377f0683;
+
+function walChecksum(bigEndian, buffer, start, end, s0 = 0, s1 = 0) {
+  // SQLite's checksum walks the region in 8-byte steps using native (LE) or
+  // big-endian 32-bit words depending on the magic number.
+  for (let i = start; i &lt; end; i += 8) {
+    const x0 = bigEndian ? buffer.readUInt32BE(i) : buffer.readUInt32LE(i);
+    const x1 = bigEndian ? buffer.readUInt32BE(i + 4) : buffer.readUInt32LE(i + 4);
+    s0 = (s0 + x0 + s1) &gt;&gt;&gt; 0;
+    s1 = (s1 + x1 + s0) &gt;&gt;&gt; 0;
+  }
+  return [s0, s1];
+}
+
+export function parseWal(walPath) {
+  const wal = readFileSync(walPath);
+  if (wal.length &lt; WAL_HEADER_SIZE) {
+    return { header: null, frames: [], fileBytes: wal.length, reason: "file shorter than a WAL header" };
+  }
+  const magic = wal.readUInt32BE(0);
+  if (magic !== WAL_MAGIC_LE &amp;&amp; magic !== WAL_MAGIC_BE) {
+    return { header: null, frames: [], fileBytes: wal.length, reason: `bad magic 0x${magic.toString(16)}` };
+  }
+  const bigEndian = magic === WAL_MAGIC_BE;
+  const header = {
+    magic,
+    bigEndian,
+    version: wal.readUInt32BE(4),
+    pageSize: wal.readUInt32BE(8),
+    checkpointSeq: wal.readUInt32BE(12),
+    salt1: wal.readUInt32BE(16),
+    salt2: wal.readUInt32BE(20),
+    cksum1: wal.readUInt32BE(24),
+    cksum2: wal.readUInt32BE(28),
+  };
+  const [h0, h1] = walChecksum(bigEndian, wal, 0, 24);
+  header.checksumValid = h0 === header.cksum1 &amp;&amp; h1 === header.cksum2;
+
+  const frameSize = FRAME_HEADER_SIZE + header.pageSize;
+  const frames = [];
+  let s0 = header.cksum1;
+  let s1 = header.cksum2;
+  let chainIntact = header.checksumValid;
+  let offset = WAL_HEADER_SIZE;
+  let index = 1;
+  while (offset + frameSize &lt;= wal.length) {
+    const frame = {
+      index,
+      offset,
+      pgno: wal.readUInt32BE(offset),
+      dbSizeAfterCommit: wal.readUInt32BE(offset + 4),
+      salt1: wal.readUInt32BE(offset + 8),
+      salt2: wal.readUInt32BE(offset + 12),
+      cksum1: wal.readUInt32BE(offset + 16),
+      cksum2: wal.readUInt32BE(offset + 20),
+      dataOffset: offset + FRAME_HEADER_SIZE,
+    };
+    frame.saltMatchesHeader = frame.salt1 === header.salt1 &amp;&amp; frame.salt2 === header.salt2;
+    if (chainIntact &amp;&amp; frame.saltMatchesHeader) {
+      [s0, s1] = walChecksum(bigEndian, wal, offset, offset + 8, s0, s1);
+      [s0, s1] = walChecksum(bigEndian, wal, frame.dataOffset, frame.dataOffset + header.pageSize, s0, s1);
+      frame.checksumValid = s0 === frame.cksum1 &amp;&amp; s1 === frame.cksum2;
+      if (!frame.checksumValid) chainIntact = false;
+    } else {
+      frame.checksumValid = false;
+      chainIntact = false;
+    }
+    frames.push(frame);
+    offset += frameSize;
+    index += 1;
+  }
+  // Recovery only honours valid frames up to and including the last commit
+  // frame (dbSizeAfterCommit &gt; 0) of the unbroken chain.
+  let liveFrameCount = 0;
+  for (const frame of frames) {
+    if (!frame.checksumValid) break;
+    if (frame.dbSizeAfterCommit &gt; 0) liveFrameCount = frame.index;
+  }
+  // Classify: "live" = replayed by SQLite; "live-uncommitted" = chain-valid
+  // frames after the last commit (an in-flight transaction); "stale" = beyond
+  // the chain break. Stale frames keep whatever salt they were written with:
+  // a normal WAL restart bumps salt1, but recovery after an unreadable header
+  // keeps the on-disk salt and simply rewrites frame 1 onwards, so stale
+  // frames can carry the SAME salt as the live header.
+  for (const frame of frames) {
+    frame.status = frame.checksumValid
+      ? frame.index &lt;= liveFrameCount ? "live" : "live-uncommitted"
+      : "stale";
+  }
+  return { header, frames, fileBytes: wal.length, liveFrameCount, wal };
+}
+
+export function summarizeGenerations(parsed) {
+  const groups = new Map();
+  for (const frame of parsed.frames) {
+    const isLive = frame.status !== "stale";
+    const key = `${isLive ? "live" : "stale"}:${frame.salt1}:${frame.salt2}`;
+    let group = groups.get(key);
+    if (!group) {
+      group = { salt1: frame.salt1, salt2: frame.salt2, frameCount: 0, firstIndex: frame.index, lastIndex: frame.index, commitFrames: 0, pages: new Set(), isLive };
+      groups.set(key, group);
+    }
+    group.frameCount += 1;
+    group.lastIndex = frame.index;
+    if (frame.dbSizeAfterCommit &gt; 0) group.commitFrames += 1;
+    group.pages.add(frame.pgno);
+  }
+  return [...groups.values()].sort((a, b) =&gt; Number(b.isLive) - Number(a.isLive) || a.firstIndex - b.firstIndex);
+}
+
+/**
+ * Parse the wal-index header (-shm). Layout per wal.c: two 48-byte copies of
+ * WalIndexHdr (native byte order) followed by WalCkptInfo. mxFrame is the last
+ * valid frame readers may use, nBackfill how many frames a checkpoint has
+ * copied into the main file, aReadMark[] the snapshot each reader slot pins.
+ * A long-lived reader pins checkpoints at its aReadMark value, which is how a
+ * main file can sit weeks behind the WAL.
+ */
+export function parseShm(shmPath) {
+  if (!existsSync(shmPath)) return { exists: false };
+  const shm = readFileSync(shmPath);
+  if (shm.length &lt; 136) return { exists: true, fileBytes: shm.length, reason: "shorter than a wal-index header" };
+  const readHdr = (o) =&gt; ({
+    iVersion: shm.readUInt32LE(o),
+    iChange: shm.readUInt32LE(o + 8),
+    isInit: shm[o + 12],
+    bigEndCksum: shm[o + 13],
+    szPage: shm.readUInt16LE(o + 14),
+    mxFrame: shm.readUInt32LE(o + 16),
+    nPage: shm.readUInt32LE(o + 20),
+    salt1: shm.readUInt32BE(o + 32),
+    salt2: shm.readUInt32BE(o + 36),
+  });
+  const copy1 = readHdr(0);
+  const copy2 = readHdr(48);
+  const ckpt = {
+    nBackfill: shm.readUInt32LE(96),
+    aReadMark: [0, 1, 2, 3, 4].map((i) =&gt; shm.readUInt32LE(100 + i * 4)),
+    nBackfillAttempted: shm.readUInt32LE(128),
+  };
+  return { exists: true, fileBytes: shm.length, copy1, copy2, copiesMatch: JSON.stringify(copy1) === JSON.stringify(copy2), ckpt };
+}
+
+export function inspect(dbPath) {
+  const walPath = `${dbPath}-wal`;
+  const shm = parseShm(`${dbPath}-shm`);
+  if (!existsSync(walPath)) {
+    return { dbPath, walPath, exists: false, shm };
+  }
+  const parsed = parseWal(walPath);
+  const generations = parsed.header ? summarizeGenerations(parsed) : [];
+  return {
+    dbPath,
+    walPath,
+    exists: true,
+    fileBytes: parsed.fileBytes,
+    header: parsed.header,
+    reason: parsed.reason,
+    totalFrames: parsed.frames.length,
+    liveFrameCount: parsed.liveFrameCount ?? 0,
+    generations: generations.map((g) =&gt; ({ ...g, distinctPages: g.pages.size, pages: undefined })),
+    shm,
+  };
+}
+
+/**
+ * Best-effort rebuild of a stale generation. Frames 1..k of the stale
+ * generation were overwritten by the live generation, so the checksum chain
+ * cannot be verified; instead the surviving stale frames are applied in file
+ * order onto a copy of the main database file up to the last stale commit
+ * frame. Pages whose only copy lived in the overwritten prefix are missing,
+ * so always run PRAGMA integrity_check on the result. NOTE: the copy of the
+ * main file must be the one from the cold backup taken right after the
+ * incident; later checkpoints overwrite pages of the main file too.
+ */
+export function recoverGeneration(dbPath, outDir, { salt1 } = {}) {
+  const parsed = parseWal(`${dbPath}-wal`);
+  if (!parsed.header) throw new Error(`not a WAL file: ${parsed.reason}`);
+  const generations = summarizeGenerations(parsed);
+  // Default: the stale generation holding the most frames. (After a normal
+  // WAL restart salt1 is old+1; after recovery of an unreadable header SQLite
+  // keeps the on-disk salt, so stale frames may share the live salt. Neither
+  // "header salt1 - 1" nor "different salt" is a reliable default.)
+  const candidates = generations.filter((g) =&gt; !g.isLive &amp;&amp; (salt1 === undefined || g.salt1 === salt1));
+  if (candidates.length === 0) {
+    throw new Error(`no stale generation${salt1 === undefined ? "" : ` with salt1=${salt1}`}; generations: ${JSON.stringify(generations.map((g) =&gt; ({ salt1: g.salt1, frames: g.frameCount, live: g.isLive })))}`);
+  }
+  const target = candidates.sort((a, b) =&gt; b.frameCount - a.frameCount)[0];
+  const frames = parsed.frames.filter((f) =&gt; f.status === "stale" &amp;&amp; f.salt1 === target.salt1 &amp;&amp; f.salt2 === target.salt2);
+  let lastCommit = -1;
+  for (let i = 0; i &lt; frames.length; i += 1) if (frames[i].dbSizeAfterCommit &gt; 0) lastCommit = i;
+  const applied = frames.slice(0, lastCommit + 1);
+
+  mkdirSync(outDir, { recursive: true });
+  const outDb = join(outDir, basename(dbPath));
+  copyFileSync(dbPath, outDb);
+  const fd = openSync(outDb, "r+");
+  try {
+    const { pageSize } = parsed.header;
+    let finalDbSize = 0;
+    for (const frame of applied) {
+      writeSync(fd, parsed.wal, frame.dataOffset, pageSize, (frame.pgno - 1) * pageSize);
+      if (frame.dbSizeAfterCommit &gt; 0) finalDbSize = frame.dbSizeAfterCommit;
+    }
+    if (finalDbSize &gt; 0) ftruncateSync(fd, finalDbSize * pageSize);
+  } finally {
+    closeSync(fd);
+  }
+  return {
+    outDb,
+    generation: { salt1: target.salt1, salt2: target.salt2, firstIndex: target.firstIndex, lastIndex: target.lastIndex },
+    appliedFrames: applied.length,
+    skippedTrailingFrames: frames.length - applied.length,
+    overwrittenPrefixFrames: target.firstIndex - 1,
+  };
+}
+
+const invokedDirectly = process.argv[1] &amp;&amp; import.meta.url.endsWith(basename(process.argv[1]));
+if (invokedDirectly) {
+  const [command, dbPath, outDir, ...rest] = process.argv.slice(2);
+  if (command === "inspect" &amp;&amp; dbPath) {
+    console.log(JSON.stringify(inspect(dbPath), null, 2));
+  } else if (command === "recover" &amp;&amp; dbPath &amp;&amp; outDir) {
+    const saltFlag = rest.indexOf("--salt1");
+    const salt1 = saltFlag !== -1 ? Number(rest[saltFlag + 1]) : undefined;
+    console.log(JSON.stringify(recoverGeneration(dbPath, outDir, { salt1 }), null, 2));
+  } else {
+    console.error("usage: issue-2190-wal-tool.mjs inspect &lt;bb.db&gt; | recover &lt;bb.db&gt; &lt;out-dir&gt; [--salt1 N]");
+    process.exit(2);
+  }
+}
+</pre></details>
+
+  <h3>F. What the reporter should run on the cold copy (settles the trigger and may recover the data)</h3>
+  <ol start="9">
+    <li><pre>node issue-2190-wal-tool.mjs inspect /path/to/cold-copy/bb.db</pre>
+      <ul>
+        <li><code>header.checksumValid</code>, <code>liveFrameCount</code> vs <code>totalFrames</code>, and <code>generations[]</code>: a small live generation followed by a large stale one (frames with <code>isLive:false</code>) confirms the "WAL invalidated and restarted" mechanism and means the Aug 9–21 pages are still in the file. A single fully-live generation whose content is all ≤ Aug 9 would instead point at an external restore of the three files.</li>
+        <li><code>shm.ckpt.nBackfill</code> / <code>nBackfillAttempted</code> / <code>aReadMark</code> from the cold <code>-shm</code>: <code>nBackfill</code> far below <code>mxFrame</code> before the incident means checkpoints were pinned.</li>
+        <li><code>header.checkpointSeq</code> and <code>salt1</code> vs the stale frames' <code>salt1</code>: equal salts mean recovery after an unreadable header; <code>salt1+1</code> means a normal WAL restart (which requires a completed checkpoint and would be a different story).</li>
+      </ul></li>
+    <li>If stale frames exist: <pre>node issue-2190-wal-tool.mjs recover /path/to/cold-copy/bb.db /tmp/bb-2190-recovered
+sqlite3 /tmp/bb-2190-recovered/bb.db 'PRAGMA integrity_check; SELECT id,name,created_at FROM projects; SELECT COUNT(*) FROM threads;'</pre>
+      Frames overwritten by the post-incident generation (the first few dozen) are gone, so treat the result as best-effort and run <code>integrity_check</code>; in the simulated case hot pages were rewritten by later transactions and everything came back.</li>
+    <li>At the time of the incident, <code>lsof ~/.bb/bb.db*</code> would have listed the pinning reader; <code>fs_usage -w -f filesys | grep bb.db</code> would show who wrote the WAL/shm. Worth running now if the problem recurs.</li>
+  </ol>
+
+  <h2>5. Root cause</h2>
+  <h3>5.1 bb's durability posture turns any WAL loss into unbounded data loss</h3>
+  <p><a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/packages/db/src/connection.ts#L164-L190"><code>packages/db/src/connection.ts createConnection()</code></a> enables WAL and leaves the checkpoint policy at SQLite's defaults:</p>
+  <pre>export function createConnection(
+  dbPath: string = "bb.db",
+  options: CreateConnectionOptions = {},
+) {
+  const sqlite = new Database(dbPath);
+  sqlite.pragma("auto_vacuum = INCREMENTAL");
+  // Enable WAL mode for better concurrent read performance
+  sqlite.pragma("journal_mode = WAL");
+  sqlite.pragma("foreign_keys = ON");
+  // WAL + NORMAL: no fsync per commit. Power loss can drop the last
+  // transactions; it cannot corrupt the file. ...
+  sqlite.pragma("synchronous = NORMAL");
+  sqlite.pragma(`cache_size = -${SQLITE_CACHE_SIZE_KIB}`);
+  sqlite.pragma(`mmap_size = ${SQLITE_MMAP_SIZE_BYTES}`);
+  sqlite.pragma(`busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+  // (no wal_autocheckpoint / journal_size_limit: SQLite defaults apply,
+  //  i.e. a PASSIVE checkpoint is attempted only once the WAL holds &gt;= 1000 pages)
+</pre>
+  <p>The server opens the database once (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/start-server.ts#L53-L56"><code>apps/server/src/start-server.ts L53-L56</code></a> → <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/db.ts#L22-L46"><code>initDb</code></a>) and the shutdown path never closes it:</p>
+  <pre>  const runShutdown = (): Promise&lt;void&gt; =&gt; {
+    ...
+    shutdownPromise = (async () =&gt; {
+      eventLoopStallMonitor.stop();
+      clearInterval(sweepInterval);
+      pluginCatalogService.stopPeriodicRefresh();
+      await pluginService.stopPeriodicUpdateChecks();
+      await pluginService.stop().catch(...);
+      const closeServer = new Promise&lt;void&gt;((resolve, reject) =&gt; { server.close(...) });
+      await closeWebSockets();
+      await closeServer;
+      // &lt;-- db.$client.close() is never called: no checkpoint at shutdown
+    })();
+    return shutdownPromise;
+  };
+  ...
+  process.once("SIGTERM", () =&gt; {
+    void runShutdown().finally(() =&gt; process.exit(0));
+  });
+</pre>
+  <p>Consequences, all observed on the real instance (section 4A): the only thing that ever moves the main file is the auto-checkpoint when the WAL reaches 1000 pages; a fresh install's <code>bb.db</code> is a single empty page with the entire database in the WAL; SIGTERM leaves it that way; a light-usage install may never reach 1000 pages; and any reader that holds a read transaction pins even those checkpoints (section 4C). The hourly maintenance sweep (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/services/system/periodic-sweeps.ts#L301-L333"><code>apps/server/src/services/system/periodic-sweeps.ts L301-L333</code></a>) only issues <code>wal_checkpoint(PASSIVE)</code> when the freelist exceeds 1024 pages, which a small database never hits (my instance logged only <code>Incremental database vacuum skipped below freelist threshold</code>). Nothing logs WAL size, checkpoint progress or recovery.</p>
+
+  <h3>5.2 SQLite treats an unreadable WAL as empty, silently</h3>
+  <p>When a connection finds the wal-index header invalid (zeroed <code>-shm</code>, mismatching copies) it re-runs <code>walIndexRecover()</code> against the WAL file. In SQLite 3.53.1 as bundled by better-sqlite3 12.10.0 (<code>deps/sqlite3/sqlite3.c</code> at lines 68880-68892):</p>
+  <pre>    /* Verify that the WAL header checksum is correct */
+    walChecksumBytes(pWal-&gt;hdr.bigEndCksum==SQLITE_BIGENDIAN,
+        aBuf, WAL_HDRSIZE-2*4, 0, pWal-&gt;hdr.aFrameCksum
+    );
+    if( pWal-&gt;hdr.aFrameCksum[0]!=sqlite3Get4byte(&amp;aBuf[24])
+     || pWal-&gt;hdr.aFrameCksum[1]!=sqlite3Get4byte(&amp;aBuf[28])
+    ){
+      goto finished;          /* &lt;-- WAL treated as EMPTY, no error returned */
+    }
+</pre>
+  <p>A bad magic number, page size or header checksum, or a broken frame checksum chain, ends recovery with <code>mxFrame = 0</code> (or the last valid commit) and <code>SQLITE_OK</code>. The handle that bb has had open since Aug 16 then reads pages from the main file, which is the last checkpoint. The next commit writes frame 1 again with the same salt (the salt is copied before the checksum check), so the old frames beyond the new ones are unreachable to SQLite but physically present, which is exactly why "the WAL was ~7 MB" yet "replaying it does not surface the lost rows" and why the forensic tool can still read them.</p>
+
+  <h3>5.3 What I could not establish: the trigger</h3>
+  <p>I traced every reference to the database path in the repo. Only the server process opens <code>bb.db</code> (<code>lsof</code> on the live instance confirms: one pid). Plugins get <code>plugins/&lt;id&gt;/data.db</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/services/plugins/plugin-api.ts#L654-L661"><code>apps/server/src/services/plugins/plugin-api.ts L654-L661</code></a>); plugin state snapshots copy only those files (their <code>wal_checkpoint(TRUNCATE)</code> at <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/services/plugins/plugin-state-snapshot.ts#L180-L180"><code>apps/server/src/services/plugins/plugin-state-snapshot.ts L180-L180</code></a> runs on a plugin <code>data.db</code> handle); <code>bb-app</code> and the desktop app only print the path (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/packages/bb-app/src/launcher.ts#L3535-L3535"><code>packages/bb-app/src/launcher.ts L3535-L3535</code></a>); the legacy dev-data migration renames files inside <code>~/.bb-dev</code>; the only <code>VACUUM</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/packages/db/src/data/maintenance.ts#L406-L426"><code>compactDatabase</code></a>) runs on the server's own handle for legacy non-incremental databases and cannot revert data. No code copies, restores, deletes, truncates or reopens <code>bb.db*</code>. The Squirrel update path does not touch <code>~/.bb</code>. So the event at 15:10 came from outside bb.</p>
+  <p>The <code>bb.db</code> mtime is the strongest discriminator between candidates. In WAL mode the only SQLite operation that writes the main file is a checkpoint, a checkpoint copies <em>committed WAL frames into</em> <code>bb.db</code> (data-preserving by construction), and after a WAL-invalidation bb's own handle would not checkpoint again until ~1000 new pages had accumulated (walkthrough step 9). A main file rewritten in the same minute as a data-losing event is therefore hard to attribute to SQLite at all. Candidates, re-ranked with that in mind:</p>
+  <ol>
+    <li><strong>An in-place rewrite of <code>~/.bb/bb.db{,-wal,-shm}</code> by a non-SQLite actor</strong> (dotfile sync, backup/restore agent, a "restore previous version" action, a cloud-sync client reconciling an older copy). Writing an older main file and its companion WAL/shm in place explains the mtime at 15:10, the revert through the open handle (the files are memory-mapped / re-read on the next transaction), the ~7 MB WAL that replays to the old state (it is the old WAL), and the reappearing deleted threads. Fingerprint in the cold copy: a single all-live WAL generation whose newest content is ≤ Aug 9, and <code>bb.db-shm</code>/<code>bb.db-wal</code> mtimes also at 15:10.</li>
+    <li><strong>A tool that had <code>bb.db</code> open since ~Aug 9</strong> (DB browser, <code>sqlite3</code> shell, a backup agent linking SQLite) that pinned checkpoints (section 4C) and at 15:10 damaged the WAL header / wal-index (crash mid-write, unsupported VFS, an explicit "journal mode" action). This explains the revert, the WAL size and the replay failure (section 4B), but <em>not</em> the <code>bb.db</code> mtime unless the same tool also wrote the main file outside of SQLite. Fingerprint: a small live generation followed by a large stale generation with the same salt; the Aug 9–21 pages are then still in the file and <code>recover</code> may bring them back.</li>
+    <li><strong>A third-party in-process plugin touching <code>bb.db</code>/<code>bb.db-shm</code> with <code>fs</code> APIs</strong>, which under POSIX advisory-lock semantics drops the server's SQLite locks and lets a second opener believe it is alone. Same fingerprint and same mtime objection as (2); it only changes who the second opener could be.</li>
+  </ol>
+  <p>The cold copy (section 4F) distinguishes (1) from (2)/(3) in one command. If the WAL shows a stale generation, the data is recoverable today; every further hour of use overwrites more of it.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>bb cannot prevent another process from damaging or replacing files in <code>~/.bb</code>, but it can make the exposure window minutes instead of weeks where that is possible, and make the event loud and recoverable instead of silent where it is not. Which candidate trigger each item mitigates is stated explicitly, because they differ: under candidate (1) (external rewrite of all three files) no checkpoint policy helps and only the tripwire and backups do; under (2)/(3) with a reader pinning the WAL, passive checkpoints copy nothing (section 4C) and the value is the warning; only in the unpinned case do checkpoints bound the loss. Confident about the following:</p>
+  <ol>
+    <li><strong>Checkpoint at shutdown.</strong> In <code>runShutdown()</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/start-server.ts#L272-L298"><code>apps/server/src/start-server.ts L272-L298</code></a>) call <code>db.$client.close()</code> after WebSockets/plugins are stopped (and in the <code>uncaughtException</code> exit). SQLite then performs the close-time checkpoint and deletes the WAL. Mitigates: the "fresh install / light use has an empty <code>bb.db</code> for weeks" exposure (section 4A) across restarts. Does not help the reporter's case as described (the server never restarted between Aug 16 and the event, and a pinned reader blocks the close-time checkpoint too). Risk: close must run after every consumer stopped using the handle; wrap in try/catch so a failing close never blocks exit.</li>
+    <li><strong>Periodic passive checkpoint with progress logging.</strong> Add a cheap sweep (e.g. every 60 s, or in <code>runPeriodicSweeps</code>) that runs <code>PRAGMA wal_checkpoint(PASSIVE)</code> and reads its <code>(busy, log, checkpointed)</code> result. Log at <code>warn</code> when <code>checkpointed &lt; log</code> for several consecutive runs ("a reader is pinning bb.db-wal at frame N; bb.db is M frames behind") and include the WAL byte size. Efficacy, honestly stated: when no reader pins the WAL this bounds the unbackfilled window to ~1 minute instead of 1000 pages. When a reader pins the WAL, as in the report's leading WAL-invalidation scenario, the checkpoint copies nothing (section 4C: <code>{"busy":0,"log":8314,"checkpointed":0}</code>), so the reporter's data would <em>not</em> have been safer, but there would have been a warning naming the problem within minutes of the reader appearing instead of 12 days of silence. Against an external rewrite of all three files it does nothing. Risk: none for correctness (PASSIVE never blocks writers); I/O cost is proportional to new frames only.</li>
+    <li><strong>A tripwire for "the database went backwards"</strong> (mitigates every candidate, including the external rewrite). On every sweep persist a monotonic high-water mark (for example <code>MAX(events.sequence)</code> or a counter in a tiny <code>system_meta</code> row) to a sidecar file in the data dir; if the live value is ever lower than the sidecar, log an error, surface it in the UI/CLI (<code>bb doctor</code>), and stop the periodic checkpoint so post-incident writes do not overwrite the stale frames that still hold the data. The walkthrough shows a 100% recovery is possible right after the event and degrades with every later write.</li>
+    <li><strong>Rolling backups</strong> (the only item that restores data under every candidate). A daily <code>VACUUM INTO '&lt;dataDir&gt;/backups/bb-YYYYMMDD.db'</code> with a small retention (e.g. 7) from the maintenance sweep. The reporter had no APFS snapshot and no bb backup; this is the only thing that turns an unexplained revert into a five-minute restore.</li>
+    <li><strong>Plugin-side guard (defensive, lower confidence).</strong> Document in the plugin SDK that in-process plugins must never open <code>bb.db*</code> with <code>fs</code> (POSIX lock drop), and consider checking <code>lsof</code>-style diagnostics in <code>bb doctor</code>.</li>
+  </ol>
+  <p>Tests: the packages/db test in this report cannot observe a server-level fix (section 4E). A fix PR should add an <code>apps/server</code> test that boots the server against a temp data dir, writes a row, runs the shutdown path and asserts the main file alone (copy of <code>bb.db</code> without <code>-wal</code>) contains the row; a second test that the periodic checkpoint runs and that a pinned reader (open read transaction from a child process, as in <code>issue-2190-pinned-reader.ts</code>) produces the warning; and a third that the tripwire fires when <code>MAX(events.sequence)</code> drops below the sidecar value.</p>
+
+  <h2>7. PR review</h2>
+  <p>No pull requests are linked to this issue.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/1919">#1919</a> (closed 2026-08-19) — <code>storage.database()</code> leaked tens of thousands of SQLite handles on plugin <code>data.db</code> files inside the server process. Different file, but it shows in-process plugins can exhaust fds and interact with SQLite file handling in the same process as <code>bb.db</code>; 0.38.0 predates the fix.</li>
+    <li><a href="https://github.com/get-bb/bb/pull/1438">#1438</a> (merged 2026-08-12, shipped in 0.38.0) — introduced <code>mmap_size</code> and <code>synchronous=NORMAL</code>. Not causal here (no power loss; mmap only changes how main-file pages are read), but any fix PR should keep them in mind when adding checkpoints.</li>
+    <li>No earlier report of a reverting <code>bb.db</code> was found (searched "sqlite WAL", "data loss database", "threads disappeared").</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Commands run</h3>
+  <pre>gh issue view 2190 --repo get-bb/bb --json number,title,body,labels,comments,state,createdAt,author
+pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build
+git grep -n -l -E "journal_mode|wal_checkpoint|wal_autocheckpoint|VACUUM|\.backup\(" -- '*.ts' '*.js' '*.mjs'
+git grep -n -E '"bb\.db"|bb\.db|\.db-wal|\.db-shm' -- '*.ts' '*.js' '*.mjs' '*.json' '*.md'
+git grep -n "createConnection(" -- '*.ts'            # only apps/server/src/db.ts + seed-perf-db
+git grep -n -E "\$client\.close\(\)|sqlite\.close\(\)|db\.close\(\)" -- apps/server/src packages/db/src   # nothing
+git log --format='%h %ad %s' --date=short -S"mmap_size" -- packages/db/src/connection.ts  # d5175bdf5 2026-08-12 (#1438)
+git merge-base --is-ancestor d5175bdf5 desktop-v0.38.0   # yes: 0.38.0 contains #1438
+git fetch origin main; git log fcada5a3b..origin/main --oneline   # 2 unrelated commits
+cd packages/db &amp;&amp; pnpm exec vitest run test/issue-2190-wal-revert.test.ts
+cd packages/db &amp;&amp; pnpm exec tsx test/issue-2190-walkthrough.ts
+cd packages/db &amp;&amp; pnpm exec tsx test/issue-2190-pinned-reader.ts
+cd packages/db &amp;&amp; pnpm exec tsx test/issue-2190-exit-durability.ts
+bash packages/db/test/issue-2190-run-all.sh        # walkthrough, pinned-reader, exit-durability, vitest -&gt; repro/*.txt
+scripts/bb-dev-app current; bash packages/db/test/issue-2190-part-a.sh   # product-level part A -&gt; repro/part-a-transcript.txt
+git show desktop-v0.38.0:packages/db/package.json | grep better-sqlite3  # "12.10.0"
+pnpm dev:stop; rm -rf $DATA; lsof port check</pre>
+  <h3>Artifacts</h3>
+  <ul>
+    <li><a href="2190/repro/walkthrough-output.txt">walkthrough-output.txt</a>, <a href="2190/repro/pinned-reader-output.txt">pinned-reader-output.txt</a>, <a href="2190/repro/exit-durability-output.txt">exit-durability-output.txt</a></li>
+    <li><a href="2190/repro/part-a-transcript.txt">part-a-transcript.txt</a> (verbatim product-level run), <a href="2190/repro/live-inspect-running.json">live-inspect-running.json</a>, <a href="2190/repro/live-inspect-after-sigterm.json">live-inspect-after-sigterm.json</a> (real dev instance)</li>
+    <li>Runners: <a href="2190/repro/issue-2190-part-a.sh">issue-2190-part-a.sh</a>, <a href="2190/repro/issue-2190-run-all.sh">issue-2190-run-all.sh</a> (copy into <code>packages/db/test/</code>)</li>
+    <li><a href="2190/repro/vitest-final.txt">vitest-final.txt</a>; <a href="2190/repro/vitest-run1.txt">vitest-run1.txt</a> is the first draft run whose helper assumed the main file had a <code>projects</code> table; its <code>no such table: projects</code> failure is what revealed that the main file holds no schema at all, and <a href="2190/repro/vitest-run2.txt">vitest-run2.txt</a> is the corrected run.</li>
+    <li>Sources: <a href="2190/repro/issue-2190-wal-tool.mjs">issue-2190-wal-tool.mjs</a>, <a href="2190/repro/issue-2190-live-inspect.mjs">issue-2190-live-inspect.mjs</a>, <a href="2190/repro/issue-2190-walkthrough.ts">issue-2190-walkthrough.ts</a>, <a href="2190/repro/issue-2190-pinned-reader.ts">issue-2190-pinned-reader.ts</a>, <a href="2190/repro/issue-2190-exit-durability.ts">issue-2190-exit-durability.ts</a>, <a href="2190/repro/issue-2190-wal-revert.test.ts">issue-2190-wal-revert.test.ts</a></li>
+  </ul>
+  <h3>Server log of the dev instance (only database-related lines during the whole run)</h3>
+  <pre>@bb/server:dev: [08:52:06] DEBUG: [server] Incremental database vacuum skipped below freelist threshold {"freelistStats":{"databaseBytes":692224,"freelistBytes":0,"freelistCount":0,"pageCount":169,"pageSize":4096}}
+@bb/host-daemon:dev: [08:52:33] INFO: [host-daemon] Disconnected from server {"serverUrl":"http://127.0.0.1:24667","code":1001,"reason":"server-shutdown"}
+@bb/server:dev: [dev-supervisor:server] Child exited unexpectedly with exit code 0. Restarting in 1s.</pre>
+  <h3>Notes on the simulation's fidelity</h3>
+  <p>The only induced step (walkthrough step 4) zeroes <code>bb.db-shm</code> in place and flips one bit in the WAL header checksum from another process. Truncating the shm to zero instead (what a second SQLite opener does when it holds the exclusive DMS lock) would SIGBUS a process that has the shm mapped, which is why the in-place variant was used; SQLite's response (recovery, empty WAL, silent fallback to the main file, same-salt restart) is identical for any cause that leaves the header unreadable. The reporter's process did not crash, which is consistent with an in-place modification rather than a truncation.</p>
+  <h2>10. Verification</h2>
+  <p>An independent verifier re-ran this report in a separate worktree at <code>fcada5a3b</code> with its own dev instance (ports 16384/24384/32384). Part A matched (4096-byte <code>bb.db</code> after start, after project creation and after SIGTERM of the only opener); the walkthrough, pinned-reader, exit-durability and vitest runs matched step for step; every cited code location was confirmed at <code>fcada5a3b</code> and <code>origin/main</code> (<code>15f21ade7</code>) has no change to the relevant paths. The verifier refuted one claim: the "<code>bb.db</code> mtime changed: true" in walkthrough step 6 came from a <code>PRAGMA wal_checkpoint(PASSIVE)</code> the harness itself ran; without it the commit after the revert does not touch <code>bb.db</code>.</p>
+  <p>Changes in this revision, each re-run rather than reworded: the harness checkpoint was removed from step 6 (now prints <code>bb.db mtime changed: false</code>), and steps 9–10 were added to measure when bb would write <code>bb.db</code> on its own (195 commits / 1001 pages later, by which point recovery is impossible) versus an explicitly labelled induced checkpoint; the mtime claim row is now "Not explained by the simulated mechanism" and the TL;DR no longer lists it as reproduced; 5.3 re-ranks the trigger candidates using the mtime and notes that a SQLite checkpoint cannot both write <code>bb.db</code> and lose data; the pinned-reader experiment now issues an explicit passive checkpoint while pinned (<code>checkpointed: 0</code> of 8314) and section 6 states per candidate what each fix does and does not mitigate; section 4E and the test docblock no longer claim the packages/db test can observe a server-level fix, and the test asserts the post-revert commit leaves the mtime unchanged; Part A is fully derived (<code>DATA</code>, host id, scratch repo creation, ports) and was re-run on a fresh instance with the transcript attached; the better-sqlite3 pin (identical 12.10.0 in <code>desktop-v0.38.0</code>), the "same salt" comment and the "recreated data survived" row were corrected. Verifier artifacts live in <a href="2190/verify/">2190/verify/</a>.</p>
+</main></body></html>

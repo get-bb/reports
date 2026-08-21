@@ -1,0 +1,12 @@
+const page = await browser.getPage("bb2093");
+await page.fill("ref/e310", "");
+await page.keyboard.down("Meta");
+await page.keyboard.press("a");
+await page.keyboard.up("Meta");
+await page.keyboard.press("Backspace");
+await new Promise((r) => setTimeout(r, 500));
+await page.fill("ref/e310", "ci.yml");
+await new Promise((r) => setTimeout(r, 2500));
+await page.screenshot({ path: "/tmp/bb-reports/issues/assets/2093-file-search-ci-yml-empty.png" });
+const s2 = await page.snapshot({ interactive: true, track: "search" });
+({ bug: s2.full.slice(-700) });

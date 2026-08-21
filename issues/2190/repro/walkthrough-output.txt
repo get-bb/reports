@@ -1,0 +1,80 @@
+
+== 1. open bb.db with bb's createConnection() + migrate() (what apps/server does at start)
+pragmas: journal_mode=wal wal_autocheckpoint=1000 synchronous=1 mmap_size=1073741824
+files: bb.db=4096 bb.db-wal=646872 bb.db-shm=32768
+open handle sees projects: ["Personal"]
+main file alone sees: (no projects table in main file)
+
+== 2. simulate the last checkpoint ('Aug 9'): a project exists, then PRAGMA wal_checkpoint(TRUNCATE)
+files: bb.db=618496 bb.db-wal=0 bb.db-shm=32768
+main file alone sees: ["Personal","old-project-from-aug-9"]
+
+== 3. 'Aug 9 -> Aug 21': delete the old project, create 40 new ones (each its own transaction)
+open handle sees 41 projects: ["Personal","lost-00","lost-01","lost-02"] ...
+main file alone sees: ["Personal","old-project-from-aug-9"]
+files: bb.db=618496 bb.db-wal=844632 bb.db-shm=32768
+WAL before: {"header":{"salt1":966818975,"salt2":1949032780,"checkpointSeq":1,"checksumValid":true},"totalFrames":205,"liveFrameCount":205}
+
+== 4. THE EVENT (from another process): wal-index (-shm) zeroed in place + 1 bit flipped in the WAL header checksum
+done; the server handle was never closed or reopened
+
+== 5. next read on the SAME open handle (no restart, no exception thrown)
+open handle sees projects: ["Personal","old-project-from-aug-9"]
+  -> the 40 projects are gone and the deleted 'Aug 9' project is back
+
+== 6. server keeps running; one more write ('created-after-revert'). NOTE: bb issues no checkpoint here, so bb.db is NOT written
+open handle sees projects: ["Personal","created-after-revert","old-project-from-aug-9"]
+bb.db mtime changed: false (expected false: the commit only restarts the WAL at frame 1)
+files: bb.db=618496 bb.db-wal=844632 bb.db-shm=32768 (WAL keeps its old size)
+WAL after: {
+ "header": {
+  "salt1": 966818975,
+  "salt2": 1949032780,
+  "checkpointSeq": 1,
+  "checksumValid": true
+ },
+ "totalFrames": 205,
+ "liveFrameCount": 5,
+ "generations": [
+  {
+   "salt1": 966818975,
+   "salt2": 1949032780,
+   "frameCount": 5,
+   "firstIndex": 1,
+   "lastIndex": 5,
+   "commitFrames": 1,
+   "isLive": true,
+   "distinctPages": 5
+  },
+  {
+   "salt1": 966818975,
+   "salt2": 1949032780,
+   "frameCount": 200,
+   "firstIndex": 6,
+   "lastIndex": 205,
+   "commitFrames": 40,
+   "isLive": false,
+   "distinctPages": 5
+  }
+ ]
+}
+
+== 7. 'replaying the WAL on a copy' (copy bb.db + -wal + -shm elsewhere and open)
+replay copy sees: ["Personal","created-after-revert","old-project-from-aug-9"]
+
+== 8. forensic recovery: apply the stale frames onto a copy of the main file
+recover result: {"outDb":"/var/folders/k6/m70477s10v77w8fx0nvghbqr0000gn/T/bb-2190-walkthrough-pNTecH/recovered/bb.db","generation":{"salt1":966818975,"salt2":1949032780,"firstIndex":6,"lastIndex":205},"appliedFrames":200,"skippedTrailingFrames":0,"overwrittenPrefixFrames":5}
+integrity_check: ok
+recovered projects: 41 ["Personal","lost-00","lost-01","lost-02"] ... ["lost-38","lost-39"]
+
+== 9. what bb does on its own after the revert: keep committing; bb.db is written only by SQLite's 1000-page auto-checkpoint
+commits (one row each) before bb.db was written by the auto-checkpoint: 195
+WAL at that point: {"totalFrames":1001,"liveFrameCount":1001,"nBackfill":1001,"staleGenerations":0}
+  -> a single commit right after the revert does not touch bb.db; ~1000 WAL pages of later writes are needed, and by then the stale frames holding the lost data have been overwritten
+recovery attempted now: "recovery no longer possible: no stale generation; generations: [{\"salt1\":966818975,\"frames\":1001,\"live\":true}]"
+
+== 10. INDUCED (bb never does this): an explicit PRAGMA wal_checkpoint(PASSIVE) on the server handle
+checkpoint result: [{"busy":0,"log":5,"checkpointed":5}]
+bb.db mtime changed: true (only a checkpoint writes bb.db; bb runs one only via the 1000-page auto-checkpoint or the hourly sweep when the freelist >= 1024 pages)
+
+scratch dir: /var/folders/k6/m70477s10v77w8fx0nvghbqr0000gn/T/bb-2190-walkthrough-pNTecH (tool: /Users/sawyerhood/.bb-machines/bee.getbb.app/checkouts/bb/.claude/worktrees/wf_21e66a79-f02-14/packages/db/test/issue-2190-wal-tool.mjs)

@@ -1,0 +1,10 @@
+const page = await browser.getPage("bb2093");
+const snap0raw = await page.snapshot({ interactive: true }); const snap0 = { full: typeof snap0raw === "string" ? snap0raw : snap0raw.full };
+const m = snap0.full.match(/textbox "Ask for a follow-up[^"]*" \[[^\]]*ref=(e\d+)/);
+const ref = m ? m[1] : null;
+await page.click("ref/" + ref);
+await page.type("ref/" + ref, "@ci.yml");
+await new Promise((r) => setTimeout(r, 2500));
+await page.screenshot({ path: "/tmp/bb-reports/issues/assets/2093-mention-ci-yml.png" });
+const snapraw = await page.snapshot({ interactive: true }); const snap = { full: typeof snapraw === "string" ? snapraw : snapraw.full };
+({ ref, tail: snap.full.slice(-1200) });

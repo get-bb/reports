@@ -1,0 +1,199 @@
+diff --git a/apps/server/src/routes/threads/data.ts b/apps/server/src/routes/threads/data.ts
+index f8a741ade..e8ce0acc8 100644
+--- a/apps/server/src/routes/threads/data.ts
++++ b/apps/server/src/routes/threads/data.ts
+@@ -355,8 +355,12 @@ export function registerThreadDataRoutes(app: Hono, deps: AppDeps): void {
+       summaryOnly,
+       includeProviderUnhandledOperations,
+     };
++    const paramsKey = buildThreadTimelineParamsKey(keyArgs);
+     const full = timelineCache.getOrBuild(
+-      buildThreadTimelineCacheKey({ ...keyArgs, maxSeq }),
++      {
++        paramsKey,
++        revisionKey: buildThreadTimelineCacheKey({ ...keyArgs, maxSeq }),
++      },
+       () => {
+         const { profile, response } = buildThreadTimelineWithProfile(
+           deps.db,
+@@ -399,7 +403,6 @@ export function registerThreadDataRoutes(app: Hono, deps: AppDeps): void {
+       query.afterSequence,
+       "afterSequence",
+     );
+-    const paramsKey = buildThreadTimelineParamsKey(keyArgs);
+     const previous =
+       afterSequence === undefined
+         ? undefined
+diff --git a/apps/server/src/services/threads/timeline-cache.ts b/apps/server/src/services/threads/timeline-cache.ts
+index f5e1c903a..340a7120c 100644
+--- a/apps/server/src/services/threads/timeline-cache.ts
++++ b/apps/server/src/services/threads/timeline-cache.ts
+@@ -13,20 +13,20 @@ import type { ThreadTimelinePageRequest } from "./timeline-pagination.js";
+  * (detail view + side-chat tabs), debounced realtime invalidations that fire
+  * after the tail already settled, and re-opening a thread.
+  *
+- * Keying on the thread high-water `maxSeq` makes invalidation implicit: any
+- * appended event bumps `maxSeq`, producing a new key and a cold rebuild. The
+- * key MUST also include every other input the projection depends on:
++ * Keying each revision on the thread high-water `maxSeq` makes invalidation
++ * implicit: any appended event bumps `maxSeq`, producing a cold rebuild. The
++ * cache keeps only the newest revision for each request shape; otherwise an
++ * active thread with compact projected rows can pin one full response per
++ * event until the global LRU fills. The request shape MUST include every other
++ * input the projection depends on:
+  * `thread.status` (interrupt flips earlier rows), `environmentId` (workspace
+  * root relativizes file paths), provider display name (labels dynamic-provider
+  * diagnostic rows), and the row-shape request flags. Event pruning
+  * (`pruneResolvedItemDeltas`, background-task progress) is output-preserving
+  * and never lowers `maxSeq`, so it cannot stale a cached entry.
+  *
+- * Entries with many rows are not cached: an expanded active turn (the streaming
+- * case) produces hundreds of rows AND a `maxSeq` that changes on every event,
+- * so caching it only thrashes the LRU and pins large objects for no reuse. Idle
+- * windows collapse completed turns to a handful of rows regardless of thread
+- * size, so the cap excludes exactly the entries that would never be reused.
++ * Entries with many rows are not cached: an expanded active turn produces
++ * hundreds of rows, so caching it would pin a large object for little reuse.
+  */
+ 
+ const DEFAULT_MAX_ENTRIES = 128;
+@@ -40,7 +40,7 @@ interface ThreadTimelineCacheOptions {
+ 
+ interface ThreadTimelineCache {
+   getOrBuild(
+-    key: string,
++    keys: { paramsKey: string; revisionKey: string },
+     build: () => ThreadTimelineResponse,
+   ): ThreadTimelineResponse;
+   /** Number of currently cached entries (for tests/metrics). */
+@@ -53,21 +53,28 @@ export function createThreadTimelineCache(
+   const maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES;
+   const maxCacheableRows =
+     options.maxCacheableRows ?? DEFAULT_MAX_CACHEABLE_ROWS;
+-  const entries = new Map<string, ThreadTimelineResponse>();
++  const entries = new Map<
++    string,
++    { revisionKey: string; value: ThreadTimelineResponse }
++  >();
+ 
+   return {
+-    getOrBuild(key, build) {
+-      const cached = entries.get(key);
+-      if (cached !== undefined) {
++    getOrBuild({ paramsKey, revisionKey }, build) {
++      const cached = entries.get(paramsKey);
++      if (cached?.revisionKey === revisionKey) {
+         // Re-insert to mark most-recently-used.
+-        entries.delete(key);
+-        entries.set(key, cached);
+-        return cached;
++        entries.delete(paramsKey);
++        entries.set(paramsKey, cached);
++        return cached.value;
+       }
+ 
+       const value = build();
++      // A newer revision supersedes the old response even when the new value
++      // is too large to cache. Keeping the stale value cannot produce a hit
++      // and needlessly retains its rows.
++      entries.delete(paramsKey);
+       if (value.rows.length <= maxCacheableRows) {
+-        entries.set(key, value);
++        entries.set(paramsKey, { revisionKey, value });
+         while (entries.size > maxEntries) {
+           const oldest = entries.keys().next().value;
+           if (oldest === undefined) {
+diff --git a/apps/server/test/services/threads/timeline-cache.test.ts b/apps/server/test/services/threads/timeline-cache.test.ts
+index 141af64fe..da68e0f7f 100644
+--- a/apps/server/test/services/threads/timeline-cache.test.ts
++++ b/apps/server/test/services/threads/timeline-cache.test.ts
+@@ -57,35 +57,60 @@ const baseKeyArgs: ThreadTimelineCacheKeyArgs = {
+   includeProviderUnhandledOperations: false,
+ };
+ 
++function cacheKeys(revisionKey: string, paramsKey = revisionKey) {
++  return { paramsKey, revisionKey };
++}
++
+ describe("createThreadTimelineCache", () => {
+   it("builds once for the same key and serves cached on repeat", () => {
+     const cache = createThreadTimelineCache();
+     const build = vi.fn(() => makeResponse(3));
+ 
+-    const first = cache.getOrBuild("k", build);
+-    const second = cache.getOrBuild("k", build);
++    const first = cache.getOrBuild(cacheKeys("k"), build);
++    const second = cache.getOrBuild(cacheKeys("k"), build);
+ 
+     expect(build).toHaveBeenCalledTimes(1);
+     expect(second).toBe(first);
+     expect(cache.size).toBe(1);
+   });
+ 
+-  it("rebuilds when the key changes (e.g. new maxSeq)", () => {
++  it("rebuilds and replaces the prior revision for the same request shape", () => {
+     const cache = createThreadTimelineCache();
+     const build = vi.fn(() => makeResponse(3));
+ 
+-    cache.getOrBuild("k1", build);
+-    cache.getOrBuild("k2", build);
++    cache.getOrBuild(
++      cacheKeys(buildThreadTimelineCacheKey(baseKeyArgs), "latest-shape"),
++      build,
++    );
++    cache.getOrBuild(
++      cacheKeys(
++        buildThreadTimelineCacheKey({ ...baseKeyArgs, maxSeq: 11 }),
++        "latest-shape",
++      ),
++      build,
++    );
+ 
+     expect(build).toHaveBeenCalledTimes(2);
++    expect(cache.size).toBe(1);
++  });
++
++  it("retains separate request shapes independently", () => {
++    const cache = createThreadTimelineCache();
++    const build = vi.fn(() => makeResponse(3));
++
++    cache.getOrBuild(cacheKeys("revision", "latest-page"), build);
++    cache.getOrBuild(cacheKeys("revision", "older-page"), build);
++
++    expect(build).toHaveBeenCalledTimes(2);
++    expect(cache.size).toBe(2);
+   });
+ 
+   it("does not cache responses above the row cap (streaming expanded turns)", () => {
+     const cache = createThreadTimelineCache({ maxCacheableRows: 5 });
+     const build = vi.fn(() => makeResponse(50));
+ 
+-    cache.getOrBuild("k", build);
+-    cache.getOrBuild("k", build);
++    cache.getOrBuild(cacheKeys("k"), build);
++    cache.getOrBuild(cacheKeys("k"), build);
+ 
+     expect(build).toHaveBeenCalledTimes(2);
+     expect(cache.size).toBe(0);
+@@ -95,15 +120,15 @@ describe("createThreadTimelineCache", () => {
+     const cache = createThreadTimelineCache({ maxEntries: 2 });
+     const build = vi.fn(() => makeResponse(1));
+ 
+-    cache.getOrBuild("a", build); // [a]
+-    cache.getOrBuild("b", build); // [a,b]
+-    cache.getOrBuild("a", build); // touch a -> [b,a]
+-    cache.getOrBuild("c", build); // evict b -> [a,c]
++    cache.getOrBuild(cacheKeys("a"), build); // [a]
++    cache.getOrBuild(cacheKeys("b"), build); // [a,b]
++    cache.getOrBuild(cacheKeys("a"), build); // touch a -> [b,a]
++    cache.getOrBuild(cacheKeys("c"), build); // evict b -> [a,c]
+ 
+     expect(cache.size).toBe(2);
+     const buildAgain = vi.fn(() => makeResponse(1));
+-    cache.getOrBuild("a", buildAgain); // still cached
+-    cache.getOrBuild("b", buildAgain); // evicted -> rebuild
++    cache.getOrBuild(cacheKeys("a"), buildAgain); // still cached
++    cache.getOrBuild(cacheKeys("b"), buildAgain); // evicted -> rebuild
+     expect(buildAgain).toHaveBeenCalledTimes(1);
+   });
+ });

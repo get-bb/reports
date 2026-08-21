@@ -1,0 +1,324 @@
+diff --git a/plugins/provider-acp/src/bridge/bridge.test.ts b/plugins/provider-acp/src/bridge/bridge.test.ts
+index bbdc60318d..502bb5a752 100644
+--- a/plugins/provider-acp/src/bridge/bridge.test.ts
++++ b/plugins/provider-acp/src/bridge/bridge.test.ts
+@@ -23,7 +23,10 @@ import {
+   type CapturedBridgeJsonRpcOutput,
+ } from "@bb/provider-bridge-protocol/testing";
+ import { assembleCapturedThreadEvents } from "@bb/agent-runtime/test/bridge-delta-assembly";
+-import { handleLine } from "./bridge.js";
++import {
++  __setSpontaneousTurnIdleTimeoutForTests,
++  handleLine,
++} from "./bridge.js";
+ import { ACP_BRIDGE_NO_ACTIVE_TURN_ERROR_CODE } from "../bridge-protocol.js";
+ import { ACP_BRIDGE_MCP_SERVER_NAME } from "./tool-proxy-mcp.js";
+ 
+@@ -1251,6 +1254,99 @@ describe("acp bridge", () => {
+     expect(agentMessageTexts()).toContain("echo:hello there");
+   });
+ 
++  describe("agent-initiated turns (OMP async-job delivery)", () => {
++    afterEach(() => {
++      __setSpontaneousTurnIdleTimeoutForTests(undefined);
++    });
++
++    it("opens a vouched turn for unsolicited agent output and closes it on quiet", async () => {
++      __setSpontaneousTurnIdleTimeoutForTests(150);
++      const { providerThreadId } = await startThread();
++      const turnId = sendTurnRequest("turn/start", providerThreadId, {
++        input: [{ type: "text", text: "spontaneous-stream:2", mentions: [] }],
++      });
++      await waitForResponse(turnId);
++      await waitForTurnCompleted();
++
++      await waitFor(
++        () =>
++          agentMessageTexts().some((t) => t.includes("spontaneous:1"))
++            ? true
++            : undefined,
++        "spontaneous stream",
++      );
++      await waitFor(
++        () =>
++          threadEventsOfType("turn/completed").length >= 2 ? true : undefined,
++        "spontaneous turn quiet-close",
++      );
++
++      expect(threadEventsOfType("turn/started")).toHaveLength(2);
++      const joined = agentMessageTexts().join("");
++      expect(joined).toContain("spontaneous:0spontaneous:1");
++      // The injected result echo stays noise: exactly one accepted input (the
++      // user turn), no phantom user row for the replayed async result.
++      expect(
++        emittedDeltaKinds().filter((kind) => kind === "input.accepted"),
++      ).toHaveLength(1);
++    });
++
++    it("settles a still-open spontaneous turn before the next bb turn opens", async () => {
++      const { providerThreadId } = await startThread();
++      const first = sendTurnRequest("turn/start", providerThreadId, {
++        input: [{ type: "text", text: "spontaneous-stream:2", mentions: [] }],
++      });
++      await waitForResponse(first);
++      await waitForTurnCompleted();
++      // Wait until the spontaneous stream has fully arrived: the turn stays
++      // open (the production 120s quiet window is running) but is quiescent.
++      await waitFor(
++        () =>
++          agentMessageTexts().some((t) => t.includes("spontaneous:1"))
++            ? true
++            : undefined,
++        "spontaneous stream complete",
++      );
++
++      // The 120s quiet window is still running, so the spontaneous turn is open
++      // when the user's next turn arrives; it must settle before the new turn.
++      const second = sendTurnRequest("turn/start", providerThreadId, {
++        input: [{ type: "text", text: "hello there", mentions: [] }],
++      });
++      await waitForResponse(second);
++      await waitFor(
++        () =>
++          threadEventsOfType("turn/completed").length === 3 ? true : undefined,
++        "all three turns settled",
++      );
++
++      expect(threadEventsOfType("turn/started")).toHaveLength(3);
++      expect(threadEventsOfType("turn/completed")).toHaveLength(3);
++      const texts = agentMessageTexts();
++      expect(texts.join("")).toContain("spontaneous:0spontaneous:1");
++      expect(texts.at(-1)).toBe("echo:hello there");
++    });
++
++    it("does not open a turn for unsolicited non-work updates", async () => {
++      const { providerThreadId } = await startThread();
++      const turnId = sendTurnRequest("turn/start", providerThreadId, {
++        input: [{ type: "text", text: "spontaneous-noise", mentions: [] }],
++      });
++      await waitForResponse(turnId);
++      await waitForTurnCompleted();
++      // The noise update is followed by a usage_update: a positive bridge-side
++      // signal (a contextWindow delta) that the idle traffic was processed.
++      await waitFor(
++        () =>
++          emittedDeltaKinds().includes("contextWindow") ? true : undefined,
++        "idle usage_update contextWindow delta",
++      );
++
++      expect(threadEventsOfType("turn/started")).toHaveLength(1);
++      expect(threadEventsOfType("turn/completed")).toHaveLength(1);
++    });
++  });
++
+   it("authenticates ACP sessions with cached tokens when advertised", async () => {
+     const { providerThreadId } = await startThread({
+       envVars: { FAKE_ACP_AUTH_METHODS: "cached_token" },
+diff --git a/plugins/provider-acp/src/bridge/bridge.ts b/plugins/provider-acp/src/bridge/bridge.ts
+index ae463266a8..73213ec0bf 100644
+--- a/plugins/provider-acp/src/bridge/bridge.ts
++++ b/plugins/provider-acp/src/bridge/bridge.ts
+@@ -199,6 +199,13 @@ interface AcpThreadSession {
+   stopping: boolean;
+   /** Resolves when the in-flight turn or maintenance prompt fully settles. */
+   turnSettled: Promise<void> | undefined;
++  /**
++   * True while a bridge-opened turn carries agent-initiated output (OMP
++   * async-job delivery): ACP brackets no turn for it, so the bridge vouches
++   * the lifecycle itself (provider-bridge-protocol.md, turn lifecycle rule 3).
++   */
++  spontaneousTurnOpen: boolean;
++  spontaneousQuietTimer: NodeJS.Timeout | undefined;
+   pendingPermissions: Set<PendingAcpPermission>;
+   cursorMcpApproval: CursorMcpApproval | undefined;
+ }
+@@ -216,9 +223,20 @@ let dynamicToolBridgePromise: Promise<AcpDynamicToolBridge> | null = null;
+ // this timeout forces disposal. Stop remains a best-effort success boundary.
+ const THREAD_STOP_CANCEL_TIMEOUT_MS = 4_000;
+ 
+-// ---------------------------------------------------------------------------
+-// stdout helpers (bridge → runtime)
+-// ---------------------------------------------------------------------------
++/**
++ * Quiet window that closes an agent-initiated turn. ACP gives it no end
++ * bracket, so silence is the only bridge-side signal; a slow provider can
++ * split such a turn (the next chunk re-opens one), never lose its output.
++ */
++export const SPONTANEOUS_TURN_IDLE_TIMEOUT_MS = 120_000;
++let spontaneousTurnIdleTimeoutMs = SPONTANEOUS_TURN_IDLE_TIMEOUT_MS;
++
++/** Shrinks the quiet window in tests; `undefined` restores production. */
++export function __setSpontaneousTurnIdleTimeoutForTests(
++  ms: number | undefined,
++): void {
++  spontaneousTurnIdleTimeoutMs = ms ?? SPONTANEOUS_TURN_IDLE_TIMEOUT_MS;
++}
+ 
+ interface BridgeNotification {
+   jsonrpc: "2.0";
+@@ -1569,6 +1587,7 @@ async function handleFsWriteTextFile(
+ // ---------------------------------------------------------------------------
+ 
+ function removeSession(session: AcpThreadSession): void {
++  clearSpontaneousTurn(session);
+   if (sessionsByBbThreadId.get(session.bbThreadId) === session) {
+     sessionsByBbThreadId.delete(session.bbThreadId);
+   }
+@@ -1711,6 +1730,8 @@ async function startAgentSession(
+     pendingLoadUsageUpdate: undefined,
+     stopping: false,
+     turnSettled: undefined,
++    spontaneousTurnOpen: false,
++    spontaneousQuietTimer: undefined,
+     pendingPermissions: new Set(),
+     cursorMcpApproval: undefined,
+   };
+@@ -1895,6 +1916,8 @@ async function stopSession(session: AcpThreadSession): Promise<void> {
+     "ACP session stopped before the steer was sent",
+   );
+   cancelPendingPermissions(session);
++  // An interrupt settles whatever work is open, vouched or prompted.
++  settleSpontaneousTurn(session, "cancelled");
+ 
+   if (session.activePromptKind !== null && !session.connection.exited) {
+     session.connection.notify("session/cancel", {
+@@ -2020,6 +2043,7 @@ function runTurn(
+   session: AcpThreadSession,
+   firstInput: AcpPendingTurnInput,
+ ): void {
++  settleSpontaneousTurn(session);
+   session.activePromptKind = "turn";
+   emitForSession(session, ACP_TURN_STARTED_METHOD, {
+     threadId: session.bbThreadId,
+@@ -2120,6 +2144,7 @@ function startCompaction(
+   session: AcpThreadSession,
+   pending: AcpPendingTurnInput,
+ ): void {
++  settleSpontaneousTurn(session);
+   session.activePromptKind = "compaction";
+   emitForSession(session, ACP_COMPACTION_STARTED_METHOD, {
+     threadId: session.bbThreadId,
+@@ -2190,6 +2215,56 @@ function handleAgentRequest(
+   }
+ }
+ 
++// ---------------------------------------------------------------------------
++// Agent-initiated turns (OMP async-job delivery)
++// ---------------------------------------------------------------------------
++
++/**
++ * Session updates that carry agent work. Arriving with no prompt in flight
++ * they are an agent-initiated turn: ACP sends no turn bracket for it, so the
++ * bridge opens one itself — the sanctioned shape for provider-internal
++ * activity (provider-bridge-protocol.md, turn lifecycle rule 3). The next
++ * bb-initiated turn settles a still-open one first, `thread/stop` interrupts
++ * it, and a quiet window closes it as completed.
++ */
++const AGENT_WORK_UPDATE_KINDS: Record<string, true> = {
++  agent_message_chunk: true,
++  agent_thought_chunk: true,
++  tool_call: true,
++  tool_call_update: true,
++  plan: true,
++};
++
++function clearSpontaneousTurn(session: AcpThreadSession): void {
++  session.spontaneousTurnOpen = false;
++  if (session.spontaneousQuietTimer !== undefined) {
++    clearTimeout(session.spontaneousQuietTimer);
++    session.spontaneousQuietTimer = undefined;
++  }
++}
++
++function settleSpontaneousTurn(
++  session: AcpThreadSession,
++  stopReason: z.infer<typeof acpStopReasonSchema> = "end_turn",
++): void {
++  if (!session.spontaneousTurnOpen) {
++    return;
++  }
++  clearSpontaneousTurn(session);
++  emitForSession(session, ACP_TURN_COMPLETED_METHOD, {
++    threadId: session.bbThreadId,
++    stopReason,
++  });
++}
++
++function armSpontaneousQuietTimer(session: AcpThreadSession): void {
++  clearTimeout(session.spontaneousQuietTimer);
++  session.spontaneousQuietTimer = setTimeout(() => {
++    session.spontaneousQuietTimer = undefined;
++    settleSpontaneousTurn(session);
++  }, spontaneousTurnIdleTimeoutMs);
++}
++
+ function handleAgentNotification(
+   session: AcpThreadSession,
+   method: string,
+@@ -2223,6 +2298,18 @@ function handleAgentNotification(
+   ) {
+     return;
+   }
++  if (
++    session.activePromptKind === null &&
++    AGENT_WORK_UPDATE_KINDS[parsed.data.update.sessionUpdate] === true
++  ) {
++    if (!session.spontaneousTurnOpen) {
++      session.spontaneousTurnOpen = true;
++      emitForSession(session, ACP_TURN_STARTED_METHOD, {
++        threadId: session.bbThreadId,
++      });
++    }
++    armSpontaneousQuietTimer(session);
++  }
+   emitForSession(session, ACP_UPDATE_METHOD, {
+     threadId: session.bbThreadId,
+     update: parsed.data.update,
+diff --git a/plugins/provider-acp/src/bridge/fake-acp-agent.mjs b/plugins/provider-acp/src/bridge/fake-acp-agent.mjs
+index 70c7a40691..996dec98ff 100755
+--- a/plugins/provider-acp/src/bridge/fake-acp-agent.mjs
++++ b/plugins/provider-acp/src/bridge/fake-acp-agent.mjs
+@@ -388,6 +388,43 @@ async function handlePrompt(message) {
+     notifyUpdate(
+       messageChunk(`mcp-server-config:${JSON.stringify(currentMcpServers)}`),
+     );
++  } else if (text.includes("spontaneous-stream")) {
++    // OMP async-delivery shape: once this prompt's response has gone out, the
++    // agent emits an unsolicited user_message_chunk (result injection) plus
++    // agent chunks with no session/prompt driving them. The count rides the
++    // text (`spontaneous-stream:4`), defaulting to 2, spaced 60ms apart.
++    const chunks = Number(text.match(/spontaneous-stream:(\d+)/)?.[1] ?? 2);
++    setTimeout(() => {
++      notifyUpdate({
++        sessionUpdate: "user_message_chunk",
++        content: { type: "text", text: "background job settled" },
++      });
++      for (let i = 0; i < chunks; i += 1) {
++        setTimeout(
++          () => {
++            notifyUpdate(messageChunk(`spontaneous:${i}`));
++          },
++          60 * (i + 1),
++        );
++      }
++    }, 40);
++  } else if (text.includes("spontaneous-noise")) {
++    // Unsolicited non-work update: must not open a turn.
++    setTimeout(() => {
++      notifyUpdate({
++        sessionUpdate: "available_commands_update",
++        commands: [],
++      });
++      // Followed by a usage_update: observable proof the idle traffic was
++      // processed even though neither update may open a turn.
++      setTimeout(() => {
++        notifyUpdate({
++          sessionUpdate: "usage_update",
++          used: 1_000,
++          size: 128_000,
++        });
++      }, 100);
++    }, 40);
+   } else {
+     notifyUpdate(messageChunk(`echo:${text}`));
+   }

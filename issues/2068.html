@@ -1,0 +1,512 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2068 Archived idle threads block branch checkout after the workspace is released</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.med { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .verdict { font-weight:600; }
+  .v-ok { color:var(--high); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:18px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:6px; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2068 · Archived idle threads block branch checkout after the workspace is released</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill med">Priority: Medium</span> <span class="pill">Effort: small</span> <span class="pill">threads</span> <span class="pill">workspaces</span>
+    <a href="https://github.com/get-bb/bb/issues/2068">open on GitHub</a>
+    <a href="https://github.com/get-bb/bb/pull/2069">PR #2069</a>
+    <span>2026-08-21 · base <code>fcada5a3b</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict v-ok">REPRODUCED</span> (live, through the web UI and the HTTP API, and as a failing vitest) · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>In a project whose workspace is a plain local git checkout ("Work locally"), archive every thread, then start a new thread with the branch picker set to <em>New branch from: main</em>. bb refuses with <code>409 Cannot checkout branch while another thread is using this workspace</code>, even though the project shows "No threads". The server protects a shared folder from a branch checkout while another thread is using it by asking the database whether any <em>live</em> thread points at that folder. That query (<code>hasLiveThreadAtHostPath</code>) filters on <code>deleted_at IS NULL</code> and status in <code>starting/idle/active</code> but never looks at <code>archived_at</code>. Archiving does not change a thread's status, so an archived idle thread satisfies the query forever and pins the workspace until the thread is deleted. The one-line fix (PR #2069) swaps the query's <code>nonDeletedThreads()</code> for the existing <code>liveThreads()</code> helper, which adds <code>archived_at IS NULL</code>; I verified the PR fixes the live repro and keeps the active-thread guard.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Creating a thread with "New branch from: main" in a local unmanaged workspace whose threads are all archived fails with <code>Cannot checkout branch while another thread is using this workspace</code>.</td><td class="ok">Verified</td><td>Live on my dev instance: <code>POST /api/v1/threads</code> → <code>HTTP 409</code> with that exact message (step 4 below); same toast in the web UI (<a href="assets/2068-error-toast.png">screenshot</a>). DB showed only archived idle threads in the project.</td></tr>
+    <tr><td>The project had no unarchived threads, including hidden ones.</td><td class="ok">Verified (for my repro)</td><td><code>sqlite3 … "select id,status,archived_at,visibility from threads where project_id=…"</code> → both rows archived, <code>visible</code>, status <code>idle</code>.</td></tr>
+    <tr><td><code>bb thread stop</code> does not help because stopping an idle thread is a no-op.</td><td class="ok">Verified</td><td><code>pnpm bb:dev thread stop thr_jzgzjh5wen</code> printed "stopped", status stayed <code>idle</code>, retry still 409. Code: <code>requestThreadStopForCurrentState</code> only acts on active/starting/stopping threads (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/services/threads/thread-lifecycle.ts#L1352-L1385">thread-lifecycle.ts#L1352-L1385</a>).</td></tr>
+    <tr><td>Creating the thread without a branch checkout avoids the failure.</td><td class="ok">Verified</td><td>Same request without <code>workspace.branch</code> → <code>HTTP 201</code> (step 5). Guard is gated on <code>checksOutBranch</code>.</td></tr>
+    <tr><td>Mechanism: <code>hasLiveThreadAtHostPath()</code> uses <code>nonDeletedThreads()</code> and status ∈ starting/idle/active, never filters <code>archivedAt</code>; archiving preserves <code>idle</code>.</td><td class="ok">Verified</td><td><a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/packages/db/src/data/threads.ts#L1398-L1417">threads.ts#L1398-L1417</a>, <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/packages/db/src/data/threads.ts#L1845-L1863">archiveThread</a> only sets <code>archivedAt</code>. Repro vitest fails on base with <code>{ reason: 'live-thread' }</code>.</td></tr>
+    <tr><td>A <code>liveThreads()</code> helper that adds <code>archivedAt IS NULL</code> already exists.</td><td class="ok">Verified</td><td><a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/packages/db/src/data/threads.ts#L65-L71">threads.ts#L65-L71</a>; every other "live" query in the file (e.g. <code>listLiveThreadsInEnvironment</code>) uses it.</td></tr>
+    <tr><td>The guard was introduced in #1049.</td><td class="ok">Verified</td><td><code>git log -S hasLiveThreadAtHostPath</code> → <code>bed45061f Scope the workspace path claim to the project (#1049)</code>.</td></tr>
+    <tr><td>Environment: bb-app 0.38.0, Linux x64, Node 26.7.0.</td><td class="unv">Unverified</td><td>I reproduced on macOS / Node 22 at <code>fcada5a3b</code>; the query is platform-independent and unchanged since #1049, so the platform does not matter.</td></tr>
+    <tr><td>The deterministic reproducer script in the comment reproduces the bug.</td><td class="ok">Verified (equivalent)</td><td>My vitest (section 4) is the same scenario plus a route-level case through <code>createThreadFromRequest</code>; both fail on base exactly as the comment's script prints.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb worktree at base <code>fcada5a3b88302acb9944aa74b11db4ecaa215a0</code> (main, 2026-08-21). <code>origin/main</code> ahead by 3 commits (2ad4bfaae, 15f21ade7, b2e80352b), none touch the guard → not fixed on main.</li>
+    <li>macOS 26.5.2 (arm64), Node v22.23.1, pnpm workspace; provider used for the two real turns: <code>claude-code</code> (Claude Code CLI 2.1.238); codex-cli 0.149.0 present but unused.</li>
+    <li>Own dev instance via <code>scripts/bb-dev-app current</code>: App <code>http://localhost:13684</code>, Server <code>http://localhost:21684</code>, Host daemon <code>127.0.0.1:29684</code>, data dir <code>~/.bb-dev/bb-machines-bee.getbb.app-checkouts-bb-.claude-worktrees-wf_21e66a79-f02-15-b5cd6c3c9fb7</code> (deleted at cleanup).</li>
+    <li>Scratch repo <code>/tmp/bb-2068-repo</code> (one commit on <code>main</code>), project <code>proj_2xirasxmz4</code>, host <code>host_eqirmyrp9n</code>.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <h3>4a. Unit-level (no running app, ~4 s)</h3>
+  <ol>
+    <li>Save the test below as <code>apps/server/test/threads/repro-2068-archived-thread-blocks-checkout.test.ts</code> (copy in <a href="2068/repro/repro-2068-archived-thread-blocks-checkout.test.ts">2068/repro/</a>).</li>
+    <li>Run from <code>apps/server</code>: <code>pnpm exec vitest run test/threads/repro-2068-archived-thread-blocks-checkout.test.ts</code></li>
+    <li>Expected: 3 passed. Actual on <code>fcada5a3b</code> (<a href="2068/repro/vitest-base-fcada5a3b.log">full log</a>):
+<pre> RUN  v4.1.1 /Users/sawyerhood/.bb-machines/bee.getbb.app/checkouts/bb/.claude/worktrees/wf_21e66a79-f02-15/apps/server
+
+ ❯  @bb/server  test/threads/repro-2068-archived-thread-blocks-checkout.test.ts (3 tests | 2 failed) 264ms
+     × unmanagedAttachRefusal: an archived idle thread must not count as a live workspace user 137ms
+     × createThreadFromRequest: 'New branch from main' in a project whose only thread is archived must not 409 70ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL   @bb/server  test/threads/repro-2068-archived-thread-blocks-checkout.test.ts &gt; #2068 archived idle thread and the branch-checkout guard &gt; unmanagedAttachRefusal: an archived idle thread must not count as a live workspace user
+AssertionError: expected { reason: 'live-thread', …(1) } to be null
+
+- Expected:
+null
+
++ Received:
+{
+  "message": "Cannot checkout branch while another thread is using this workspace",
+  "reason": "live-thread",
+}
+
+ ❯ test/threads/repro-2068-archived-thread-blocks-checkout.test.ts:55:9
+     53|           projectId: project.id,
+     54|         }),
+     55|       ).toBeNull();
+       |         ^
+     56|     });
+     57|   });
+ ❯ withTestHarness test/helpers/test-app.ts:283:18
+ ❯ test/threads/repro-2068-archived-thread-blocks-checkout.test.ts:21:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL   @bb/server  test/threads/repro-2068-archived-thread-blocks-checkout.test.ts &gt; #2068 archived idle thread and the branch-checkout guard &gt; createThreadFromRequest: 'New branch from main' in a project whose only thread is archived must not 409
+Error: Cannot checkout branch while another thread is using this workspace
+ ❯ assertUnmanagedHostPathIsAttachable src/services/threads/thread-create.ts:391:11
+    389|   });
+    390|   if (refusal) {
+    391|     throw new ApiError(409, "invalid_request", refusal.message);
+       |           ^
+    392|   }
+    393| }
+ ❯ createThreadFromRequest src/services/threads/thread-create.ts:785:9
+ ❯ test/threads/repro-2068-archived-thread-blocks-checkout.test.ts:81:22
+ ❯ withTestHarness test/helpers/test-app.ts:283:12
+ ❯ test/threads/repro-2068-archived-thread-blocks-checkout.test.ts:60:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  2 failed | 1 passed (3)
+   Start at  08:53:03
+   Duration  3.49s (transform 1.40s, setup 0ms, import 3.15s, tests 264ms, environment 0ms)
+
+</pre>
+    The control test (unarchived <code>active</code> thread still refuses) passes, so the guard itself is fine; only archived rows leak through.</li>
+  </ol>
+<pre>// Repro for get-bb/bb#2068: archived idle threads keep the workspace "live"
+// for the branch-checkout guard in unmanagedAttachRefusal().
+import { archiveThread, getThread, listEnvironments } from "@bb/db";
+import { describe, expect, it } from "vitest";
+import { createThreadFromRequest } from "../../src/services/threads/thread-create.js";
+import { unmanagedAttachRefusal } from "../../src/services/threads/workspace-path-claims.js";
+import { textInput } from "../helpers/prompt-input.js";
+import {
+  seedEnvironment,
+  seedHostSession,
+  seedProjectWithSource,
+  seedThread,
+} from "../helpers/seed.js";
+import { withTestHarness } from "../helpers/test-app.js";
+
+const HOST_DATA_DIR = "/home/agent/.bb";
+const SHARED_PATH = "/tmp/repro-2068-workspace";
+
+describe("#2068 archived idle thread and the branch-checkout guard", () =&gt; {
+  it("unmanagedAttachRefusal: an archived idle thread must not count as a live workspace user", async () =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      const { host } = seedHostSession(harness.deps, { id: "host-2068-unit" });
+      const { project } = seedProjectWithSource(harness.deps, {
+        hostId: host.id,
+        name: "Repro 2068",
+        path: SHARED_PATH,
+      });
+      const environment = seedEnvironment(harness.deps, {
+        hostId: host.id,
+        projectId: project.id,
+        path: SHARED_PATH,
+      });
+      const thread = seedThread(harness.deps, {
+        projectId: project.id,
+        environmentId: environment.id,
+        status: "idle",
+      });
+
+      // Same write the archive route performs (thread-archive.ts -&gt;
+      // archiveThreadAndReleaseChildren -&gt; archiveThread).
+      archiveThread(harness.deps.db, harness.deps.hub, thread.id);
+      const archived = getThread(harness.deps.db, thread.id);
+      expect(archived?.archivedAt).not.toBeNull();
+      expect(archived?.status).toBe("idle");
+
+      // FAILS on fcada5a3b: returns { reason: "live-thread", ... }
+      expect(
+        unmanagedAttachRefusal(harness.deps.db, {
+          checksOutBranch: true,
+          dataDir: HOST_DATA_DIR,
+          hostId: host.id,
+          path: SHARED_PATH,
+          projectId: project.id,
+        }),
+      ).toBeNull();
+    });
+  });
+
+  it("createThreadFromRequest: 'New branch from main' in a project whose only thread is archived must not 409", async () =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      const { host } = seedHostSession(harness.deps, { id: "host-2068-route" });
+      const { project } = seedProjectWithSource(harness.deps, {
+        hostId: host.id,
+        name: "Repro 2068 route",
+        path: SHARED_PATH,
+      });
+      const environment = seedEnvironment(harness.deps, {
+        hostId: host.id,
+        projectId: project.id,
+        path: SHARED_PATH,
+      });
+      const oldThread = seedThread(harness.deps, {
+        projectId: project.id,
+        environmentId: environment.id,
+        status: "idle",
+      });
+      archiveThread(harness.deps.db, harness.deps.hub, oldThread.id);
+
+      // FAILS on fcada5a3b with ApiError 409
+      // "Cannot checkout branch while another thread is using this workspace"
+      const thread = await createThreadFromRequest(harness.deps, {
+        environment: {
+          type: "host",
+          hostId: host.id,
+          workspace: {
+            type: "unmanaged",
+            path: SHARED_PATH,
+            branch: { kind: "new", baseBranch: "main" },
+          },
+        },
+        input: textInput("Reply only with ok."),
+        origin: "app",
+        projectId: project.id,
+        providerId: "codex",
+        startedOnBehalfOf: null,
+      });
+      expect(thread.projectId).toBe(project.id);
+      expect(listEnvironments(harness.deps.db, project.id)).toHaveLength(1);
+    });
+  });
+
+  it("control: an unarchived active thread at the path still refuses the checkout", async () =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      const { host } = seedHostSession(harness.deps, { id: "host-2068-ctrl" });
+      const { project } = seedProjectWithSource(harness.deps, {
+        hostId: host.id,
+        name: "Repro 2068 control",
+        path: SHARED_PATH,
+      });
+      const environment = seedEnvironment(harness.deps, {
+        hostId: host.id,
+        projectId: project.id,
+        path: SHARED_PATH,
+      });
+      seedThread(harness.deps, {
+        projectId: project.id,
+        environmentId: environment.id,
+        status: "active",
+      });
+
+      expect(
+        unmanagedAttachRefusal(harness.deps.db, {
+          checksOutBranch: true,
+          dataDir: HOST_DATA_DIR,
+          hostId: host.id,
+          path: SHARED_PATH,
+          projectId: project.id,
+        }),
+      ).toMatchObject({ reason: "live-thread" });
+    });
+  });
+});
+</pre>
+
+  <h3>4b. Live, through the API and the UI</h3>
+  <ol>
+    <li>Start a dev instance and create a scratch repo + project:
+<pre>scripts/bb-dev-app current            # prints App/Server URLs; mine: server http://localhost:21684
+mkdir -p /tmp/bb-2068-repo &amp;&amp; cd /tmp/bb-2068-repo &amp;&amp; git init -q -b main &amp;&amp; echo hello &gt; README.md &amp;&amp; git add . &amp;&amp; git commit -qm init
+curl -s http://localhost:21684/api/v1/hosts          # note the host id (host_eqirmyrp9n)
+curl -s -X POST http://localhost:21684/api/v1/projects -H 'content-type: application/json' \
+  -d '{"name":"qa-2068","source":{"type":"local_path","path":"/tmp/bb-2068-repo","hostId":"host_eqirmyrp9n"}}'
+# → {"id":"proj_2xirasxmz4", ...}</pre></li>
+    <li>Create one ordinary thread in the local workspace (no branch checkout) and wait for it to go idle (<a href="2068/repro/step1-create-thread.json">step1-create-thread.json</a>):
+<pre>curl -s -X POST http://localhost:21684/api/v1/threads -H 'content-type: application/json' -d @step1-create-thread.json
+# → HTTP 201 {"id":"thr_jzgzjh5wen","status":"starting",...}
+# poll until: status=idle environmentId=env_uvfmh7vcmz archivedAt=None</pre>
+<pre>{
+  "projectId": "proj_2xirasxmz4",
+  "providerId": "claude-code",
+  "origin": "app",
+  "title": "2068 first thread",
+  "permissionMode": "accept-edits",
+  "input": [{"type": "text", "text": "Reply only with ok."}],
+  "environment": {"type": "host", "hostId": "host_eqirmyrp9n", "workspace": {"type": "unmanaged", "path": "/tmp/bb-2068-repo"}}
+}
+</pre></li>
+    <li>Archive it and confirm the project has no unarchived threads:
+<pre>pnpm bb:dev thread archive thr_jzgzjh5wen
+# Thread thr_jzgzjh5wen archived
+sqlite3 &lt;data-dir&gt;/bb.db "select id,status,archived_at,deleted_at,visibility from threads where project_id='proj_2xirasxmz4';"
+# thr_jzgzjh5wen|idle|1787327679973||visible</pre></li>
+    <li>Create a thread with <em>New branch from: main</em> in the same folder (<a href="2068/repro/step3-create-branch-thread.json">step3-create-branch-thread.json</a>):
+<pre>curl -s -X POST http://localhost:21684/api/v1/threads -H 'content-type: application/json' -d @step3-create-branch-thread.json -w '\nHTTP %{http_code}\n'
+
+expected: HTTP 201 and a thread whose environment checks out bb/&lt;thread-id&gt; from main
+actual:   {"code":"invalid_request","message":"Cannot checkout branch while another thread is using this workspace"}
+          HTTP 409</pre>
+<pre>{
+  "projectId": "proj_2xirasxmz4",
+  "providerId": "claude-code",
+  "origin": "app",
+  "title": "2068 second thread (new branch from main)",
+  "permissionMode": "accept-edits",
+  "input": [{"type": "text", "text": "Reply only with ok."}],
+  "environment": {"type": "host", "hostId": "host_eqirmyrp9n", "workspace": {"type": "unmanaged", "path": "/tmp/bb-2068-repo", "branch": {"kind": "new", "baseBranch": "main"}}}
+}
+</pre>
+    <code>bb thread stop thr_jzgzjh5wen</code> reports "stopped" but the status stays <code>idle</code> and the retry is still 409.</li>
+    <li>Control: the same request without <code>"branch"</code> returns <code>HTTP 201</code> (<code>thr_k9yxf8mk9i</code>), confirming the refusal comes from the branch-checkout guard only.</li>
+  </ol>
+  <p>The same flow in the web UI (both threads archived first, so the sidebar shows "No threads"):</p>
+  <figure><img src="assets/2068-branch-new.png" alt="Compose view with No threads in the sidebar and branch picker set to New branch from: main"><figcaption>Before submitting: project <code>qa-2068</code> lists "No threads" (both archived), environment "Work locally", branch picker set to "New branch from: main".</figcaption></figure>
+  <figure><img src="assets/2068-error-toast.png" alt="Toast: Cannot checkout branch while another thread is using this workspace"><figcaption>After pressing Enter on "Reply only with ok.": toast "Cannot checkout branch while another thread is using this workspace"; console shows the 409 from <code>/api/v1/threads</code>. No thread is created.</figcaption></figure>
+  <p>Repro files: <a href="2068/repro/">2068/repro/</a> (test, request bodies, responses, vitest logs, PR diff).</p>
+
+  <h2>5. Root cause</h2>
+  <p><code>createThreadFromRequest</code> → <code>assertUnmanagedHostPathIsAttachable</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/services/threads/thread-create.ts#L379-L393">thread-create.ts#L379-L393</a>) → <code>unmanagedAttachRefusal</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/services/threads/workspace-path-claims.ts#L70-L79">workspace-path-claims.ts#L70-L79</a>):</p>
+<pre>  if (
+    args.checksOutBranch &amp;&amp;
+    hasLiveThreadAtHostPath(db, { hostId: args.hostId, path: args.path })
+  ) {
+    return {
+      reason: "live-thread",
+      message:
+        "Cannot checkout branch while another thread is using this workspace",
+    };
+  }</pre>
+  <p><code>hasLiveThreadAtHostPath</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/packages/db/src/data/threads.ts#L1398-L1417">packages/db/src/data/threads.ts#L1398-L1417</a>) is the only query behind that decision:</p>
+<pre>export interface HasLiveThreadAtHostPathArgs {
+  hostId: string;
+  path: string;
+}
+
+/**
+ * Whether any project has a live thread working in one physical directory.
+ * A branch checkout rewrites the working tree, so it must not run while
+ * another project's agent uses the same folder.
+ */
+export function hasLiveThreadAtHostPath(
+  db: DbConnection,
+  args: HasLiveThreadAtHostPathArgs,
+): boolean {
+  const row = db
+    .select({ id: threads.id })
+    .from(threads)
+    .innerJoin(environments, eq(threads.environmentId, environments.id))
+    .where(
+      and(
+        eq(environments.hostId, args.hostId),
+        eq(environments.path, args.path),
+        nonDeletedThreads(                       // &lt;-- deleted_at IS NULL only; archived_at is ignored
+          inArray(threads.status, [...NON_TERMINAL_THREAD_STATUSES]),   // starting | idle | active
+        ),
+      ),
+    )
+    .get();
+
+  return row !== undefined;
+}</pre>
+  <p>The two predicate helpers at the top of the file (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/packages/db/src/data/threads.ts#L65-L71">#L65-L71</a>) make the distinction explicit; this query picked the weaker one despite being named "live":</p>
+<pre>function nonDeletedThreads(...where: ThreadWhere[]): ThreadWhere {
+  return and(...where, isNull(threads.deletedAt));
+}
+
+function liveThreads(...where: ThreadWhere[]): ThreadWhere {
+  return nonDeletedThreads(...where, isNull(threads.archivedAt));
+}</pre>
+  <p>Archiving (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/packages/db/src/data/threads.ts#L1845-L1863">archiveThread</a>) writes only <code>archivedAt</code>; the archive route (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/services/threads/thread-archive.ts#L84-L119">thread-archive.ts</a>) stops an <em>active</em> thread (which moves it to <code>stopping</code>, a status the guard already ignores) but an idle thread has nothing to stop and keeps <code>status = 'idle'</code>:</p>
+<pre>export function archiveThread(db, notifier, id) {
+  const now = Date.now();
+  const updated = db
+    .update(threads)
+    .set({ archivedAt: now, updatedAt: now })   // status is untouched: an idle thread stays "idle"
+    .where(eq(threads.id, id))
+    .returning()
+    .get();
+  ...
+}</pre>
+  <p>So after archiving, the row is <code>{status: 'idle', archived_at: &lt;ts&gt;, deleted_at: NULL}</code>, the <code>INNER JOIN environments</code> still matches the folder's environment (archiving does not detach the environment; unmanaged environments are never cleaned up), and the guard reports a live thread indefinitely. The only ways out on base are to delete the thread (removes history) or to not request a branch checkout, exactly as the issue says. Nothing else depends on this query, so the blast radius is the branch-checkout path of thread create (the <code>update_environment_directory</code> tool calls the same helper with <code>checksOutBranch: false</code> and is unaffected).</p>
+  <p><strong>Deeper observations (not bugs in this issue, but worth knowing):</strong></p>
+  <ul>
+    <li>The guard is intentionally cross-project, but it is also cross-thread <em>within</em> the project: any unarchived idle thread in a local workspace blocks "New branch from" for a sibling thread (verified on the PR build: with one unarchived idle thread present the request is still 409). Users must archive the previous thread before they can branch. That matches the issue's stated expectation, but the UI gives no hint about which thread is holding the folder.</li>
+    <li><code>NON_TERMINAL_THREAD_STATUSES</code> excludes <code>stopping</code>, so a thread whose stop RPC is still in flight (agent process possibly still writing) does not block a checkout. Pre-existing, unchanged by the PR.</li>
+  </ul>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>Use the existing <code>liveThreads()</code> predicate in <code>hasLiveThreadAtHostPath</code> so the definition of "live" matches every other live-thread query in the file (<code>deleted_at IS NULL AND archived_at IS NULL</code>), and keep the status filter. That is exactly the one-line change in PR #2069. Safety argument: an archived thread is never resumed without being unarchived first (unarchive clears <code>archivedAt</code> and the guard applies again), and archiving an active thread synchronously marks it <code>stopping</code>, which the guard already ignored, so excluding archived rows does not open a new window in which an agent is working in the folder. What could go wrong: nothing new; the residual race (checkout while a <code>stopping</code> thread's turn is still being interrupted) exists before and after. A follow-up could include <code>stopping</code> threads that still have an active turn, and the 409 message could name the blocking thread.</p>
+
+  <h2>7. PR review</h2>
+  <h3>PR #2069 — "Allow branch checkout after workspace threads are archived" (hemaaanth, agent-generated)</h3>
+  <p><strong>What it changes:</strong> one line in <code>packages/db/src/data/threads.ts</code> (<code>nonDeletedThreads(</code> → <code>liveThreads(</code> inside <code>hasLiveThreadAtHostPath</code>) plus one new test in <code>apps/server/test/threads/workspace-path-claims.test.ts</code> ("allows branch checkout after every thread at the path is archived"). Full diff: <a href="2068/repro/pr-2069.diff">pr-2069.diff</a>.</p>
+<pre>diff --git a/apps/server/test/threads/workspace-path-claims.test.ts b/apps/server/test/threads/workspace-path-claims.test.ts
+index 91a1b891f6..7224bf6bc2 100644
+--- a/apps/server/test/threads/workspace-path-claims.test.ts
++++ b/apps/server/test/threads/workspace-path-claims.test.ts
+@@ -1,3 +1,4 @@
++import { archiveThread } from "@bb/db";
+ import { describe, expect, it } from "vitest";
+ import { unmanagedAttachRefusal } from "../../src/services/threads/workspace-path-claims.js";
+ import {
+@@ -141,4 +142,39 @@ describe("unmanagedAttachRefusal", () =&gt; {
+       ).toMatchObject({ reason: "live-thread" });
+     });
+   });
++
++  it("allows branch checkout after every thread at the path is archived", async () =&gt; {
++    await withTestHarness(async (harness) =&gt; {
++      const { host } = seedHostSession(harness.deps, {
++        id: "host-claims-archived",
++      });
++      const sharedPath = "/tmp/archived-shared";
++      const { project } = seedProjectWithSource(harness.deps, {
++        hostId: host.id,
++        name: "Archived",
++        path: sharedPath,
++      });
++      const environment = seedEnvironment(harness.deps, {
++        hostId: host.id,
++        projectId: project.id,
++        path: sharedPath,
++      });
++      const thread = seedThread(harness.deps, {
++        projectId: project.id,
++        environmentId: environment.id,
++        status: "idle",
++      });
++      archiveThread(harness.deps.db, harness.deps.hub, thread.id);
++
++      expect(
++        unmanagedAttachRefusal(harness.deps.db, {
++          checksOutBranch: true,
++          dataDir: HOST_DATA_DIR,
++          hostId: host.id,
++          path: sharedPath,
++          projectId: project.id,
++        }),
++      ).toBeNull();
++    });
++  });
+ });
+diff --git a/packages/db/src/data/threads.ts b/packages/db/src/data/threads.ts
+index eda475b8b3..f1c97c02a4 100644
+--- a/packages/db/src/data/threads.ts
++++ b/packages/db/src/data/threads.ts
+@@ -1411,7 +1411,7 @@ export function hasLiveThreadAtHostPath(
+       and(
+         eq(environments.hostId, args.hostId),
+         eq(environments.path, args.path),
+-        nonDeletedThreads(
++        liveThreads(
+           inArray(threads.status, [...NON_TERMINAL_THREAD_STATUSES]),
+         ),
+       ),
+</pre>
+  <p><strong>Root cause or symptom?</strong> Root cause. The query was the single source of the wrong answer; the change aligns it with the codebase's own definition of "live" and keeps the non-terminal status filter. Correct layer (a db data-access predicate; no server/daemon boundary involved). No wire shapes change, so no <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump is needed. No casts, no behaviour change beyond the intended one.</p>
+  <p><strong>Findings:</strong></p>
+  <table><tr><th>Where</th><th>Severity</th><th>Finding</th></tr>
+    <tr><td><code>packages/db/src/data/threads.ts:1414</code></td><td>none</td><td>Change is correct and minimal. I tried to break it with: archived <code>active</code> thread (archive path marks it <code>stopping</code> synchronously, and <code>stopping</code> was never in the status list, so no new window); unarchive (restores the block); a second unarchived idle thread (still 409, guard intact); second project sharing the path (still cross-project).</td></tr>
+    <tr><td><code>apps/server/test/threads/workspace-path-claims.test.ts:146-179</code></td><td>low</td><td>Test archives via the raw <code>archiveThread</code> db call rather than the archive service/route, and only exercises <code>unmanagedAttachRefusal</code> directly. Acceptable (the route ends in the same write), but a <code>createThreadFromRequest</code> case with <code>branch: {kind:"new"}</code> would guard the actual user path; my repro test includes one and passes on the PR.</td></tr>
+    <tr><td>PR description</td><td>low</td><td>Verification section lists direct <code>pnpm --filter</code> runs (AGENTS.md asks for turbo) and a "review receipt" path on the author's machine; cosmetic. Branch is based on <code>6be45053b</code> (a week behind main) but cherry-picks cleanly onto <code>fcada5a3b</code>; GitHub reports MERGEABLE/CLEAN.</td></tr>
+    <tr><td>Doc comment <code>threads.ts:1393-1397</code></td><td>nit</td><td>Could state that archived threads are excluded because archive settles the runtime; not required.</td></tr>
+  </table>
+  <p><strong>Tests I ran:</strong></p>
+  <ul>
+    <li>On the PR branch (<code>0046679d9</code>): <code>vitest run</code> of my repro test + <code>workspace-path-claims.test.ts</code> + <code>thread-create-shared-workspace-path.test.ts</code> → 12/12 pass (<a href="2068/repro/vitest-pr2069.log">log</a>). The two repro cases that fail on base pass; the active-thread control still refuses.</li>
+    <li>Cherry-picked the PR commit onto <code>fcada5a3b</code> (branch <code>pr2069-on-base</code>), ran <code>pnpm exec turbo run test --filter=@bb/server --filter=@bb/db --force</code> → <code>@bb/db</code> 406/406, <code>@bb/server</code> 1901/1901 (<a href="2068/test-pr2069-on-base.log">log</a>).</li>
+    <li>Restarted my dev instance on <code>pr2069-on-base</code> with the same DB (two archived idle threads in the folder) and replayed step 4: <code>HTTP 201</code>, thread <code>thr_y9rr748i7x</code> ran, and <code>git -C /tmp/bb-2068-repo branch</code> shows <code>* bb/thr_y9rr748i7x</code>. Then, with that new thread unarchived and idle, the same request is again 409 — the guard still protects a genuinely live thread.</li>
+  </ul>
+  <figure><img src="assets/2068-pr-success.png" alt="Thread created on the PR build, footer shows branch bb/thr_y9rr748i7x"><figcaption>PR build: the "New branch from: main" thread is created and answers "ok"; the footer shows the checked-out branch <code>bb/thr_y9rr748i7x</code>.</figcaption></figure>
+  <p><strong>Verdict: MERGE.</strong> Fixes the root cause with the smallest correct change, keeps the safety guard, and has regression coverage. Optional follow-ups: add a route-level test, and have the 409 name the blocking thread.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/pull/1049">#1049</a> "Scope the workspace path claim to the project" — introduced <code>hasLiveThreadAtHostPath</code> and this guard (fixes <a href="https://github.com/get-bb/bb/issues/1043">#1043</a>).</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1624">#1624</a> "Support discovered worktrees and continuing existing branches" — adjacent branch/workspace UX.</li>
+    <li>No other open issue mentions the "Cannot checkout branch while another thread is using this workspace" message.</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Commands run (in order)</h3>
+<pre>gh issue view 2068 --comments; gh pr view 2069; gh pr diff 2069
+git checkout fcada5a3b; git fetch origin main; git log fcada5a3b..origin/main --oneline -- packages/db/src/data/threads.ts apps/server/src/services/threads/workspace-path-claims.ts   # (empty)
+pnpm install --frozen-lockfile --prefer-offline; pnpm exec turbo run build
+git log --format='%h %ad %s' --date=short -S hasLiveThreadAtHostPath -- packages/db/src/data/threads.ts   # bed45061f 2026-08-06 (#1049)
+# write apps/server/test/threads/repro-2068-archived-thread-blocks-checkout.test.ts
+cd apps/server &amp;&amp; pnpm exec vitest run test/threads/repro-2068-archived-thread-blocks-checkout.test.ts      # 2 failed / 1 passed on base
+scripts/bb-dev-app current          # App :13684, Server :21684, Host daemon :29684
+git init /tmp/bb-2068-repo …; curl POST /api/v1/projects …                                               # proj_2xirasxmz4
+curl POST /api/v1/threads -d @step1-create-thread.json                                                   # thr_jzgzjh5wen → idle
+pnpm bb:dev thread archive thr_jzgzjh5wen
+curl POST /api/v1/threads -d @step3-create-branch-thread.json                                            # HTTP 409
+pnpm bb:dev thread stop thr_jzgzjh5wen; (retry) → HTTP 409
+curl POST /api/v1/threads (no branch)                                                                    # HTTP 201 thr_k9yxf8mk9i; then archived
+doobie (headless Chrome) → compose view, Branch picker → New branch → main → type prompt → Enter       # toast 409 (screenshots)
+gh pr checkout 2069; pnpm exec turbo run build --filter=@bb/server; vitest run (3 files)                 # 12 passed
+git checkout -b pr2069-on-base fcada5a3b; git cherry-pick 0046679d9
+scripts/bb-dev-app current (pr2069-on-base); curl POST … step3 → HTTP 201 thr_y9rr748i7x; git branch → bb/thr_y9rr748i7x
+pnpm exec turbo run test --filter=@bb/server --filter=@bb/db --force                                     # 406 + 1901 passed
+pnpm dev:stop; cleanup</pre>
+  <h3>vitest on PR #2069 branch</h3>
+<pre> RUN  v4.1.1 /Users/sawyerhood/.bb-machines/bee.getbb.app/checkouts/bb/.claude/worktrees/wf_21e66a79-f02-15/apps/server
+
+
+ Test Files  3 passed (3)
+      Tests  12 passed (12)
+   Start at  08:57:12
+   Duration  3.52s (transform 4.73s, setup 0ms, import 8.17s, tests 1.56s, environment 0ms)
+
+</pre>
+  <h3>Live responses</h3>
+<pre>step3 (base fcada5a3b):  HTTP 409 {"code":"invalid_request","message":"Cannot checkout branch while another thread is using this workspace"}
+step5 (pr2069-on-base):  HTTP 201 {"id":"thr_y9rr748i7x","projectId":"proj_2xirasxmz4","environmentId":"env_uvfmh7vcmz","providerId":"claude-code","title":"2068 second thread (new branch from main)",...,"status":"starting","archivedAt":null,...}
+/tmp/bb-2068-repo after step5:  * bb/thr_y9rr748i7x
+                                  main
+threads table before step5:     thr_jzgzjh5wen|idle|1787327679973   thr_k9yxf8mk9i|idle|1787327768934   (both archived, deleted_at NULL)</pre>
+  <p>Other artifacts: <a href="2068/install.log">install.log</a>, <a href="2068/build.log">build.log</a>, <a href="2068/dev-app-start.log">dev-app-start.log</a>, <a href="2068/dev-app-restart-pr.log">dev-app-restart-pr.log</a>, <a href="2068/repro/step1-response.json">step1-response.json</a>, <a href="2068/repro/step3-response.json">step3-response.json</a>, <a href="2068/repro/step4-nobranch-response.json">step4-nobranch-response.json</a>, <a href="2068/repro/step5-pr-response.json">step5-pr-response.json</a>.</p>
+</main></body></html>

@@ -1,0 +1,1519 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2066 Timeline cache retains obsolete revisions for the same request shape</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.med { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .verdict { font-weight:600; }
+  .v-repro { color:var(--high); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; max-height:520px; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; background:#fff; } figcaption { font-size:13px; color:var(--muted); margin-top:6px; }
+  details summary { cursor:pointer; color:var(--accent); }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2066 · Timeline cache retains obsolete revisions for the same request shape</h1>
+  <p class="meta">
+    <span class="pill">Bug / perf</span> <span class="pill med">Priority: Medium</span> <span class="pill">Effort: low</span> <span class="pill">perf</span> <span class="pill">threads</span>
+    <a href="https://github.com/get-bb/bb/issues/2066">open on GitHub</a>
+    <span>2026-08-21 · base <code>fcada5a3b</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict v-repro">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high</p>
+  <p><strong>Linked PR:</strong> <a href="https://github.com/get-bb/bb/pull/2067">#2067</a> (draft) — review verdict: <strong>REQUEST CHANGES (minor; the fix itself is correct and measured effective)</strong>.</p>
+
+  <h2>1. TL;DR</h2>
+  <p>The bb server memoizes built thread-timeline responses in a 128-entry LRU so that refetching an idle thread is cheap. The cache key includes the thread's high-water event sequence (<code>maxSeq</code>). A thread's <code>maxSeq</code> only ever increases, so the moment an event is appended the previous entry can never be looked up again, but it stays strongly referenced until 127 more entries push it out. During a streaming turn the web client refetches the same window after every event batch (at least every 50 ms, up to 1 s on slow builds: <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/app/src/hooks/cache-owners/realtime-cache-registry.ts#L179-L180">realtime-cache-registry.ts:179-180</a> clamps the trailing delay between 50 ms and 1,000 ms scaled by the observed fetch duration), so one active thread fills all 128 slots with dead revisions within a few seconds and keeps them there. This is bounded (128 × one response object), not a leak, but it is pure waste: on a seeded 9,001-event thread 100 append+refetch rounds grew the server's GC'd V8 heap by 19–22 MB on <code>fcada5a3b</code> versus 3.6 MB with PR #2067 applied. Larger threads (the reporter's had 1,400-event windows) retain proportionally more. The issue's core claim is correct; its secondary numbers (&quot;response payloads 1.1–4.8 MiB&quot;) appear to be a misreading of the <code>eventDataBytes</code> field of the slow-build log (input event JSON, not the response).</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>The cache keys entries by request params <em>and</em> <code>maxSeq</code>.</td><td class="ok">Verified</td><td><a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/services/threads/timeline-cache.ts#L126-L130"><code>buildThreadTimelineCacheKey</code></a> returns <code>`${maxSeq}|${paramsKey}`</code>; the route passes it at <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/routes/threads/data.ts#L358-L360">data.ts:358</a>.</td></tr>
+    <tr><td>Every appended event creates a new key and the obsolete revision stays resident until global LRU eviction.</td><td class="ok">Verified</td><td>Route-level test against the real <code>GET /threads/:id/timeline</code>: after 150 append+fetch rounds on one thread <code>cache.size === 128</code> (only 1 entry is reachable). Unit test: 2 revisions → size 2. See §4.</td></tr>
+    <tr><td>Obsolete entries are unreachable by lookup (so retaining them has no value).</td><td class="ok">Verified</td><td><code>maxSeq</code> is <code>MAX(sequence)</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/packages/db/src/data/events.ts#L3065-L3077">events.ts:3065</a>) and is monotonic: even message-edit, the one flow that deletes events, first appends a <code>system/operation</code> event above the old max and then deletes the suffix below it (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/services/threads/thread-edit-message.ts#L554-L578">thread-edit-message.ts:554-578</a>). Pruning never lowers it (doc comment, <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/services/threads/timeline-cache.ts#L16-L23">timeline-cache.ts:16</a>).</td></tr>
+    <tr><td>Regression assertion fails with <code>2 !== 1</code> before the fix.</td><td class="ok">Verified</td><td><code>AssertionError: expected 2 to be 1</code> on <code>fcada5a3b</code> (§4, unit test).</td></tr>
+    <tr><td>Active thread stayed below the projected-row cutoff, so revisions were cacheable.</td><td class="ok">Verified (in general)</td><td>Cap is 200 rows (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/services/threads/timeline-cache.ts#L33">L33</a>). The seeded 9,001-event thread's latest window is 99 rows / 107 KB JSON; in the live loop rows stayed ≤ 200 for the first 100 appended items. The 200-row cap only excludes <em>large</em> expanded turns; ordinary streaming turns are cached on every event.</td></tr>
+    <tr><td>&quot;Response payloads around 1.1–4.8 MiB&quot; in server logs.</td><td class="no">Refuted as stated</td><td>The server never logs response size. The slow-build log (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/services/threads/timeline-build-log.ts#L93-L112">timeline-build-log.ts:93-112</a>) logs <code>eventDataBytes</code> — the JSON size of the <em>input events</em> in the window. On my thread that field was 459,376 bytes for a 107,571-byte response (4.3:1). The reporter's 1.1–4.8 MiB is almost certainly <code>eventDataBytes</code>; the cached objects were likely a quarter of that per revision.</td></tr>
+    <tr><td>Desktop app at 1.5–1.7 GB, server 300–650 MB, caused/amplified by this retention.</td><td class="unv">Unverified (plausible contributor, not shown to be dominant)</td><td>No heap snapshot in the issue. Measured here: 128 dead revisions of a 100–200-row response ≈ 20 MB of heap. For a 1,400-event window the per-revision object is larger (perhaps 0.3–1 MB), so 128 revisions could plausibly reach 40–130 MB. It cannot explain 300–650 MB on its own; the same incident also had 1.34 s builds decoding 1.1–4.8 MiB of events per request (see #1749, #1129).</td></tr>
+    <tr><td>Not a duplicate of #1749.</td><td class="ok">Verified</td><td>#1749 is about the event-budget calibration of the window size; this is about response retention in the cache. Related, not duplicate.</td></tr>
+    <tr><td>Fix is localized and low effort; does not change response data or cacheability.</td><td class="ok">Verified</td><td>PR #2067 touches one service file, one route call site and one test; all timeline/delta/public-thread tests pass (§7).</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb base commit <code>fcada5a3b88302acb9944aa74b11db4ecaa215a0</code> (main, 2026-08-21); <code>origin/main</code> has no later commits touching <code>apps/server/src/services/threads/timeline-cache.ts</code> or <code>routes/threads/data.ts</code>, so the bug is still present on main.</li>
+    <li>macOS 26.5.2 (25F84), Apple Silicon, 36 GB RAM; Node v22.23.1; codex-cli 0.149.0 (no provider turn was needed — events were inserted directly).</li>
+    <li>Isolated dev instance from this worktree: App <code>:12143</code>, Server <code>:20143</code>, host daemon <code>:28143</code>, data dir <code>~/.bb-dev/bb-machines-bee.getbb.app-checkouts-bb-.claude-worktrees-wf_21e66a79-f02-17-e0641bf7a98d</code> (deleted at cleanup). Seeded with <code>pnpm seed:perf -- --projects 1 --threads 6 --events 30000 --seed 7</code> (22,436 event rows; largest thread <code>thr_6zik7e8uvr</code> = 9,001 events / 5.2 MB of event JSON).</li>
+    <li>Revision pass: second isolated worktree (<code>f02-23</code>): App <code>:12532</code>, Server <code>:20532</code>, host daemon <code>:28532</code>, data dir <code>~/.bb-dev/…-wf_21e66a79-f02-23-9a71be3ce607</code> (deleted at cleanup), seeded with the same command (same thread/environment/provider-thread ids, confirming the seed is deterministic). The independent verifier used a third (<code>f02-21</code>, server <code>:25775</code>).</li>
+    <li>Vitest 4.1.1 via <code>pnpm exec vitest run</code> inside <code>apps/server</code>; in-memory SQLite through the repo's <code>withTestHarness</code>.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <h3>4a. Unit level (the issue's own steps) — fails on <code>fcada5a3b</code></h3>
+  <ol>
+    <li>Save <a href="2066/repro/repro-2066-unit.test.ts">repro-2066-unit.test.ts</a> as <code>apps/server/test/services/threads/repro-2066-unit.test.ts</code>.</li>
+    <li>Run it from <code>apps/server</code>:<pre>pnpm exec vitest run test/services/threads/repro-2066-unit.test.ts
+
+expected: both tests pass (cache.size === 1 after a newer revision of the same shape)
+actual:
+ RUN  v4.1.1 /Users/sawyerhood/.bb-machines/bee.getbb.app/checkouts/bb/.claude/worktrees/wf_21e66a79-f02-23/apps/server
+ ❯  @bb/server  test/services/threads/repro-2066-unit.test.ts (2 tests | 2 failed) 4ms
+     × replaces the previous revision of the same request shape 3ms
+     × is bounded only by the global LRU for a single streaming thread 1ms
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+ FAIL   @bb/server  test/services/threads/repro-2066-unit.test.ts &gt; #2066 unit &gt; replaces the previous revision of the same request shape
+AssertionError: expected 2 to be 1 // Object.is equality
+- Expected
++ Received
+- 1
++ 2
+ ❯ test/services/threads/repro-2066-unit.test.ts:68:24
+     66|     );
+     67|     // Expected 1 (only maxSeq 11 is reachable). Actual on fcada5a3b: …
+     68|     expect(cache.size).toBe(1);
+       |                        ^
+     69|   });
+     70|
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+ FAIL   @bb/server  test/services/threads/repro-2066-unit.test.ts &gt; #2066 unit &gt; is bounded only by the global LRU for a single streaming thread
+AssertionError: expected 128 to be 1 // Object.is equality
+- Expected
++ Received
+- 1
++ 128
+ ❯ test/services/threads/repro-2066-unit.test.ts:79:24
+     77|     }
+     78|     // Expected 1. Actual on fcada5a3b: 128 (DEFAULT_MAX_ENTRIES).
+     79|     expect(cache.size).toBe(1);
+       |                        ^
+     80|   });
+     81| });
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+ Test Files  1 failed (1)
+      Tests  2 failed (2)
+   Start at  09:38:39
+   Duration  82ms (transform 12ms, setup 0ms, import 17ms, tests 4ms, environment 0ms)</pre></li>
+  </ol>
+  <details><summary>repro-2066-unit.test.ts</summary><pre>/**
+ * Unit-level repro for get-bb/bb#2066 against the cache in isolation, using the
+ * exact key builder the route uses. Two revisions (maxSeq 10 then 11) of one
+ * request shape leave two resident entries although only the newest can ever
+ * be looked up again (a thread's maxSeq never decreases).
+ */
+import { describe, expect, it } from "vitest";
+import type { ThreadTimelineResponse } from "@bb/server-contract";
+import {
+  buildThreadTimelineCacheKey,
+  createThreadTimelineCache,
+  type ThreadTimelineCacheKeyArgs,
+} from "../../../src/services/threads/timeline-cache.js";
+
+function makeResponse(rowCount: number): ThreadTimelineResponse {
+  return {
+    rows: Array.from({ length: rowCount }, (_, index) =&gt; ({
+      id: `row-${index}`,
+      kind: "system",
+      threadId: "thr_x",
+      turnId: null,
+      sourceSeqStart: index,
+      sourceSeqEnd: index,
+      startedAt: 0,
+      createdAt: 0,
+      systemKind: "debug",
+      title: "t",
+      detail: null,
+      status: null,
+    })),
+    activePromptMode: null,
+    activeThinking: null,
+    activeWorkflows: [],
+    activeBackgroundCommands: [],
+    pendingTodos: null,
+    goal: null,
+    modelFallback: null,
+    maxSeq: 0,
+    timelinePage: {
+      kind: "latest",
+      segmentLimit: 20,
+      returnedSegmentCount: 0,
+      hasOlderRows: false,
+      olderCursor: null,
+    },
+  };
+}
+
+const shape: ThreadTimelineCacheKeyArgs = {
+  threadId: "thr_x",
+  maxSeq: 10,
+  status: "active",
+  environmentId: null,
+  page: { kind: "latest", segmentLimit: 20 },
+  includeNestedRows: false,
+  summaryOnly: false,
+  includeProviderUnhandledOperations: false,
+};
+
+describe("#2066 unit", () =&gt; {
+  it("replaces the previous revision of the same request shape", () =&gt; {
+    const cache = createThreadTimelineCache();
+    cache.getOrBuild(buildThreadTimelineCacheKey(shape), () =&gt; makeResponse(3));
+    cache.getOrBuild(buildThreadTimelineCacheKey({ ...shape, maxSeq: 11 }), () =&gt;
+      makeResponse(3),
+    );
+    // Expected 1 (only maxSeq 11 is reachable). Actual on fcada5a3b: 2.
+    expect(cache.size).toBe(1);
+  });
+
+  it("is bounded only by the global LRU for a single streaming thread", () =&gt; {
+    const cache = createThreadTimelineCache();
+    for (let maxSeq = 1; maxSeq &lt;= 500; maxSeq++) {
+      cache.getOrBuild(buildThreadTimelineCacheKey({ ...shape, maxSeq }), () =&gt;
+        makeResponse(3),
+      );
+    }
+    // Expected 1. Actual on fcada5a3b: 128 (DEFAULT_MAX_ENTRIES).
+    expect(cache.size).toBe(1);
+  });
+});
+</pre></details>
+  <p><strong>Scope of this file:</strong> it calls <code>getOrBuild(buildThreadTimelineCacheKey(shape), build)</code>, i.e. the <em>base</em> string-key signature, so it only demonstrates the bug on <code>fcada5a3b</code>. Any fix changes that signature (PR #2067 takes <code>{ paramsKey, revisionKey }</code>, the proposed fix in §6 takes <code>{ paramsKey, maxSeq }</code>), and against either this file throws <code>TypeError: Cannot read properties of undefined (reading 'value')</code> rather than passing. The same two scenarios rewritten for each new signature are <a href="2066/repro/repro-2066-unit-pr2067.test.ts">repro-2066-unit-pr2067.test.ts</a> (passes on the PR branch, 2/2; <a href="2066/repro/pr2067-unit-variants.log">log</a>, which also shows the base-signature file's TypeError on that branch) and <a href="2066/repro/repro-2066-unit-after-fix.test.ts">repro-2066-unit-after-fix.test.ts</a> (passes on base + <a href="2066/repro/proposed-fix-2066.diff">proposed-fix-2066.diff</a>, 2/2; <a href="2066/repro/proposed-fix-tests.log">log</a>). The signature-independent fail-before/pass-after evidence is the route-level test in §4b.</p>
+  <details><summary>repro-2066-unit-pr2067.test.ts</summary><pre>/**
+ * The two #2066 unit scenarios (repro-2066-unit.test.ts) rewritten against
+ * PR #2067's `getOrBuild({ paramsKey, revisionKey }, build)` signature, so the
+ * "pass after" half of the claim can be shown on the PR branch. The base-tree
+ * version cannot run against the PR: it passes a string key and throws
+ * `TypeError: Cannot read properties of undefined (reading 'value')`.
+ *
+ * Note: this file also fails on fcada5a3b (2 and 128 instead of 1) because the
+ * base cache accepts the object as an opaque Map key, but that is a type error
+ * at compile time, not evidence; use repro-2066-unit.test.ts for "fails before".
+ */
+import { describe, expect, it } from "vitest";
+import type { ThreadTimelineResponse } from "@bb/server-contract";
+import {
+  buildThreadTimelineCacheKey,
+  buildThreadTimelineParamsKey,
+  createThreadTimelineCache,
+  type ThreadTimelineCacheKeyArgs,
+} from "../../../src/services/threads/timeline-cache.js";
+
+function makeResponse(rowCount: number): ThreadTimelineResponse {
+  return {
+    rows: Array.from({ length: rowCount }, (_, index) =&gt; ({
+      id: `row-${index}`,
+      kind: "system",
+      threadId: "thr_x",
+      turnId: null,
+      sourceSeqStart: index,
+      sourceSeqEnd: index,
+      startedAt: 0,
+      createdAt: 0,
+      systemKind: "debug",
+      title: "t",
+      detail: null,
+      status: null,
+    })),
+    activePromptMode: null,
+    activeThinking: null,
+    activeWorkflows: [],
+    activeBackgroundCommands: [],
+    pendingTodos: null,
+    goal: null,
+    modelFallback: null,
+    maxSeq: 0,
+    timelinePage: {
+      kind: "latest",
+      segmentLimit: 20,
+      returnedSegmentCount: 0,
+      hasOlderRows: false,
+      olderCursor: null,
+    },
+  };
+}
+
+const shape: ThreadTimelineCacheKeyArgs = {
+  threadId: "thr_x",
+  maxSeq: 10,
+  status: "active",
+  environmentId: null,
+  page: { kind: "latest", segmentLimit: 20 },
+  includeNestedRows: false,
+  summaryOnly: false,
+  includeProviderUnhandledOperations: false,
+};
+
+// Exactly what routes/threads/data.ts does on the PR branch.
+const keysFor = (args: ThreadTimelineCacheKeyArgs) =&gt; ({
+  paramsKey: buildThreadTimelineParamsKey(args),
+  revisionKey: buildThreadTimelineCacheKey(args),
+});
+
+describe("#2066 unit (PR #2067 signature)", () =&gt; {
+  it("replaces the previous revision of the same request shape", () =&gt; {
+    const cache = createThreadTimelineCache();
+    cache.getOrBuild(keysFor(shape), () =&gt; makeResponse(3));
+    cache.getOrBuild(keysFor({ ...shape, maxSeq: 11 }), () =&gt; makeResponse(3));
+    expect(cache.size).toBe(1);
+  });
+
+  it("keeps one entry for a single streaming thread regardless of revision count", () =&gt; {
+    const cache = createThreadTimelineCache();
+    for (let maxSeq = 1; maxSeq &lt;= 500; maxSeq++) {
+      cache.getOrBuild(keysFor({ ...shape, maxSeq }), () =&gt; makeResponse(3));
+    }
+    expect(cache.size).toBe(1);
+  });
+});
+</pre></details>
+  <details><summary>repro-2066-unit-after-fix.test.ts</summary><pre>/**
+ * The two #2066 unit scenarios (repro-2066-unit.test.ts) written against the
+ * proposed fix's `getOrBuild({ paramsKey, maxSeq }, build)` signature
+ * (proposed-fix-2066.diff). Run on fcada5a3b + proposed-fix-2066.diff.
+ * Does not apply to fcada5a3b (string key) or PR #2067 (`revisionKey`).
+ */
+import { describe, expect, it } from "vitest";
+import type { ThreadTimelineResponse } from "@bb/server-contract";
+import {
+  buildThreadTimelineParamsKey,
+  createThreadTimelineCache,
+  type ThreadTimelineCacheKeyArgs,
+} from "../../../src/services/threads/timeline-cache.js";
+
+function makeResponse(rowCount: number): ThreadTimelineResponse {
+  return {
+    rows: Array.from({ length: rowCount }, (_, index) =&gt; ({
+      id: `row-${index}`,
+      kind: "system",
+      threadId: "thr_x",
+      turnId: null,
+      sourceSeqStart: index,
+      sourceSeqEnd: index,
+      startedAt: 0,
+      createdAt: 0,
+      systemKind: "debug",
+      title: "t",
+      detail: null,
+      status: null,
+    })),
+    activePromptMode: null,
+    activeThinking: null,
+    activeWorkflows: [],
+    activeBackgroundCommands: [],
+    pendingTodos: null,
+    goal: null,
+    modelFallback: null,
+    maxSeq: 0,
+    timelinePage: {
+      kind: "latest",
+      segmentLimit: 20,
+      returnedSegmentCount: 0,
+      hasOlderRows: false,
+      olderCursor: null,
+    },
+  };
+}
+
+const shape: ThreadTimelineCacheKeyArgs = {
+  threadId: "thr_x",
+  status: "active",
+  environmentId: null,
+  page: { kind: "latest", segmentLimit: 20 },
+  includeNestedRows: false,
+  summaryOnly: false,
+  includeProviderUnhandledOperations: false,
+};
+const paramsKey = buildThreadTimelineParamsKey(shape);
+
+describe("#2066 unit (proposed-fix signature)", () =&gt; {
+  it("replaces the previous revision of the same request shape", () =&gt; {
+    const cache = createThreadTimelineCache();
+    cache.getOrBuild({ paramsKey, maxSeq: 10 }, () =&gt; makeResponse(3));
+    cache.getOrBuild({ paramsKey, maxSeq: 11 }, () =&gt; makeResponse(3));
+    expect(cache.size).toBe(1);
+  });
+
+  it("keeps one entry for a single streaming thread regardless of revision count", () =&gt; {
+    const cache = createThreadTimelineCache();
+    for (let maxSeq = 1; maxSeq &lt;= 500; maxSeq++) {
+      cache.getOrBuild({ paramsKey, maxSeq }, () =&gt; makeResponse(3));
+    }
+    expect(cache.size).toBe(1);
+  });
+});
+</pre></details>
+  <details><summary>pr2067-unit-variants.log (PR branch: PR-signature file passes, base-signature file throws)</summary><pre> RUN  v4.1.1 /Users/sawyerhood/.bb-machines/bee.getbb.app/checkouts/bb/.claude/worktrees/wf_21e66a79-f02-23/apps/server
+ ✓  @bb/server  test/services/threads/repro-2066-unit-pr2067.test.ts &gt; #2066 unit (PR #2067 signature) &gt; replaces the previous revision of the same request shape 1ms
+ ✓  @bb/server  test/services/threads/repro-2066-unit-pr2067.test.ts &gt; #2066 unit (PR #2067 signature) &gt; keeps one entry for a single streaming thread regardless of revision count 1ms
+ ×  @bb/server  test/services/threads/repro-2066-unit.test.ts &gt; #2066 unit &gt; replaces the previous revision of the same request shape 2ms
+   → Cannot read properties of undefined (reading 'value')
+ ×  @bb/server  test/services/threads/repro-2066-unit.test.ts &gt; #2066 unit &gt; is bounded only by the global LRU for a single streaming thread 0ms
+   → Cannot read properties of undefined (reading 'value')
+ ✓  @bb/server  test/services/threads/pr-2067-adversarial.test.ts &gt; PR #2067 adversarial &gt; an oversized newer revision evicts the previous cacheable revision (claimed in PR body, untested there) 1ms
+ ✓  @bb/server  test/services/threads/pr-2067-adversarial.test.ts &gt; PR #2067 adversarial &gt; a replacement is most-recently-used for LRU purposes 1ms
+ ✓  @bb/server  test/services/threads/pr-2067-adversarial.test.ts &gt; PR #2067 adversarial &gt; a stale revision request never returns the newer cached value 0ms
+ ✓  @bb/server  test/services/threads/pr-2067-adversarial.test.ts &gt; PR #2067 adversarial &gt; bounded: N revisions of one shape never exceed one entry 1ms
+ ✓  @bb/server  test/services/threads/timeline-cache.test.ts &gt; createThreadTimelineCache &gt; builds once for the same key and serves cached on repeat 1ms
+ ✓  @bb/server  test/services/threads/timeline-cache.test.ts &gt; createThreadTimelineCache &gt; rebuilds and replaces the prior revision for the same request shape 0ms
+ ✓  @bb/server  test/services/threads/timeline-cache.test.ts &gt; createThreadTimelineCache &gt; retains separate request shapes independently 0ms
+ ✓  @bb/server  test/services/threads/timeline-cache.test.ts &gt; createThreadTimelineCache &gt; does not cache responses above the row cap (streaming expanded turns) 0ms
+ ✓  @bb/server  test/services/threads/timeline-cache.test.ts &gt; createThreadTimelineCache &gt; evicts least-recently-used entries beyond maxEntries 0ms
+ ✓  @bb/server  test/services/threads/timeline-cache.test.ts &gt; buildThreadTimelineCacheKey &gt; differs when any projection input differs 0ms
+ ✓  @bb/server  test/services/threads/timeline-cache.test.ts &gt; buildThreadTimelineCacheKey &gt; distinguishes older-page cursors 0ms
+ ✓  @bb/server:isolated  test/public/repro-2066-timeline-cache-retention.test.ts &gt; #2066 timeline cache retains superseded revisions &gt; keeps one resident response per appended event for the same request shape 357ms
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+ FAIL   @bb/server  test/services/threads/repro-2066-unit.test.ts &gt; #2066 unit &gt; replaces the previous revision of the same request shape
+TypeError: Cannot read properties of undefined (reading 'value')
+ ❯ Object.getOrBuild src/services/threads/timeline-cache.ts:68:23
+     66|         entries.delete(paramsKey);
+     67|         entries.set(paramsKey, cached);
+     68|         return cached.value;
+       |                       ^
+     69|       }
+     70|
+ ❯ test/services/threads/repro-2066-unit.test.ts:63:11
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+ FAIL   @bb/server  test/services/threads/repro-2066-unit.test.ts &gt; #2066 unit &gt; is bounded only by the global LRU for a single streaming thread
+TypeError: Cannot read properties of undefined (reading 'value')
+ ❯ Object.getOrBuild src/services/threads/timeline-cache.ts:68:23
+     66|         entries.delete(paramsKey);
+     67|         entries.set(paramsKey, cached);
+     68|         return cached.value;
+       |                       ^
+     69|       }
+     70|
+ ❯ test/services/threads/repro-2066-unit.test.ts:74:13
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+ Test Files  1 failed | 4 passed (5)
+      Tests  2 failed | 14 passed (16)
+   Start at  09:28:29
+   Duration  2.28s (transform 1.25s, setup 0ms, import 1.98s, tests 369ms, environment 0ms)
+</pre></details>
+
+  <h3>4b. Route level — the real <code>GET /api/v1/threads/:id/timeline</code> against in-memory SQLite</h3>
+  <p>This drives the real route handler (real key construction, real row cap, real LRU). The only instrumentation is a <code>vi.mock</code> wrapper around <code>createThreadTimelineCache</code> so the test can read <code>.size</code> of the instance the route creates. One completed turn with a 24 KB assistant message, then a second turn to which 150 <code>agentMessage</code> items are appended one at a time, refetching the same window after each append (what the web client does during streaming, throttled to ≥50 ms in <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/app/src/hooks/cache-owners/realtime-cache-registry.ts#L179">realtime-cache-registry.ts:179</a>).</p>
+  <ol>
+    <li>Save <a href="2066/repro/repro-2066-timeline-cache-retention.test.ts">repro-2066-timeline-cache-retention.test.ts</a> as <code>apps/server/test/public/repro-2066-timeline-cache-retention.test.ts</code>.</li>
+    <li>Run from <code>apps/server</code>:<pre>pnpm exec vitest run test/public/repro-2066-timeline-cache-retention.test.ts
+
+expected: cache.size === 1 (only the newest maxSeq can ever be requested again)
+actual:
+ RUN  v4.1.1 /Users/sawyerhood/.bb-machines/bee.getbb.app/checkouts/bb/.claude/worktrees/wf_21e66a79-f02-17/apps/server
+stdout | test/public/repro-2066-timeline-cache-retention.test.ts &gt; #2066 timeline cache retains superseded revisions &gt; keeps one resident response per appended event for the same request shape
+[2066] first-response bytes=24859 rows(last)=152 rounds=150 cache.size=128
+ ❯  @bb/server:isolated  test/public/repro-2066-timeline-cache-retention.test.ts (1 test | 1 failed) 407ms
+     × keeps one resident response per appended event for the same request shape 407ms
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+ FAIL   @bb/server:isolated  test/public/repro-2066-timeline-cache-retention.test.ts &gt; #2066 timeline cache retains superseded revisions &gt; keeps one resident response per appended event for the same request shape
+AssertionError: expected 128 to be 1 // Object.is equality
+- Expected
++ Received
+- 1
++ 128
+ ❯ test/public/repro-2066-timeline-cache-retention.test.ts:144:26
+    142|         `[2066] first-response bytes=${first.bytes} rows(last)=${lastR…
+    143|       );
+    144|       expect(cache.size).toBe(1);
+       |                          ^
+    145|     });
+    146|   });
+ ❯ Module.withTestHarness test/helpers/test-app.ts:283:12
+ ❯ test/public/repro-2066-timeline-cache-retention.test.ts:54:5
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+ Test Files  1 failed (1)
+      Tests  1 failed (1)
+   Start at  08:59:47
+   Duration  3.80s (transform 1.81s, setup 0ms, import 3.24s, tests 407ms, environment 0ms)</pre></li>
+  </ol>
+  <details><summary>repro-2066-timeline-cache-retention.test.ts</summary><pre>/**
+ * Repro for get-bb/bb#2066: the timeline response cache keys on `maxSeq`, so
+ * every appended event leaves the previous revision resident (and unreachable,
+ * because a thread's maxSeq is monotonic) until global LRU eviction.
+ *
+ * Drives the REAL `GET /api/v1/threads/:id/timeline` route against an
+ * in-memory SQLite database. The only instrumentation is wrapping the cache
+ * factory so the test can read `.size` of the instance the route creates.
+ */
+import { describe, expect, it, vi } from "vitest";
+import { threadScope, turnScope } from "@bb/domain";
+import { threadTimelineResponseSchema } from "@bb/server-contract";
+import { seedEvent, seedThreadFixture } from "../helpers/seed.js";
+import { withTestHarness } from "../helpers/test-app.js";
+import type { TestAppHarness } from "../helpers/test-app.js";
+import type { createThreadTimelineCache as CreateCache } from "../../src/services/threads/timeline-cache.js";
+
+const createdCaches: ReturnType&lt;typeof CreateCache&gt;[] = [];
+
+vi.mock(
+  "../../src/services/threads/timeline-cache.js",
+  async (importOriginal) =&gt; {
+    const mod =
+      await importOriginal&lt;
+        typeof import("../../src/services/threads/timeline-cache.js")
+      &gt;();
+    return {
+      ...mod,
+      createThreadTimelineCache: (
+        ...args: Parameters&lt;typeof mod.createThreadTimelineCache&gt;
+      ) =&gt; {
+        const cache = mod.createThreadTimelineCache(...args);
+        createdCaches.push(cache);
+        return cache;
+      },
+    };
+  },
+);
+
+async function fetchTimeline(harness: TestAppHarness, threadId: string) {
+  const response = await harness.app.request(
+    `/api/v1/threads/${threadId}/timeline`,
+  );
+  expect(response.status).toBe(200);
+  const text = await response.text();
+  return {
+    bytes: Buffer.byteLength(text),
+    body: threadTimelineResponseSchema.parse(JSON.parse(text)),
+  };
+}
+
+describe("#2066 timeline cache retains superseded revisions", () =&gt; {
+  it("keeps one resident response per appended event for the same request shape", async () =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      const cache = createdCaches.at(-1);
+      if (!cache) {
+        throw new Error("route did not create a timeline cache");
+      }
+      const { environment, thread } = seedThreadFixture(harness);
+      const base = {
+        threadId: thread.id,
+        environmentId: environment.id,
+        providerThreadId: "p1",
+      } as const;
+
+      // A completed turn with a sizeable assistant message so each cached
+      // revision carries real payload weight.
+      const bigText = "lorem ipsum ".repeat(2_000); // ~24 KB
+      seedEvent(harness.deps, {
+        ...base,
+        scope: threadScope(),
+        sequence: 1,
+        type: "system/manager/user_message",
+        data: { text: "hello" },
+      });
+      seedEvent(harness.deps, {
+        ...base,
+        scope: turnScope("turn-1"),
+        sequence: 2,
+        type: "turn/started",
+        data: {},
+      });
+      seedEvent(harness.deps, {
+        ...base,
+        scope: turnScope("turn-1"),
+        sequence: 3,
+        type: "item/completed",
+        data: { item: { type: "agentMessage", id: "a-1", text: bigText } },
+      });
+      seedEvent(harness.deps, {
+        ...base,
+        scope: turnScope("turn-1"),
+        sequence: 4,
+        type: "turn/completed",
+        data: { status: "completed" },
+      });
+
+      const first = await fetchTimeline(harness, thread.id);
+      expect(first.body.maxSeq).toBe(4);
+      expect(cache.size).toBe(1);
+      // Well under the 200-row cap, so every revision is cacheable.
+      expect(first.body.rows.length).toBeLessThan(200);
+
+      // A second, streaming turn: each appended event bumps maxSeq and the
+      // client refetches the same window (same request shape).
+      seedEvent(harness.deps, {
+        ...base,
+        scope: turnScope("turn-2"),
+        sequence: 5,
+        type: "turn/started",
+        data: {},
+      });
+      const rounds = 150;
+      let lastRows = 0;
+      for (let i = 0; i &lt; rounds; i++) {
+        seedEvent(harness.deps, {
+          ...base,
+          scope: turnScope("turn-2"),
+          sequence: 6 + i,
+          type: "item/completed",
+          data: {
+            item: {
+              type: "agentMessage",
+              id: `a-2-${i}`,
+              text: `chunk ${i}`,
+            },
+          },
+        });
+        const page = await fetchTimeline(harness, thread.id);
+        expect(page.body.maxSeq).toBe(6 + i);
+        lastRows = page.body.rows.length;
+        // Still cacheable (row count grows slowly; stays &lt;= 200 here).
+        expect(lastRows).toBeLessThanOrEqual(200);
+      }
+
+      // A thread's maxSeq is monotonic (getLatestThreadSequence = MAX(sequence)),
+      // so only the entry keyed by the newest maxSeq can ever be hit again.
+      // Every other entry is dead weight. Expected: 1 live revision.
+      // Actual on fcada5a3b: the global LRU bound (128) of dead revisions.
+      // eslint-disable-next-line no-console
+      console.log(
+        `[2066] first-response bytes=${first.bytes} rows(last)=${lastRows} rounds=${rounds} cache.size=${cache.size}`,
+      );
+      expect(cache.size).toBe(1);
+    });
+  });
+});
+</pre></details>
+  <p>This file drives the route through HTTP and never names the cache signature, so it is the one that runs unchanged before and after. With PR #2067 cherry-picked onto <code>fcada5a3b</code> it passes (<a href="2066/repro/route-test-pr2067-single.log">log</a>, and again in <a href="2066/repro/pr2067-unit-variants.log">pr2067-unit-variants.log</a>); with the proposed fix from §6 applied it passes too (<a href="2066/repro/proposed-fix-tests.log">proposed-fix-tests.log</a>).</p>
+
+  <h3>4c. Live instance — heap growth on a seeded 9,001-event thread</h3>
+  <p>Fresh server each run, 3 warm fetches, force a full GC through the inspector and read <code>Runtime.getHeapUsage</code>; then 100 rounds of &quot;insert one <code>agentMessage</code> event into the dev SQLite DB, GET the timeline&quot;; then GC + read again. Scripts: <a href="2066/repro/measure.sh">measure.sh</a>, <a href="2066/repro/live-loop.sh">live-loop.sh</a>, <a href="2066/repro/heap-after-gc.mjs">heap-after-gc.mjs</a>.</p>
+  <p><strong>To run it yourself</strong> (nothing is tied to a particular checkout: <code>measure.sh</code> derives the worktree from <code>git rev-parse --show-toplevel</code> and the data dir / server URL from <code>scripts/bb-dev-app status</code>, and uses the inspector on <code>127.0.0.1:9229</code>):</p>
+  <pre>cd &lt;your bb worktree at fcada5a3b&gt;
+pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build
+scripts/bb-dev-app current &amp;&amp; pnpm dev:stop               # creates the per-worktree data dir
+pnpm seed:perf -- --projects 1 --threads 6 --events 30000 --seed 7   # deterministic: thr_6zik7e8uvr / env_866bjs4xjm / 8e22443c-… are stable
+/tmp/bb-reports/issues/2066/repro/measure.sh base 100
+git fetch origin pull/2067/head:pr-2067 &amp;&amp; git checkout -B pr-2067-on-base fcada5a3b &amp;&amp; git cherry-pick 206096e4b
+/tmp/bb-reports/issues/2066/repro/measure.sh pr2067 100
+pnpm dev:stop</pre>
+  <p>Original runs (author's first worktree, <code>f02-17</code>, server :20143):</p>
+  <pre>branch=fcada5a3b pid=57624
+{"label":"base: before loop (warm, 1 cached revision)","usedMB":159.8,"totalMB":168.1}
+server pid=57624 start rss=329680KB thread=thr_6zik7e8uvr turn=turn_repro_1787328398
+end rss=399872KB
+{"label":"base: after 100 append+fetch rounds","usedMB":179.2,"totalMB":189.1}
+branch=fcada5a3b pid=62002
+{"label":"base-run2: before loop (warm, 1 cached revision)","usedMB":159.5,"totalMB":170.6}
+server pid=62002 start rss=325632KB thread=thr_6zik7e8uvr turn=turn_repro_1787328467
+end rss=511872KB
+{"label":"base-run2: after 100 append+fetch rounds","usedMB":181.3,"totalMB":192.6}
+branch=f81524c34 pid=59927
+{"label":"pr2067: before loop (warm, 1 cached revision)","usedMB":160,"totalMB":169.3}
+server pid=59927 start rss=343296KB thread=thr_6zik7e8uvr turn=turn_repro_1787328433
+end rss=402336KB
+{"label":"pr2067: after 100 append+fetch rounds","usedMB":163.6,"totalMB":173.6}
+</pre>
+  <p>Re-run for this revision with the portable <code>measure.sh</code> in a fresh worktree (<code>f02-23</code>, server :20532, data dir re-seeded with the same command), plus the proposed fix from §6 (<a href="2066/repro/revise/">2066/repro/revise/</a>):</p>
+  <pre>worktree=/Users/sawyerhood/.bb-machines/bee.getbb.app/checkouts/bb/.claude/worktrees/wf_21e66a79-f02-23 db=/Users/sawyerhood/.bb-dev/bb-machines-bee.getbb.app-checkouts-bb-.claude-worktrees-wf_21e66a79-f02-23-9a71be3ce607/bb.db server=http://localhost:20532 out=/tmp/bb-reports/issues/2066/repro/revise
+branch=fcada5a3b pid=51097
+{"label":"base: before loop (warm, 1 cached revision)","usedMB":159.9,"totalMB":169.6}
+server pid=51097 start rss=368208KB thread=thr_6zik7e8uvr turn=turn_repro_1787329950
+end rss=548896KB
+{"label":"base: after 100 append+fetch rounds","usedMB":181.6,"totalMB":191.8}
+
+worktree=/Users/sawyerhood/.bb-machines/bee.getbb.app/checkouts/bb/.claude/worktrees/wf_21e66a79-f02-23 db=/Users/sawyerhood/.bb-dev/bb-machines-bee.getbb.app-checkouts-bb-.claude-worktrees-wf_21e66a79-f02-23-9a71be3ce607/bb.db server=http://localhost:20532 out=/tmp/bb-reports/issues/2066/repro/revise
+branch=2723db725 pid=53490
+{"label":"pr2067: before loop (warm, 1 cached revision)","usedMB":160.5,"totalMB":170.8}
+server pid=53490 start rss=345264KB thread=thr_6zik7e8uvr turn=turn_repro_1787329993
+end rss=408416KB
+{"label":"pr2067: after 100 append+fetch rounds","usedMB":164.1,"totalMB":175.1}
+
+worktree=/Users/sawyerhood/.bb-machines/bee.getbb.app/checkouts/bb/.claude/worktrees/wf_21e66a79-f02-23 db=/Users/sawyerhood/.bb-dev/bb-machines-bee.getbb.app-checkouts-bb-.claude-worktrees-wf_21e66a79-f02-23-9a71be3ce607/bb.db server=http://localhost:20532 out=/tmp/bb-reports/issues/2066/repro/revise
+branch=d9499b4a7 pid=56205
+{"label":"proposed-fix: before loop (warm, 1 cached revision)","usedMB":159.1,"totalMB":170.3}
+server pid=56205 start rss=342320KB thread=thr_6zik7e8uvr turn=turn_repro_1787330025
+end rss=416720KB
+{"label":"proposed-fix: after 100 append+fetch rounds","usedMB":166,"totalMB":177.1}
+</pre>
+  <figure><img src="assets/2066-heap.svg" alt="Bar chart: GC'd heap before and after 100 rounds across eight runs. Base grows by 19.4, 21.8, 19.3 and 21.7 MB; PR #2067 grows by 3.6, 6.0 and 3.6 MB; the proposed fix grows by 6.9 MB."><figcaption>Post-GC V8 heap of the bb server process before vs after 100 append+refetch rounds, across the author's two original runs, the independent verifier's run (<code>2066/verify/</code>), and the re-run for this revision. Base retains ~19–22 MB (100 dead revisions of a 100–200-row response, ~200 KB each in-heap); with PR #2067 or the proposed fix the growth is 3.6–6.9 MB (the separate 4-deep <code>timelineLatestRowsCache</code> ring, the 100 extra events in the window, plus noise). Process RSS (in the CSVs) is not a useful signal here — V8 had not collected in any run.</figcaption></figure>
+  <p>Per-round samples (<a href="2066/repro/live-base.csv">live-base.csv</a>, <a href="2066/repro/live-pr2067.csv">live-pr2067.csv</a>; revise re-run: <a href="2066/repro/revise/live-base.csv">live-base.csv</a>, <a href="2066/repro/revise/live-pr2067.csv">live-pr2067.csv</a>, <a href="2066/repro/revise/live-proposed-fix.csv">live-proposed-fix.csv</a>): every response was 99–199 rows, i.e. under the 200-row cap, so every revision was stored. The response bytes per round are byte-identical across branches (the fix does not change response data).</p>
+  <pre>base:
+round,maxSeq,responseBytes,rows,serverRssKb
+1,9003,107927,100,339664
+10,9012,111133,109,364624
+50,9052,125453,149,388016
+100,9102,143355,199,399872
+
+PR #2067:
+round,maxSeq,responseBytes,rows,serverRssKb
+1,9003,107927,100,351136
+10,9012,111133,109,383664
+50,9052,125453,149,397520
+100,9102,143355,199,402336</pre>
+  <p>Repro files: <a href="2066/repro/">2066/repro/</a></p>
+
+  <h2>5. Root cause</h2>
+  <p>The cache (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/services/threads/timeline-cache.ts#L52-L85">timeline-cache.ts:52-85</a>) is a plain <code>Map&lt;string, ThreadTimelineResponse&gt;</code> with LRU re-insertion and a 128-entry bound:</p>
+  <pre>getOrBuild(key, build) {
+  const cached = entries.get(key);
+  if (cached !== undefined) { entries.delete(key); entries.set(key, cached); return cached; }
+  const value = build();
+  if (value.rows.length &lt;= maxCacheableRows) {
+    entries.set(key, value);
+    while (entries.size &gt; maxEntries) { /* evict oldest */ }
+  }
+  return value;
+}</pre>
+  <p>The key is <code>`${maxSeq}|${paramsKey}`</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/services/threads/timeline-cache.ts#L126-L130">L126-130</a>), and the route computes <code>maxSeq</code> from the database on every request (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/routes/threads/data.ts#L335">data.ts:335</a>). Because <code>maxSeq = MAX(sequence)</code> never decreases, an entry keyed by an older <code>maxSeq</code> is unreachable the moment a newer one is stored, yet nothing removes it: the design deliberately uses the key change as the invalidation mechanism (&quot;Keying on the thread high-water maxSeq makes invalidation implicit&quot;, <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/services/threads/timeline-cache.ts#L16-L23">L16-23</a>) and relies on the row cap (&quot;an expanded active turn produces hundreds of rows AND a maxSeq that changes on every event, so caching it only thrashes the LRU&quot;, <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/services/threads/timeline-cache.ts#L25-L29">L25-29</a>) to keep streaming revisions out.</p>
+  <p>That second assumption is where the reasoning breaks: the 200-row cap excludes only <em>large</em> expanded turns. A typical streaming turn on a long thread projects to well under 200 rows (the seeded thread: 99 rows at rest, 199 after 100 appended items), so every event-driven refetch stores a fresh full response. The client refetches after every event batch, so one viewed streaming thread produces ~128 revisions in seconds and from then on holds all 128 LRU slots with entries that can never hit. The symptom (server heap proportional to 128 × response size, even though only one response is useful) follows directly.</p>
+  <p><strong>Related but separate mechanisms, so the reader does not conflate them:</strong></p>
+  <ul>
+    <li><code>timelineLatestRowsCache</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/services/threads/timeline-latest-rows-cache.ts#L23-L24">timeline-latest-rows-cache.ts:23-24</a>) keeps a 4-deep ring of <em>rows</em> per params key for delta computation, 64 keys max. It intentionally keeps a few revisions and shares the <code>rows</code> arrays by reference with the response cache (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/routes/threads/data.ts#L411">data.ts:411</a>), so it is not double-counting the newest revision. It is already keyed the right way (params key → revisions) — the same shape PR #2067 gives the response cache.</li>
+    <li>&quot;Older&quot; pages are also keyed by <code>maxSeq</code>, so every appended event invalidates every cached older page of that thread too, even though their content rarely changes. That is a cold-rebuild cost, not a retention cost, and out of scope here.</li>
+    <li>The reporter's 300–650 MB server footprint also includes the build path itself (decoding 1.1–4.8 MiB of event JSON per request at 1.4k events/window; see #1749 and #1129). This issue's fix bounds the retained responses; it does not make builds cheaper.</li>
+  </ul>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>Key the map by the request shape (<code>paramsKey</code>, which already exists for the delta cache) and store the revision alongside the value; treat a different revision as a miss that <em>replaces</em> the slot. This is exactly what PR #2067 does. I would make one simplification: pass <code>maxSeq</code> as a number rather than a second string that embeds the params key again.</p>
+  <pre>// timeline-cache.ts
+const entries = new Map&lt;string, { maxSeq: number; value: ThreadTimelineResponse }&gt;();
+
+getOrBuild({ paramsKey, maxSeq }, build) {
+  const cached = entries.get(paramsKey);
+  if (cached?.maxSeq === maxSeq) { entries.delete(paramsKey); entries.set(paramsKey, cached); return cached.value; }
+  const value = build();
+  entries.delete(paramsKey);                  // a newer revision supersedes the old one even if uncacheable
+  if (value.rows.length &lt;= maxCacheableRows) {
+    entries.set(paramsKey, { maxSeq, value });
+    while (entries.size &gt; maxEntries) { /* evict oldest */ }
+  }
+  return value;
+}
+
+// data.ts
+const full = timelineCache.getOrBuild({ paramsKey, maxSeq }, () =&gt; ...);   // paramsKey computed once, above</pre>
+  <p><code>buildThreadTimelineCacheKey</code> then has no remaining caller and can be deleted (the repo's simplicity rule). Correctness argument: all inputs that select the projection are still in <code>paramsKey</code>; the hit condition is unchanged (<code>paramsKey</code> equal and <code>maxSeq</code> equal); the only behavioral difference is that stale revisions are dropped eagerly, and they were unreachable anyway. Risk: if <code>maxSeq</code> were ever allowed to decrease (e.g. a future rewind that deletes a suffix <em>without</em> appending a marker event), both the old and the new design would serve stale rows for an equal <code>maxSeq</code>; that is pre-existing and should be guarded at the event-deletion site, not here. Tests: the route test in §4b fails before (<code>128 !== 1</code>) and passes after without modification; the two unit scenarios from §4a, rewritten for the <code>{ paramsKey, maxSeq }</code> signature (<a href="2066/repro/repro-2066-unit-after-fix.test.ts">repro-2066-unit-after-fix.test.ts</a>), pass after (the base-signature file in §4a cannot run against any fix, see the note there).</p>
+  <p><strong>Implemented and checked</strong> (branch <code>proposed-fix-2066</code> on <code>fcada5a3b</code>, <a href="2066/repro/proposed-fix-2066.diff">proposed-fix-2066.diff</a>: <code>timeline-cache.ts</code>, one call site in <code>data.ts</code>, and <code>timeline-cache.test.ts</code> adapted — <code>buildThreadTimelineCacheKey</code> and the <code>maxSeq</code> field of <code>ThreadTimelineCacheKeyArgs</code> are gone, the key-builder tests target <code>buildThreadTimelineParamsKey</code>, and the oversized-replacement and stale-revision cases are added): <code>repro-2066-unit-after-fix</code> 2/2, route test 1/1, <code>timeline-cache.test.ts</code> 9/9, <code>timeline-latest-rows-cache</code>, <code>public-thread-timeline-delta</code> and <code>public-thread-timeline-output-preview</code> all pass (25/25, <a href="2066/repro/proposed-fix-tests.log">log</a>); <code>pnpm exec turbo run typecheck --filter=@bb/server</code> passes (<a href="2066/repro/proposed-fix-typecheck.log">log</a>); ESLint clean on the three files. Live measurement (§4c): +6.9 MB over 100 rounds versus +21.7 MB for base in the same session.</p>
+  <details><summary>proposed-fix-2066.diff</summary><pre>diff --git a/apps/server/src/routes/threads/data.ts b/apps/server/src/routes/threads/data.ts
+index f8a741ade..e3c9a3007 100644
+--- a/apps/server/src/routes/threads/data.ts
++++ b/apps/server/src/routes/threads/data.ts
+@@ -56,7 +56,6 @@ import type {
+ } from "../../services/threads/timeline-pagination.js";
+ import { createSlowThreadTimelineBuildLogger } from "../../services/threads/timeline-build-log.js";
+ import {
+-  buildThreadTimelineCacheKey,
+   buildThreadTimelineParamsKey,
+   createThreadTimelineCache,
+ } from "../../services/threads/timeline-cache.js";
+@@ -355,8 +354,9 @@ export function registerThreadDataRoutes(app: Hono, deps: AppDeps): void {
+       summaryOnly,
+       includeProviderUnhandledOperations,
+     };
++    const paramsKey = buildThreadTimelineParamsKey(keyArgs);
+     const full = timelineCache.getOrBuild(
+-      buildThreadTimelineCacheKey({ ...keyArgs, maxSeq }),
++      { paramsKey, maxSeq },
+       () =&gt; {
+         const { profile, response } = buildThreadTimelineWithProfile(
+           deps.db,
+@@ -399,7 +399,6 @@ export function registerThreadDataRoutes(app: Hono, deps: AppDeps): void {
+       query.afterSequence,
+       "afterSequence",
+     );
+-    const paramsKey = buildThreadTimelineParamsKey(keyArgs);
+     const previous =
+       afterSequence === undefined
+         ? undefined
+diff --git a/apps/server/src/services/threads/timeline-cache.ts b/apps/server/src/services/threads/timeline-cache.ts
+index f5e1c903a..a8bca92f9 100644
+--- a/apps/server/src/services/threads/timeline-cache.ts
++++ b/apps/server/src/services/threads/timeline-cache.ts
+@@ -13,9 +13,12 @@ import type { ThreadTimelinePageRequest } from "./timeline-pagination.js";
+  * (detail view + side-chat tabs), debounced realtime invalidations that fire
+  * after the tail already settled, and re-opening a thread.
+  *
+- * Keying on the thread high-water `maxSeq` makes invalidation implicit: any
+- * appended event bumps `maxSeq`, producing a new key and a cold rebuild. The
+- * key MUST also include every other input the projection depends on:
++ * Entries are keyed by request shape (`paramsKey`) and store the thread
++ * high-water `maxSeq` they were built at. A request with a different `maxSeq`
++ * is a miss that *replaces* the slot: `maxSeq` never decreases, so the old
++ * revision could never be looked up again and keeping it until global LRU
++ * eviction only pins a dead response per appended event (#2066). The request
++ * shape MUST include every other input the projection depends on:
+  * `thread.status` (interrupt flips earlier rows), `environmentId` (workspace
+  * root relativizes file paths), provider display name (labels dynamic-provider
+  * diagnostic rows), and the row-shape request flags. Event pruning
+@@ -23,10 +26,9 @@ import type { ThreadTimelinePageRequest } from "./timeline-pagination.js";
+  * and never lowers `maxSeq`, so it cannot stale a cached entry.
+  *
+  * Entries with many rows are not cached: an expanded active turn (the streaming
+- * case) produces hundreds of rows AND a `maxSeq` that changes on every event,
+- * so caching it only thrashes the LRU and pins large objects for no reuse. Idle
+- * windows collapse completed turns to a handful of rows regardless of thread
+- * size, so the cap excludes exactly the entries that would never be reused.
++ * case) produces hundreds of rows that are rebuilt on every event, so storing
++ * them pins a large object for no reuse. The per-shape slot bounds the *count*
++ * of retained revisions; the row cap bounds their *size*.
+  */
+ 
+ const DEFAULT_MAX_ENTRIES = 128;
+@@ -40,7 +42,7 @@ interface ThreadTimelineCacheOptions {
+ 
+ interface ThreadTimelineCache {
+   getOrBuild(
+-    key: string,
++    key: { paramsKey: string; maxSeq: number },
+     build: () =&gt; ThreadTimelineResponse,
+   ): ThreadTimelineResponse;
+   /** Number of currently cached entries (for tests/metrics). */
+@@ -53,21 +55,27 @@ export function createThreadTimelineCache(
+   const maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES;
+   const maxCacheableRows =
+     options.maxCacheableRows ?? DEFAULT_MAX_CACHEABLE_ROWS;
+-  const entries = new Map&lt;string, ThreadTimelineResponse&gt;();
++  const entries = new Map&lt;
++    string,
++    { maxSeq: number; value: ThreadTimelineResponse }
++  &gt;();
+ 
+   return {
+-    getOrBuild(key, build) {
+-      const cached = entries.get(key);
+-      if (cached !== undefined) {
++    getOrBuild({ paramsKey, maxSeq }, build) {
++      const cached = entries.get(paramsKey);
++      if (cached?.maxSeq === maxSeq) {
+         // Re-insert to mark most-recently-used.
+-        entries.delete(key);
+-        entries.set(key, cached);
+-        return cached;
++        entries.delete(paramsKey);
++        entries.set(paramsKey, cached);
++        return cached.value;
+       }
+ 
+       const value = build();
++      // A newer revision supersedes the stored one even when the new value is
++      // too large to cache: the old one can never hit again.
++      entries.delete(paramsKey);
+       if (value.rows.length &lt;= maxCacheableRows) {
+-        entries.set(key, value);
++        entries.set(paramsKey, { maxSeq, value });
+         while (entries.size &gt; maxEntries) {
+           const oldest = entries.keys().next().value;
+           if (oldest === undefined) {
+@@ -86,8 +94,6 @@ export function createThreadTimelineCache(
+ 
+ export interface ThreadTimelineCacheKeyArgs {
+   threadId: string;
+-  /** Thread high-water event sequence; bumps on every appended event. */
+-  maxSeq: number;
+   status: ThreadStatus;
+   environmentId: string | null;
+   providerDisplayName?: string;
+@@ -104,12 +110,12 @@ function pageKeyPart(page: ThreadTimelinePageRequest): string {
+ }
+ 
+ /**
+- * The cache identity *excluding* `maxSeq` — i.e. everything that selects which
+- * window is being requested, but not which revision of it. Used to track the
+- * latest-sent rows per request shape for delta computation.
++ * The request shape: everything that selects which window is being requested,
++ * but not which revision (`maxSeq`) of it. Shared by the response cache and the
++ * latest-rows delta cache.
+  */
+ export function buildThreadTimelineParamsKey(
+-  args: Omit&lt;ThreadTimelineCacheKeyArgs, "maxSeq"&gt;,
++  args: ThreadTimelineCacheKeyArgs,
+ ): string {
+   return [
+     args.threadId,
+@@ -122,9 +128,3 @@ export function buildThreadTimelineParamsKey(
+     args.includeProviderUnhandledOperations ? "1" : "0",
+   ].join("|");
+ }
+-
+-export function buildThreadTimelineCacheKey(
+-  args: ThreadTimelineCacheKeyArgs,
+-): string {
+-  return `${args.maxSeq}|${buildThreadTimelineParamsKey(args)}`;
+-}
+diff --git a/apps/server/test/services/threads/timeline-cache.test.ts b/apps/server/test/services/threads/timeline-cache.test.ts
+index 141af64fe..7ef779e94 100644
+--- a/apps/server/test/services/threads/timeline-cache.test.ts
++++ b/apps/server/test/services/threads/timeline-cache.test.ts
+@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
+ import type { ThreadTimelineResponse } from "@bb/server-contract";
+ import type { ThreadTimelinePageRequest } from "../../../src/services/threads/timeline-pagination.js";
+ import {
+-  buildThreadTimelineCacheKey,
++  buildThreadTimelineParamsKey,
+   createThreadTimelineCache,
+   type ThreadTimelineCacheKeyArgs,
+ } from "../../../src/services/threads/timeline-cache.js";
+@@ -48,7 +48,6 @@ const latestPage: ThreadTimelinePageRequest = {
+ 
+ const baseKeyArgs: ThreadTimelineCacheKeyArgs = {
+   threadId: "thr_x",
+-  maxSeq: 10,
+   status: "idle",
+   environmentId: null,
+   page: latestPage,
+@@ -57,62 +56,92 @@ const baseKeyArgs: ThreadTimelineCacheKeyArgs = {
+   includeProviderUnhandledOperations: false,
+ };
+ 
++const k = (paramsKey: string, maxSeq = 1) =&gt; ({ paramsKey, maxSeq });
++
+ describe("createThreadTimelineCache", () =&gt; {
+-  it("builds once for the same key and serves cached on repeat", () =&gt; {
++  it("builds once for the same shape and revision and serves cached on repeat", () =&gt; {
+     const cache = createThreadTimelineCache();
+     const build = vi.fn(() =&gt; makeResponse(3));
+ 
+-    const first = cache.getOrBuild("k", build);
+-    const second = cache.getOrBuild("k", build);
++    const first = cache.getOrBuild(k("k"), build);
++    const second = cache.getOrBuild(k("k"), build);
+ 
+     expect(build).toHaveBeenCalledTimes(1);
+     expect(second).toBe(first);
+     expect(cache.size).toBe(1);
+   });
+ 
+-  it("rebuilds when the key changes (e.g. new maxSeq)", () =&gt; {
++  it("rebuilds on a new maxSeq and replaces the prior revision of the same shape", () =&gt; {
+     const cache = createThreadTimelineCache();
+     const build = vi.fn(() =&gt; makeResponse(3));
+ 
+-    cache.getOrBuild("k1", build);
+-    cache.getOrBuild("k2", build);
++    cache.getOrBuild(k("k", 10), build);
++    cache.getOrBuild(k("k", 11), build);
+ 
+     expect(build).toHaveBeenCalledTimes(2);
++    expect(cache.size).toBe(1);
++  });
++
++  it("never returns a newer revision to a request for an older maxSeq", () =&gt; {
++    const cache = createThreadTimelineCache();
++    const newer = makeResponse(2);
++    cache.getOrBuild(k("k", 11), () =&gt; newer);
++    const rebuilt = makeResponse(1);
++    const served = cache.getOrBuild(k("k", 10), () =&gt; rebuilt);
++    expect(served).toBe(rebuilt);
++  });
++
++  it("retains separate request shapes independently", () =&gt; {
++    const cache = createThreadTimelineCache();
++    const build = vi.fn(() =&gt; makeResponse(3));
++
++    cache.getOrBuild(k("latest", 10), build);
++    cache.getOrBuild(k("older:5", 10), build);
++
++    expect(cache.size).toBe(2);
+   });
+ 
+   it("does not cache responses above the row cap (streaming expanded turns)", () =&gt; {
+     const cache = createThreadTimelineCache({ maxCacheableRows: 5 });
+     const build = vi.fn(() =&gt; makeResponse(50));
+ 
+-    cache.getOrBuild("k", build);
+-    cache.getOrBuild("k", build);
++    cache.getOrBuild(k("k"), build);
++    cache.getOrBuild(k("k"), build);
+ 
+     expect(build).toHaveBeenCalledTimes(2);
+     expect(cache.size).toBe(0);
+   });
+ 
++  it("drops a cached revision when its replacement is above the row cap", () =&gt; {
++    const cache = createThreadTimelineCache({ maxCacheableRows: 5 });
++
++    cache.getOrBuild(k("k", 1), () =&gt; makeResponse(3));
++    expect(cache.size).toBe(1);
++    cache.getOrBuild(k("k", 2), () =&gt; makeResponse(50));
++    expect(cache.size).toBe(0);
++  });
++
+   it("evicts least-recently-used entries beyond maxEntries", () =&gt; {
+     const cache = createThreadTimelineCache({ maxEntries: 2 });
+     const build = vi.fn(() =&gt; makeResponse(1));
+ 
+-    cache.getOrBuild("a", build); // [a]
+-    cache.getOrBuild("b", build); // [a,b]
+-    cache.getOrBuild("a", build); // touch a -&gt; [b,a]
+-    cache.getOrBuild("c", build); // evict b -&gt; [a,c]
++    cache.getOrBuild(k("a"), build); // [a]
++    cache.getOrBuild(k("b"), build); // [a,b]
++    cache.getOrBuild(k("a"), build); // touch a -&gt; [b,a]
++    cache.getOrBuild(k("c"), build); // evict b -&gt; [a,c]
+ 
+     expect(cache.size).toBe(2);
+     const buildAgain = vi.fn(() =&gt; makeResponse(1));
+-    cache.getOrBuild("a", buildAgain); // still cached
+-    cache.getOrBuild("b", buildAgain); // evicted -&gt; rebuild
++    cache.getOrBuild(k("a"), buildAgain); // still cached
++    cache.getOrBuild(k("b"), buildAgain); // evicted -&gt; rebuild
+     expect(buildAgain).toHaveBeenCalledTimes(1);
+   });
+ });
+ 
+-describe("buildThreadTimelineCacheKey", () =&gt; {
++describe("buildThreadTimelineParamsKey", () =&gt; {
+   it("differs when any projection input differs", () =&gt; {
+-    const base = buildThreadTimelineCacheKey(baseKeyArgs);
++    const base = buildThreadTimelineParamsKey(baseKeyArgs);
+     const variants: ThreadTimelineCacheKeyArgs[] = [
+-      { ...baseKeyArgs, maxSeq: 11 },
+       { ...baseKeyArgs, status: "active" },
+       { ...baseKeyArgs, environmentId: "env_1" },
+       { ...baseKeyArgs, includeNestedRows: true },
+@@ -128,12 +157,12 @@ describe("buildThreadTimelineCacheKey", () =&gt; {
+       },
+     ];
+     for (const variant of variants) {
+-      expect(buildThreadTimelineCacheKey(variant)).not.toBe(base);
++      expect(buildThreadTimelineParamsKey(variant)).not.toBe(base);
+     }
+   });
+ 
+   it("distinguishes older-page cursors", () =&gt; {
+-    const cursorA = buildThreadTimelineCacheKey({
++    const cursorA = buildThreadTimelineParamsKey({
+       ...baseKeyArgs,
+       page: {
+         kind: "older",
+@@ -141,7 +170,7 @@ describe("buildThreadTimelineCacheKey", () =&gt; {
+         beforeCursor: { anchorSeq: 5, anchorId: "a5" },
+       },
+     });
+-    const cursorB = buildThreadTimelineCacheKey({
++    const cursorB = buildThreadTimelineParamsKey({
+       ...baseKeyArgs,
+       page: {
+         kind: "older",
+</pre></details>
+  <details><summary>proposed-fix-tests.log</summary><pre> RUN  v4.1.1 /Users/sawyerhood/.bb-machines/bee.getbb.app/checkouts/bb/.claude/worktrees/wf_21e66a79-f02-23/apps/server
+ ✓  @bb/server  test/services/threads/repro-2066-unit-after-fix.test.ts &gt; #2066 unit (proposed-fix signature) &gt; replaces the previous revision of the same request shape 1ms
+ ✓  @bb/server  test/services/threads/repro-2066-unit-after-fix.test.ts &gt; #2066 unit (proposed-fix signature) &gt; keeps one entry for a single streaming thread regardless of revision count 0ms
+ ✓  @bb/server  test/services/threads/timeline-latest-rows-cache.test.ts &gt; createTimelineLatestRowsCache &gt; keeps a ring of recent revisions per params key and evicts the oldest 1ms
+ ✓  @bb/server  test/services/threads/timeline-latest-rows-cache.test.ts &gt; createTimelineLatestRowsCache &gt; a repeated set at the same revision refreshes recency without consuming a ring slot 0ms
+ ✓  @bb/server  test/services/threads/timeline-latest-rows-cache.test.ts &gt; createTimelineLatestRowsCache &gt; bounds params keys LRU-style; a lookup counts as use 0ms
+ ✓  @bb/server  test/services/threads/timeline-cache.test.ts &gt; createThreadTimelineCache &gt; builds once for the same shape and revision and serves cached on repeat 1ms
+ ✓  @bb/server  test/services/threads/timeline-cache.test.ts &gt; createThreadTimelineCache &gt; rebuilds on a new maxSeq and replaces the prior revision of the same shape 0ms
+ ✓  @bb/server  test/services/threads/timeline-cache.test.ts &gt; createThreadTimelineCache &gt; never returns a newer revision to a request for an older maxSeq 0ms
+ ✓  @bb/server  test/services/threads/timeline-cache.test.ts &gt; createThreadTimelineCache &gt; retains separate request shapes independently 0ms
+ ✓  @bb/server  test/services/threads/timeline-cache.test.ts &gt; createThreadTimelineCache &gt; does not cache responses above the row cap (streaming expanded turns) 0ms
+ ✓  @bb/server  test/services/threads/timeline-cache.test.ts &gt; createThreadTimelineCache &gt; drops a cached revision when its replacement is above the row cap 0ms
+ ✓  @bb/server  test/services/threads/timeline-cache.test.ts &gt; createThreadTimelineCache &gt; evicts least-recently-used entries beyond maxEntries 0ms
+ ✓  @bb/server  test/services/threads/timeline-cache.test.ts &gt; buildThreadTimelineParamsKey &gt; differs when any projection input differs 1ms
+ ✓  @bb/server  test/services/threads/timeline-cache.test.ts &gt; buildThreadTimelineParamsKey &gt; distinguishes older-page cursors 0ms
+ ✓  @bb/server  test/public/public-thread-timeline-output-preview.test.ts &gt; GET /threads/:id/timeline inline output preview &gt; previews the running turn's large outputs and leaves small ones whole 119ms
+ ✓  @bb/server  test/public/public-thread-timeline-output-preview.test.ts &gt; GET /threads/:id/timeline inline output preview &gt; nested-row consumers still receive the full inline output 78ms
+ ✓  @bb/server  test/public/public-thread-timeline-delta.test.ts &gt; GET /threads/:id/timeline?afterSequence (row-patch delta) &gt; a full fetch carries no delta and echoes maxSeq 115ms
+ ✓  @bb/server  test/public/public-thread-timeline-delta.test.ts &gt; GET /threads/:id/timeline?afterSequence (row-patch delta) &gt; delta + merge reproduces a fresh full window when rows are appended 86ms
+ ✓  @bb/server  test/public/public-thread-timeline-delta.test.ts &gt; GET /threads/:id/timeline?afterSequence (row-patch delta) &gt; delta + merge reproduces a fresh full window when a turn completes (collapse) 72ms
+ ✓  @bb/server  test/public/public-thread-timeline-delta.test.ts &gt; GET /threads/:id/timeline?afterSequence (row-patch delta) &gt; two interleaved clients both receive deltas (snapshot ring per params key) 83ms
+ ✓  @bb/server  test/public/public-thread-timeline-output-preview.test.ts &gt; GET /threads/:id/timeline inline output preview &gt; turn-summary-details scoped to the previewed row returns its whole output 70ms
+ ✓  @bb/server  test/public/public-thread-timeline-output-preview.test.ts &gt; GET /threads/:id/timeline inline output preview &gt; row-scoped details still resolve after the turn completes (expand/complete race) 74ms
+ ✓  @bb/server  test/public/public-thread-timeline-output-preview.test.ts &gt; GET /threads/:id/timeline inline output preview (tool rows) &gt; previews a large tool result and row-scoped details return it whole 71ms
+ ✓  @bb/server  test/public/public-thread-timeline-delta.test.ts &gt; GET /threads/:id/timeline?afterSequence (row-patch delta) &gt; a no-op delta (no new events) returns an empty patch and merges to the same rows 69ms
+ ✓  @bb/server:isolated  test/public/repro-2066-timeline-cache-retention.test.ts &gt; #2066 timeline cache retains superseded revisions &gt; keeps one resident response per appended event for the same request shape 440ms
+ Test Files  6 passed (6)
+      Tests  25 passed (25)
+   Start at  09:30:04
+   Duration  3.19s (transform 5.30s, setup 0ms, import 8.15s, tests 1.29s, environment 0ms)
+</pre></details>
+
+  <h2>7. PR review — #2067 &quot;fix(server): retain one timeline revision per request shape&quot;</h2>
+  <p><strong>Status:</strong> draft, from fork <code>Yazington/bb</code>, single commit <code>206096e4b</code>, based on <code>6be45053b</code> (68 commits behind the base commit); no CI has run on it (&quot;no checks reported&quot;). It cherry-picks onto <code>fcada5a3b</code> with no conflicts (branch <code>pr-2067-on-base</code> in my worktree; <a href="2066/repro/pr-2067.diff">diff</a>).</p>
+  <p><strong>What it changes:</strong> <code>getOrBuild</code> takes <code>{ paramsKey, revisionKey }</code>, the map is keyed by <code>paramsKey</code> and stores <code>{ revisionKey, value }</code>; a hit requires the stored <code>revisionKey</code> to equal the requested one; a miss deletes the slot before deciding whether the new value is cacheable; the route computes <code>paramsKey</code> once and passes both keys. Tests rewritten for the new signature plus two new ones (replace-same-shape → size 1; distinct shapes → size 2). Doc comment updated.</p>
+  <p><strong>Root cause or symptom?</strong> Root cause. It removes the dead-revision retention at the cache layer, on the server side where the policy belongs. No wire shapes change, so no <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump is needed. No casts, no <code>unknown</code>, no behavior change to responses or cacheability thresholds.</p>
+  <h3>Findings</h3>
+  <table><tr><th>Where</th><th>Severity</th><th>Finding</th></tr>
+    <tr><td>PR description, &quot;How you verified&quot;</td><td>minor (accuracy)</td><td>Claims regression coverage for &quot;oversized replacements&quot; and &quot;7/7 passed&quot;. The test file has 7 tests, but none covers a small cacheable revision being superseded by an oversized one; the existing &quot;does not cache responses above the row cap&quot; test uses the same oversized value twice. I wrote that case (<a href="2066/repro/pr-2067-adversarial.test.ts">pr-2067-adversarial.test.ts</a>); the code handles it (size goes 1 → 0), so add the test rather than claim it.</td></tr>
+    <tr><td><code>apps/server/src/services/threads/timeline-cache.ts</code> L42-45, L56-59; <code>routes/threads/data.ts</code> L361-366</td><td>minor (simplicity)</td><td><code>revisionKey</code> is <code>buildThreadTimelineCacheKey(...)</code> = <code>`${maxSeq}|${paramsKey}`</code>, which re-embeds the params key the map is already keyed by. Passing <code>maxSeq: number</code> and storing it (as <code>timelineLatestRowsCache</code> already does) is simpler, removes a string build per request, and lets <code>buildThreadTimelineCacheKey</code> be deleted along with the two tests that only exercise it (&quot;differs when any projection input differs&quot;, &quot;distinguishes older-page cursors&quot; can target <code>buildThreadTimelineParamsKey</code> instead).</td></tr>
+    <tr><td><code>timeline-cache.ts</code> doc comment L25-28</td><td>nit</td><td>The rewritten rationale for the row cap drops the observation that the cap is what keeps <em>large</em> streaming revisions out; worth keeping one sentence that the cap is still needed for size, while the per-shape slot is what bounds count.</td></tr>
+    <tr><td>Branch hygiene</td><td>process</td><td>Draft, 68 commits behind, no CI. Needs a rebase onto current <code>main</code>, ready-for-review, and the PR template's &quot;tests that fail before and pass after&quot; (the new replace test does fail before — verified in §4a).</td></tr>
+  </table>
+  <h3>Tests I ran on <code>pr-2067-on-base</code></h3>
+  <ul>
+    <li><code>pnpm exec vitest run test/public/repro-2066-timeline-cache-retention.test.ts</code> — passes (size 1 after 150 rounds); fails on base with 128.</li>
+    <li>PR's <code>test/services/threads/timeline-cache.test.ts</code> (7) + my adversarial file (4: oversized replacement evicts, replacement becomes MRU, stale-revision request never returns the newer value, 1000 revisions → 1 entry) — 11/11 pass (<a href="2066/repro/pr2067-adversarial.log">log</a>).</li>
+    <li><code>repro-2066-unit-pr2067.test.ts</code> (the §4a scenarios in the PR's signature) — 2/2 pass; the base-signature <code>repro-2066-unit.test.ts</code> throws <code>TypeError</code> on this branch as expected (<a href="2066/repro/pr2067-unit-variants.log">log</a>: 14 passed / 2 failed, the 2 being that file).</li>
+    <li><code>test/public test/services/threads test/threads</code> — 74 files, 695 tests pass (<a href="2066/repro/pr2067-server-subset.log">log</a>).</li>
+    <li><code>pnpm exec turbo run typecheck --filter=@bb/server</code> — pass; ESLint on the three changed files — clean.</li>
+    <li>Live measurement (§4c): heap growth over 100 rounds drops from +19.4/+21.8 MB (base) to +3.6 MB; re-run for this revision: +21.7 MB → +3.6 MB; independent verifier: +19.3 MB → +6.0 MB.</li>
+  </ul>
+  <p><strong>Verdict: REQUEST CHANGES (minor).</strong> The change is correct, at the right layer, and measurably fixes the retention. Before merge: add the oversized-replacement test the description already claims, consider passing <code>maxSeq</code> instead of a redundant <code>revisionKey</code> string and deleting <code>buildThreadTimelineCacheKey</code>, rebase, and take it out of draft so CI runs.</p>
+  <details><summary>PR #2067 diff as applied onto fcada5a3b</summary><pre>diff --git a/apps/server/src/routes/threads/data.ts b/apps/server/src/routes/threads/data.ts
+index f8a741ade..e8ce0acc8 100644
+--- a/apps/server/src/routes/threads/data.ts
++++ b/apps/server/src/routes/threads/data.ts
+@@ -355,8 +355,12 @@ export function registerThreadDataRoutes(app: Hono, deps: AppDeps): void {
+       summaryOnly,
+       includeProviderUnhandledOperations,
+     };
++    const paramsKey = buildThreadTimelineParamsKey(keyArgs);
+     const full = timelineCache.getOrBuild(
+-      buildThreadTimelineCacheKey({ ...keyArgs, maxSeq }),
++      {
++        paramsKey,
++        revisionKey: buildThreadTimelineCacheKey({ ...keyArgs, maxSeq }),
++      },
+       () =&gt; {
+         const { profile, response } = buildThreadTimelineWithProfile(
+           deps.db,
+@@ -399,7 +403,6 @@ export function registerThreadDataRoutes(app: Hono, deps: AppDeps): void {
+       query.afterSequence,
+       "afterSequence",
+     );
+-    const paramsKey = buildThreadTimelineParamsKey(keyArgs);
+     const previous =
+       afterSequence === undefined
+         ? undefined
+diff --git a/apps/server/src/services/threads/timeline-cache.ts b/apps/server/src/services/threads/timeline-cache.ts
+index f5e1c903a..340a7120c 100644
+--- a/apps/server/src/services/threads/timeline-cache.ts
++++ b/apps/server/src/services/threads/timeline-cache.ts
+@@ -13,20 +13,20 @@ import type { ThreadTimelinePageRequest } from "./timeline-pagination.js";
+  * (detail view + side-chat tabs), debounced realtime invalidations that fire
+  * after the tail already settled, and re-opening a thread.
+  *
+- * Keying on the thread high-water `maxSeq` makes invalidation implicit: any
+- * appended event bumps `maxSeq`, producing a new key and a cold rebuild. The
+- * key MUST also include every other input the projection depends on:
++ * Keying each revision on the thread high-water `maxSeq` makes invalidation
++ * implicit: any appended event bumps `maxSeq`, producing a cold rebuild. The
++ * cache keeps only the newest revision for each request shape; otherwise an
++ * active thread with compact projected rows can pin one full response per
++ * event until the global LRU fills. The request shape MUST include every other
++ * input the projection depends on:
+  * `thread.status` (interrupt flips earlier rows), `environmentId` (workspace
+  * root relativizes file paths), provider display name (labels dynamic-provider
+  * diagnostic rows), and the row-shape request flags. Event pruning
+  * (`pruneResolvedItemDeltas`, background-task progress) is output-preserving
+  * and never lowers `maxSeq`, so it cannot stale a cached entry.
+  *
+- * Entries with many rows are not cached: an expanded active turn (the streaming
+- * case) produces hundreds of rows AND a `maxSeq` that changes on every event,
+- * so caching it only thrashes the LRU and pins large objects for no reuse. Idle
+- * windows collapse completed turns to a handful of rows regardless of thread
+- * size, so the cap excludes exactly the entries that would never be reused.
++ * Entries with many rows are not cached: an expanded active turn produces
++ * hundreds of rows, so caching it would pin a large object for little reuse.
+  */
+ 
+ const DEFAULT_MAX_ENTRIES = 128;
+@@ -40,7 +40,7 @@ interface ThreadTimelineCacheOptions {
+ 
+ interface ThreadTimelineCache {
+   getOrBuild(
+-    key: string,
++    keys: { paramsKey: string; revisionKey: string },
+     build: () =&gt; ThreadTimelineResponse,
+   ): ThreadTimelineResponse;
+   /** Number of currently cached entries (for tests/metrics). */
+@@ -53,21 +53,28 @@ export function createThreadTimelineCache(
+   const maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES;
+   const maxCacheableRows =
+     options.maxCacheableRows ?? DEFAULT_MAX_CACHEABLE_ROWS;
+-  const entries = new Map&lt;string, ThreadTimelineResponse&gt;();
++  const entries = new Map&lt;
++    string,
++    { revisionKey: string; value: ThreadTimelineResponse }
++  &gt;();
+ 
+   return {
+-    getOrBuild(key, build) {
+-      const cached = entries.get(key);
+-      if (cached !== undefined) {
++    getOrBuild({ paramsKey, revisionKey }, build) {
++      const cached = entries.get(paramsKey);
++      if (cached?.revisionKey === revisionKey) {
+         // Re-insert to mark most-recently-used.
+-        entries.delete(key);
+-        entries.set(key, cached);
+-        return cached;
++        entries.delete(paramsKey);
++        entries.set(paramsKey, cached);
++        return cached.value;
+       }
+ 
+       const value = build();
++      // A newer revision supersedes the old response even when the new value
++      // is too large to cache. Keeping the stale value cannot produce a hit
++      // and needlessly retains its rows.
++      entries.delete(paramsKey);
+       if (value.rows.length &lt;= maxCacheableRows) {
+-        entries.set(key, value);
++        entries.set(paramsKey, { revisionKey, value });
+         while (entries.size &gt; maxEntries) {
+           const oldest = entries.keys().next().value;
+           if (oldest === undefined) {
+diff --git a/apps/server/test/services/threads/timeline-cache.test.ts b/apps/server/test/services/threads/timeline-cache.test.ts
+index 141af64fe..da68e0f7f 100644
+--- a/apps/server/test/services/threads/timeline-cache.test.ts
++++ b/apps/server/test/services/threads/timeline-cache.test.ts
+@@ -57,35 +57,60 @@ const baseKeyArgs: ThreadTimelineCacheKeyArgs = {
+   includeProviderUnhandledOperations: false,
+ };
+ 
++function cacheKeys(revisionKey: string, paramsKey = revisionKey) {
++  return { paramsKey, revisionKey };
++}
++
+ describe("createThreadTimelineCache", () =&gt; {
+   it("builds once for the same key and serves cached on repeat", () =&gt; {
+     const cache = createThreadTimelineCache();
+     const build = vi.fn(() =&gt; makeResponse(3));
+ 
+-    const first = cache.getOrBuild("k", build);
+-    const second = cache.getOrBuild("k", build);
++    const first = cache.getOrBuild(cacheKeys("k"), build);
++    const second = cache.getOrBuild(cacheKeys("k"), build);
+ 
+     expect(build).toHaveBeenCalledTimes(1);
+     expect(second).toBe(first);
+     expect(cache.size).toBe(1);
+   });
+ 
+-  it("rebuilds when the key changes (e.g. new maxSeq)", () =&gt; {
++  it("rebuilds and replaces the prior revision for the same request shape", () =&gt; {
+     const cache = createThreadTimelineCache();
+     const build = vi.fn(() =&gt; makeResponse(3));
+ 
+-    cache.getOrBuild("k1", build);
+-    cache.getOrBuild("k2", build);
++    cache.getOrBuild(
++      cacheKeys(buildThreadTimelineCacheKey(baseKeyArgs), "latest-shape"),
++      build,
++    );
++    cache.getOrBuild(
++      cacheKeys(
++        buildThreadTimelineCacheKey({ ...baseKeyArgs, maxSeq: 11 }),
++        "latest-shape",
++      ),
++      build,
++    );
+ 
+     expect(build).toHaveBeenCalledTimes(2);
++    expect(cache.size).toBe(1);
++  });
++
++  it("retains separate request shapes independently", () =&gt; {
++    const cache = createThreadTimelineCache();
++    const build = vi.fn(() =&gt; makeResponse(3));
++
++    cache.getOrBuild(cacheKeys("revision", "latest-page"), build);
++    cache.getOrBuild(cacheKeys("revision", "older-page"), build);
++
++    expect(build).toHaveBeenCalledTimes(2);
++    expect(cache.size).toBe(2);
+   });
+ 
+   it("does not cache responses above the row cap (streaming expanded turns)", () =&gt; {
+     const cache = createThreadTimelineCache({ maxCacheableRows: 5 });
+     const build = vi.fn(() =&gt; makeResponse(50));
+ 
+-    cache.getOrBuild("k", build);
+-    cache.getOrBuild("k", build);
++    cache.getOrBuild(cacheKeys("k"), build);
++    cache.getOrBuild(cacheKeys("k"), build);
+ 
+     expect(build).toHaveBeenCalledTimes(2);
+     expect(cache.size).toBe(0);
+@@ -95,15 +120,15 @@ describe("createThreadTimelineCache", () =&gt; {
+     const cache = createThreadTimelineCache({ maxEntries: 2 });
+     const build = vi.fn(() =&gt; makeResponse(1));
+ 
+-    cache.getOrBuild("a", build); // [a]
+-    cache.getOrBuild("b", build); // [a,b]
+-    cache.getOrBuild("a", build); // touch a -&gt; [b,a]
+-    cache.getOrBuild("c", build); // evict b -&gt; [a,c]
++    cache.getOrBuild(cacheKeys("a"), build); // [a]
++    cache.getOrBuild(cacheKeys("b"), build); // [a,b]
++    cache.getOrBuild(cacheKeys("a"), build); // touch a -&gt; [b,a]
++    cache.getOrBuild(cacheKeys("c"), build); // evict b -&gt; [a,c]
+ 
+     expect(cache.size).toBe(2);
+     const buildAgain = vi.fn(() =&gt; makeResponse(1));
+-    cache.getOrBuild("a", buildAgain); // still cached
+-    cache.getOrBuild("b", buildAgain); // evicted -&gt; rebuild
++    cache.getOrBuild(cacheKeys("a"), buildAgain); // still cached
++    cache.getOrBuild(cacheKeys("b"), buildAgain); // evicted -&gt; rebuild
+     expect(buildAgain).toHaveBeenCalledTimes(1);
+   });
+ });
+</pre></details>
+  <details><summary>pr-2067-adversarial.test.ts</summary><pre>/**
+ * Adversarial checks for PR #2067 (one timeline revision per request shape).
+ * Exercises paths the PR's own tests do not: an oversized replacement must
+ * drop the previous cacheable revision, a replacement must become MRU, and a
+ * hit on the newest revision must not be disturbed by a sibling shape.
+ */
+import { describe, expect, it, vi } from "vitest";
+import type { ThreadTimelineResponse } from "@bb/server-contract";
+import { createThreadTimelineCache } from "../../../src/services/threads/timeline-cache.js";
+
+function makeResponse(rowCount: number): ThreadTimelineResponse {
+  return {
+    rows: Array.from({ length: rowCount }, (_, index) =&gt; ({
+      id: `row-${index}`,
+      kind: "system",
+      threadId: "thr_x",
+      turnId: null,
+      sourceSeqStart: index,
+      sourceSeqEnd: index,
+      startedAt: 0,
+      createdAt: 0,
+      systemKind: "debug",
+      title: "t",
+      detail: null,
+      status: null,
+    })),
+    activePromptMode: null,
+    activeThinking: null,
+    activeWorkflows: [],
+    activeBackgroundCommands: [],
+    pendingTodos: null,
+    goal: null,
+    modelFallback: null,
+    maxSeq: 0,
+    timelinePage: {
+      kind: "latest",
+      segmentLimit: 20,
+      returnedSegmentCount: 0,
+      hasOlderRows: false,
+      olderCursor: null,
+    },
+  };
+}
+
+const k = (paramsKey: string, maxSeq: number) =&gt; ({
+  paramsKey,
+  revisionKey: `${maxSeq}|${paramsKey}`,
+});
+
+describe("PR #2067 adversarial", () =&gt; {
+  it("an oversized newer revision evicts the previous cacheable revision (claimed in PR body, untested there)", () =&gt; {
+    const cache = createThreadTimelineCache({ maxCacheableRows: 5 });
+    cache.getOrBuild(k("shape", 1), () =&gt; makeResponse(3));
+    expect(cache.size).toBe(1);
+    cache.getOrBuild(k("shape", 2), () =&gt; makeResponse(50));
+    expect(cache.size).toBe(0);
+  });
+
+  it("a replacement is most-recently-used for LRU purposes", () =&gt; {
+    const cache = createThreadTimelineCache({ maxEntries: 2 });
+    cache.getOrBuild(k("a", 1), () =&gt; makeResponse(1)); // [a]
+    cache.getOrBuild(k("b", 1), () =&gt; makeResponse(1)); // [a,b]
+    cache.getOrBuild(k("a", 2), () =&gt; makeResponse(1)); // replace a -&gt; [b,a]
+    cache.getOrBuild(k("c", 1), () =&gt; makeResponse(1)); // evict b -&gt; [a,c]
+    const rebuild = vi.fn(() =&gt; makeResponse(1));
+    cache.getOrBuild(k("a", 2), rebuild);
+    expect(rebuild).not.toHaveBeenCalled();
+    cache.getOrBuild(k("b", 1), rebuild);
+    expect(rebuild).toHaveBeenCalledTimes(1);
+  });
+
+  it("a stale revision request never returns the newer cached value", () =&gt; {
+    const cache = createThreadTimelineCache();
+    const v2 = makeResponse(2);
+    cache.getOrBuild(k("shape", 2), () =&gt; v2);
+    const v1 = makeResponse(1);
+    const got = cache.getOrBuild(k("shape", 1), () =&gt; v1);
+    expect(got).toBe(v1);
+    // And the lower revision now owns the slot (caller-supplied truth wins).
+    expect(cache.getOrBuild(k("shape", 1), () =&gt; makeResponse(9))).toBe(v1);
+  });
+
+  it("bounded: N revisions of one shape never exceed one entry", () =&gt; {
+    const cache = createThreadTimelineCache();
+    for (let seq = 1; seq &lt;= 1000; seq++) {
+      cache.getOrBuild(k("shape", seq), () =&gt; makeResponse(3));
+    }
+    expect(cache.size).toBe(1);
+  });
+});
+</pre></details>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/1749">#1749</a> timelineWindowEventBudget assumes 0.06 ms/event — same thread class (long active threads, slow builds); explains the 1.34 s builds in the reporter's logs, which this issue does not address.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1129">#1129</a> (closed) Large finished turns can OOM bb-server during timeline projection — the build-path memory story; complementary.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1131">#1131</a> Synchronous SQLite on the event loop — why repeated cold rebuilds hurt every client.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1301">#1301</a> Thread timeline never unmounts history (renderer side) — likely the bigger share of the reporter's 670 MB renderer number.</li>
+    <li>Origin of the cache: <a href="https://github.com/get-bb/bb/pull/201">#201</a> &quot;Timeline performance: incremental delta updates + response caching&quot; (2026-06-18).</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Slow-build log line from my instance (shows which byte count the server logs)</h3>
+  <pre>{"level":30,"time":1787328248165,"component":"server","threadId":"thr_6zik7e8uvr","totalDurationMs":454.7,"thresholdMs":150,"suppressedSinceLastLog":0,"selectionStrategy":"standard-window","pageKind":"latest","segmentLimit":20,"eventRowCount":956,"eventDataBytes":459376,"decodedEventCount":956,"projectedRowCount":99,"responseRowCount":99,"stageTimings":[{"durationMs":48.724042000001646,"stage":"event-query"},{"durationMs":28.06095799999821,"stage":"accepted-client-request-context-query"},{"durationMs":292.8353329999991,"stage":"event-json-decode"},{"durationMs":0.565082999997685,"stage":"summary-compaction"},{"durationMs":0.7982910000027914,"stage":"context-window-query"},{"durationMs":33.00687499999913,"stage":"context-window-json-decode"},{"durationMs":50.58583400000134,"stage":"thread-view-projection"},{"durationMs":0.135707999997976,"stage":"pagination-segmentation"}],"msg":"Thread t</pre>
+  <p><code>eventDataBytes: 459376</code> for a window whose HTTP response was 107,571 bytes (99 rows). There is no response-size field anywhere in the server's logging (<code>grep -rn "responseBytes|payloadBytes|content-length" apps/server/src</code> only finds compression/static-file headers).</p>
+  <h3>Commands run</h3>
+  <pre>git checkout -B repro-2066 fcada5a3b
+pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build
+cd apps/server &amp;&amp; pnpm exec vitest run test/services/threads/repro-2066-unit.test.ts      # fails: 2!==1, 128!==1
+cd apps/server &amp;&amp; pnpm exec vitest run test/public/repro-2066-timeline-cache-retention.test.ts   # fails: 128!==1
+scripts/bb-dev-app current          # App :12143  Server :20143  Host daemon :28143
+pnpm dev:stop &amp;&amp; pnpm seed:perf -- --projects 1 --threads 6 --events 30000 --seed 7
+sqlite3 &lt;data-dir&gt;/bb.db "select thread_id,count(*),sum(length(data)),max(sequence) from events group by thread_id order by 2 desc"
+/tmp/bb-reports/issues/2066/repro/measure.sh base 100
+git fetch origin pull/2067/head:pr-2067 &amp;&amp; git checkout -B pr-2067-on-base fcada5a3b &amp;&amp; git cherry-pick 206096e4b
+/tmp/bb-reports/issues/2066/repro/measure.sh pr2067 100
+git checkout repro-2066 &amp;&amp; /tmp/bb-reports/issues/2066/repro/measure.sh base-run2 100
+cd apps/server &amp;&amp; pnpm exec vitest run test/services/threads/pr-2067-adversarial.test.ts test/services/threads/timeline-cache.test.ts   # on PR branch
+cd apps/server &amp;&amp; pnpm exec vitest run test/public test/services/threads test/threads                                                  # on PR branch
+pnpm exec turbo run typecheck --filter=@bb/server
+pnpm dev:stop; rm -rf &lt;data-dir&gt;
+
+# revision pass (fresh worktree f02-23, server :20532)
+git checkout -B revise-2066 fcada5a3b &amp;&amp; pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build
+cd apps/server &amp;&amp; pnpm exec vitest run test/services/threads/repro-2066-unit.test.ts test/public/repro-2066-timeline-cache-retention.test.ts   # base: 3 failed (2!==1, 128!==1, 128!==1)
+git fetch origin pull/2067/head:pr-2067 &amp;&amp; git checkout -B pr-2067-on-base fcada5a3b &amp;&amp; git cherry-pick 206096e4b
+cd apps/server &amp;&amp; pnpm exec vitest run --reporter=verbose test/services/threads/repro-2066-unit-pr2067.test.ts test/services/threads/repro-2066-unit.test.ts test/public/repro-2066-timeline-cache-retention.test.ts test/services/threads/pr-2067-adversarial.test.ts test/services/threads/timeline-cache.test.ts   # 14 passed, 2 failed (base-signature file: TypeError)
+git checkout -B proposed-fix-2066 fcada5a3b &amp;&amp; git apply /tmp/bb-reports/issues/2066/repro/proposed-fix-2066.diff
+cd apps/server &amp;&amp; pnpm exec vitest run --reporter=verbose test/services/threads/repro-2066-unit-after-fix.test.ts test/public/repro-2066-timeline-cache-retention.test.ts test/services/threads/timeline-cache.test.ts test/public/public-thread-timeline-delta.test.ts test/public/public-thread-timeline-output-preview.test.ts test/services/threads/timeline-latest-rows-cache.test.ts   # 25 passed
+pnpm exec turbo run typecheck --filter=@bb/server   # pass
+scripts/bb-dev-app current &amp;&amp; pnpm dev:stop &amp;&amp; pnpm seed:perf -- --projects 1 --threads 6 --events 30000 --seed 7
+git checkout revise-2066 &amp;&amp; OUT_DIR=/tmp/bb-reports/issues/2066/repro/revise /tmp/bb-reports/issues/2066/repro/measure.sh base 100          # +21.7 MB
+git checkout pr-2067-on-base &amp;&amp; OUT_DIR=… measure.sh pr2067 100                                                                          # +3.6 MB
+git checkout proposed-fix-2066 &amp;&amp; OUT_DIR=… measure.sh proposed-fix 100                                                                  # +6.9 MB
+pnpm dev:stop; rm -rf &lt;data-dir&gt;</pre>
+  <h3>live-loop.sh</h3><pre>#!/usr/bin/env bash
+# Live repro for get-bb/bb#2066 against an isolated bb dev instance.
+#
+# Appends N agentMessage events to an existing thread (directly in the dev
+# SQLite db, which the server re-reads per request) and refetches the same
+# timeline window after each append -- exactly what the web client does during
+# a streaming turn. Samples the server process RSS as it goes.
+#
+# Usage: live-loop.sh &lt;server-url&gt; &lt;db-path&gt; &lt;thread-id&gt; &lt;env-id&gt; &lt;provider-thread-id&gt; &lt;rounds&gt; &lt;out-csv&gt;
+set -euo pipefail
+SERVER=$1; DB=$2; THREAD=$3; ENV_ID=$4; PTID=$5; ROUNDS=$6; OUT=$7
+PORT=${SERVER##*:}
+PID=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t | head -1)
+TURN="turn_repro_$(date +%s)"
+seq_now() { sqlite3 "$DB" "select max(sequence) from events where thread_id='$THREAD';"; }
+rss_kb() { ps -p "$PID" -o rss= | tr -d ' '; }
+append() { # $1 type, $2 item_id|NULL, $3 item_kind|NULL, $4 data-json
+  local s; s=$(( $(seq_now) + 1 ))
+  sqlite3 "$DB" "insert into events (id,thread_id,environment_id,scope_kind,turn_id,provider_thread_id,sequence,type,item_id,item_kind,data,created_at)
+    values ('evt_repro_${s}','$THREAD','$ENV_ID','turn','$TURN','$PTID',$s,'$1',$2,$3,'$4',$(date +%s)000);"
+}
+fetch() { curl -s -m 30 -o /tmp/2066-timeline.json -w '%{size_download}' "$SERVER/api/v1/threads/$THREAD/timeline"; }
+
+echo "round,maxSeq,responseBytes,rows,serverRssKb" &gt; "$OUT"
+echo "server pid=$PID start rss=$(rss_kb)KB thread=$THREAD turn=$TURN" &gt;&amp;2
+append 'turn/started' NULL NULL "{\"providerThreadId\":\"$PTID\"}"
+for ((i=1; i&lt;=ROUNDS; i++)); do
+  append 'item/completed' "'msg_repro_$i'" "'agentMessage'" "{\"providerThreadId\":\"$PTID\",\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_repro_$i\",\"text\":\"chunk $i\"}}"
+  bytes=$(fetch)
+  rows=$(node -e 'const r=JSON.parse(require("fs").readFileSync("/tmp/2066-timeline.json","utf8"));process.stdout.write(String(r.rows.length)+" "+r.maxSeq)')
+  echo "$i,${rows#* },$bytes,${rows% *},$(rss_kb)" &gt;&gt; "$OUT"
+done
+echo "end rss=$(rss_kb)KB" &gt;&amp;2
+</pre>
+  <h3>heap-after-gc.mjs</h3><pre>// Measures the V8 heap of a running node process after a forced full GC.
+// Usage: node heap-after-gc.mjs &lt;pid&gt; [label]
+// Sends SIGUSR1 (activates the inspector on 127.0.0.1:9229), connects over
+// the DevTools protocol, runs HeapProfiler.collectGarbage, then reads
+// Runtime.getHeapUsage. Prints JSON {label, usedMB, totalMB}.
+import { execSync } from "node:child_process";
+
+const pid = Number(process.argv[2]);
+const label = process.argv[3] ?? "";
+process.kill(pid, "SIGUSR1");
+let target;
+for (let i = 0; i &lt; 50; i++) {
+  try {
+    const list = JSON.parse(
+      execSync("curl -s http://127.0.0.1:9229/json/list").toString(),
+    );
+    target = list[0]?.webSocketDebuggerUrl;
+    if (target) break;
+  } catch {}
+  await new Promise((r) =&gt; setTimeout(r, 100));
+}
+if (!target) throw new Error("inspector did not come up on 9229");
+const ws = new WebSocket(target);
+await new Promise((r, j) =&gt; { ws.onopen = r; ws.onerror = j; });
+let id = 0;
+const pending = new Map();
+ws.onmessage = (m) =&gt; {
+  const msg = JSON.parse(m.data);
+  if (msg.id &amp;&amp; pending.has(msg.id)) { pending.get(msg.id)(msg); pending.delete(msg.id); }
+};
+const call = (method, params = {}) =&gt; new Promise((r) =&gt; { const i = ++id; pending.set(i, r); ws.send(JSON.stringify({ id: i, method, params })); });
+await call("HeapProfiler.enable");
+await call("HeapProfiler.collectGarbage");
+await call("HeapProfiler.collectGarbage");
+const { result } = await call("Runtime.getHeapUsage");
+console.log(JSON.stringify({ label, usedMB: +(result.usedSize / 1048576).toFixed(1), totalMB: +(result.totalSize / 1048576).toFixed(1) }));
+ws.close();
+</pre>
+  <h3>measure.sh</h3><pre>#!/usr/bin/env bash
+# Full live measurement for one branch: fresh server, warm fetches, GC'd heap
+# baseline, N append+fetch rounds, GC'd heap afterwards.
+#
+# Usage (run from inside the bb worktree whose branch you want to measure):
+#   cd &lt;your bb worktree&gt; &amp;&amp; /tmp/bb-reports/issues/2066/repro/measure.sh &lt;label&gt; &lt;rounds&gt;
+#
+# Nothing is hardcoded to a particular worktree: WT is the git toplevel of the
+# current directory, and DB / SERVER come from `scripts/bb-dev-app status`
+# (which derives ports and the data dir from the worktree path). Override any
+# of WT, DB, SERVER, OUT_DIR via the environment if needed.
+#
+# Prerequisites (once per worktree):
+#   pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build
+#   scripts/bb-dev-app current &amp;&amp; pnpm dev:stop      # creates the data dir
+#   pnpm seed:perf -- --projects 1 --threads 6 --events 30000 --seed 7
+# The seed is deterministic, so THREAD / ENV_ID / PTID below are stable.
+# heap-after-gc.mjs uses the inspector on 127.0.0.1:9229 (SIGUSR1 default);
+# the script aborts if that port is already taken.
+set -euo pipefail
+LABEL=$1; ROUNDS=$2
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" &amp;&amp; pwd)
+OUT_DIR=${OUT_DIR:-$HERE}
+WT=${WT:-$(git rev-parse --show-toplevel)}
+cd "$WT"
+STATUS=$(scripts/bb-dev-app status)
+DB=${DB:-$(printf '%s\n' "$STATUS" | sed -n 's/^Data dir: //p')/bb.db}
+SERVER=${SERVER:-$(printf '%s\n' "$STATUS" | sed -n 's/^Server: //p')}
+PORT=${SERVER##*:}
+THREAD=thr_6zik7e8uvr; ENV_ID=env_866bjs4xjm; PTID=8e22443c-a63a-724c-e6a1-7e51fdbc2789
+
+[ -f "$DB" ] || { echo "no db at $DB (run scripts/bb-dev-app current, pnpm dev:stop, pnpm seed:perf first)" &gt;&amp;2; exit 1; }
+echo "worktree=$WT db=$DB server=$SERVER out=$OUT_DIR" &gt;&amp;2
+
+pnpm dev:stop &gt;/dev/null 2&gt;&amp;1 || true   # also releases 9229 if a previous run activated the inspector
+sleep 3
+if lsof -nP -iTCP:9229 -sTCP:LISTEN -t &gt;/dev/null 2&gt;&amp;1; then echo "inspector port 9229 already in use by another process" &gt;&amp;2; exit 1; fi
+sqlite3 "$DB" "delete from events where id like 'evt_repro_%';"
+scripts/bb-dev-app current &gt;"$OUT_DIR/dev-start-$LABEL.log" 2&gt;&amp;1
+for i in $(seq 1 60); do curl -s -m 3 -o /dev/null -f "$SERVER/api/v1/projects" &amp;&amp; break; sleep 1; done
+PID=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t | head -1)
+echo "branch=$(git rev-parse --short HEAD) pid=$PID"
+for i in 1 2 3; do curl -s -m 30 -o /dev/null "$SERVER/api/v1/threads/$THREAD/timeline"; done
+node "$HERE/heap-after-gc.mjs" "$PID" "$LABEL: before loop (warm, 1 cached revision)"
+"$HERE/live-loop.sh" "$SERVER" "$DB" "$THREAD" "$ENV_ID" "$PTID" "$ROUNDS" "$OUT_DIR/live-$LABEL.csv"
+node "$HERE/heap-after-gc.mjs" "$PID" "$LABEL: after $ROUNDS append+fetch rounds"
+</pre>
+  <p>Other artifacts: <a href="2066/repro/seed-perf.log">seed-perf.log</a>, <a href="2066/repro/timeline-thr_6zik7e8uvr.json">timeline-thr_6zik7e8uvr.json</a> (the 107 KB at-rest response), <a href="2066/repro/route-test-base.log">route-test-base.log</a>, <a href="2066/repro/unit-test-base.log">unit-test-base.log</a>, <a href="2066/repro/pr2067-typecheck.log">pr2067-typecheck.log</a>, <a href="2066/repro/pr2067-unit-variants.log">pr2067-unit-variants.log</a>, <a href="2066/repro/proposed-fix-tests.log">proposed-fix-tests.log</a>, <a href="2066/repro/proposed-fix-typecheck.log">proposed-fix-typecheck.log</a>, <a href="2066/repro/revise/">revise/</a> (re-run logs and CSVs), <a href="2066/verify/">verify/</a> (independent verifier's logs).</p>
+
+  <h2>10. Verification</h2>
+  <p>An independent verifier followed §4a and §4b literally in a separate worktree at <code>fcada5a3b</code> (fresh install + build): both failed exactly as shown, including the identical <code>[2066] first-response bytes=24859 rows(last)=152 rounds=150 cache.size=128</code> line. For §4c the verifier had to edit four hardcoded lines of the original <code>measure.sh</code> (worktree path, DB path, port) and then reproduced the measurement on their own isolated instance: base <code>160.1 → 179.4 MB</code> (+19.3), PR #2067 <code>159.8 → 165.8 MB</code> (+6.0) (<a href="2066/verify/">logs</a>). All root-cause code references, the <code>origin/main</code> not-fixed check, the PR diff / merge-base / draft status, and the &quot;oversized replacement&quot; test-coverage finding were confirmed.</p>
+  <p><strong>What changed in this revision:</strong></p>
+  <ul>
+    <li><strong>Major (fixed):</strong> §6 claimed the §4a unit tests &quot;fail before and pass after&quot;. That was false: the §4a file uses the base string-key signature and throws <code>TypeError</code> against PR #2067 (and would against any fix). Re-ran on the PR branch to confirm (<a href="2066/repro/pr2067-unit-variants.log">log</a>), rewrote the sentence, added <a href="2066/repro/repro-2066-unit-pr2067.test.ts">repro-2066-unit-pr2067.test.ts</a> (passes 2/2 on the PR branch) and <a href="2066/repro/repro-2066-unit-after-fix.test.ts">repro-2066-unit-after-fix.test.ts</a>, and actually implemented the proposed fix (<a href="2066/repro/proposed-fix-2066.diff">diff</a>) so its pass-after claims are backed by runs (25/25 tests, typecheck, live measurement +6.9 MB). The route-level test (§4b) is now identified as the signature-independent fail-before/pass-after evidence.</li>
+    <li><strong>Minor (fixed):</strong> <code>measure.sh</code> no longer hardcodes the worktree, data dir or port; it reads them from <code>git rev-parse --show-toplevel</code> and <code>scripts/bb-dev-app status</code>, checks the inspector port after stopping any previous instance, and documents the seed prerequisite. Verified by running it unmodified in a third worktree (<code>f02-23</code>, port :20532): base +21.7 MB, PR #2067 +3.6 MB (<a href="2066/repro/revise/">revise/</a>). The chart now shows all eight runs.</li>
+    <li><strong>Minor (fixed):</strong> TL;DR now states the client refetch cadence as &quot;at least every 50 ms, up to 1 s on slow builds&quot; with the exact constants cited.</li>
+    <li>Also corrected in passing: the repro unit tests used <code>status: &quot;running&quot;</code>, which is not a <code>ThreadStatus</code> (vitest does not typecheck, so it ran anyway); changed to <code>&quot;active&quot;</code> in all three unit files so they pass <code>turbo typecheck</code>. The base-run logs were re-captured after this change and are unchanged in substance (<code>2 !== 1</code>, <code>128 !== 1</code>).</li>
+  </ul>
+</main></body></html>
