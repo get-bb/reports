@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2225 Claude Code api_retry events remain unclassifiable when the SDK reports unknown/null status; turns can stall through blind retry storms</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.med { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:6px; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2225 · Claude Code api_retry events remain unclassifiable when the SDK reports unknown/null status; turns can stall through blind retry storms</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill med">Priority: Medium</span> <span class="pill">Effort: unset</span> <span class="pill">providers</span> <span class="pill">provider-claude-code</span>
+    <a href="https://github.com/get-bb/bb/issues/2225">open on GitHub</a>
+    <span>2026-08-24 · base <code>494f66526</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high</p>
+  <p>The issue describes a limitation plus a missing guardrail rather than a single crash, so "reproduced" here means: every observable the issue reports was reproduced live on a bb dev instance against <code>494f66526</code> (ten <code>category: "unknown"</code> retries, 2 min 56 s of stall, no escalation), and the cause was traced to a specific line in the Claude Code CLI binary. The investigation also found a second, bb-owned defect on the same code path that the issue does not mention: the CLI's <code>error: "overloaded"</code> value (HTTP 529) is rejected by bb's schema, so 529 retries are not even relayed as <code>provider/error</code> — they land in the thread as "Unhandled Claude Code event".</p>
+
+  <h2>1. TL;DR</h2>
+  <p>When the Claude Code CLI cannot reach the Anthropic API (connection refused, socket reset, timeout — anything without an HTTP response) it emits an <code>api_retry</code> stream line with <code>error: "unknown"</code> and <code>error_status: null</code>. bb forwards each one as a <code>provider/error</code> with <code>willRetry: true</code> and <code>errorInfo.category: "unknown"</code>, because there is literally nothing else on the line to classify. The value comes from a tiny classifier inside the CLI binary (<code>aen(e)</code>, shown below) that only inspects <code>e.status</code>; connection errors have no status, so they fall through to <code>"unknown"</code>. The CLI then retries up to 10 times with exponential backoff (~3 minutes for a dead upstream), and bb has no turn-level guardrail: the runtime treats every <code>willRetry: true</code> error as "still working" and nothing counts consecutive retries. The user sees a "Working..." thread with a single rotating retry row for three minutes, then a terminal "Provider error" that is itself unclassified (no <code>errorInfo</code> at all, even though the CLI's prose says "ConnectionRefused"). Separately, bb's <code>claudeAssistantMessageErrorSchema</code> predates the SDK's <code>"overloaded"</code> value, so HTTP 529 retries fail schema parsing and are downgraded to thread-scoped <code>provider/unhandled</code> rows — a genuine bb bug with a two-line fix, verified here.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>The CLI emits <code>api_retry</code> with <code>error: "unknown"</code>, <code>error_status: null</code> on transient upstream failures</td><td class="ok">Verified</td><td>Captured verbatim from <code>claude</code> 2.1.241 against a closed port and against a socket-reset stand-in (<code>cli-connection-refused-verify.ndjson</code>, <code>cli-socket-reset.ndjson</code>). It is specifically <em>connection-level</em> failures; HTTP 500 arrives as <code>server_error</code>/500 and HTTP 529 as <code>overloaded</code>/529.</td></tr>
+    <tr><td>bb relays each retry as <code>provider/error</code> classified <code>category: "unknown"</code>, <code>httpStatusCode: null</code></td><td class="ok">Verified</td><td>Thread <code>thr_765fs987rc</code> on the dev instance: events 6–15 are exactly <code>{"category":"unknown","providerCode":"unknown","httpStatusCode":null}</code> (<code>thread-unknown-events.txt</code>).</td></tr>
+    <tr><td>The retry loop (up to <code>max_retries = 10</code>, exponential backoff) lives in the CLI; bb has no turn-level abort</td><td class="ok">Verified</td><td>Ten retries spaced 0.6 s → 38 s; turn ran 18:02:37 → 18:05:33 (2 min 56 s). No code in the server, runtime, or plugin counts retries; the only <code>willRetry</code> consumer in the runtime treats retrying errors as "not idle" (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L990-L993">runtime.ts#L990</a>). The old provider-turn watchdog has "no current producer" (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/threads/thread-lifecycle.ts#L343-L344">thread-lifecycle.ts#L343</a>).</td></tr>
+    <tr><td>"A single turn burned 9 retries over ~244 seconds before the user interrupted"</td><td class="ok">Verified (equivalent)</td><td>My run: 10 retries, 176 s until the CLI gave up on its own. The per-attempt delays match the reporter's shape (≈0.6, 1, 2, 4, 8, 17, 32–39 s).</td></tr>
+    <tr><td>"85 provider/error retry events across parent and child threads" in one session</td><td class="unv">Unverified</td><td>Count from the reporter's session; not reproducible here and not needed for the mechanism. Child threads go through the same translator, so the shape is plausible.</td></tr>
+    <tr><td>0.39.0 already appends <code>HTTP &lt;status&gt;</code> and attaches structured <code>errorInfo</code> with an http-status fallback</td><td class="ok">Verified</td><td><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-claude-code/src/delta-translation.ts#L289-L293">buildClaudeApiRetryDetail</a>; <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-claude-code/src/error-info.ts#L40-L69">getProviderErrorCategoryFromClaudeCode</a>. HTTP 500 retry relays as <code>internal</code>/<code>server_error</code>/500 (repro test, control case).</td></tr>
+    <tr><td>"When it reports unknown/null … there is nothing left for bb to classify"</td><td class="ok">Verified, with one caveat</td><td>True for the retry notices. But the <em>terminal</em> error after the last retry is also relayed without any <code>errorInfo</code> (event 19), even though the CLI's result text names the cause ("Connection refused … (ConnectionRefused)") and the synthetic assistant message carries <code>error: "server_error"</code>. That terminal line is bb-classifiable and currently is not.</td></tr>
+    <tr><td>Suggestion 1: the CLI should surface transport context</td><td class="unv">Out of bb's control</td><td>The CLI's classifier is <code>aen(e)</code> in the binary (section 5). Only Anthropic can change what goes on the wire; bb can only consume what the CLI emits.</td></tr>
+    <tr><td>Suggestion 2: host-side guardrail after N consecutive retries</td><td class="unv">Design request, not a regression</td><td>Nothing implements it today (see above). Section 6 gives a concrete shape.</td></tr>
+    <tr><td><em>(Not claimed in the issue)</em> HTTP 529 retries are not relayed as <code>provider/error</code> at all</td><td class="no">New defect found</td><td><code>claudeAssistantMessageErrorSchema</code> lacks <code>"overloaded"</code>, which the installed SDK 0.3.197 types declare and both claude 2.1.197 (bundled) and 2.1.241 (host) emit. Parse fails → <code>provider/unhandled</code> "Unhandled Claude Code event", no <code>willRetry</code>, no category. Thread <code>thr_x5ruupvejk</code> events 8–9; repro test fails on <code>494f66526</code>.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb <code>494f66526913557ab076e048218236f0a6610927</code> (main, 2026-08-24), own worktree <code>…/.claude/worktrees/wf_846839f8-f8a-42</code></li>
+    <li>macOS 26.5.2 (Darwin 25.5, arm64), Node v22.23.1, pnpm workspace install with <code>--frozen-lockfile</code></li>
+    <li>Claude Code CLI on PATH: <code>2.1.241</code> (<code>~/.local/bin/claude</code>; this is what the plugin spawns — <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-claude-code/src/bridge/session-options.ts#L291-L321">resolveClaudeCodeExecutable</a> prefers PATH). SDK <code>@anthropic-ai/claude-agent-sdk@0.3.197</code>, whose bundled binary is <code>2.1.197</code> — verified it emits the same <code>error: "overloaded"</code> for 529 (<code>cli-2.1.197-bundled-529.ndjson</code>).</li>
+    <li>Dev instance: App <code>http://localhost:16781</code>, Server <code>http://localhost:24781</code>, Host daemon <code>127.0.0.1:32781</code>, data dir <code>~/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-42-8e9d9c155122</code> (deleted after the run). Host daemon started with <code>ANTHROPIC_BASE_URL=http://127.0.0.1:45950</code> and a dummy <code>ANTHROPIC_API_KEY</code> so the CLI talks to a local stand-in instead of api.anthropic.com (no real usage spent).</li>
+    <li>Upstream stand-in: <code>fake-upstream.mjs</code> (modes <code>529</code>, <code>500</code>, <code>reset</code>, <code>hang</code>); "connection refused" is just the stand-in not running.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <h3>4a. Ten seconds, no bb: what the CLI puts on the wire</h3>
+  <ol>
+    <li>Point the CLI at a closed port and cap retries so it finishes quickly:
+<pre>mkdir -p /tmp/bb-2225-cwd &amp;&amp; cd /tmp/bb-2225-cwd
+ANTHROPIC_BASE_URL=http://127.0.0.1:1 ANTHROPIC_API_KEY=sk-ant-api03-fake CLAUDE_CODE_MAX_RETRIES=2 \
+  claude -p "Reply only with ok." --output-format stream-json --verbose | grep -E 'api_retry|"type":"result"'</pre>
+    Actual output (claude 2.1.241, verbatim, trimmed to the relevant keys):
+<pre>{"type":"system","subtype":"api_retry","attempt":1,"max_retries":2,"retry_delay_ms":581,"error_status":null,"error":"unknown",...}
+{"type":"system","subtype":"api_retry","attempt":2,"max_retries":2,"retry_delay_ms":1142,"error_status":null,"error":"unknown",...}
+{"type":"result","subtype":"success","is_error":true,"api_error_status":null,"result":"API Error: Connection refused — a firewall or proxy may be blocking it (ConnectionRefused)",...}</pre>
+    Note the retry lines say <code>unknown</code>/<code>null</code> while the final result line names the real cause. The same happens for a socket reset (<code>cli-socket-reset.ndjson</code>).</li>
+    <li>Same command with the stand-in answering HTTP 529 (<code>node fake-upstream.mjs 45951 529</code>, <code>ANTHROPIC_BASE_URL=http://127.0.0.1:45951</code>):
+<pre>{"type":"system","subtype":"api_retry","attempt":1,"max_retries":2,"retry_delay_ms":611,"error_status":529,"error":"overloaded",...}</pre>
+    <code>"overloaded"</code> is not in bb's enum (section 5b).</li>
+  </ol>
+
+  <h3>4b. Unit-level repro at the exact bb code path (fails on 494f66526)</h3>
+  <p>Drop <code>issue-2225-api-retry.test.ts</code> into <code>plugins/provider-claude-code/src/</code> and run it from that package directory: <code>pnpm exec vitest run src/issue-2225-api-retry.test.ts</code>. It feeds the captured SDK lines through the plugin's delta translator via the package's own <code>createClaudeDeltaHarness</code>.</p>
+<pre> RUN  v4.1.1 /Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-42/plugins/provider-claude-code
+
+ ❯  bb-plugin-provider-claude-code  src/issue-2225-api-retry.test.ts (4 tests | 1 failed) 10ms
+     × relays an HTTP 529 overloaded retry as a retrying overloaded error 4ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL   bb-plugin-provider-claude-code  src/issue-2225-api-retry.test.ts &gt; #2225 Claude Code api_retry classification &gt; relays an HTTP 529 overloaded retry as a retrying overloaded error
+AssertionError: expected [ &#x27;provider/unhandled&#x27; ] to not deeply equal [ &#x27;provider/unhandled&#x27; ]
+
+Compared values have no visual difference.
+
+ ❯ src/issue-2225-api-retry.test.ts:125:43
+    123|
+    124|     // What main actually emits for this line (the assertion below pri…
+    125|     expect(events.map((e) =&gt; e.type)).not.toEqual([&quot;provider/unhandled…
+       |                                           ^
+    126|     expect(providerErrors(events)).toEqual([
+    127|       expect.objectContaining({
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 3 passed (4)
+   Start at  10:59:15
+   Duration  469ms (transform 271ms, setup 0ms, import 391ms, tests 10ms, environment 0ms)</pre>
+  <p>Tests 1, 2 and 4 pass and <em>document</em> the issue's claims (connection-level retry → category <code>unknown</code>; ten consecutive retries → ten <code>willRetry: true</code> relays and no <code>turn/completed</code>; HTTP 500 is fully classified). Test 3 <strong>fails</strong>: the 529 line is translated to <code>["provider/unhandled"]</code> instead of a retrying <code>provider/error</code>. With the two-line fix in section 6 applied, all four pass (<code>vitest-fixed.txt</code>; the existing <code>delta-translation.test.ts</code> suite still passes, 57/57, <code>vitest-fixed-full.txt</code>; plugin typecheck clean, <code>typecheck-fixed.txt</code>).</p>
+  <details><summary>Repro test source</summary><pre>import { describe, expect, it } from &quot;vitest&quot;;
+import type { ThreadEvent } from &quot;@bb/domain&quot;;
+import { turnScope } from &quot;@bb/domain&quot;;
+import { TURN_1, createClaudeDeltaHarness } from &quot;./delta-test-harness.js&quot;;
+
+/**
+ * Repro for get-bb/bb#2225: Claude Code `api_retry` notices with
+ * `error: &quot;unknown&quot;` / `error_status: null`, plus what the same code path does
+ * with the `error: &quot;overloaded&quot;` value the current CLI emits for HTTP 529.
+ *
+ * Every SDK line below was captured verbatim from `claude` 2.1.241 run against
+ * a local stand-in upstream (see fake-upstream.mjs next to this report):
+ *   - connection refused  -&gt; error &quot;unknown&quot;,     error_status null
+ *   - HTTP 529 overloaded -&gt; error &quot;overloaded&quot;,  error_status 529
+ *   - HTTP 500            -&gt; error &quot;server_error&quot;, error_status 500
+ */
+
+const THREAD_ID = &quot;thr_issue_2225&quot;;
+
+function sdkMessage(message: Record&lt;string, unknown&gt;): Record&lt;string, unknown&gt; {
+  return {
+    jsonrpc: &quot;2.0&quot;,
+    method: &quot;sdk/message&quot;,
+    params: { threadId: THREAD_ID, message },
+  };
+}
+
+function providerErrors(events: readonly ThreadEvent[]) {
+  return events.filter((event) =&gt; event.type === &quot;provider/error&quot;);
+}
+
+function apiRetry(args: {
+  attempt: number;
+  error: string;
+  error_status: number | null;
+  retry_delay_ms?: number;
+}): Record&lt;string, unknown&gt; {
+  return {
+    type: &quot;system&quot;,
+    subtype: &quot;api_retry&quot;,
+    attempt: args.attempt,
+    max_retries: 10,
+    retry_delay_ms: args.retry_delay_ms ?? 574,
+    error_status: args.error_status,
+    error: args.error,
+    session_id: &quot;d5606891-5aa7-42c2-9fbb-83b80619fa3d&quot;,
+    uuid: `5bf90f95-782c-499e-9593-7a3f495d98e${args.attempt}`,
+  };
+}
+
+describe(&quot;#2225 Claude Code api_retry classification&quot;, () =&gt; {
+  // Documents the limitation the issue reports: a connection-level failure
+  // (ECONNREFUSED, ECONNRESET, timeout) arrives as `unknown`/null and bb can
+  // only relay it as category &quot;unknown&quot; with no HTTP status.
+  it(&quot;relays a connection-level retry as an unclassifiable provider/error&quot;, () =&gt; {
+    const harness = createClaudeDeltaHarness();
+    const events = harness.translate(
+      sdkMessage(apiRetry({ attempt: 1, error: &quot;unknown&quot;, error_status: null })),
+      { threadId: THREAD_ID },
+    );
+
+    expect(providerErrors(events)).toEqual([
+      expect.objectContaining({
+        type: &quot;provider/error&quot;,
+        scope: turnScope(TURN_1),
+        message: &quot;Provider error&quot;,
+        detail: &quot;Claude Code API retry 1/10 after 574ms: unknown&quot;,
+        willRetry: true,
+        errorInfo: {
+          category: &quot;unknown&quot;,
+          providerCode: &quot;unknown&quot;,
+          httpStatusCode: null,
+        },
+      }),
+    ]);
+  });
+
+  // Documents the second half of the issue: nothing in bb escalates. Ten
+  // consecutive unknown retries in one turn are ten willRetry:true relays and
+  // no terminal error; the turn stays open until the CLI gives up or the user
+  // interrupts.
+  it(&quot;never escalates a run of consecutive unknown retries&quot;, () =&gt; {
+    const harness = createClaudeDeltaHarness();
+    const events: ThreadEvent[] = [];
+    for (let attempt = 1; attempt &lt;= 10; attempt += 1) {
+      events.push(
+        ...harness.translate(
+          sdkMessage(
+            apiRetry({ attempt, error: &quot;unknown&quot;, error_status: null }),
+          ),
+          { threadId: THREAD_ID },
+        ),
+      );
+    }
+
+    const errors = providerErrors(events);
+    expect(errors).toHaveLength(10);
+    expect(errors.every((e) =&gt; e.type === &quot;provider/error&quot; &amp;&amp; e.willRetry)).toBe(
+      true,
+    );
+    expect(events.filter((e) =&gt; e.type === &quot;turn/completed&quot;)).toHaveLength(0);
+  });
+
+  // FAILS on 494f66526. `claudeAssistantMessageErrorSchema` (schemas.ts:126)
+  // predates the SDK&#x27;s `overloaded` value, so `claudeApiRetryMessageSchema`
+  // rejects the line, translateSystemMessage falls through to `[]`, and the
+  // envelope dispatch downgrades the notice to a thread-scoped
+  // `provider/unhandled` (&quot;Unhandled Claude Code event&quot;): no provider/error,
+  // no willRetry, no category, no turn opened.
+  it(&quot;relays an HTTP 529 overloaded retry as a retrying overloaded error&quot;, () =&gt; {
+    const harness = createClaudeDeltaHarness();
+    const events = harness.translate(
+      sdkMessage(
+        apiRetry({
+          attempt: 1,
+          error: &quot;overloaded&quot;,
+          error_status: 529,
+          retry_delay_ms: 611,
+        }),
+      ),
+      { threadId: THREAD_ID },
+    );
+
+    // What main actually emits for this line (the assertion below prints it):
+    expect(events.map((e) =&gt; e.type)).not.toEqual([&quot;provider/unhandled&quot;]);
+    expect(providerErrors(events)).toEqual([
+      expect.objectContaining({
+        type: &quot;provider/error&quot;,
+        detail: &quot;Claude Code API retry 1/10 after 611ms: HTTP 529 overloaded&quot;,
+        willRetry: true,
+        errorInfo: {
+          category: &quot;overloaded&quot;,
+          providerCode: &quot;overloaded&quot;,
+          httpStatusCode: 529,
+        },
+      }),
+    ]);
+  });
+
+  // Control: the HTTP 500 line the CLI emits today is fully classified.
+  it(&quot;classifies an HTTP 500 server_error retry as internal&quot;, () =&gt; {
+    const harness = createClaudeDeltaHarness();
+    const events = harness.translate(
+      sdkMessage(
+        apiRetry({
+          attempt: 1,
+          error: &quot;server_error&quot;,
+          error_status: 500,
+          retry_delay_ms: 614,
+        }),
+      ),
+      { threadId: THREAD_ID },
+    );
+
+    expect(providerErrors(events)).toEqual([
+      expect.objectContaining({
+        detail: &quot;Claude Code API retry 1/10 after 614ms: HTTP 500 server_error&quot;,
+        willRetry: true,
+        errorInfo: {
+          category: &quot;internal&quot;,
+          providerCode: &quot;server_error&quot;,
+          httpStatusCode: 500,
+        },
+      }),
+    ]);
+  });
+});</pre></details>
+
+  <h3>4c. End to end on a bb dev instance (the stall the issue describes)</h3>
+  <ol>
+    <li>Start the stand-in and a dev instance whose host daemon inherits the override (the plugin passes the daemon's env to the CLI):
+<pre>node fake-upstream.mjs 45950 529 &amp;
+export ANTHROPIC_BASE_URL=http://127.0.0.1:45950 ANTHROPIC_API_KEY=sk-ant-api03-fake-2225
+scripts/bb-dev-app current            # prints App/Server/Host daemon URLs and the data dir
+eval "$(scripts/bb-dev-app env)"
+pnpm bb:dev machine list --json        # → host id
+curl -s -X POST $BB_SERVER_URL/api/v1/projects -H 'content-type: application/json' \
+  -d '{"name":"qa","source":{"type":"local_path","path":"/tmp/bb-2225-cwd","hostId":"&lt;host id&gt;"}}'</pre></li>
+    <li><strong>529 case.</strong> Spawn a thread while the stand-in answers 529:
+<pre>pnpm bb:dev thread spawn --project &lt;proj&gt; --provider claude-code --permission-mode accept-edits \
+  --title "2225 overloaded retries" --prompt "Reply only with ok." --json</pre>
+    Expected: two retrying <code>provider/error</code> events with <code>category: "overloaded"</code>, <code>httpStatusCode: 529</code>, <code>willRetry: true</code>, then the terminal error.<br>
+    Actual (<code>thread-overloaded-events.txt</code>, thread-scoped, before the turn even opens):
+<pre>1|2026-08-24T18:01:13Z|client/turn/requested|thread|{&quot;direction&quot;:&quot;outbound&quot;,&quot;requestId&quot;:&quot;creq_7u376us628&quot;,&quot;source&quot;:&quot;spawn&quot;,&quot;initiator&quot;:&quot;user&quot;,&quot;senderThreadId&quot;:null,&quot;systemMessageKind&quot;:&quot;unlabeled&quot;,&quot;systemMessageSubject&quot;:null,&quot;input&quot;:[{&quot;type&quot;:&quot;text&quot;,&quot;text&quot;:&quot;Reply only with ok.&quot;,&quot;mentions&quot;:[]}],&quot;target&quot;:{&quot;kind&quot;:&quot;thread-start&quot;},&quot;request&quot;:{&quot;method&quot;:&quot;thread/start&quot;,&quot;params&quot;:{}},&quot;execution&quot;:{&quot;model&quot;:&quot;claude-opus-5[1m]&quot;,&quot;serv …
+2|2026-08-24T18:01:13Z|client/thread/start|thread|{&quot;direction&quot;:&quot;outbound&quot;,&quot;source&quot;:&quot;spawn&quot;,&quot;initiator&quot;:&quot;user&quot;,&quot;request&quot;:{&quot;method&quot;:&quot;thread/start&quot;,&quot;params&quot;:{}}}
+7|2026-08-24T18:01:15Z|thread/identity|thread|{&quot;providerThreadId&quot;:&quot;a2cc127d-a9ad-47ba-b8d5-06f0caf457b5&quot;}
+8|2026-08-24T18:01:15Z|provider/unhandled|thread|{&quot;providerThreadId&quot;:&quot;a2cc127d-a9ad-47ba-b8d5-06f0caf457b5&quot;,&quot;providerId&quot;:&quot;claude-code&quot;,&quot;rawType&quot;:&quot;sdk/system&quot;,&quot;rawEvent&quot;:{&quot;jsonrpc&quot;:&quot;2.0&quot;,&quot;method&quot;:&quot;sdk/message&quot;,&quot;params&quot;:{&quot;message&quot;:{&quot;type&quot;:&quot;system&quot;,&quot;subtype&quot;:&quot;api_retry&quot;,&quot;attempt&quot;:1,&quot;max_retries&quot;:10,&quot;retry_delay_ms&quot;:549,&quot;error_status&quot;:529,&quot;error&quot;:&quot;overloaded&quot;,&quot;session_id&quot;:&quot;a2cc127d-a9ad-47ba-b8d5-06f0caf457b5&quot;,&quot;uuid&quot;:&quot;46 …
+9|2026-08-24T18:01:16Z|provider/unhandled|thread|{&quot;providerThreadId&quot;:&quot;a2cc127d-a9ad-47ba-b8d5-06f0caf457b5&quot;,&quot;providerId&quot;:&quot;claude-code&quot;,&quot;rawType&quot;:&quot;sdk/system&quot;,&quot;rawEvent&quot;:{&quot;jsonrpc&quot;:&quot;2.0&quot;,&quot;method&quot;:&quot;sdk/message&quot;,&quot;params&quot;:{&quot;message&quot;:{&quot;type&quot;:&quot;system&quot;,&quot;subtype&quot;:&quot;api_retry&quot;,&quot;attempt&quot;:2,&quot;max_retries&quot;:10,&quot;retry_delay_ms&quot;:1032,&quot;error_status&quot;:529,&quot;error&quot;:&quot;overloaded&quot;,&quot;session_id&quot;:&quot;a2cc127d-a9ad-47ba-b8d5-06f0caf457b5&quot;,&quot;uuid&quot;:&quot;c …
+10|2026-08-24T18:01:17Z|turn/started|turn|{&quot;providerThreadId&quot;:&quot;a2cc127d-a9ad-47ba-b8d5-06f0caf457b5&quot;}
+11|2026-08-24T18:01:17Z|turn/input/accepted|turn|{&quot;providerThreadId&quot;:&quot;a2cc127d-a9ad-47ba-b8d5-06f0caf457b5&quot;,&quot;clientRequestId&quot;:&quot;creq_7u376us628&quot;}
+12|2026-08-24T18:01:17Z|item/completed|turn|{&quot;providerThreadId&quot;:&quot;a2cc127d-a9ad-47ba-b8d5-06f0caf457b5&quot;,&quot;item&quot;:{&quot;type&quot;:&quot;agentMessage&quot;,&quot;id&quot;:&quot;da4f152953-i1&quot;,&quot;text&quot;:&quot;API Error: Repeated 529 Overloaded errors. The API is at capacity — this is usually temporary. Try again in a moment. If it persists, check your inference gateway (127.0.0.1:45950).&quot;}}
+13|2026-08-24T18:01:17Z|thread/contextWindowUsage/updated|turn|{&quot;providerThreadId&quot;:&quot;a2cc127d-a9ad-47ba-b8d5-06f0caf457b5&quot;,&quot;contextWindowUsage&quot;:{&quot;usedTokens&quot;:0,&quot;modelContextWindow&quot;:null,&quot;estimated&quot;:true}}
+14|2026-08-24T18:01:17Z|thread/tokenUsage/updated|turn|{&quot;providerThreadId&quot;:&quot;a2cc127d-a9ad-47ba-b8d5-06f0caf457b5&quot;,&quot;tokenUsage&quot;:{&quot;total&quot;:{&quot;totalTokens&quot;:0,&quot;inputTokens&quot;:0,&quot;cachedInputTokens&quot;:0,&quot;outputTokens&quot;:0,&quot;reasoningOutputTokens&quot;:0},&quot;last&quot;:{&quot;totalTokens&quot;:0,&quot;inputTokens&quot;:0,&quot;cachedInputTokens&quot;:0,&quot;outputTokens&quot;:0,&quot;reasoningOutputTokens&quot;:0},&quot;modelContextWindow&quot;:null}}
+15|2026-08-24T18:01:17Z|provider/error|turn|{&quot;providerThreadId&quot;:&quot;a2cc127d-a9ad-47ba-b8d5-06f0caf457b5&quot;,&quot;message&quot;:&quot;Provider error&quot;,&quot;detail&quot;:&quot;API Error: Repeated 529 Overloaded errors. The API is at capacity — this is usually temporary. Try again in a moment. If it persists, check your inference gateway (127.0.0.1:45950).&quot;,&quot;errorInfo&quot;:{&quot;category&quot;:&quot;overloaded&quot;,&quot;providerCode&quot;:null,&quot;httpStatusCode&quot;:529}}
+16|2026-08-24T18:01:17Z|turn/completed|turn|{&quot;providerThreadId&quot;:&quot;a2cc127d-a9ad-47ba-b8d5-06f0caf457b5&quot;,&quot;status&quot;:&quot;failed&quot;,&quot;providerCheckpointId&quot;:&quot;c67b8727-243f-4e38-8269-44e5ea6a5c25&quot;}</pre>
+    <figure><img src="assets/2225-overloaded-retries-live.png" alt="Thread page showing two 'Unhandled Claude Code event' rows followed by the terminal overloaded error"><figcaption>Base commit, 529 case. Look at the two grey <strong>"Unhandled Claude Code event"</strong> rows above "Worked for 0ms": those are the api_retry notices bb failed to parse. (The CLI itself gives up after 3 attempts on 529 — "Repeated 529 Overloaded errors" — so this case does not stall.)</figcaption></figure></li>
+    <li><strong>Unknown case.</strong> Kill the stand-in (port now refuses connections) and spawn again:
+<pre>kill %1   # fake-upstream
+pnpm bb:dev thread spawn --project &lt;proj&gt; --provider claude-code --permission-mode accept-edits \
+  --title "2225 unknown retries" --prompt "Reply only with ok." --json</pre>
+    Actual (<code>thread-unknown-events.txt</code>; turn-scoped; timestamps UTC):
+<pre>1|2026-08-24 18:02:35|client/turn/requested|thread|{&quot;direction&quot;:&quot;outbound&quot;,&quot;source&quot;:&quot;spawn&quot;,&quot;initiator&quot;:&quot;user&quot;,&quot;request&quot;:{&quot;method&quot;:&quot;thread/start&quot;,&quot;params&quot;:{}},&quot;requestId&quot;:&quot;creq_kdipke5j7p&quot;,&quot;senderThreadId&quot;:null,&quot;input&quot;:[{&quot;type&quot;:&quot;text&quot;,&quot;text&quot;:&quot;Reply only with ok.&quot;,&quot;mentions&quot;:[]}],&quot;target&quot;:{&quot;kind&quot;:&quot;thread-start&quot;},&quot;execution&quot;:{&quot;model&quot;:&quot;claude-opus-5[1m]&quot;,&quot;permissionMode&quot;:&quot;accept-edits&quot;,&quot;reasoningLevel&quot;:&quot;medium&quot;,&quot;service …
+2|2026-08-24 18:02:35|client/thread/start|thread|{&quot;direction&quot;:&quot;outbound&quot;,&quot;source&quot;:&quot;spawn&quot;,&quot;initiator&quot;:&quot;user&quot;,&quot;request&quot;:{&quot;method&quot;:&quot;thread/start&quot;,&quot;params&quot;:{}}}
+3|2026-08-24 18:02:36|thread/identity|thread|{&quot;providerThreadId&quot;:&quot;f4c22603-2764-460b-b6d6-9e53421bce03&quot;}
+4|2026-08-24 18:02:37|turn/started|turn|{&quot;providerThreadId&quot;:&quot;f4c22603-2764-460b-b6d6-9e53421bce03&quot;}
+5|2026-08-24 18:02:37|turn/input/accepted|turn|{&quot;providerThreadId&quot;:&quot;f4c22603-2764-460b-b6d6-9e53421bce03&quot;,&quot;clientRequestId&quot;:&quot;creq_kdipke5j7p&quot;}
+6|2026-08-24 18:02:37|provider/error|turn|{&quot;providerThreadId&quot;:&quot;f4c22603-2764-460b-b6d6-9e53421bce03&quot;,&quot;message&quot;:&quot;Provider error&quot;,&quot;detail&quot;:&quot;Claude Code API retry 1/10 after 585ms: unknown&quot;,&quot;willRetry&quot;:true,&quot;errorInfo&quot;:{&quot;category&quot;:&quot;unknown&quot;,&quot;providerCode&quot;:&quot;unknown&quot;,&quot;httpStatusCode&quot;:null}}
+7|2026-08-24 18:02:38|provider/error|turn|{&quot;providerThreadId&quot;:&quot;f4c22603-2764-460b-b6d6-9e53421bce03&quot;,&quot;message&quot;:&quot;Provider error&quot;,&quot;detail&quot;:&quot;Claude Code API retry 2/10 after 1026ms: unknown&quot;,&quot;willRetry&quot;:true,&quot;errorInfo&quot;:{&quot;category&quot;:&quot;unknown&quot;,&quot;providerCode&quot;:&quot;unknown&quot;,&quot;httpStatusCode&quot;:null}}
+8|2026-08-24 18:02:39|provider/error|turn|{&quot;providerThreadId&quot;:&quot;f4c22603-2764-460b-b6d6-9e53421bce03&quot;,&quot;message&quot;:&quot;Provider error&quot;,&quot;detail&quot;:&quot;Claude Code API retry 3/10 after 2210ms: unknown&quot;,&quot;willRetry&quot;:true,&quot;errorInfo&quot;:{&quot;category&quot;:&quot;unknown&quot;,&quot;providerCode&quot;:&quot;unknown&quot;,&quot;httpStatusCode&quot;:null}}
+9|2026-08-24 18:02:41|provider/error|turn|{&quot;providerThreadId&quot;:&quot;f4c22603-2764-460b-b6d6-9e53421bce03&quot;,&quot;message&quot;:&quot;Provider error&quot;,&quot;detail&quot;:&quot;Claude Code API retry 4/10 after 4023ms: unknown&quot;,&quot;willRetry&quot;:true,&quot;errorInfo&quot;:{&quot;category&quot;:&quot;unknown&quot;,&quot;providerCode&quot;:&quot;unknown&quot;,&quot;httpStatusCode&quot;:null}}
+10|2026-08-24 18:02:45|provider/error|turn|{&quot;providerThreadId&quot;:&quot;f4c22603-2764-460b-b6d6-9e53421bce03&quot;,&quot;message&quot;:&quot;Provider error&quot;,&quot;detail&quot;:&quot;Claude Code API retry 5/10 after 8183ms: unknown&quot;,&quot;willRetry&quot;:true,&quot;errorInfo&quot;:{&quot;category&quot;:&quot;unknown&quot;,&quot;providerCode&quot;:&quot;unknown&quot;,&quot;httpStatusCode&quot;:null}}
+11|2026-08-24 18:02:53|provider/error|turn|{&quot;providerThreadId&quot;:&quot;f4c22603-2764-460b-b6d6-9e53421bce03&quot;,&quot;message&quot;:&quot;Provider error&quot;,&quot;detail&quot;:&quot;Claude Code API retry 6/10 after 16671ms: unknown&quot;,&quot;willRetry&quot;:true,&quot;errorInfo&quot;:{&quot;category&quot;:&quot;unknown&quot;,&quot;providerCode&quot;:&quot;unknown&quot;,&quot;httpStatusCode&quot;:null}}
+12|2026-08-24 18:03:10|provider/error|turn|{&quot;providerThreadId&quot;:&quot;f4c22603-2764-460b-b6d6-9e53421bce03&quot;,&quot;message&quot;:&quot;Provider error&quot;,&quot;detail&quot;:&quot;Claude Code API retry 7/10 after 32339ms: unknown&quot;,&quot;willRetry&quot;:true,&quot;errorInfo&quot;:{&quot;category&quot;:&quot;unknown&quot;,&quot;providerCode&quot;:&quot;unknown&quot;,&quot;httpStatusCode&quot;:null}}
+13|2026-08-24 18:03:42|provider/error|turn|{&quot;providerThreadId&quot;:&quot;f4c22603-2764-460b-b6d6-9e53421bce03&quot;,&quot;message&quot;:&quot;Provider error&quot;,&quot;detail&quot;:&quot;Claude Code API retry 8/10 after 33558ms: unknown&quot;,&quot;willRetry&quot;:true,&quot;errorInfo&quot;:{&quot;category&quot;:&quot;unknown&quot;,&quot;providerCode&quot;:&quot;unknown&quot;,&quot;httpStatusCode&quot;:null}}
+14|2026-08-24 18:04:16|provider/error|turn|{&quot;providerThreadId&quot;:&quot;f4c22603-2764-460b-b6d6-9e53421bce03&quot;,&quot;message&quot;:&quot;Provider error&quot;,&quot;detail&quot;:&quot;Claude Code API retry 9/10 after 39090ms: unknown&quot;,&quot;willRetry&quot;:true,&quot;errorInfo&quot;:{&quot;category&quot;:&quot;unknown&quot;,&quot;providerCode&quot;:&quot;unknown&quot;,&quot;httpStatusCode&quot;:null}}
+15|2026-08-24 18:04:55|provider/error|turn|{&quot;providerThreadId&quot;:&quot;f4c22603-2764-460b-b6d6-9e53421bce03&quot;,&quot;message&quot;:&quot;Provider error&quot;,&quot;detail&quot;:&quot;Claude Code API retry 10/10 after 37789ms: unknown&quot;,&quot;willRetry&quot;:true,&quot;errorInfo&quot;:{&quot;category&quot;:&quot;unknown&quot;,&quot;providerCode&quot;:&quot;unknown&quot;,&quot;httpStatusCode&quot;:null}}
+16|2026-08-24 18:05:33|item/completed|turn|{&quot;providerThreadId&quot;:&quot;f4c22603-2764-460b-b6d6-9e53421bce03&quot;,&quot;item&quot;:{&quot;type&quot;:&quot;agentMessage&quot;,&quot;id&quot;:&quot;da4f152953-i2&quot;,&quot;text&quot;:&quot;API Error: Connection refused — a firewall or proxy may be blocking it (ConnectionRefused)&quot;}}
+17|2026-08-24 18:05:33|thread/contextWindowUsage/updated|turn|{&quot;providerThreadId&quot;:&quot;f4c22603-2764-460b-b6d6-9e53421bce03&quot;,&quot;contextWindowUsage&quot;:{&quot;usedTokens&quot;:0,&quot;modelContextWindow&quot;:null,&quot;estimated&quot;:true}}
+18|2026-08-24 18:05:33|thread/tokenUsage/updated|turn|{&quot;providerThreadId&quot;:&quot;f4c22603-2764-460b-b6d6-9e53421bce03&quot;,&quot;tokenUsage&quot;:{&quot;total&quot;:{&quot;totalTokens&quot;:0,&quot;inputTokens&quot;:0,&quot;cachedInputTokens&quot;:0,&quot;outputTokens&quot;:0,&quot;reasoningOutputTokens&quot;:0},&quot;last&quot;:{&quot;totalTokens&quot;:0,&quot;inputTokens&quot;:0,&quot;cachedInputTokens&quot;:0,&quot;outputTokens&quot;:0,&quot;reasoningOutputTokens&quot;:0},&quot;modelContextWindow&quot;:null}}
+19|2026-08-24 18:05:33|provider/error|turn|{&quot;providerThreadId&quot;:&quot;f4c22603-2764-460b-b6d6-9e53421bce03&quot;,&quot;message&quot;:&quot;Provider error&quot;,&quot;detail&quot;:&quot;API Error: Connection refused — a firewall or proxy may be blocking it (ConnectionRefused)&quot;}
+20|2026-08-24 18:05:33|turn/completed|turn|{&quot;providerThreadId&quot;:&quot;f4c22603-2764-460b-b6d6-9e53421bce03&quot;,&quot;status&quot;:&quot;failed&quot;,&quot;providerCheckpointId&quot;:&quot;eab045d6-bf7f-4d4f-ad82-034ca8b4bdb1&quot;}</pre>
+    Observe: (i) every retry is <code>category: "unknown"</code>, <code>httpStatusCode: null</code>; (ii) the turn stays open for 2 min 56 s with nothing in bb able to end it; (iii) the terminal <code>provider/error</code> (seq 19) has <em>no</em> <code>errorInfo</code> at all although its text says "ConnectionRefused".
+    <figure><img src="assets/2225-unknown-retries-live.png" alt="Thread page during the retry storm: a single retry row 'Claude Code API retry 7/10 after 32339ms: unknown' and 'Working...'"><figcaption>Base commit, 48 s into the unknown case. The only feedback is one rotating row, <strong>"Claude Code API retry 7/10 after 32339ms: unknown"</strong>, plus "Working...". Nothing says <em>what</em> is failing; the user can only wait or press stop.</figcaption></figure>
+    <figure><img src="assets/2225-unknown-retries-final.png" alt="Thread page after the CLI gave up: 'Worked for 2m 56s' and a generic 'Provider error' box with the Connection refused text"><figcaption>Same thread after the CLI exhausted 10 retries. <strong>"Worked for 2m 56s"</strong> and a generic <strong>"Provider error"</strong> (no category pill, compare with the "Provider overloaded" label in the 529 screenshot) even though the text names the cause.</figcaption></figure></li>
+    <li><strong>With the schema fix applied</strong> (section 6, step 1) and the instance restarted, the 529 case relays correctly; the unhandled rows are gone and the retries are classified (<code>thread-overloaded-fixed-events.txt</code>):
+<pre>1|2026-08-24 18:07:38|client/turn/requested|thread|{&quot;direction&quot;:&quot;outbound&quot;,&quot;source&quot;:&quot;spawn&quot;,&quot;initiator&quot;:&quot;user&quot;,&quot;request&quot;:{&quot;method&quot;:&quot;thread/start&quot;,&quot;params&quot;:{}},&quot;requestId&quot;:&quot;creq_hy5p67793e&quot;,&quot;senderThreadId&quot;:null,&quot;input&quot;:[{&quot;type&quot;:&quot;text&quot;,&quot;text&quot;:&quot;Reply only with ok.&quot;,&quot;mentions&quot;:[]}],&quot;target&quot;:{&quot;kind&quot;:&quot;thread-start&quot;},&quot;execution&quot;:{&quot;model&quot;:&quot;claude-opus-5[1m]&quot;,&quot;permissionMode&quot;:&quot;accept-edits&quot;,&quot;reasoningLevel&quot;:&quot;medium&quot;,&quot;service …
+2|2026-08-24 18:07:38|client/thread/start|thread|{&quot;direction&quot;:&quot;outbound&quot;,&quot;source&quot;:&quot;spawn&quot;,&quot;initiator&quot;:&quot;user&quot;,&quot;request&quot;:{&quot;method&quot;:&quot;thread/start&quot;,&quot;params&quot;:{}}}
+3|2026-08-24 18:07:44|thread/identity|thread|{&quot;providerThreadId&quot;:&quot;3bc60c99-3358-442e-a1db-39068a7e8d3c&quot;}
+4|2026-08-24 18:07:48|turn/started|turn|{&quot;providerThreadId&quot;:&quot;3bc60c99-3358-442e-a1db-39068a7e8d3c&quot;}
+5|2026-08-24 18:07:48|turn/input/accepted|turn|{&quot;providerThreadId&quot;:&quot;3bc60c99-3358-442e-a1db-39068a7e8d3c&quot;,&quot;clientRequestId&quot;:&quot;creq_hy5p67793e&quot;}
+6|2026-08-24 18:07:48|provider/error|turn|{&quot;providerThreadId&quot;:&quot;3bc60c99-3358-442e-a1db-39068a7e8d3c&quot;,&quot;message&quot;:&quot;Provider error&quot;,&quot;detail&quot;:&quot;Claude Code API retry 1/10 after 582ms: HTTP 529 overloaded&quot;,&quot;willRetry&quot;:true,&quot;errorInfo&quot;:{&quot;category&quot;:&quot;overloaded&quot;,&quot;providerCode&quot;:&quot;overloaded&quot;,&quot;httpStatusCode&quot;:529}}
+7|2026-08-24 18:07:48|provider/error|turn|{&quot;providerThreadId&quot;:&quot;3bc60c99-3358-442e-a1db-39068a7e8d3c&quot;,&quot;message&quot;:&quot;Provider error&quot;,&quot;detail&quot;:&quot;Claude Code API retry 2/10 after 1189ms: HTTP 529 overloaded&quot;,&quot;willRetry&quot;:true,&quot;errorInfo&quot;:{&quot;category&quot;:&quot;overloaded&quot;,&quot;providerCode&quot;:&quot;overloaded&quot;,&quot;httpStatusCode&quot;:529}}
+8|2026-08-24 18:07:49|item/completed|turn|{&quot;providerThreadId&quot;:&quot;3bc60c99-3358-442e-a1db-39068a7e8d3c&quot;,&quot;item&quot;:{&quot;type&quot;:&quot;agentMessage&quot;,&quot;id&quot;:&quot;da2620fe37-i1&quot;,&quot;text&quot;:&quot;API Error: Repeated 529 Overloaded errors. The API is at capacity — this is usually temporary. Try again in a moment. If it persists, check your inference gateway (127.0.0.1:45950).&quot;}}
+9|2026-08-24 18:07:49|thread/contextWindowUsage/updated|turn|{&quot;providerThreadId&quot;:&quot;3bc60c99-3358-442e-a1db-39068a7e8d3c&quot;,&quot;contextWindowUsage&quot;:{&quot;usedTokens&quot;:0,&quot;modelContextWindow&quot;:null,&quot;estimated&quot;:true}}
+10|2026-08-24 18:07:49|thread/tokenUsage/updated|turn|{&quot;providerThreadId&quot;:&quot;3bc60c99-3358-442e-a1db-39068a7e8d3c&quot;,&quot;tokenUsage&quot;:{&quot;total&quot;:{&quot;totalTokens&quot;:0,&quot;inputTokens&quot;:0,&quot;cachedInputTokens&quot;:0,&quot;outputTokens&quot;:0,&quot;reasoningOutputTokens&quot;:0},&quot;last&quot;:{&quot;totalTokens&quot;:0,&quot;inputTokens&quot;:0,&quot;cachedInputTokens&quot;:0,&quot;outputTokens&quot;:0,&quot;reasoningOutputTokens&quot;:0},&quot;modelContextWindow&quot;:null}}
+11|2026-08-24 18:07:49|provider/error|turn|{&quot;providerThreadId&quot;:&quot;3bc60c99-3358-442e-a1db-39068a7e8d3c&quot;,&quot;message&quot;:&quot;Provider error&quot;,&quot;detail&quot;:&quot;API Error: Repeated 529 Overloaded errors. The API is at capacity — this is usually temporary. Try again in a moment. If it persists, check your inference gateway (127.0.0.1:45950).&quot;,&quot;errorInfo&quot;:{&quot;category&quot;:&quot;overloaded&quot;,&quot;providerCode&quot;:null,&quot;httpStatusCode&quot;:529}}
+12|2026-08-24 18:07:49|turn/completed|turn|{&quot;providerThreadId&quot;:&quot;3bc60c99-3358-442e-a1db-39068a7e8d3c&quot;,&quot;status&quot;:&quot;failed&quot;,&quot;providerCheckpointId&quot;:&quot;dc3f06e6-ad22-47a8-9594-a1ed8e44d611&quot;}</pre>
+    <figure><img src="assets/2225-overloaded-retries-fixed.png" alt="Thread page on the fixed build: no unhandled rows, just 'Worked for 2s' and 'Provider overloaded'"><figcaption>Fixed build, 529 case: the two "Unhandled Claude Code event" rows are gone. (Retrying rows are collapsed by the timeline once the turn settles, which is why no retry row is visible here either.)</figcaption></figure></li>
+  </ol>
+  <p>Repro files: <code>2225/repro/</code></p>
+
+  <h2>5. Root cause</h2>
+  <h3>5a. Why the retries say "unknown" (CLI-owned)</h3>
+  <p>The <code>error</code> field on <code>api_retry</code> is computed by this function inside the Claude Code binary (extracted with <code>strings</code> from <code>~/.local/share/claude/versions/2.1.241</code>, <code>claude-cli-2.1.241-api-retry-classifier-verify.txt</code>):</p>
+<pre>function aen(e){
+  if(e.status===529||e.message?.includes('"type":"overloaded_error"'))return"overloaded";
+  if(e.status===429)return"rate_limit";
+  if(e.status===401||e.status===403)return"authentication_failed";
+  if(e.status!==void 0&amp;&amp;e.status&gt;=408)return"server_error";
+  return"unknown"}
+…
+subtype:"api_retry",attempt:sr.retryAttempt,max_retries:sr.maxRetries,retry_delay_ms:sr.retryInMs,
+error_status:sr.error.status??null,error:aen(sr.error)</pre>
+  <p>It looks only at <code>e.status</code>. A connection refused / reset / timeout error from the fetch layer has no status, so <code>error_status</code> is <code>null</code> and <code>error</code> is <code>"unknown"</code>. The error class name and message that the CLI clearly has (it prints "Connection refused … (ConnectionRefused)" in the final result) are not put on the retry line. The SDK's own type comment says as much: "error_status is null for connection errors (e.g. timeouts) that had no HTTP response" (<code>sdk.d.ts excerpt</code>). bb's translator is faithful to that input:</p>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-claude-code/src/delta-translation.ts#L733-L757">delta-translation.ts#L733-L757</a> — <code>translateSystemMessage</code> parses the line, builds <code>errorInfo</code> from <code>error</code> + <code>error_status</code>, and emits a <code>provider.error</code> delta with <code>willRetry: true</code> (opening a turn if none is open).</li>
+    <li><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-claude-code/src/error-info.ts#L65-L68">error-info.ts#L65-L68</a> — <code>case "unknown"</code> falls back to the HTTP-status classifier, and with <code>null</code> status returns <code>"unknown"</code>. There is no other signal on the line.</li>
+  </ul>
+  <h3>5b. Why 529 retries become "Unhandled Claude Code event" (bb-owned, not in the issue)</h3>
+  <p><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-claude-code/src/schemas.ts#L126-L136">schemas.ts#L126-L136</a> enumerates the SDK's <code>SDKAssistantMessageError</code> values but omits <code>"overloaded"</code>, which the pinned SDK (0.3.197, <code>sdk.d.ts:2764</code>) declares and which the CLI emits for HTTP 529 via <code>aen</code> above. The enum was written in #1640 against an older SDK; the repo's own fixture (<code>__fixtures__/transcripts/foreground-agent-api-retry.ndjson</code>) still shows the old shape <code>error_status: 529, error: "server_error"</code>, which is why nothing caught the drift. Consequence chain:</p>
+  <ol>
+    <li><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-claude-code/src/schemas.ts#L167-L177">claudeApiRetryMessageSchema</a> rejects the line (<code>error</code> not in enum).</li>
+    <li><code>translateSystemMessage</code> tries every other system-subtype schema, none match, and returns <code>[]</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-claude-code/src/delta-translation.ts#L883">#L883</a>).</li>
+    <li>The envelope dispatch turns an empty translation into <code>unhandledDeltas(...)</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-claude-code/src/delta-translation.ts#L1386-L1394">#L1386-L1394</a>); <code>describeRawEvent</code> does not list <code>api_retry</code> as a known subtype (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-claude-code/src/visibility.ts#L212-L241">visibility.ts#L212-L241</a>) so coverage is <code>"unknown"</code> and a thread-scoped <code>provider/unhandled</code> is emitted.</li>
+    <li>The notice loses <code>willRetry</code>, loses its category, does not open the turn, and renders as "Unhandled Claude Code event". The only reason the 529 turn still fails cleanly is that the CLI itself bails after three 529s; a 529 storm that the CLI kept retrying would be invisible to bb as retries.</li>
+  </ol>
+  <h3>5c. Why nothing stops the storm (bb-owned, design gap)</h3>
+  <p>The retry loop and its budget (<code>max_retries</code>, <code>CLAUDE_CODE_MAX_RETRIES</code>) live in the CLI. On the bb side the only consumer of <code>willRetry</code> is the runtime's idle tracking — a retrying error just means "not idle" (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L990-L993">runtime.ts#L990-L993</a>). No server, runtime, or plugin code counts consecutive retries or elapsed retry time per turn (grep for any such counter comes back empty), and the provider-turn watchdog that once existed has "no current producer" (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/threads/thread-lifecycle.ts#L343-L344">thread-lifecycle.ts#L343</a>; removed as dead code in #2140).</p>
+  <h3>5d. Deeper issue: the terminal error is also unclassified</h3>
+  <p>After the last retry the CLI emits a synthetic assistant message (<code>model: "&lt;synthetic&gt;"</code>, top-level <code>error: "server_error"</code>) and a result with <code>subtype: "success"</code>, <code>is_error: true</code>, <code>api_error_status: null</code>. bb builds the terminal <code>errorInfo</code> only from <code>api_error_status</code> and the result subtype (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-claude-code/src/delta-translation.ts#L1235-L1256">delta-translation.ts#L1235-L1256</a>); with <code>null</code> and <code>"success"</code> that yields <code>null</code>, so the terminal <code>provider/error</code> ships with no <code>errorInfo</code> (seq 19 above) and the UI shows a bare "Provider error". The assistant-level <code>error</code> code is parsed by the schema but never read by the translator. This is the one place in the unknown case where bb <em>does</em> have a signal and drops it.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <ol>
+    <li><strong>Accept <code>"overloaded"</code> (confident; verified).</strong> Add it to <code>claudeAssistantMessageErrorSchema</code> and map it to <code>"overloaded"</code> in <code>getProviderErrorCategoryFromClaudeCode</code>. Diff: <code>fix-overloaded.diff</code>. Risk: none beyond the enum widening; the http-status branch already returns <code>"overloaded"</code> for 529, so the switch arm only matters when the CLI sends <code>overloaded</code> without a status (the <code>overloaded_error</code>-in-message path of <code>aen</code>). Also refresh the stale 529 fixture so the conformance suite exercises the current CLI shape. To stop this class of drift, derive the zod enum from the SDK's <code>SDKAssistantMessageError</code> union with a compile-time <code>satisfies</code> check so a future SDK bump fails typecheck instead of silently degrading to <code>provider/unhandled</code>.</li>
+    <li><strong>Classify the terminal error (confident).</strong> In <code>translateResultMessage</code>, when the result is a failure with no <code>api_error_status</code>, fall back to the most recent <code>api_retry</code> code/status recorded in the dialect state for the open segment (the Codex provider already does exactly this correlation — <code>resolveCodexErrorInfo</code> in <code>plugins/provider-codex/src/delta-translation.ts</code>), and additionally read the synthetic assistant message's top-level <code>error</code> code. At minimum the terminal error would become <code>providerCode: "server_error"</code>; with a small prose map ("ConnectionRefused", "ECONNRESET", "timed out") it can become a <code>"network"</code>-style category. The plugin already ignores that assistant <code>error</code> field, so the change is local.</li>
+    <li><strong>Turn-level guardrail (design; not confident about the exact policy, so the shape only).</strong> Per AGENTS.md the server owns product policy, so the count belongs in the server/runtime, not the daemon: track consecutive <code>provider/error</code> with <code>willRetry: true</code> per turn (reset on any item/turn progress) and, past a threshold (e.g. 5 attempts or 60 s of cumulative <code>retry_delay_ms</code>), either interrupt the turn through the existing stop path and emit a terminal <code>provider/error</code> with <code>willRetry: false</code> and the last known <code>errorInfo</code>, or at least emit a distinct "upstream unreachable" system event so the UI can show more than "Working...". Cheaper alternative with the same user-visible effect: have the daemon launch the CLI with a lower <code>CLAUDE_CODE_MAX_RETRIES</code> (the CLI honours the env var; verified above), which bounds the stall at the source but loses the CLI's own backoff for genuinely transient blips. What could go wrong: aborting too eagerly during real upstream incidents turns a self-healing 30 s blip into a failed turn; the threshold should be conservative and the abort should preserve the provider checkpoint so a follow-up message resumes cleanly.</li>
+    <li><strong>Upstream ask.</strong> The retry-line classifier in the CLI should include the fetch error name (<code>e.name</code> / <code>e.cause?.code</code>) when <code>status</code> is absent. Until then items 1–3 are the whole of what bb can do.</li>
+  </ol>
+
+  <h2>7. PR review</h2>
+  <p>No open PRs are linked to this issue.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/1840">#1840</a> (closed) — Codex terminal stream disconnects misclassified as generic provider errors. Same pattern as 5d: the terminal event loses the structured category that the retry events carried; the fix (PR #1563) correlates retry and terminal errors per turn and is the template for item 2 above.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1914">#1914</a> — a rate-limited workflow call reports only "Workflow worker failed"; another case of a classified upstream failure degrading to a generic error by the time it reaches the user.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/2097">#2097</a> (closed) — Claude threads reused a stale CLI process after a terminal authentication failure; touches the same terminal-error path in <code>translateResultMessage</code>.</li>
+    <li><a href="https://github.com/get-bb/bb/pull/2140">#2140</a> — removed the dead provider-turn watchdog producer; relevant to where a guardrail would live.</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Files</h3>
+  <ul>
+    <li><code>issue-2225-api-retry.test.ts</code> — repro test; <code>vitest-main.txt</code> (base, 1 failed), <code>vitest-fixed.txt</code> (fix applied, 4 passed), <code>vitest-fixed-full.txt</code>, <code>typecheck-fixed.txt</code></li>
+    <li><code>fix-overloaded.diff</code> — the two-line schema/category fix</li>
+    <li><code>fake-upstream.mjs</code>, <code>run-with-timeout.mjs</code>, <code>wait-server.sh</code> — helpers</li>
+    <li>CLI captures (claude 2.1.241 unless noted): <code>connection refused</code>, <code>connection refused (earlier run)</code>, <code>socket reset</code>, <code>HTTP 500</code>, <code>HTTP 529</code>, <code>HTTP 529 with the SDK-bundled 2.1.197 binary</code></li>
+    <li>bb thread event dumps: <code>unknown</code>, <code>529 (base)</code>, <code>529 (fix applied)</code>, raw CLI JSON <code>thread-overloaded-log.clean.json</code>; spawn responses <code>unknown</code>, <code>529</code>, <code>529 fixed</code>; <code>project-create.json</code></li>
+    <li>Binary evidence: <code>CLI classifier strings</code>, <code>SDK type excerpt</code></li>
+    <li>Stand-in logs: <code>45950 (base run)</code>, <code>45950 (fixed run)</code>, <code>45951 (bundled CLI)</code></li>
+    <li>Instance logs: <code>install.log</code>, <code>build.log</code>, <code>dev-app-start.log</code>, <code>dev-app-restart-fixed.log</code>, <code>dev-app-stop.log</code></li>
+  </ul>
+  <h3>Notes and caveats</h3>
+  <ul>
+    <li>The first attempt at this report ran the same matrix in worktree <code>wf_846839f8-f8a-35</code> (ports 17426/25426/33426); its CLI captures (<code>cli-*.ndjson</code> without the <code>-verify</code> suffix) are kept and agree with this run.</li>
+    <li>The repo's recorded-conformance suite for the Claude plugin had one pre-existing failure on the base commit unrelated to this change (<code>recorded/fork</code> replays no events; <code>vitest-conformance-main.txt</code> from the first attempt). It was not re-run here.</li>
+    <li>The plugin typecheck with the fix reported a turbo cache hit because the first attempt had already typechecked the identical diff; the cache key is content-hashed, so the result is valid.</li>
+    <li><code>origin/main</code> at the time of writing (<code>21cb6b68b</code>) has no commits after <code>494f66526</code> touching <code>plugins/provider-claude-code</code>, <code>packages/agent-runtime</code>, or the thread services, so nothing here is already fixed.</li>
+    <li>Not reproduced with a real api.anthropic.com outage (obviously); the stand-in exercises the identical CLI code path (the <code>aen</code> classifier sees the same error objects the fetch layer produces for real connection failures).</li>
+  </ul>
+  <h3>Commands run (abridged, in order)</h3>
+<pre>git checkout --detach 494f66526
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+claude --version                                                  # 2.1.241
+node_modules/.pnpm/@anthropic-ai+claude-agent-sdk-darwin-arm64@0.3.197/.../claude --version   # 2.1.197
+cd /tmp/bb-2225-cwd &amp;&amp; ANTHROPIC_BASE_URL=http://127.0.0.1:1 ANTHROPIC_API_KEY=sk-ant-api03-fake CLAUDE_CODE_MAX_RETRIES=2 \
+  claude -p "Reply only with ok." --output-format stream-json --verbose &gt; cli-connection-refused-verify.ndjson
+cp issue-2225-api-retry.test.ts plugins/provider-claude-code/src/ &amp;&amp; (cd plugins/provider-claude-code &amp;&amp; pnpm exec vitest run src/issue-2225-api-retry.test.ts)   # 1 failed
+node fake-upstream.mjs 45950 529 &amp;
+ANTHROPIC_BASE_URL=http://127.0.0.1:45950 ANTHROPIC_API_KEY=... scripts/bb-dev-app current
+curl -s -X POST http://localhost:24781/api/v1/projects ... /tmp/bb-2225-cwd host_kjgnc46z7w        # proj_65abtuakx5
+pnpm bb:dev thread spawn --project proj_65abtuakx5 --provider claude-code ... "2225 overloaded retries"   # thr_x5ruupvejk
+pnpm bb:dev thread log thr_x5ruupvejk --json
+kill &lt;fake-upstream&gt;; pnpm bb:dev thread spawn ... "2225 unknown retries"                           # thr_765fs987rc
+sqlite3 &lt;data dir&gt;/bb.db "select sequence, datetime(created_at/1000,'unixepoch'), type, scope_kind, data from events where thread_id='thr_765fs987rc' order by sequence"
+doobie ... page.screenshot (live / final)
+git apply fix-overloaded.diff; pnpm exec vitest run ...; pnpm exec turbo run typecheck --filter=bb-plugin-provider-claude-code
+node fake-upstream.mjs 45950 529 &amp;; scripts/bb-dev-app current; pnpm bb:dev thread spawn ... "(fix applied)"        # thr_zkfgmgkmzd
+strings -n 8 ~/.local/share/claude/versions/2.1.241 | grep -o 'function [A-Za-z0-9_$]*(e){if(e.status===529...'
+pnpm dev:stop; rm -rf &lt;data dir&gt; /tmp/bb-2225-cwd; lsof -nP -iTCP -sTCP:LISTEN | grep -E '16781|24781|32781|45950|45951'</pre>
+</main></body></html>

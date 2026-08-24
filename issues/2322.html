@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2322 env.json writers can silently overwrite concurrent updates</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.med { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2322 · env.json writers can silently overwrite concurrent updates</h1>
+  <p class="meta">
+    <span class="pill">Type: Bug (not set on issue)</span> <span class="pill med">Priority: Medium</span> <span class="pill">Effort: not set</span> <span class="pill">desktop</span> <span class="pill">cli</span>
+    <a href="https://github.com/get-bb/bb/issues/2322">open on GitHub</a>
+    <span>2026-08-24 · base <code>494f66526</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict no">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high</p>
+  <p class="meta">Filed by an agent (GPT-5.6) on 2026-08-23 with no comments. No linked PRs. The launcher code it points at is unchanged between the base commit and <code>origin/main</code> at the time of writing, so this is not already fixed.</p>
+
+  <h2>1. TL;DR</h2>
+  <p>
+    <code>bb-app env set KEY VALUE</code> and <code>bb-app env unset KEY</code> update <code>~/.bb/env.json</code> (provider secrets such as <code>OPENAI_API_KEY</code> and startup-only knobs such as <code>BB_SERVER_PORT</code>) by reading the whole file, patching it in memory, writing a temp file, and <code>rename()</code>-ing it over <code>env.json</code>. The rename is atomic, but nothing prevents two writers from both reading the same old snapshot: whichever renames last wins and silently drops the other writer's change. With two <code>bb-app env set</code> processes started at the same time against an empty data dir, 16 of 20 trials ended with only one of the two keys in the file; in-process, the loss is deterministic. The mirror case is worse for secrets: an <code>env unset OPENAI_API_KEY</code> racing with any unrelated <code>env set</code> leaves the supposedly removed key back in the file.
+  </p>
+  <p>
+    One claim in the issue does not hold: there is no plugin or server code path that writes <code>env.json</code>. The server only <em>reads</em> the file on reload, and no plugin API touches it. The only writer in the repo is the launcher's <code>env</code> command, so the real-world race is two <code>bb-app env</code> invocations at once (for example two agents, or an agent and a human). The same read-merge-rename shape is used for <code>config.json</code> (<code>bb-app config set</code>) and <code>client.json</code>, and <code>config.json</code> loses updates the same way (8 of 10 trials).
+  </p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>"A BB CLI process and an authorized plugin both update different keys in the managed <code>env.json</code> file."</td><td class="no">Partially refuted</td><td>No plugin surface writes <code>env.json</code>. <code>grep -rn formatBbAppEnvPath\|bbAppManagedEnvFileSchema</code> over the repo finds only <code>packages/bb-app/src/launcher.ts</code> (read + write) and <code>apps/server/src/services/system/bb-app-managed-config.ts</code> (read only, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/system/bb-app-managed-config.ts#L148-L160">L148-L160</a>). <code>packages/plugin-sdk</code>, <code>packages/plugin-host</code>, <code>plugins/</code>, <code>apps/desktop</code>, <code>apps/cli</code>, and <code>apps/host-daemon</code> have zero references. The only in-repo writer is <code>bb-app env set|unset</code>; the concurrent-writer scenario that actually exists is two launcher processes.</td></tr>
+    <tr><td>"Each writer can read a whole document, project its change, and atomically rename that projection later."</td><td class="ok">Verified</td><td><code>writeManagedEnv</code> → <code>readManagedEnvFile</code> + <code>mergeManagedEnvFile</code> + <code>writeManagedEnvFile</code> (temp file + <code>rename</code>), <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/bb-app/src/launcher.ts#L1254-L1283">launcher.ts L1254-L1283</a>.</td></tr>
+    <tr><td>"The rename is atomic but not conditional at the commit boundary, so the last writer can silently erase an unrelated concurrent update."</td><td class="ok">Verified</td><td>Process-level: 16/20 lost updates (<code>race-20.log</code>). In-process vitest repro fails deterministically on both the set/set and unset/set cases (<code>vitest-repro.log</code>). Neither writer reports an error.</td></tr>
+    <tr><td>"<code>launcher.ts:1183-1211</code> performs whole-document merge and temp-file rename with no expected revision or shared writer lock."</td><td class="ok">Verified (line numbers stale)</td><td>At base <code>494f66526</code> the merge is L1169-L1184 and the write is L1262-L1283. No lock, no revision, no <code>O_EXCL</code>, no mtime/inode check anywhere in the path.</td></tr>
+    <tr><td>"<code>launcher.ts:1905-1938</code> routes both <code>env set</code> and <code>env unset</code> through that read-then-write shape."</td><td class="ok">Verified (line numbers stale)</td><td>At base: <code>runEnvCommand</code> L1979-L2032. <code>unset</code> (L1999-L2013) calls <code>readManagedEnvFile</code> then <code>writeManagedEnvFile</code> directly; <code>set</code> (L2024-L2030) goes through <code>writeManagedEnv</code>, which does the same read → merge → write. Two code paths, same race.</td></tr>
+    <tr><td>Expected: "BB owns one transactional <code>env.json</code> mutation surface used by CLI, server, and authorized plugins."</td><td class="unv">Unverified (product ask)</td><td>Neither the server nor any plugin mutates <code>env.json</code> today, so "used by CLI, server, and plugins" describes a surface that does not exist rather than one that is broken. The defect itself only needs the launcher's two paths serialized.</td></tr>
+    <tr><td>Acceptance: "Plugins can configure non-secret launcher paths without editing <code>env.json</code> through a private file protocol."</td><td class="unv">Unverified (feature request)</td><td>No evidence in the repo or issue of a plugin that needs this. Out of scope for the bug; listed here so a reviewer does not treat it as part of the fix.</td></tr>
+    <tr><td>Acceptance: "Successful mutation preserves ... private file mode."</td><td class="ok">Already true</td><td>Temp file is created with <code>mode: 0o600</code>; after the race the surviving file is still <code>-rw-------</code> (repro test line 40 passes; control run shows <code>-rw-------</code>).</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb repo at base commit <code>494f66526913557ab076e048218236f0a6610927</code> (detached), <code>packages/bb-app</code> version 0.39.0, built with <code>pnpm exec turbo run build</code>.</li>
+    <li>macOS Darwin 25.5.0 (Apple Silicon), Node v22.23.1, pnpm from PATH, vitest via <code>pnpm exec vitest</code> in <code>packages/bb-app</code>.</li>
+    <li>No providers or dev instance were needed: the bug is entirely inside the launcher's file handling. <code>scripts/bb-dev-app</code> was never started; every run used a throwaway <code>--data-dir</code> under <code>/tmp</code> and <code>--server-port 45711</code> (verified unused with <code>lsof</code>) so the post-write reload POST hits nothing.</li>
+    <li>Gotcha: the launcher prefers <code>$BB_SERVER_URL</code> over <code>--server-port</code> when building the reload URL (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/bb-app/src/launcher.ts#L1363-L1365">launcher.ts L1363-L1365</a>). The repro scripts <code>unset BB_SERVER_URL</code> and the vitest file refuses to run if it is set.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <p>Repro files: <code>2322/repro/</code> — <code>race.sh</code> (two real processes), <code>control-and-config.sh</code> (sequential control + <code>config.json</code> variant), <code>env-concurrent-writers.test.ts</code> (deterministic in-process vitest).</p>
+  <ol>
+    <li>Build the launcher at the base commit.
+<pre>git checkout 494f66526
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=bb-app</pre></li>
+    <li>Run two <code>bb-app env set</code> processes for <em>different</em> keys at the same time against one fresh data dir, 20 times, and inspect <code>env.json</code> after each pair finishes (this is exactly what <code>race.sh</code> does).
+<pre>unset BB_SERVER_URL
+DATA=$(mktemp -d /tmp/bb-2322-race.XXXXXX)
+node packages/bb-app/dist/bb-app.js --data-dir "$DATA" --server-port 45711 env set OPENAI_API_KEY key-a &amp;
+node packages/bb-app/dist/bb-app.js --data-dir "$DATA" --server-port 45711 env set BB_SERVER_PORT 40123 &amp;
+wait; cat "$DATA/env.json"</pre>
+<pre>expected (every trial): { "env": { "OPENAI_API_KEY": "key-a", "BB_SERVER_PORT": "40123" } }
+actual (bash 2322/repro/race.sh &lt;repo&gt; 20):
+trial 1: ok (both keys present)
+trial 2: LOST UPDATE -&gt; env.json has keys [BB_SERVER_PORT]
+trial 3: LOST UPDATE -&gt; env.json has keys [BB_SERVER_PORT]
+trial 4: LOST UPDATE -&gt; env.json has keys [OPENAI_API_KEY]
+trial 5: LOST UPDATE -&gt; env.json has keys [BB_SERVER_PORT]
+trial 6: ok (both keys present)
+trial 7: LOST UPDATE -&gt; env.json has keys [OPENAI_API_KEY]
+trial 8: LOST UPDATE -&gt; env.json has keys [OPENAI_API_KEY]
+trial 9: LOST UPDATE -&gt; env.json has keys [BB_SERVER_PORT]
+trial 10: ok (both keys present)
+trial 11: LOST UPDATE -&gt; env.json has keys [BB_SERVER_PORT]
+trial 12: LOST UPDATE -&gt; env.json has keys [BB_SERVER_PORT]
+trial 13: LOST UPDATE -&gt; env.json has keys [BB_SERVER_PORT]
+trial 14: LOST UPDATE -&gt; env.json has keys [BB_SERVER_PORT]
+trial 15: LOST UPDATE -&gt; env.json has keys [OPENAI_API_KEY]
+trial 16: LOST UPDATE -&gt; env.json has keys [BB_SERVER_PORT]
+trial 17: LOST UPDATE -&gt; env.json has keys [OPENAI_API_KEY]
+trial 18: LOST UPDATE -&gt; env.json has keys [BB_SERVER_PORT]
+trial 19: LOST UPDATE -&gt; env.json has keys [OPENAI_API_KEY]
+trial 20: ok (both keys present)
+lost updates: 16 / 20</pre>
+      Both processes print <code>Set &lt;KEY&gt; in .../env.json</code> and exit 0; nothing signals that one of the writes was discarded.</li>
+    <li>Control: the same two commands run one after the other keep both keys and the private mode (<code>control-and-config.sh</code>, first section).
+<pre>Set OPENAI_API_KEY in /tmp/bb-2322-seq.ePZb14/env.json
+No running bb server found at http://127.0.0.1:45711; config will apply on next start.
+Set BB_SERVER_PORT in /tmp/bb-2322-seq.ePZb14/env.json
+No running bb server found at http://127.0.0.1:45711; config will apply on next start.
+--- /tmp/bb-2322-seq.ePZb14/env.json (-rw-------):
+{
+  "env": {
+    "OPENAI_API_KEY": "key-a",
+    "BB_SERVER_PORT": "40123"
+  }
+}</pre></li>
+    <li>Deterministic unit-level repro. Copy <code>2322/repro/env-concurrent-writers.test.ts</code> to <code>packages/bb-app/test/</code> and run it. Because both <code>runBbApp</code> calls suspend at the same <code>await readFile</code> before either renames, the interleaving is fixed and both assertions fail every time.
+<pre>cd packages/bb-app
+env -u BB_SERVER_URL pnpm exec vitest run test/env-concurrent-writers.test.ts</pre>
+<pre>FAIL  issue #2322: concurrent env.json writers &gt; keeps both keys when two `env set` writers run concurrently
+AssertionError: expected { env: { BB_SERVER_PORT: '40123' } } to deeply equal { env: { …(2) } }
+  {
+    "env": {
+      "BB_SERVER_PORT": "40123",
+-     "OPENAI_API_KEY": "key-from-writer-a",
+    },
+  }
+ ❯ test/env-concurrent-writers.test.ts:42:21
+
+FAIL  issue #2322: concurrent env.json writers &gt; does not resurrect a key that a concurrent `env unset` removed
+AssertionError: expected { env: { …(2) } } to deeply equal { env: { BB_SERVER_PORT: '40123' } }
+  {
+    "env": {
+      "BB_SERVER_PORT": "40123",
++     "OPENAI_API_KEY": "stale-secret",
+    },
+  }
+ ❯ test/env-concurrent-writers.test.ts:67:21
+
+ Test Files  1 failed (1)
+      Tests  2 failed (2)</pre>
+      The first assertion fails because the <code>BB_SERVER_PORT</code> writer's snapshot (<code>{}</code>) never saw <code>OPENAI_API_KEY</code>. The second fails because the <code>set</code> writer's snapshot still contained <code>OPENAI_API_KEY: "stale-secret"</code>, so its rename re-committed a secret the concurrent <code>unset</code> had just removed. The mode assertion on line 40 passes: private mode is not the problem.</li>
+  </ol>
+  <h3>Repro test (also at <code>2322/repro/env-concurrent-writers.test.ts</code>)</h3>
+<pre>// Repro for get-bb/bb#2322: two concurrent `bb-app env set` writers lose one update.
+// Expected to FAIL on main (494f66526): the final env.json keeps only the last writer's key.
+import { mkdtempSync, readFileSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+import { runBbApp } from "../src/launcher.js";
+
+// Port with nothing listening: the post-write "reload running server" POST must
+// not reach the developer's real bb instance on :38886.
+const UNUSED_SERVER_PORT = "45711";
+
+// The launcher prefers BB_SERVER_URL from the environment over --server-port
+// (launcher.ts resolveBbAppStartContext), so run this file with
+// `env -u BB_SERVER_URL pnpm exec vitest run test/env-concurrent-writers.test.ts`.
+if (process.env.BB_SERVER_URL !== undefined) {
+  throw new Error(
+    "Unset BB_SERVER_URL before running this repro so the post-write reload POST goes to an unused port.",
+  );
+}
+
+describe("issue #2322: concurrent env.json writers", () =&gt; {
+  it("keeps both keys when two `env set` writers run concurrently", async () =&gt; {
+    const dataDir = mkdtempSync(join(tmpdir(), "bb-app-env-race-"));
+
+    await Promise.all([
+      runBbApp([
+        "--data-dir", dataDir, "--server-port", UNUSED_SERVER_PORT,
+        "env", "set", "OPENAI_API_KEY", "key-from-writer-a",
+      ]),
+      runBbApp([
+        "--data-dir", dataDir, "--server-port", UNUSED_SERVER_PORT,
+        "env", "set", "BB_SERVER_PORT", "40123",
+      ]),
+    ]);
+
+    const envPath = join(dataDir, "env.json");
+    const written = JSON.parse(readFileSync(envPath, "utf8"));
+    // Private file mode is preserved (this part works today).
+    expect(statSync(envPath).mode &amp; 0o777).toBe(0o600);
+    // BUG: only one of the two keys survives.
+    expect(written).toEqual({
+      env: { OPENAI_API_KEY: "key-from-writer-a", BB_SERVER_PORT: "40123" },
+    });
+  });
+
+  it("does not resurrect a key that a concurrent `env unset` removed", async () =&gt; {
+    const dataDir = mkdtempSync(join(tmpdir(), "bb-app-env-race-unset-"));
+    await runBbApp([
+      "--data-dir", dataDir, "--server-port", UNUSED_SERVER_PORT,
+      "env", "set", "OPENAI_API_KEY", "stale-secret",
+    ]);
+
+    await Promise.all([
+      runBbApp([
+        "--data-dir", dataDir, "--server-port", UNUSED_SERVER_PORT,
+        "env", "unset", "OPENAI_API_KEY",
+      ]),
+      runBbApp([
+        "--data-dir", dataDir, "--server-port", UNUSED_SERVER_PORT,
+        "env", "set", "BB_SERVER_PORT", "40123",
+      ]),
+    ]);
+
+    const written = JSON.parse(readFileSync(join(dataDir, "env.json"), "utf8"));
+    // BUG: the `set` writer's stale snapshot re-commits the secret that `unset` removed.
+    expect(written).toEqual({ env: { BB_SERVER_PORT: "40123" } });
+  });
+});</pre>
+
+  <h2>5. Root cause</h2>
+  <p>
+    The launcher treats <code>env.json</code> as a whole-document value. Every mutation is <em>read snapshot → compute new document → atomic replace</em>, with no coordination between writers. Atomic replace only guarantees that readers never see a torn file; it says nothing about whether the snapshot the writer started from is still current. Two writers that both read before either renames will each produce a full document from the same stale base, and the second <code>rename()</code> overwrites the first writer's document wholesale. The symptom (a key vanishes, or an unset key reappears) is exactly the classic lost-update anomaly.
+  </p>
+  <h3>The <code>set</code> path</h3>
+  <p><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/bb-app/src/launcher.ts#L1254-L1283">packages/bb-app/src/launcher.ts L1254-L1283</a>:</p>
+<pre>async function writeManagedEnv(args: WriteManagedEnvFileArgs): Promise&lt;void&gt; {
+  const existingConfig = await readManagedEnvFile({ dataDir: args.dataDir }); // (1) snapshot
+  await writeManagedEnvFile({
+    config: mergeManagedEnvFile(existingConfig, args.config),                  // (2) patch in memory
+    dataDir: args.dataDir,
+  });
+}
+
+async function writeManagedEnvFile(args: WriteManagedEnvFileArgs): Promise&lt;void&gt; {
+  await mkdir(args.dataDir, { recursive: true });
+  const nextConfig = pruneManagedEnvFile(args.config);
+  const envPath = formatBbAppEnvPath(args.dataDir);
+  const tempPath = join(args.dataDir, `.env.json.${process.pid}.${randomUUID()}.tmp`);
+  try {
+    await writeFile(tempPath, `${JSON.stringify(nextConfig, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    await rename(tempPath, envPath);                                            // (3) unconditional replace
+  } catch (error) {
+    await unlink(tempPath).catch(() =&gt; undefined);
+    throw error;
+  }
+}</pre>
+  <p>Between (1) and (3) there is no lock, no <code>O_EXCL</code> guard, and no check that <code>env.json</code> is still the file that was read. The per-process temp name (<code>pid + uuid</code>) only prevents two writers from clobbering each other's <em>temp</em> file; it does nothing for the final <code>rename</code> target.</p>
+  <h3>The <code>unset</code> path is a second copy of the same shape</h3>
+  <p><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/bb-app/src/launcher.ts#L1999-L2013">launcher.ts L1999-L2013</a> does not even go through <code>writeManagedEnv</code>: it calls <code>readManagedEnvFile</code> and then <code>writeManagedEnvFile</code> with <code>unsetManagedEnvKey(currentConfig, key)</code>. So <code>set</code> and <code>unset</code> are two separately written read-then-write sequences, which is why the issue asks for them to share one path. The merge itself (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/bb-app/src/launcher.ts#L1169-L1184">L1169-L1184</a>) is a shallow spread over the stale <code>currentConfig.env</code>, which is fine on its own; it is the stale input that is the problem.</p>
+  <h3>Why the process-level race hits so often</h3>
+  <p>Each <code>bb-app env set</code> process spends ~100 ms+ booting Node and loading the 640 KB bundle before it reaches (1). Two processes started back-to-back reach (1) within microseconds of each other, and the window from (1) to (3) is a few file-system syscalls, so "both read before either writes" is the common case, not the edge case. In-process (vitest) the interleaving is fixed because both calls park on the same <code>await readFile</code> tick.</p>
+  <h3>Deeper issue: every managed file in the launcher has the same shape</h3>
+  <ul>
+    <li><code>config.json</code>: <code>readManagedConfigForWrite</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/bb-app/src/launcher.ts#L1002-L1041">L1002-L1041</a>) + <code>writeManagedConfigFile</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/bb-app/src/launcher.ts#L1195-L1218">L1195-L1218</a>), called from <code>runConfigCommand</code> set/unset. Reproduced: two concurrent <code>bb-app config set</code> lose a key in 8 of 10 trials (<code>control-and-config.log</code>). <code>config.json</code> also carries <code>machineCredential</code> and <code>customModels</code>, so a lost update there can be more damaging than in <code>env.json</code>.</li>
+    <li><code>client.json</code>: <code>writeClientConfigFile</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/bb-app/src/launcher.ts#L1285-L1305">L1285-L1305</a>), same temp-and-rename without a lock.</li>
+  </ul>
+  <p>What is <em>not</em> involved: the server never writes these files (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/system/bb-app-managed-config.ts#L148-L160">it only reads them on <code>/api/v1/system/config/reload</code></a>), the host daemon does not touch them, and there is no plugin API for them. The issue's framing of "CLI vs. authorized plugin" is therefore hypothetical; the real contention is launcher-vs-launcher (two agents or an agent and a human running <code>bb-app env</code>/<code>bb-app config</code> at the same moment), which is plausible now that agents routinely run these commands.</p>
+  <p>History: the env write path arrived with commit <code>f17e8e4b6</code> ("Replace AI service implementation", 2026-05-18) and has not changed since. <code>git log 494f66526..origin/main -- packages/bb-app/src/launcher.ts</code> is empty, so the defect is still on <code>main</code>.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>
+    POSIX has no compare-and-rename, so a "conditional rename" cannot be built from <code>rename()</code> alone; any revision-check scheme still needs mutual exclusion between the check and the rename. All writers are local processes on one filesystem, so the simplest correct primitive is an exclusive lock file held across the whole read → patch → rename sequence:
+  </p>
+  <ol>
+    <li>Add one helper in <code>launcher.ts</code>, e.g. <code>mutateManagedJsonFile({ dataDir, fileName, mutate })</code>, that (a) <code>mkdir -p</code> the data dir, (b) acquires <code>&lt;dataDir&gt;/.&lt;fileName&gt;.lock</code> with <code>open(lockPath, "wx", 0o600)</code> in a bounded retry loop (say 50 × 20 ms, then fail with "another bb-app command is updating env.json; retry"), treating a lock older than a few seconds as stale and removing it, (c) reads the current file inside the lock, (d) calls <code>mutate(current)</code> to get the next document, (e) does the existing temp-file + <code>rename</code> with <code>mode: 0o600</code>, and (f) releases the lock in <code>finally</code>.</li>
+    <li>Route <code>env set</code>, <code>env unset</code>, <code>config set</code>, <code>config unset</code> (and the <code>client</code> writers) through that helper, deleting the separate <code>readX</code>-then-<code>writeX</code> sequences in <code>runEnvCommand</code> and <code>runConfigCommand</code>. This also satisfies the "set and unset share the same transaction path" acceptance item.</li>
+    <li>Keep the existing pre-validation (<code>validateManagedConfigForWrite</code>, <code>parseServerBindHost</code>) <em>before</em> taking the lock, so invalid input never holds or touches the file.</li>
+    <li>Test: the two in-process cases in the repro file become the regression tests (both keys survive; unset is not resurrected), plus a spawn-based case that starts two real <code>dist/bb-app.js</code> processes and asserts both keys are present. Passing the lock means the <code>Promise.all</code> interleaving now serializes; the first test's assertions flip to green without any change to the file format.</li>
+  </ol>
+  <p>What could go wrong: a crashed writer leaves a stale lock (handled by the age check); lock files on network filesystems where <code>O_EXCL</code> is unreliable (not a supported bb-app setup; <code>bb-app</code> declares <code>os: darwin, linux</code> and data dirs are local); a human editing <code>env.json</code> in an editor is still unsynchronized, which is acceptable. A revision field inside the JSON would change the strict <code>bbAppManagedEnvFileSchema</code> wire/file shape for no benefit over the lock, so avoid it. No server, daemon, or protocol change is needed, so <code>HOST_DAEMON_PROTOCOL_VERSION</code> is untouched. The "plugins configure launcher paths via a private file protocol" acceptance item is a separate feature and should be split out of this bug.</p>
+
+  <h2>7. PR review</h2>
+  <p>No pull requests are linked to this issue (<code>gh pr list --search 2322</code> returns nothing; the PRs that mention <code>env.json</code> — #2045, #2087, #1125 — are merged and unrelated).</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li>None found. Searches for <code>env.json</code>, <code>config.json overwrite</code>, and <code>launcher concurrent write atomic rename</code> across open and closed issues return only #2322 and unrelated items (#1637 plugin submission, #1124 unauthenticated bind, both closed).</li>
+    <li>Same-class defect not yet filed: <code>bb-app config set</code> / <code>config unset</code> and the <code>client.json</code> writer (see section 5). The fix above covers them; if the fix is scoped to <code>env.json</code> only, a follow-up issue should track <code>config.json</code>, which holds <code>machineCredential</code>.</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Artifacts</h3>
+  <ul>
+    <li><code>2322/race-20.log</code> — 20-trial process-level race, 16 lost updates.</li>
+    <li><code>2322/control-and-config.log</code> — sequential control and <code>config.json</code> variant (8/10 lost).</li>
+    <li><code>2322/vitest-repro.log</code> — vitest output of the in-process repro at base commit.</li>
+    <li><code>2322/repro/</code> — <code>race.sh</code>, <code>control-and-config.sh</code>, <code>env-concurrent-writers.test.ts</code>.</li>
+    <li><code>2322/build.log</code>, <code>2322/install.log</code>.</li>
+  </ul>
+  <h3>Commands run</h3>
+<pre>gh issue view 2322 --comments --json number,title,body,labels,state,comments,createdAt,author,url
+git checkout 494f66526 &amp;&amp; pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build
+git fetch origin main; git log 494f66526..origin/main --oneline -- packages/bb-app/src/launcher.ts packages/bb-app/src/   # empty
+grep -rn "formatBbAppEnvPath\|bbAppManagedEnvFileSchema\|BbAppManagedEnvFile" --include='*.ts' --include='*.tsx' .   # launcher.ts + server read-only
+grep -rn "managedEnv\|ManagedEnv\|env\.json\|bb-app env" packages/plugin-sdk/src packages/plugin-host/src plugins apps/desktop/src apps/cli/src apps/host-daemon/src   # no hits
+git log --oneline -S "writeManagedEnvFile" -- packages/bb-app/src/launcher.ts   # f17e8e4b6 2026-05-18
+lsof -nP -iTCP:45711 -sTCP:LISTEN   # free
+cd packages/bb-app &amp;&amp; env -u BB_SERVER_URL -u BB_HOST_DAEMON_PORT pnpm exec vitest run test/env-concurrent-writers.test.ts
+env -u BB_SERVER_URL -u BB_HOST_DAEMON_PORT bash /tmp/bb-reports/issues/2322/repro/race.sh &lt;worktree&gt; 20
+bash /tmp/bb-reports/issues/2322/repro/control-and-config.sh &lt;worktree&gt; 10
+gh pr list --search "env.json" --state all; gh pr list --search 2322 --state all; gh issue list --search "env.json" --state all</pre>
+  <h3>Note on the first vitest run</h3>
+  <p>The first execution of the repro test ran with the orchestration shell's <code>BB_SERVER_URL=http://127.0.0.1:62937</code> still exported. Because the launcher prefers that variable over <code>--server-port</code>, the post-write reload <code>POST /api/v1/system/config/reload</code> reached the workflow's own dev server on :62937 (not the user's real instance on :38886), which simply re-read its own managed config. Both runs produced identical lost-update results; the logs kept in this report are from the second run with the variable unset. The scripts and test now guard against this.</p>
+  <h3>Raw <code>control-and-config.log</code></h3>
+<pre>== control: sequential env set
+Set OPENAI_API_KEY in /tmp/bb-2322-seq.ePZb14/env.json
+No running bb server found at http://127.0.0.1:45711; config will apply on next start.
+Set BB_SERVER_PORT in /tmp/bb-2322-seq.ePZb14/env.json
+No running bb server found at http://127.0.0.1:45711; config will apply on next start.
+--- /tmp/bb-2322-seq.ePZb14/env.json (-rw-------):
+{
+  "env": {
+    "OPENAI_API_KEY": "key-a",
+    "BB_SERVER_PORT": "40123"
+  }
+}
+
+== config.json: concurrent config set (same read-merge-rename shape)
+trial 1: LOST UPDATE -&gt; config.json has keys [BB_APP_URL]
+trial 2: LOST UPDATE -&gt; config.json has keys [BB_APP_URL]
+trial 3: LOST UPDATE -&gt; config.json has keys [BB_APP_URL]
+trial 4: LOST UPDATE -&gt; config.json has keys [BB_APP_URL]
+trial 5: LOST UPDATE -&gt; config.json has keys [BB_INFERENCE]
+trial 6: ok (both keys present)
+trial 7: LOST UPDATE -&gt; config.json has keys [BB_INFERENCE]
+trial 8: LOST UPDATE -&gt; config.json has keys [BB_APP_URL]
+trial 9: LOST UPDATE -&gt; config.json has keys [BB_INFERENCE]
+trial 10: ok (both keys present)
+config.json lost updates: 8 / 10</pre>
+</main></body></html>

@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1748 server heap sized from host RAM, not the cgroup limit</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.medium { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  .v-no { color:var(--high); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1748 · Server heap is sized from host RAM, not the cgroup limit, so it fills the memory cap with garbage</h1>
+  <p class="meta">
+    <span class="pill">Type: (unset)</span> <span class="pill medium">Medium</span> <span class="pill">Effort: (unset)</span>
+    <span class="pill">perf</span> <span class="pill">host</span>
+    <a href="https://github.com/get-bb/bb/issues/1748">open on GitHub</a>
+    <span>2026-08-18</span>
+    <span>base <code>16ceb3a540f81c1189efaffb27a39b1d9443abf5</code> (main)</span>
+  </p>
+  <p class="meta">
+    <span class="verdict v-no">Verdict: NOT REPRODUCED (core claim refuted)</span>
+    <span>· root-cause confidence: <b>high</b></span>
+    <span>· linked open PRs: <a href="https://github.com/get-bb/bb/pull/1757">#1757</a> (REQUEST CHANGES)</span>
+  </p>
+
+  <h2>TL;DR</h2>
+  <p><b>Plain-language framing.</b> bb's launcher (<code>bb-app</code>) starts the server as a plain <code>node apps/server/dist/index.js</code> child. Node's V8 engine picks a maximum JavaScript heap ("heap_size_limit") when it starts. The reporter runs bb inside a systemd user unit with <code>MemoryHigh=3G</code>/<code>MemoryMax=3800M</code> on a 4.9&nbsp;GiB host, sees the server sawtooth between ~625 and ~1088&nbsp;MB RSS, measured a heap limit of <b>1728&nbsp;MB</b>, and concludes that V8 "sizes its heap from total host RAM and ignores any cgroup memory limit", so bb should pass <code>--max-old-space-size</code> derived from <code>/sys/fs/cgroup/memory.max</code>.</p>
+  <p><b>That premise is wrong, and the reporter's own number proves it.</b> Node has been cgroup-aware for the heap since v12 (<code>SetIsolateCreateParamsForNode</code> feeds <code>min(total RAM, uv_get_constrained_memory())</code> into V8's <code>ConfigureDefaults</code>; libuv reads <code>memory.max</code> <em>and</em> <code>memory.high</code> of the process's cgroup and takes the smaller). On this 58&nbsp;GiB machine, node 24.18 in a scope with the reporter's exact properties reports <code>heap_size_limit = 1728 MiB</code> — exactly the reporter's value — and that 1728 is <code>3 GiB / 2 + 192</code>, i.e. derived from <code>MemoryHigh=3G</code>. A 4.9&nbsp;GiB host with <em>no</em> cgroup limit gives 2240&nbsp;MiB (V8's 2&nbsp;GiB old-generation cap + young generation), so 1728 cannot have come from the host RAM. I confirmed the same with the real bb server binary via a Node diagnostic report (<code>javascriptHeap.memoryLimit</code>). The bb code claim ("<code>grep max-old-space-size</code> returns nothing; the launcher does not set it") is true, but nothing needs to for the cgroup to be honored.</p>
+  <p>What remains true is a narrower, policy-level point: V8's heuristic hands <em>each</em> Node process roughly half of the constrained memory, and a bb unit contains several Node processes (server, host daemon, one bridge process per live provider session) that all share the same 3&nbsp;GiB, so the server's ceiling is generous relative to what the unit can afford. And <code>NODE_OPTIONS</code> is indeed inherited by the daemon and by every provider bridge process (<code>sanitizeInheritedChildProcessEnv</code> keeps it, guarded by an existing unit test), so an operator has no way to cap only the server today. That is a feature request (a per-process heap knob or a smarter default), not the bug as reported. PR #1757 adds an opt-in <code>BB_SERVER_MAX_OLD_SPACE_MB</code>, but restates the false premise in the docs, does not honor <code>bb-app env set</code> although its docs say it does, and its validation error is swallowed and misreported as a health-check timeout by <code>bb-app start</code>.</p>
+
+  <h2>Claims vs findings</h2>
+  <table>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>bb never sets <code>--max-old-space-size</code>; not in the launcher, spawn paths, or docs</td><td class="ok">Verified</td><td><code>grep -rn "max-old-space-size\|NODE_OPTIONS\|execArgv" apps packages docs</code> at 16ceb3a54 finds no heap flag; the server is spawned as <code>spawn(process.execPath, [serverEntry])</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/bb-app/src/launcher.ts#L2901-L2907">launcher.ts#L2901-L2907</a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/bb-app/src/launcher.ts#L2671-L2678">#L2671-L2678</a>).</td></tr>
+    <tr><td>V8 auto-sizes its heap limit from total host RAM and <b>ignores any cgroup memory limit</b></td><td class="no">Refuted</td><td>Node 24.18 (libuv 1.52.1) in a scope with <code>MemoryMax=512M</code> → 259&nbsp;MiB; 1G → 560; 2G → 1120; 3G → 1728; 3800M → 2092; unconstrained on this 58&nbsp;GiB host → 4288. <code>MemoryHigh</code> alone is honored too (<code>cgroup-table.out</code>). Node source: <code>src/api/environment.cc</code> <code>SetIsolateCreateParamsForNode</code>; libuv <code>uv__get_cgroup2_memory_limits</code> reads <code>memory.max</code> and <code>memory.high</code> (Root cause).</td></tr>
+    <tr><td>"V8's default heap limit on this host measures 1728 MB, derived from the 4.9 GiB of physical RAM"</td><td class="no">Refuted (number verified, attribution wrong)</td><td>1728&nbsp;MiB is exactly what node produces under <code>MemoryHigh=3G MemoryMax=3800M</code> (min = 3&nbsp;GiB → old gen 1536 + young 192). A 4.9&nbsp;GiB (5017&nbsp;MiB) budget with no cgroup gives 2240&nbsp;MiB. Reproduced with the real bb server: <code>server-heap-limit.out</code>.</td></tr>
+    <tr><td>Server "may grow a heap that is 56% of the entire service budget"</td><td class="ok">Verified as V8 policy, not a bb defect</td><td>V8's <code>Heap::HeapSizeFromPhysicalMemory</code> uses old-gen ≈ memory/2 (capped at 2&nbsp;GiB below 16&nbsp;GiB), and Node feeds it the cgroup limit. So yes: 1536&nbsp;MiB old gen out of 3072. This is the default for <em>every</em> Node process in the unit, including the daemon and each bridge.</td></tr>
+    <tr><td>Sawtooth 625→1088&nbsp;MB RSS, 427&nbsp;MB drop in 20&nbsp;s, 1008&nbsp;MB anonymous at 1110&nbsp;MB RSS, 2578 <code>MemoryHigh</code> breaches, one OOM kill</td><td class="unv">Unverifiable</td><td>Host-specific measurements; no data attached. Consistent with normal V8 major-GC behavior under a ~1.7&nbsp;GB ceiling and with the co-location concerns in #1334/#1363/#1393. Whether the ~625&nbsp;MB trough is live set (a leak / retention issue) or not is the actually interesting question and is not answered by the issue.</td></tr>
+    <tr><td><code>sanitizeInheritedChildProcessEnv</code> strips only <code>NODE_ENV</code> and <code>BB_*</code>, so <code>NODE_OPTIONS</code> reaches spawned provider processes</td><td class="ok">Verified (code + existing test)</td><td><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/process-utils/src/index.ts#L182-L199">process-utils/src/index.ts#L182-L199</a>; the test at <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/process-utils/test/index.test.ts#L283-L300">index.test.ts#L283-L300</a> asserts <code>NODE_OPTIONS</code> survives. The daemon spawns each provider bridge as a <code>node</code> process with <code>{...sanitizeInheritedChildProcessEnv({env: process.env}), ...}</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/runtime-provider-process.ts#L493-L506">runtime-provider-process.ts#L493-L506</a>). Not exercised live (a real turn would be needed).</td></tr>
+    <tr><td>Setting <code>NODE_OPTIONS</code> at the unit level "would cap the agents too and risk crashing them mid-turn"</td><td class="unv">Partly true</td><td>True for the daemon and the Node bridge process of every session. Not true for a native <code>claude</code> binary: on this machine <code>NODE_OPTIONS=--max-old-space-size=1 claude --version</code> prints <code>2.1.234 (Claude Code)</code> and exits 0 (Bun-compiled ELF ignores it); <code>codex</code> is a Rust binary. It would apply if <code>claude</code> is the npm/Node install.</td></tr>
+    <tr><td>Suggested fix: pass <code>--max-old-space-size</code> sized from <code>/sys/fs/cgroup/memory.max</code></td><td class="no">Would only replicate what Node already does</td><td>Node already sizes from <code>min(memory.max, memory.high, RAM)</code>. A different <em>fraction</em> (or subtracting the daemon/bridge budget) is the only thing bb could add.</td></tr>
+  </table>
+
+  <h2>Environment</h2>
+  <ul>
+    <li>bb <code>16ceb3a54</code> (main, 2026-08-18) in worktree <code>/home/USER/projects/bb/.claude/worktrees/wf_242c3e11-a10-5</code>; PR #1757 checked out as <code>6ed285ae6</code> for the PR checks.</li>
+    <li>Linux 7.0.0-29-generic, cgroup v2 with a delegated user session (so <code>systemd-run --user --scope -p MemoryMax=…</code> works), 58987&nbsp;MiB RAM. Node v24.18.0 (libuv 1.52.1); reporter: Node v24.19.0. Node v26.5.0 checked once (1632&nbsp;MiB under the same scope, still cgroup-derived; <code>node26-check.out</code>).</li>
+    <li>No dev instance was needed. Real server binary runs used <code>BB_DATA_DIR=/tmp/1748-server-data-*</code>, port 41750; launcher checks used <code>/tmp/1748-bbapp-data</code>, ports 41748/41749. No screenshots (not a visual bug).</li>
+    <li>claude 2.1.234 native binary at <code>~/.local/bin/claude</code>.</li>
+  </ul>
+
+  <h2>Minimal reproduction</h2>
+  <p>Goal: check the issue's central claim (heap limit derived from host RAM, cgroup ignored) and reproduce the reporter's 1728&nbsp;MB number. Requires <code>node</code> and a cgroup-v2 systemd user session (<code>systemd-run --user --scope</code>). Nothing bb-specific is needed for step 1; step 2 uses the real bb server file.</p>
+  <h3>1. Node's default heap limit follows the cgroup limit</h3>
+  <p>Script <code>1748/repro/cgroup-table.sh</code> (also <code>heap-limit.sh</code>, the first pass with the same result plus the <code>execArgv</code>/<code>NODE_OPTIONS</code> inheritance check):</p>
+  <pre>#!/usr/bin/env bash
+# Issue #1748 experiment 2: V8&#x27;s default heap_size_limit as a function of the cgroup memory.max
+# the node process runs under (systemd-run --user --scope puts the command in a fresh cgroup with
+# the given properties). Also checks whether MemoryHigh alone (no MemoryMax) is honored.
+set -u
+show=&#x27;const v8=require(&quot;v8&quot;);const os=require(&quot;os&quot;);console.log(&quot;  totalmem MiB =&quot;,Math.round(os.totalmem()/1048576),&quot;heap_size_limit MiB =&quot;,Math.round(v8.getHeapStatistics().heap_size_limit/1048576))&#x27;
+echo &quot;node $(node --version), host RAM $(node -p &#x27;Math.round(require(&quot;os&quot;).totalmem()/1048576)&#x27;) MiB&quot;
+echo &quot;--- no cgroup limit (plain shell):&quot;; node -e &quot;$show&quot;
+for mm in 512M 1G 2G 3G 3800M 4G 5017M 8G 16G 32G; do
+  echo &quot;--- MemoryMax=$mm:&quot;
+  systemd-run --user --scope -q -p MemoryMax=$mm bash -c &quot;echo &#x27;  memory.max=&#x27;\$(cat /sys/fs/cgroup\$(cut -d: -f3 /proc/self/cgroup)/memory.max); node -e &#x27;$show&#x27;&quot; 2&gt;&amp;1
+done
+echo &quot;--- MemoryHigh=3G only (no MemoryMax), like the reporter&#x27;s MemoryHigh:&quot;
+systemd-run --user --scope -q -p MemoryHigh=3G bash -c &quot;echo &#x27;  memory.max=&#x27;\$(cat /sys/fs/cgroup\$(cut -d: -f3 /proc/self/cgroup)/memory.max) &#x27;memory.high=&#x27;\$(cat /sys/fs/cgroup\$(cut -d: -f3 /proc/self/cgroup)/memory.high); node -e &#x27;$show&#x27;&quot; 2&gt;&amp;1
+echo &quot;--- reporter&#x27;s exact unit properties MemoryHigh=3G MemoryMax=3800M:&quot;
+systemd-run --user --scope -q -p MemoryHigh=3G -p MemoryMax=3800M bash -c &quot;echo &#x27;  memory.max=&#x27;\$(cat /sys/fs/cgroup\$(cut -d: -f3 /proc/self/cgroup)/memory.max) &#x27;memory.high=&#x27;\$(cat /sys/fs/cgroup\$(cut -d: -f3 /proc/self/cgroup)/memory.high); node -e &#x27;$show&#x27;&quot; 2&gt;&amp;1
+echo &quot;--- MemoryMax on the PARENT cgroup only (child cgroup nested inside a limited scope): does node see it?&quot;
+systemd-run --user --scope -q -p MemoryMax=1G -p Delegate=yes bash -c &#x27;me=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); mkdir -p $me/child 2&gt;/dev/null &amp;&amp; echo $$ &gt; $me/child/cgroup.procs 2&gt;/dev/null; echo &quot;  own cgroup memory.max=$(cat /sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.max) parent memory.max=$(cat $me/memory.max)&quot;; node -e &#x27;&quot;$show&quot;&#x27;&#x27; 2&gt;&amp;1</pre>
+  <p>Output (<code>cgroup-table.out</code>; the last "parent cgroup" step has a quoting bug and is not part of the evidence):</p>
+  <pre>node v24.18.0, host RAM 58987 MiB
+--- no cgroup limit (plain shell):
+  totalmem MiB = 58987 heap_size_limit MiB = 4288
+--- MemoryMax=512M:
+  memory.max=536870912
+  totalmem MiB = 58987 heap_size_limit MiB = 259
+--- MemoryMax=1G:
+  memory.max=1073741824
+  totalmem MiB = 58987 heap_size_limit MiB = 560
+--- MemoryMax=2G:
+  memory.max=2147483648
+  totalmem MiB = 58987 heap_size_limit MiB = 1120
+--- MemoryMax=3G:
+  memory.max=3221225472
+  totalmem MiB = 58987 heap_size_limit MiB = 1728
+--- MemoryMax=3800M:
+  memory.max=3984588800
+  totalmem MiB = 58987 heap_size_limit MiB = 2092
+--- MemoryMax=4G:
+  memory.max=4294967296
+  totalmem MiB = 58987 heap_size_limit MiB = 2240
+--- MemoryMax=5017M:
+  memory.max=5260705792
+  totalmem MiB = 58987 heap_size_limit MiB = 2240
+--- MemoryMax=8G:
+  memory.max=8589934592
+  totalmem MiB = 58987 heap_size_limit MiB = 2240
+--- MemoryMax=16G:
+  memory.max=17179869184
+  totalmem MiB = 58987 heap_size_limit MiB = 4288
+--- MemoryMax=32G:
+  memory.max=34359738368
+  totalmem MiB = 58987 heap_size_limit MiB = 4288
+--- MemoryHigh=3G only (no MemoryMax), like the reporter&#x27;s MemoryHigh:
+  memory.max=max memory.high=3221225472
+  totalmem MiB = 58987 heap_size_limit MiB = 1728
+--- reporter&#x27;s exact unit properties MemoryHigh=3G MemoryMax=3800M:
+  memory.max=3984588800 memory.high=3221225472
+  totalmem MiB = 58987 heap_size_limit MiB = 1728
+--- MemoryMax on the PARENT cgroup only (child cgroup nested inside a limited scope): does node see it?
+/usr/bin/bash: -c: line 1: syntax error near unexpected token `(&#x27;
+/usr/bin/bash: -c: line 1: `me=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); mkdir -p $me/child 2&gt;/dev/null &amp;&amp; echo $ &gt; $me/child/cgroup.procs 2&gt;/dev/null; echo &quot;  own cgroup memory.max=$(cat /sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.max) parent memory.max=$(cat $me/memory.max)&quot;; node -e const v8=require(&quot;v8&quot;);const os=require(&quot;os&quot;);console.log(&quot;  totalmem MiB =&quot;,Math.round(os.totalmem()/1048576),&quot;heap_size_limit MiB =&quot;,Math.round(v8.getHeapStatistics().heap_size_limit/1048576))&#x27;</pre>
+  <p><b>Expected per the issue:</b> the limit stays at the host-RAM value (4288&nbsp;MiB here) regardless of the cgroup. <b>Actual:</b> it tracks the cgroup: 512M→259, 1G→560, 2G→1120, 3G→<b>1728</b>, 3800M→2092, and the reporter's exact <code>MemoryHigh=3G MemoryMax=3800M</code> pair yields <b>1728&nbsp;MiB</b>, the very number in the issue. <code>MemoryHigh</code> alone is honored as well.</p>
+
+  <h3>2. Same thing with the real bb server process</h3>
+  <p>Script <code>1748/repro/server-heap-limit.sh</code> starts <code>apps/server/dist/index.js</code> (the file <code>bb-app</code> spawns) with <code>--report-on-signal</code>, waits for <code>/health</code>, sends <code>SIGUSR2</code>, and reads <code>javascriptHeap.memoryLimit</code> from the diagnostic report:</p>
+  <pre>#!/usr/bin/env bash
+# Issue #1748 experiment 3: the REAL bb server (apps/server/dist/index.js, the file bb-app spawns)
+# started under the reporter&#x27;s exact systemd memory properties (MemoryHigh=3G, MemoryMax=3800M),
+# then asked for a Node diagnostic report (SIGUSR2) whose javascriptHeap.memoryLimit is V8&#x27;s
+# heap_size_limit. Compared with the same server started with no cgroup limit, and inside a
+# 5017M (= 4.9 GiB) cgroup, which is what a 4.9 GiB host with NO cgroup limit would produce.
+# Usage: BB_REPO=&lt;built bb worktree&gt; ./server-heap-limit.sh
+set -u
+: &quot;${BB_REPO:?set BB_REPO}&quot;
+cd &quot;$BB_REPO&quot;
+run_case() {
+  local label=&quot;$1&quot;; shift
+  local data=/tmp/1748-server-data-$label; rm -rf &quot;$data&quot;; mkdir -p &quot;$data/report&quot;
+  echo &quot;=== $label&quot;
+  BB_DATA_DIR=&quot;$data&quot; BB_SERVER_PORT=41750 BB_HOST_DAEMON_PORT=41751 NODE_ENV=production \
+    &quot;$@&quot; node --report-on-signal --report-signal=SIGUSR2 --report-directory=&quot;$data/report&quot; \
+    apps/server/dist/index.js &gt; &quot;$data/server.log&quot; 2&gt;&amp;1 &amp;
+  local wrapper=$!
+  for _ in $(seq 1 150); do
+    sleep 0.2
+    curl -sf http://127.0.0.1:41750/health &gt;/dev/null 2&gt;&amp;1 &amp;&amp; break
+  done
+  local pid
+  pid=$(pgrep -f &quot;report-directory=$data/report&quot; | head -1)
+  echo &quot;  cgroup: $(cut -d: -f3 /proc/$pid/cgroup)  memory.max=$(cat /sys/fs/cgroup$(cut -d: -f3 /proc/$pid/cgroup)/memory.max) memory.high=$(cat /sys/fs/cgroup$(cut -d: -f3 /proc/$pid/cgroup)/memory.high)&quot;
+  kill -USR2 &quot;$pid&quot;; sleep 1.5
+  local rep; rep=$(ls &quot;$data&quot;/report/*.json 2&gt;/dev/null | head -1)
+  node -e &#x27;
+    const r=JSON.parse(require(&quot;fs&quot;).readFileSync(process.argv[1],&quot;utf8&quot;));
+    const h=r.javascriptHeap; const mib=(n)=&gt;Math.round(n/1048576);
+    console.log(&quot;  node&quot;, r.header.nodejsVersion, &quot;commandLine:&quot;, r.header.commandLine.slice(0,4).join(&quot; &quot;), &quot;...&quot;);
+    console.log(&quot;  javascriptHeap.memoryLimit (heap_size_limit) MiB =&quot;, mib(h.memoryLimit), &quot; usedMemory MiB =&quot;, mib(h.usedMemory), &quot; totalMemory MiB =&quot;, mib(h.totalMemory), &quot; rss MiB =&quot;, mib(r.resourceUsage.rss ?? r.resourceUsage.maxRss*1024));
+  &#x27; &quot;$rep&quot;
+  kill -TERM &quot;$pid&quot; &quot;$wrapper&quot; 2&gt;/dev/null; wait &quot;$wrapper&quot; 2&gt;/dev/null; sleep 0.5
+}
+run_case unconstrained env
+run_case reporter-unit systemd-run --user --scope -q -p MemoryHigh=3G -p MemoryMax=3800M
+run_case host-4.9GiB-no-cgroup systemd-run --user --scope -q -p MemoryMax=5017M</pre>
+  <pre>$ BB_REPO=$PWD 1748/repro/server-heap-limit.sh
+=== unconstrained
+  cgroup: /user.slice/user-1000.slice/session-2.scope  memory.max=max memory.high=max
+  node v24.18.0 commandLine: node --report-on-signal --report-signal=SIGUSR2 --report-directory=/tmp/1748-server-data-unconstrained/report ...
+  javascriptHeap.memoryLimit (heap_size_limit) MiB = 4288  usedMemory MiB = 165  totalMemory MiB = 250  rss MiB = 370
+=== reporter-unit
+  cgroup: /user.slice/user-1000.slice/user@1000.service/app.slice/run-p2297252-i2319025.scope  memory.max=3984588800 memory.high=3221225472
+  node v24.18.0 commandLine: /home/USER/.nvm/versions/node/v24.18.0/bin/node --report-on-signal --report-signal=SIGUSR2 --report-directory=/tmp/1748-server-data-reporter-unit/report ...
+  javascriptHeap.memoryLimit (heap_size_limit) MiB = 1728  usedMemory MiB = 122  totalMemory MiB = 224  rss MiB = 319
+=== host-4.9GiB-no-cgroup
+  cgroup: /user.slice/user-1000.slice/user@1000.service/app.slice/run-p2297486-i2326942.scope  memory.max=5260705792 memory.high=max
+  node v24.18.0 commandLine: /home/USER/.nvm/versions/node/v24.18.0/bin/node --report-on-signal --report-signal=SIGUSR2 --report-directory=/tmp/1748-server-data-host-4.9GiB-no-cgroup/report ...
+  javascriptHeap.memoryLimit (heap_size_limit) MiB = 2240  usedMemory MiB = 120  totalMemory MiB = 246  rss MiB = 365</pre>
+  <p>Raw reports: <code>server-report-reporter-unit.json</code>, <code>server-report-4.9GiB-no-cgroup.json</code>. The unbounded first run in <code>server-heap-limit.out</code> was re-run once after an <code>EADDRINUSE</code> on port 41750; the recorded line is from the successful re-run.</p>
+  <p><b>Reading:</b> the bb server under the reporter's unit gets 1728&nbsp;MiB (from the 3&nbsp;GiB <code>MemoryHigh</code>); a 4.9&nbsp;GiB host without a cgroup would give it 2240&nbsp;MiB. The issue's "derived from the 4.9 GiB of physical RAM" is therefore not what happened on the reporter's host; the reporter measured the cgroup-derived value and mis-attributed it.</p>
+
+  <h2>Root cause</h2>
+  <p><b>Why bb does not need to set the flag for cgroups to count.</b> Node computes the isolate's heap constraints itself, before any bb code runs (<code>src/api/environment.cc</code>, Node v24.18.0):</p>
+  <pre>void SetIsolateCreateParamsForNode(Isolate::CreateParams* params) {
+  const uint64_t constrained_memory = uv_get_constrained_memory();
+  const uint64_t total_memory = constrained_memory &gt; 0 ?
+      std::min(uv_get_total_memory(), constrained_memory) :
+      uv_get_total_memory();
+  if (total_memory &gt; 0 &amp;&amp;
+      params-&gt;constraints.max_old_generation_size_in_bytes() == 0) {
+    // V8 defaults to 700MB or 1.4GB on 32 and 64 bit platforms respectively.
+    // This default is based on browser use-cases. Tell V8 to configure the
+    // heap based on the actual physical memory.
+    params-&gt;constraints.ConfigureDefaults(total_memory, 0);
+  }</pre>
+  <p>and libuv (<code>deps/uv/src/unix/linux.c</code>, 1.52.1) resolves the constrained memory from the process's own cgroup, taking the smaller of <code>memory.max</code> and <code>memory.high</code> (and of RLIMIT_AS/DATA):</p>
+  <pre>static void uv__get_cgroup2_memory_limits(char buf[static 1024], uint64_t* high, uint64_t* max) {
+  ...
+  snprintf(filename, sizeof(filename), "/sys/fs/cgroup/%.*s/memory.max", n, p);
+  *max = uv__read_uint64(filename);
+  snprintf(filename, sizeof(filename), "/sys/fs/cgroup/%.*s/memory.high", n, p);
+  *high = uv__read_uint64(filename);
+}
+static uint64_t uv__get_cgroup_constrained_memory(char buf[static 1024]) {
+  ...
+  return high &lt; max ? high : max;
+}</pre>
+  <p>V8's <code>ConfigureDefaults(3 GiB, 0)</code> then sets old generation = 3072/2 = 1536&nbsp;MiB (V8 caps old gen at 2048&nbsp;MiB below 16&nbsp;GiB, 4096 above) plus a young generation, giving the observed 1728&nbsp;MiB. Note libuv reads only the process's own cgroup, not ancestors; systemd places unit processes directly in the unit's cgroup, so <code>MemoryHigh</code>/<code>MemoryMax</code> on the service are seen. (A container that puts the process in a nested, unlimited child cgroup would not be seen — that is not the reporter's setup, whose measured value proves the limit was seen.)</p>
+  <p><b>Why the symptom still looks like "the heap is too big".</b> The reporter's unit hosts the server, the host daemon, one Node bridge process per live provider session, and the provider CLIs, all under one 3&nbsp;GiB <code>MemoryHigh</code>. Node's heuristic gives every one of those Node processes a ~1.5&nbsp;GiB old-generation ceiling as if it were alone in the cgroup, and V8's growing strategy lets the old generation reach a multiple of the live size between major GCs. A single server that peaks at ~1.1&nbsp;GB RSS with ~625&nbsp;MB trough is unremarkable under a 1.7&nbsp;GB ceiling; add the daemon and a few bridges and the unit crosses <code>MemoryHigh</code>. So the operational pain is plausible, but its cause is "several Node processes share one cgroup and each is sized as if alone" plus whatever the server's true live set is (#1334/#1363/#1393 territory), not "the cgroup is ignored".</p>
+  <p><b>What bb currently offers to steer this: nothing per-process.</b> The launcher spawns the server, daemon, and (via the daemon) each bridge with <code>process.execPath</code> and no node flags; <code>execArgv</code> is not inherited by <code>spawn</code> (see <code>heap-limit.out</code>: a parent started with <code>--max-old-space-size=300</code> spawns a child at 4288&nbsp;MiB), while <code>NODE_OPTIONS</code> is inherited by all of them because <code>sanitizeInheritedChildProcessEnv</code> deliberately passes it through. That is the only kernel of the issue that is a real gap.</p>
+
+  <h2>Proposed fix (first principles)</h2>
+  <ol>
+    <li><b>Do not implement the issue as filed.</b> Deriving <code>--max-old-space-size</code> from <code>/sys/fs/cgroup/memory.max</code> re-implements Node's default and would produce the same 1728&nbsp;MiB. Close or retitle the issue to the real request: "no way to cap the server heap independently of the daemon/providers" (or "server heap default should account for co-located Node processes").</li>
+    <li>If a knob is wanted, keep it opt-in and read it from the launcher's <em>resolved</em> env (<code>runtime.serverEnv</code> / the env passed to <code>createServerEnv</code>), so <code>bb-app env set</code> and the process env both work; apply at both server spawn sites in <code>launcher.ts</code>; validate at option-resolution time so an invalid value produces its own error instead of the "health check timed out" message; document it in <code>docs/configuration.md</code> without the wrong premise; add a launcher unit test for parsing plus one for the argv shape.</li>
+    <li>A better default, if the maintainers want one: pass <code>--max-old-space-size</code> only when a cgroup limit is detected and set it to a fraction that leaves room for the daemon and N bridges (say 40% of <code>min(memory.high, memory.max)</code> for the server, a smaller share for the daemon). This is a judgement call and needs measurement on a memory-capped host; a heap cap below the true live set turns "sawtooth" into "FATAL ERROR: heap out of memory", so it must be conservative and overridable.</li>
+    <li>Independently worth checking (the more likely real problem): what the server's ~625&nbsp;MB trough is made of. A heap snapshot at the trough would tell whether it is retained live state (a leak or unbounded cache) versus fragmentation. Nothing in this issue answers that.</li>
+  </ol>
+
+  <h2>PR review</h2>
+  <h3>#1757 · feat: allow capping the server's V8 heap independently of providers — <span class="no">REQUEST CHANGES</span></h3>
+  <p><b>What it changes</b> (<code>pr1757.diff</code>, 44+/9−): adds <code>resolveServerNodeFlags(process.env)</code> in <code>packages/bb-app/src/launcher.ts</code> that turns <code>BB_SERVER_MAX_OLD_SPACE_MB</code> into <code>--max-old-space-size=N</code>, prepends it to the server argv in <code>runBbServer</code> and <code>startFullStackServerProcess</code>, and adds a row to <code>docs/configuration.md</code>. Opt-in; no test.</p>
+  <p><b>Does it address the root cause?</b> It does not claim to fix the reported behavior automatically (good), but it is built on the same false premise: the new doc row and the code comment state that Node "sizes the heap from total system memory and ignores any cgroup limit". Both are wrong (see Root cause). The knob is a legitimate escape hatch for the co-location problem, but the change should not ship documentation that tells operators something untrue about Node.</p>
+  <p><b>Findings</b> (PR head <code>6ed285ae6</code>):</p>
+  <ul>
+    <li><b>[high] Env-file path silently ignored, docs say it works.</b> <code>launcher.ts:2675</code> and <code>:2934</code> call <code>resolveServerNodeFlags(process.env)</code>. The launcher's env file (<code>bb-app env set …</code>) is merged into <code>runtime.serverEnv</code>/<code>managedEnv</code>, never into <code>process.env</code> (<code>applyManagedConfigEnv</code>/<code>createServerBaseEnv</code>, <code>launcher.ts:863-890</code>). Verified live with the real launcher (<code>pr1757-launcher-check.out</code>): after <code>bb-app env set BB_SERVER_MAX_OLD_SPACE_MB 444</code> the server child is started as <code>node …/apps/server/dist/index.js</code> with <b>no</b> flag, while its environment does contain <code>BB_SERVER_MAX_OLD_SPACE_MB=444</code>. The docs row says "<code>bb-app env</code> or environment". Fix: read from the resolved env (<code>runtime.serverEnv</code> / <code>args.env</code>).</li>
+    <li><b>[medium] Validation error swallowed in the full-stack path.</b> In <code>runBbAppStart</code> the throw from <code>resolveServerNodeFlags</code> happens inside <code>startServer()</code>, whose <code>catch {}</code> prints <code>Server failed to start (health check timed out)</code> and points at an empty log dir (<code>pr1757-fullstack-invalid.out</code>). The operator never sees "must be a positive integer". The <code>bb-server</code> path does surface it. Validate once at runtime-resolution time, before spawning.</li>
+    <li><b>[medium] Wrong premise in <code>docs/configuration.md</code> and the JSDoc.</b> "Node sizes the heap from total system memory and ignores any cgroup limit" is false for every supported Node; the reporter's 1728&nbsp;MB is the cgroup-derived value. Rewrite as: "V8 sizes each Node process's heap as if it owned the whole cgroup; set this to give the server a smaller share when the daemon and providers run in the same unit."</li>
+    <li><b>[low] Lenient parsing.</b> <code>Number.parseInt("12abc", 10)</code> is 12, so <code>BB_SERVER_MAX_OLD_SPACE_MB=12abc</code> is accepted; a strict <code>/^\d+$/</code> check would be safer. Also, values below what the server actually needs turn a sawtooth into a hard OOM crash; the docs should say so.</li>
+    <li><b>[low] No tests</b>, and the description admits neither typecheck nor tests were run. I ran <code>pnpm exec turbo run typecheck --filter=bb-app</code> and <code>… test --filter=bb-app</code> on the branch: both pass (65 tests). Add a unit test for <code>resolveServerNodeFlags</code> and the argv shape.</li>
+    <li><b>[info] Scope.</b> Only the server is covered; the host daemon and the per-session bridge processes are the other Node heaps in the same cgroup and remain at V8's default. Not a blocker for an opt-in server knob, but the PR text implies the server is the whole problem.</li>
+    <li>No wire-shape change → no <code>HOST_DAEMON_PROTOCOL_VERSION</code> concern. Layer is right (launcher owns process spawn flags). No casts. Behavior unchanged when unset (verified: default run has no flag).</li>
+  </ul>
+  <p><b>Tests I ran:</b> <code>gh pr checkout 1757</code>; <code>pnpm exec turbo run typecheck --filter=bb-app</code> (pass, <code>log</code>); <code>pnpm exec turbo run test --filter=bb-app</code> (2 files, 65 tests pass, <code>log</code>); live launcher checks with <code>pr1757-launcher-check.sh</code>:</p>
+  <pre>#!/usr/bin/env bash
+# Issue #1748 / PR #1757 check: does the real launcher (bb-server, source-checkout mode) pass
+# --max-old-space-size to the spawned server when BB_SERVER_MAX_OLD_SPACE_MB is set
+#   (a) in the process environment, and
+#   (b) via `bb-app env set` (the env file), as the PR&#x27;s docs row claims?
+# Usage: BB_REPO=&lt;worktree with PR #1757 checked out and built&gt; ./pr1757-launcher-check.sh
+set -u
+: &quot;${BB_REPO:?set BB_REPO to the bb worktree root}&quot;
+DATA_DIR=/tmp/1748-bbapp-data
+PORT=41748
+rm -rf &quot;$DATA_DIR&quot;; mkdir -p &quot;$DATA_DIR&quot;
+cd &quot;$BB_REPO&quot;
+
+run_and_inspect() {
+  local label=&quot;$1&quot;; shift
+  echo &quot;=== $label&quot;
+  # bb-server spawns `node &lt;serverEntry&gt;` with stdio inherit; we only need the child&#x27;s cmdline.
+  env &quot;$@&quot; BB_DATA_DIR=&quot;$DATA_DIR&quot; BB_SERVER_PORT=&quot;$PORT&quot; BB_HOST_DAEMON_PORT=41749 \
+    pnpm exec tsx packages/bb-app/src/bin/bb-server.ts &gt; &quot;$DATA_DIR/$label.log&quot; 2&gt;&amp;1 &amp;
+  local launcher=$!
+  local child=&quot;&quot;
+  for _ in $(seq 1 100); do
+    sleep 0.2
+    child=$(pgrep -f &quot;apps/server/dist/index.js&quot; | while read -r p; do
+      if grep -q &quot;BB_DATA_DIR=$DATA_DIR&quot; /proc/$p/environ 2&gt;/dev/null; then echo &quot;$p&quot;; break; fi; done)
+    [ -n &quot;$child&quot; ] &amp;&amp; break
+    if ! kill -0 &quot;$launcher&quot; 2&gt;/dev/null; then break; fi
+  done
+  if [ -n &quot;$child&quot; ]; then
+    echo &quot;server pid $child cmdline:&quot;; tr &#x27;\0&#x27; &#x27; &#x27; &lt; /proc/$child/cmdline; echo
+    echo &quot;server env BB_SERVER_MAX_OLD_SPACE_MB=$(tr &#x27;\0&#x27; &#x27;\n&#x27; &lt; /proc/$child/environ | grep &#x27;^BB_SERVER_MAX_OLD_SPACE_MB=&#x27; | cut -d= -f2-)&quot;
+  else
+    echo &quot;no server child found; launcher output:&quot;; tail -5 &quot;$DATA_DIR/$label.log&quot;
+  fi
+  kill -TERM &quot;$launcher&quot; 2&gt;/dev/null; [ -n &quot;$child&quot; ] &amp;&amp; kill -TERM &quot;$child&quot; 2&gt;/dev/null
+  wait &quot;$launcher&quot; 2&gt;/dev/null
+  sleep 0.5
+}
+
+run_and_inspect a-process-env BB_SERVER_MAX_OLD_SPACE_MB=333
+
+echo &quot;=== writing the knob with bb-app env set (env file):&quot;
+BB_DATA_DIR=&quot;$DATA_DIR&quot; BB_SERVER_PORT=&quot;$PORT&quot; pnpm exec tsx packages/bb-app/src/bin/bb-app.ts env set BB_SERVER_MAX_OLD_SPACE_MB 444 2&gt;&amp;1 | tail -2
+echo &quot;env file contents:&quot;; cat &quot;$DATA_DIR/env&quot; 2&gt;/dev/null || cat &quot;$DATA_DIR&quot;/*.env 2&gt;/dev/null || ls &quot;$DATA_DIR&quot;
+run_and_inspect b-env-file
+
+run_and_inspect c-invalid-value BB_SERVER_MAX_OLD_SPACE_MB=abc</pre>
+  <pre>$ BB_REPO=$PWD 1748/repro/pr1757-launcher-check.sh
+=== a-process-env
+server pid 2274967 cmdline:
+/home/USER/.nvm/versions/node/v24.18.0/bin/node --max-old-space-size=333 /home/USER/projects/bb/.claude/worktrees/wf_242c3e11-a10-5/apps/server/dist/index.js
+server env BB_SERVER_MAX_OLD_SPACE_MB=333
+=== writing the knob with bb-app env set (env file):
+Set BB_SERVER_MAX_OLD_SPACE_MB in /tmp/1748-bbapp-data/env.json
+Reloaded running bb server config.
+env file contents:
+a-process-env.log
+env.json
+logs
+=== b-env-file
+server pid 2275465 cmdline:
+/home/USER/.nvm/versions/node/v24.18.0/bin/node /home/USER/projects/bb/.claude/worktrees/wf_242c3e11-a10-5/apps/server/dist/index.js
+server env BB_SERVER_MAX_OLD_SPACE_MB=444
+=== c-invalid-value
+no server child found; launcher output:
+Error: BB_SERVER_MAX_OLD_SPACE_MB must be a positive integer number of megabytes; received "abc".
+    at resolveServerNodeFlags (/home/USER/projects/bb/.claude/worktrees/wf_242c3e11-a10-5/packages/bb-app/src/launcher.ts:2922:11)
+    at runBbServer (/home/USER/projects/bb/.claude/worktrees/wf_242c3e11-a10-5/packages/bb-app/src/launcher.ts:2675:9)
+
+$ BB_SERVER_MAX_OLD_SPACE_MB=abc BB_DATA_DIR=/tmp/1748-bbapp-data BB_SERVER_PORT=41748 BB_HOST_DAEMON_PORT=41749 pnpm exec tsx packages/bb-app/src/bin/bb-app.ts start
+  bb
+  ○  Starting server  ✗  Server failed to start (health check timed out)
+     Check logs: /tmp/1748-bbapp-data/logs/
+  ●  Shutting down</pre>
+  <p>Note on the "Reloaded running bb server config." line: my first run of the <code>env set</code> step omitted <code>BB_SERVER_PORT</code>, so the launcher pinged the default port 38886 (the machine's real bb) to reload config; the saved script now passes the port. The env file written is <code>pr1757-env.json</code>.</p>
+  <p><b>Verdict: REQUEST CHANGES.</b> Fix the env source (read the resolved launcher env, not <code>process.env</code>), surface the validation error in <code>bb-app start</code>, correct the docs/comment premise, tighten parsing, add a test. With those, an opt-in knob is reasonable; the maintainers may also prefer to fold it into a co-location-aware default rather than a raw megabyte knob.</p>
+
+  <h2>Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/1334">#1334</a>: Co-located execution workload can starve the bb server and leave threads spinning (same reporter family; CPU/IO side of co-location).</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1363">#1363</a>: Provider processes need one host-daemon lease owner tied to active turns.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1393">#1393</a>: Host lacks global admission control across work sources (the natural home for "N sessions fit in this cgroup").</li>
+    <li><a href="https://github.com/get-bb/bb/pull/1757">PR #1757</a>: opt-in <code>BB_SERVER_MAX_OLD_SPACE_MB</code> (reviewed above).</li>
+  </ul>
+
+  <h2>Appendix</h2>
+  <h3>Commands run</h3>
+  <pre># worktree /home/USER/projects/bb/.claude/worktrees/wf_242c3e11-a10-5 at 16ceb3a54
+pnpm install --frozen-lockfile --prefer-offline            # 1748/install.log
+pnpm exec turbo run build                                  # 1748/build.log
+grep -rn "max-old-space-size\|NODE_OPTIONS\|execArgv" apps packages scripts docs
+1748/repro/heap-limit.sh          &gt; 1748/repro/heap-limit.out
+1748/repro/cgroup-table.sh        &gt; 1748/repro/cgroup-table.out
+BB_REPO=$PWD 1748/repro/server-heap-limit.sh &gt; 1748/repro/server-heap-limit.out   # real server + diagnostic report
+systemd-run --user --scope -q -p MemoryHigh=3G -p MemoryMax=3800M ~/.nvm/versions/node/v26.5.0/bin/node -e '…heap_size_limit…'   # node26-check.out
+NODE_OPTIONS=--max-old-space-size=1 claude --version       # native claude ignores NODE_OPTIONS
+curl -sL https://raw.githubusercontent.com/nodejs/node/v24.18.0/src/api/environment.cc ; …/deps/uv/src/unix/linux.c   # source excerpts quoted above
+gh pr checkout 1757 ; gh pr diff 1757 &gt; 1748/pr1757.diff
+pnpm exec turbo run typecheck --filter=bb-app &gt; 1748/pr-typecheck.log
+pnpm exec turbo run test --filter=bb-app      &gt; 1748/pr-tests.log
+BB_REPO=$PWD 1748/repro/pr1757-launcher-check.sh &gt; 1748/repro/pr1757-launcher-check.out
+BB_SERVER_MAX_OLD_SPACE_MB=abc BB_DATA_DIR=/tmp/1748-bbapp-data BB_SERVER_PORT=41748 BB_HOST_DAEMON_PORT=41749 pnpm exec tsx packages/bb-app/src/bin/bb-app.ts start   # pr1757-fullstack-invalid.out
+git checkout 16ceb3a54</pre>
+  <h3>heap-limit.out (first pass: flag vs NODE_OPTIONS vs cgroup, and spawn inheritance)</h3>
+  <pre>node: v24.18.0
+physical RAM (MiB): 58987
+--- default:
+heap_size_limit MiB = 4288  execArgv= [&quot;-e&quot;,&quot;const v8=require(\&quot;v8\&quot;);const s=v8.getHeapStatistics();console.log(\&quot;heap_size_limit MiB =\&quot;, Math.round(s.heap_size_limit/1048576), \&quot; execArgv=\&quot;, JSON.stringify(process.execArgv), \&quot; NODE_OPTIONS=\&quot;, process.env.NODE_OPTIONS ?? \&quot;(unset)\&quot;)&quot;]  NODE_OPTIONS= (unset)
+--- --max-old-space-size=512 flag:
+heap_size_limit MiB = 704  execArgv= [&quot;--max-old-space-size=512&quot;,&quot;-e&quot;,&quot;const v8=require(\&quot;v8\&quot;);const s=v8.getHeapStatistics();console.log(\&quot;heap_size_limit MiB =\&quot;, Math.round(s.heap_size_limit/1048576), \&quot; execArgv=\&quot;, JSON.stringify(process.execArgv), \&quot; NODE_OPTIONS=\&quot;, process.env.NODE_OPTIONS ?? \&quot;(unset)\&quot;)&quot;]  NODE_OPTIONS= (unset)
+--- NODE_OPTIONS=--max-old-space-size=512:
+heap_size_limit MiB = 704  execArgv= [&quot;-e&quot;,&quot;const v8=require(\&quot;v8\&quot;);const s=v8.getHeapStatistics();console.log(\&quot;heap_size_limit MiB =\&quot;, Math.round(s.heap_size_limit/1048576), \&quot; execArgv=\&quot;, JSON.stringify(process.execArgv), \&quot; NODE_OPTIONS=\&quot;, process.env.NODE_OPTIONS ?? \&quot;(unset)\&quot;)&quot;]  NODE_OPTIONS= --max-old-space-size=512
+--- inside a cgroup with MemoryMax=512M MemoryHigh=400M (systemd-run --user --scope):
+memory.max=536870912 memory.high=419430400
+heap_size_limit MiB = 259  execArgv= [&quot;-e&quot;,&quot;const v8=require(\&quot;v8\&quot;);const s=v8.getHeapStatistics();console.log(\&quot;heap_size_limit MiB =\&quot;, Math.round(s.heap_size_limit/1048576), \&quot; execArgv=\&quot;, JSON.stringify(process.execArgv), \&quot; NODE_OPTIONS=\&quot;, process.env.NODE_OPTIONS ?? \&quot;(unset)\&quot;)&quot;]  NODE_OPTIONS= (unset)
+--- a child spawned with spawn(process.execPath,[script]) (what bb-app does for the server) does NOT inherit the parent&#x27;s execArgv ...
+  parent execArgv= [&quot;--max-old-space-size=300&quot;,&quot;-e&quot;,&quot;const {spawnSync}=require(\&quot;child_process\&quot;);console.log(\&quot;  parent execArgv=\&quot;,JSON.stringify(process.execArgv));const r=spawnSync(process.execPath,[\&quot;/tmp/1748-child.cjs\&quot;],{encoding:\&quot;utf8\&quot;});process.stdout.write(r.stdout)&quot;]
+  child heap_size_limit MiB = 4288 execArgv= [] NODE_OPTIONS= (unset)
+--- ... but DOES inherit NODE_OPTIONS:
+  child heap_size_limit MiB = 492 execArgv= [] NODE_OPTIONS= --max-old-space-size=300</pre>
+  <h3>Where NODE_OPTIONS travels in bb (code path)</h3>
+  <pre>bb-app launcher (systemd unit env, incl. NODE_OPTIONS)
+ ├─ spawn(process.execPath, [serverEntry], {env: createServerEnv({...runtime.serverEnv})})   → server inherits NODE_OPTIONS
+ └─ spawn(process.execPath, [daemonEntry], {env: createDaemonEnv(...)})                       → daemon inherits NODE_OPTIONS
+      └─ agent-runtime spawnProvider: env = {...sanitizeInheritedChildProcessEnv({env: process.env}), ...}
+           strips only NODE_ENV and BB_*  → each provider bridge (`node bridge-bootstrap …`) inherits NODE_OPTIONS
+              └─ claude-code bridge passes that env to the Claude Agent SDK, which execs `claude`
+                 (native binary here: ignores NODE_OPTIONS; npm/Node install would honor it)</pre>
+</main></body>
+</html>

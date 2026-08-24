@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1681 Fix Pi process notification wake projection</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.medium { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .verdict { font-weight:600; }
+  .v-repro { color:var(--high); }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:4px; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1681 · Fix Pi process notification wake projection</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill medium">Medium</span> <span class="pill">Effort: Medium</span>
+    <span class="pill">providers</span> <span class="pill">provider-pi</span>
+    <a href="https://github.com/get-bb/bb/issues/1681">open on GitHub</a>
+    <span>2026-08-18</span>
+    <span>base <code>16ceb3a540f81c1189efaffb27a39b1d9443abf5</code> (main)</span>
+  </p>
+  <p class="meta">
+    <span class="verdict v-repro">Verdict: REPRODUCED</span>
+    <span>· root-cause confidence: <b>high</b></span>
+    <span>· linked open PRs: <a href="https://github.com/get-bb/bb/pull/1682">#1682</a> (draft, stacked on <a href="https://github.com/get-bb/bb/pull/1663">#1663</a>) → <b>REQUEST CHANGES</b></span>
+  </p>
+
+  <h2>TL;DR</h2>
+  <p><b>Plain-language framing.</b> Pi (the <code>pi</code> provider) lets extensions inject messages into a session. The third-party <a href="https://github.com/aliou/pi-processes">@aliou/pi-processes</a> extension runs background shell commands and, when one finishes with <code>onSuccess: "turn"</code>, calls <code>pi.sendMessage({customType: "ad-process:notification", content: "&lt;process_event …&gt;", …}, {triggerTurn: true})</code>. Pi then <em>starts a new LLM turn on its own</em> while bb thinks the thread is idle. bb's Pi bridge forwards every Pi SDK event to bb's translator (<code>packages/agent-runtime/src/pi/event-translation.ts</code>) which turns them into thread events for the UI/CLI.</p>
+  <p><b>What the user sees.</b> After the process finishes, the thread flips to "Working…", shows no input, and never finishes: the spinner stays until the user presses stop. In a dev build (or with the "show unhandled provider events" setting on) three "Unhandled Pi event" rows appear instead of the process event and the assistant's answer.</p>
+  <p><b>What is actually wrong.</b> Two schema gaps in the translator. (1) The custom message's <code>message_start</code>/<code>message_end</code> SDK envelopes have <code>role: "custom"</code>, which the translator neither handles nor whitelists, so they become <code>provider/unhandled</code>. (2) Pi's <code>agent_end.messages</code> history contains that custom message with <b>string</b> content; bb's <code>piConversationMessageSchema</code> only accepts an <em>array</em> of content blocks, so the whole <code>agent_end</code> is rejected as unhandled and <b>no <code>turn/completed</code> is emitted</b>. Because the turn was started by Pi (not by a bb prompt), bb's usual <code>pi/prompt/settled</code> fallback never fires, so the turn is stuck forever. I reproduced both live with a 30-line stand-in extension and with a 100-line unit test that fails on main.</p>
+  <p><b>PR #1682</b> fixes (2) generically (good) and (1) narrowly (only for the literal customType <code>ad-process:notification</code>). It projects the notification as an <code>item/completed</code> <code>userMessage</code> event, but nothing in <code>@bb/thread-view</code>, the app or the CLI renders provider-emitted <code>userMessage</code> items any more, so its headline claim "process event is visible as turn input" is false end to end (verified live: two consecutive "ok" assistant rows and nothing between them). Its "no text response" warning is dead code because Pi emits <code>agent_start</code> <em>before</em> the custom <code>message_start</code>, the opposite of the order its tests feed. Verdict: request changes.</p>
+
+  <h2>Claims vs findings</h2>
+  <table>
+    <tr><th>Claim (issue body)</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Pi process notifications with <code>attention: "turn"</code> "could appear not to wake an idle thread"</td><td class="ok">Verified (as "wakes but never completes")</td><td>Live: turn 2 of <code>thr_jehzdb5b6v</code> starts (<code>turn/started</code> seq 12) and never gets <code>turn/completed</code>; thread status stays <code>active</code> (<code>live-events-main.txt</code>, screenshot below).</td></tr>
+    <tr><td>bb translated the notification's <code>sdk/message_start</code> and <code>sdk/message_end</code> envelopes as <code>provider/unhandled</code></td><td class="ok">Verified</td><td>seq 13/14: <code>provider/unhandled rawType=sdk/message_start role=custom</code>, <code>…message_end role=custom</code>. Cause: <code>visibility.ts</code> maps role <code>custom</code> → <code>unknown</code> → coverage <code>unknown</code> → emitted.</td></tr>
+    <tr><td>The process input was absent from the projected turn</td><td class="ok">Verified</td><td>No user-visible input event exists for turn 2 on main (only <code>turn/started</code>); on the PR branch an event exists but is not rendered (see PR review).</td></tr>
+    <tr><td>Pi includes the custom process message in <code>agent_end.messages</code> with string content; bb expected array content and rendered the terminal envelope as "Unhandled Pi event"</td><td class="ok">Verified</td><td>seq 21 <code>provider/unhandled rawType=sdk/agent_end</code>; <code>CustomMessage.content: string | (TextContent|ImageContent)[]</code> in pi-coding-agent 0.84.0 <code>core/messages.d.ts:35</code>; bb schema at <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/pi/event-translation.ts#L171-L181">event-translation.ts#L171-L181</a>. Unit repro shows the same three unhandled events.</td></tr>
+    <tr><td>"When Pi returned an empty assistant message, the UI showed no useful activity"</td><td class="unv">Partially verified</td><td>The stuck turn is independent of whether the assistant text is empty; in my run the model answered "ok" and the UI still showed only "Working…" (delta-only agentMessage never completed because <code>agent_end</code> was rejected). Empty text just makes it look emptier.</td></tr>
+    <tr><td>Expected: one idle <code>turn</code> notification starts exactly one projected turn; <code>message_end</code>/clustered notifications don't duplicate; idle <code>context</code>/<code>ignore</code> don't start turns</td><td class="ok">Reasonable</td><td>Matches Pi semantics (<code>sendCustomMessage</code>: idle + triggerTurn → <code>_runAgentPrompt</code>; idle without trigger → append + emit <code>message_start</code>/<code>message_end</code> only). Note that on real Pi the bb turn is opened by <code>agent_start</code>, which precedes the custom <code>message_start</code>.</td></tr>
+    <tr><td>Expected: "Empty or missing assistant output produces an explicit warning"</td><td class="unv">Design choice, not a bug</td><td>Nothing in bb promises this today; PR #1682's implementation of it never fires on real Pi (ordering, see PR review).</td></tr>
+    <tr><td>Reproduce with a Pi-managed command such as <code>sleep 5; echo done</code></td><td class="ok">Verified with a stand-in extension</td><td>@aliou/pi-processes is not installed here; a 30-line extension sending the identical message shape via <code>pi.sendMessage(…, {triggerTurn:true, deliverAs:"steer"})</code> reproduces it (<code>fake-processes.extension.ts</code>). The message shape was copied from pi-processes 0.10.9 <code>extensions/processes/notification-sender.ts</code>.</td></tr>
+  </table>
+
+  <h2>Environment</h2>
+  <ul>
+    <li>bb <code>16ceb3a54</code> (main, 2026-08-18), worktree <code>/home/USER/projects/bb/.claude/worktrees/wf_242c3e11-a10-11</code>; dev instance app <code>:13268</code>, server <code>:21268</code>, host daemon <code>:29268</code>, data dir <code>/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_242c3e11-a10-11-7b71b81c9d83</code>.</li>
+    <li>Linux 7.0.0-29-generic, node v24.18.0, <code>@earendil-works/pi-coding-agent</code> 0.84.0 (bb's pinned Pi SDK), Pi model <code>openai-codex/gpt-5.6-sol</code> (from <code>~/.pi/agent/settings.json</code> defaults). @aliou/pi-processes 0.10.9 tarball inspected for the message shape (not installed).</li>
+    <li>Project <code>proj_uhfhsvtirj</code> → local path <code>/tmp/bb-1681-scratch</code> (scratch git repo containing <code>.pi/extensions/fake-processes.ts</code>). Threads: <code>thr_vhxg6p67r8</code> (extension not loaded, project untrusted — control), <code>thr_jehzdb5b6v</code> (main, bug), <code>thr_7mepbbb6s7</code> (PR #1682 branch).</li>
+    <li>Pi only loads project-local <code>.pi/extensions</code> for trusted projects, and bb's bridge has no trust prompt (<code>configured-services.ts</code> <code>resolveProjectTrusted</code>). To avoid touching <code>~/.pi</code>, the host daemon was started with <code>PI_CODING_AGENT_DIR=/tmp/bb-1681-piagent</code> (a copy of <code>~/.pi/agent/{auth,settings,models-store}.json</code> plus <code>trust.json</code> trusting <code>/tmp/bb-1681-scratch</code>).</li>
+  </ul>
+
+  <h2>Minimal reproduction</h2>
+  <h3>A. Unit-level (no accounts needed, fails on main)</h3>
+  <p>File: <code>1681/repro/issue-1681-process-notification.repro.test.ts</code> — copy to <code>packages/agent-runtime/src/pi/</code>. It feeds the translator the exact <code>sdk/message</code> sequence Pi emits for an idle <code>sendCustomMessage(msg, {triggerTurn:true})</code>: <code>agent_start</code> → <code>message_start</code>(custom) → <code>message_end</code>(custom) → <code>agent_end</code> whose <code>messages</code> contain the custom entry with string content.</p>
+  <pre>$ cd packages/agent-runtime &amp;&amp; pnpm exec vitest run src/pi/issue-1681-process-notification.repro.test.ts
+translated: [
+  "turn/started",
+  "provider/unhandled(sdk/message_start)",
+  "provider/unhandled(sdk/message_end)",
+  "provider/unhandled(sdk/agent_end)"
+]
+ × translates an idle attention:turn notification into one visible turn with input and completion
+AssertionError: expected [ …3 provider/unhandled events… ] to deeply equal []
+   ❯ src/pi/issue-1681-process-notification.repro.test.ts:84:72
+ Test Files  1 failed (1)</pre>
+  <p><b>Expected:</b> no <code>provider/unhandled</code>, one <code>turn/started</code>, a visible input item, and <code>turn/completed</code>. <b>Actual:</b> assertion (1) fails first (three unhandled events); assertions (3) and (4) would fail too — there is no input item and no <code>turn/completed</code> at all. Full log: <code>unit-repro-main.log</code>. On the PR #1682 branch the same test passes (<code>unit-repro-pr1682.log</code>).</p>
+  <pre>/**
+ * Repro for get-bb/bb#1681: Pi process notifications (custom messages sent by
+ * a Pi extension with `triggerTurn: true`, e.g. @aliou/pi-processes
+ * `ad-process:notification`) are not projected by bb.
+ */
+import { describe, expect, it } from "vitest";
+import { turnScope } from "@bb/domain";
+import { createPiEventTranslator } from "./event-translation.js";
+
+const CONTENT =
+  '&lt;process_event type="lifecycle" kind="success" process_id="proc_551c" name="sleep"&gt;Process completed successfully&lt;/process_event&gt;';
+
+const customMessage = {
+  role: "custom",
+  customType: "ad-process:notification",
+  content: CONTENT, // string, as CustomMessage.content allows
+  display: true,
+  details: { attention: "turn", kind: "success", processId: "proc_551c" },
+  timestamp: 1_786_919_243_630,
+};
+
+function sdk(message: unknown) {
+  return {
+    jsonrpc: "2.0" as const,
+    method: "sdk/message",
+    params: { threadId: "pi-thread-1", message },
+  };
+}
+
+describe("issue #1681 — Pi process notification wake", () =&gt; {
+  it("translates an idle attention:turn notification into one visible turn with input and completion", () =&gt; {
+    const translator = createPiEventTranslator({ providerId: "pi" });
+    const context = { threadId: "pi-thread-1" };
+    const all = [
+      sdk({ type: "agent_start" }),
+      sdk({ type: "message_start", message: customMessage }),
+      sdk({ type: "message_end", message: customMessage }),
+      sdk({
+        type: "agent_end",
+        willRetry: false,
+        messages: [
+          customMessage,
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "The sleep process finished." }],
+            stopReason: "stop",
+            api: "openai-responses",
+            provider: "openai-codex",
+            model: "gpt-5.6-sol",
+            usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+            timestamp: 1_786_919_246_950,
+          },
+        ],
+      }),
+    ].flatMap((event) =&gt; translator.translatePiEvent(event, context));
+
+    const types = all.map((event) =&gt;
+      event.type === "provider/unhandled" ? `provider/unhandled(${event.rawType})` : event.type);
+    console.log("translated:", JSON.stringify(types, null, 2));
+
+    // (1) the custom message_start/message_end envelopes must not surface as unhandled
+    expect(all.filter((event) =&gt; event.type === "provider/unhandled")).toEqual([]);
+    // (2) exactly one turn starts
+    expect(all.filter((event) =&gt; event.type === "turn/started")).toHaveLength(1);
+    // (3) the process event is visible as turn input
+    expect(all).toContainEqual(expect.objectContaining({
+      type: "item/completed", scope: turnScope("turn-1"),
+      item: expect.objectContaining({ type: "userMessage" }) }));
+    // (4) the turn completes (agent_end with a string-content custom entry must be accepted)
+    expect(all).toContainEqual(expect.objectContaining({
+      type: "turn/completed", scope: turnScope("turn-1"), status: "completed" }));
+  });
+});</pre>
+
+  <h3>B. Live (real Pi session, real model, stand-in extension)</h3>
+  <ol>
+    <li>Scratch repo with the extension (<code>fake-processes.extension.ts</code>; it waits 5 s after the first <code>agent_end</code>, then sends the pi-processes message shape with <code>triggerTurn: true</code>):
+<pre>mkdir -p /tmp/bb-1681-scratch/.pi/extensions &amp;&amp; cp fake-processes.extension.ts /tmp/bb-1681-scratch/.pi/extensions/fake-processes.ts
+cd /tmp/bb-1681-scratch &amp;&amp; git init -q &amp;&amp; git add -A &amp;&amp; git -c user.email=a@b -c user.name=a commit -qm init</pre></li>
+    <li>Trusted Pi agent dir (Pi refuses project extensions in untrusted projects; bb has no trust prompt):
+<pre>mkdir -p /tmp/bb-1681-piagent &amp;&amp; cp ~/.pi/agent/{auth,settings,models-store}.json /tmp/bb-1681-piagent/
+echo '{"/tmp/bb-1681-scratch": true}' &gt; /tmp/bb-1681-piagent/trust.json
+PI_CODING_AGENT_DIR=/tmp/bb-1681-piagent scripts/bb-dev-app current      # host daemon inherits the env var</pre></li>
+    <li>Project + Pi thread (Pi requires <code>--permission-mode full</code>):
+<pre>eval "$(scripts/bb-dev-app env)"
+curl -s -X POST $BB_SERVER_URL/api/v1/projects -H 'content-type: application/json' \
+  -d '{"name":"qa-1681","source":{"type":"local_path","path":"/tmp/bb-1681-scratch","hostId":"host_s9e9g2aig9"}}'   # -&gt; proj_uhfhsvtirj
+pnpm bb:dev thread spawn --project proj_uhfhsvtirj --provider pi --permission-mode full --title "1681 repro" --prompt "Reply only with ok." --json   # -&gt; thr_jehzdb5b6v</pre></li>
+    <li>Wait ~20 s, then dump events (<code>dump-events.py</code>):
+<pre>$ python3 dump-events.py $BB_SERVER_URL thr_jehzdb5b6v
+thread thr_jehzdb5b6v status=active displayStatus=active
+  1 client/turn/requested            thread       input=[{"type": "text", "text": "Reply only with ok.", "mentions": []}]
+  2 client/thread/start              thread
+  3 thread/identity                  thread
+  4 turn/started                     bt9a5255d9-1-1
+  5 turn/input/accepted              bt9a5255d9-1-1
+  6 item/started                     bt9a5255d9-1-1 agentMessage null
+  7 item/agentMessage/delta          bt9a5255d9-1-1
+  8 item/completed                   bt9a5255d9-1-1 agentMessage "ok"
+  9 thread/tokenUsage/updated        bt9a5255d9-1-1
+ 10 turn/completed                   bt9a5255d9-1-1 status=completed
+ 11 thread/contextWindowUsage/updated bt9a5255d9-1-1
+ 12 turn/started                     bt9a5255d9-1-2                      &lt;-- Pi's agent_start (extension-triggered turn)
+ 13 provider/unhandled               bt9a5255d9-1-2 rawType=sdk/message_start role=custom
+ 14 provider/unhandled               bt9a5255d9-1-2 rawType=sdk/message_end role=custom
+ 15 item/started                     bt9a5255d9-1-2 reasoning []
+ 16 item/reasoning/textDelta         bt9a5255d9-1-2
+ 17 item/reasoning/textDelta         bt9a5255d9-1-2
+ 18 item/completed                   bt9a5255d9-1-2 reasoning ["**Confirming readiness with ok**"]
+ 19 item/started                     bt9a5255d9-1-2 agentMessage null
+ 20 item/agentMessage/delta          bt9a5255d9-1-2
+ 21 provider/unhandled               bt9a5255d9-1-2 rawType=sdk/agent_end role=None   &lt;-- agent_end rejected; no turn/completed ever
+ 22 thread/contextWindowUsage/updated bt9a5255d9-1-2</pre>
+    <b>Expected:</b> seq 13 is a visible input row, seq 21 is <code>item/completed agentMessage "ok"</code> + <code>turn/completed</code>, thread returns to <code>idle</code>. <b>Actual:</b> three <code>provider/unhandled</code>, no completion, thread stays <code>active</code> indefinitely (still active minutes later when the screenshot was taken). Raw events: <code>live-events-main.raw.json</code>. The unhandled <code>message_start</code> payload (seq 13) is exactly the pi-processes shape:
+<pre>{"type":"message_start","message":{"role":"custom","customType":"ad-process:notification",
+  "content":"&lt;process_event type=\"lifecycle\" kind=\"success\" process_id=\"proc_551c\" name=\"sleep-done\"&gt;Process completed successfully: sleep 5; echo done&lt;/process_event&gt;",
+  "display":true,"details":{"kind":"success","processId":"proc_551c","processName":"sleep-done","command":"sleep 5; echo done","timestamp":1787037716911,"summary":"Process completed successfully","attention":"turn"},
+  "timestamp":1787037716911}}</pre></li>
+  </ol>
+  <figure>
+    <img src="assets/1681-stuck-turn.png" alt="thread stuck after process notification on main">
+    <figcaption><b>main @ 16ceb3a54, thread thr_jehzdb5b6v.</b> Look at: the first turn ("Reply only with ok." → "ok") is fine; below it three "Unhandled Pi event" rows (message_start, message_end, agent_end — visible because dev builds force <code>includeProviderUnhandledOperations</code>; production hides them unless the setting is on) and "Working…" with the sidebar spinner that never stops. No process input and no second "ok" are shown even though the model answered.</figcaption>
+  </figure>
+
+  <h2>Root cause</h2>
+  <p><b>1. Pi emits custom-role message boundaries that bb classifies as unknown.</b> Pi's <code>AgentSession.sendCustomMessage</code> (pi-coding-agent 0.84.0 <code>core/agent-session.js:1068-1097</code>) either runs <code>_runAgentPrompt(appMessage)</code> (idle + <code>triggerTurn</code>) or appends and emits <code>message_start</code>/<code>message_end</code>. Either way the bridge forwards them verbatim as <code>sdk/message</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/pi/bridge/bridge.ts#L416-L440">bridge.ts#L416-L440</a>). The translator's <code>piEventTypeSchema</code> does not include <code>message_start</code>/<code>message_end</code> and <code>PI_IGNORED_EVENT_TYPES</code> only lists <code>agent_settled</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/pi/event-translation.ts#L136-L140">L136-L140</a>), so translation returns <code>[]</code> and the envelope path falls back to <code>buildUnhandledPiEvent</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/pi/event-translation.ts#L549-L575">L549-L575</a>). For <code>user</code>/<code>assistant</code>/<code>toolResult</code> boundaries the visibility metadata rates them <code>noise</code> and drops them; role <code>custom</code> maps to <code>unknown</code> → coverage <code>unknown</code> → the event is emitted (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/pi/visibility.ts#L132-L143">visibility.ts#L132-L143</a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/pi/visibility.ts#L313-L328">#L313-L328</a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/provider-bridge-protocol/src/bridge-kit/provider-unhandled-event.ts#L92-L100">provider-unhandled-event.ts#L92-L100</a>). This is cosmetic on its own but means the notification content is neither shown nor persisted as input.</p>
+  <p><b>2. <code>agent_end</code> is rejected because the history contains string content — this is what strands the turn.</b></p>
+  <pre>const piConversationMessageSchema = z.object({
+    role: z.string(),
+    content: z.array(piMessageContentBlockSchema).optional(),   // &lt;-- string content (valid for CustomMessage/UserMessage) fails
+    …
+const piAgentEndEventSchema = z.object({
+    type: z.literal("agent_end"),
+    messages: z.array(piConversationMessageSchema),             // &lt;-- whole event fails
+    …
+case "agent_end": {
+  const piEvent = piAgentEndEventSchema.safeParse(event);
+  if (!piEvent.success) {
+    return buildUnexpectedEvent(event);                          // &lt;-- provider/unhandled instead of turn/completed
+  }</pre>
+  <p>(<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/pi/event-translation.ts#L171-L181">event-translation.ts#L171-L181</a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/pi/event-translation.ts#L186-L192">#L186-L192</a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/pi/event-translation.ts#L771-L775">#L771-L775</a>). Pi's own type is <code>CustomMessage.content: string | (TextContent | ImageContent)[]</code>; bb-originated prompts always use arrays (Pi's <code>prompt()</code> builds <code>[{type:"text",…}]</code>), which is why this was never seen before extensions started injecting string content. For bb-started turns the bridge's <code>pi/prompt/settled</code> notification (emitted when <code>session.prompt()</code> resolves) would still close the turn; an extension-triggered turn has no prompt call, so nothing else ever emits <code>turn/completed</code>. The runtime therefore keeps the thread <code>active</code> and (as a side effect) also stops the idle-session bookkeeping for that thread.</p>
+  <p><b>Why the symptom follows.</b> <code>agent_start</code> opens bb turn N+1 (seq 12) with no input; the custom boundaries become unhandled rows (13/14); the streamed answer stays an uncompleted delta (19/20) because completion is derived from <code>agent_end</code>; <code>agent_end</code> is rejected (21) → no completion → spinner forever. The raw payload of the unhandled <code>agent_end</code> is even lost: <code>toProviderRawEvent</code> replaced it with <code>"Provider raw event params were not JSON-serializable."</code> (Pi's message objects contain <code>undefined</code> fields), which is why the reporter had to reason from a separate recorded example.</p>
+  <p><b>Deeper/underlying.</b> bb has no concept of provider-originated turn input. User input is modelled by the server's <code>client/turn/requested</code> + <code>turn/input/accepted</code>; the provider-side <code>userMessage</code> item type still exists in <code>@bb/domain</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/domain/src/provider-event.ts#L301-L309">provider-event.ts#L301-L309</a>) but since the daemon-protocol cutover (<code>3f553d7b8</code>) nothing in <code>@bb/thread-view</code> projects it — <code>item/completed</code> for a <code>userMessage</code> falls to the "unhandled/debug" bucket (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/thread-view/src/build-event-projection.ts#L994-L1010">build-event-projection.ts#L994-L1010</a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/thread-view/src/parse-error-message.ts#L112-L126">parse-error-message.ts#L112-L126</a>). Any correct fix that wants the notification visible must add a rendering path, not just a translator event. Separately, the host daemon's idle-provider-session reaper (<code>IDLE_PROVIDER_SESSION_REAP_AFTER_MS = 30 min</code>, gated by the provider-session-reaping experiment; Pi reports <code>sessionRestorable: true</code>) will dispose an idle Pi session together with the extension that owns the background process, so a process that outlives 30 idle minutes can never wake the thread — a genuine "does not wake" case that neither the issue nor the PR addresses (not reproduced here; would need a 30-minute wait).</p>
+
+  <h2>Proposed fix (first principles)</h2>
+  <ol>
+    <li><b>Accept every valid Pi <code>AgentMessage.content</code> shape</b> in <code>piConversationMessageSchema</code> (<code>z.union([z.string(), z.array(block)])</code>) — exactly what PR #1663 / the first commit of #1682 does. This alone unsticks the turn and is the minimal, safe fix. Also make <code>toProviderRawEvent</code> strip <code>undefined</code> (JSON round-trip) so unhandled payloads are not replaced by the serialization-error stub.</li>
+    <li><b>Handle custom-role message boundaries generically</b>, not by customType literal: in the translator, treat <code>message_start</code> with <code>role: "custom"</code> as the input of the current/new turn when <code>display === true</code> (any extension: pi-processes, pi-background-tasks, Pi's own <code>nextTurn</code> messages), and rate <code>message_end</code>/non-display custom boundaries as <code>noise</code> in <code>visibility.ts</code> so they never surface as "Unhandled Pi event". Whether the input is a "user" row or a "system/extension" row is a product decision, but pick one that renders.</li>
+    <li><b>Give provider-originated input a rendering path.</b> Either (a) project <code>item/completed</code> <code>userMessage</code> in <code>@bb/thread-view</code> as a user row with a non-user initiator (touch <code>build-event-projection.ts</code>, timeline/CLI formatters, and add a snapshot test), or (b) emit an operation-style event (e.g. <code>provider/warning</code>-like "Process notification" row) that already renders. Option (a) is cleaner and also fixes the domain drift (schema type nobody consumes). Both are inside the server/app side; the wire shape (<code>ThreadEvent</code>) does not change so no <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump is needed unless a new event type is introduced.</li>
+    <li>Follow-up: exempt Pi sessions with live extension state (or all Pi sessions with an active background process) from idle reaping, or document that background processes do not survive the reap.</li>
+  </ol>
+  <p>Risk: (2) must not open a bb turn for idle <code>context</code>/<code>ignore</code> notifications (Pi emits <code>message_start</code> without <code>agent_start</code>); key on <code>state.currentTurnId</code>, as the PR does. Tests must use the real order <code>agent_start → message_start(custom)</code>.</p>
+
+  <h2>PR review</h2>
+  <h3><a href="https://github.com/get-bb/bb/pull/1682">#1682 Fix Pi process notification turns</a> (draft, author ryanbbrown, agent-generated; stacked on #1663) — verdict: <b>REQUEST CHANGES</b></h3>
+  <p><b>What it changes</b> (2 files, +579/−18, <code>diff</code>): (a) widens <code>piConversationMessageSchema.content</code> to <code>string | block[]</code> (commit <code>79c6d0904</code> = #1663); (b) adds <code>piProcessNotificationEventSchema</code> matching <code>message_start</code>/<code>message_end</code> whose message is <code>role:"custom"</code>, <code>customType:"ad-process:notification"</code>, string <code>content</code>, <code>details.attention ∈ {turn,context,ignore}</code>; on <code>message_start</code> it ensures a turn, emits an <code>item/completed</code> <code>userMessage</code> with the raw content, and returns <code>[]</code> for <code>message_end</code>/idle context/ignore; (c) tracks <code>processNotificationTurnId</code> to emit a <code>provider/warning</code> when such a turn ends without assistant text; (d) 9 new translator tests.</p>
+  <p><b>Does it address the root cause?</b> (a) yes, generically — this is the part that fixes the stuck turn. (b) fixes the "Unhandled Pi event" rows only for one third-party customType literal; every other extension custom message still hits the same path. (c) is dead on real Pi. The projected input is not rendered anywhere, so the PR's own acceptance criterion "process event is visible as turn input" is not met.</p>
+  <p><b>Tests I ran.</b> Checked out the PR (<code>gh pr checkout 1682</code>, merged base <code>16ceb3a54</code> locally, no conflicts). <code>pnpm exec turbo run test --filter=@bb/agent-runtime --force</code>: 30 files / 324 tests pass incl. my repro test (<code>log</code>). Live run on the PR branch (<code>thr_7mepbbb6s7</code>): the turn completes and no unhandled events are produced (<code>live-events-pr1682.txt</code>), but the app and <code>bb thread log</code> show no input row (<code>live-thread-log-pr1682.txt</code>):</p>
+  <pre>$ bb thread log thr_7mepbbb6s7
+── User ────────────────────────────────────────────────────
+Reply only with ok.
+
+── Assistant ───────────────────────────────────────────────
+ok
+
+── Assistant ───────────────────────────────────────────────
+ok                                     &lt;-- the process notification that triggered this turn is invisible</pre>
+  <figure>
+    <img src="assets/1681-pr1682-turn.png" alt="PR 1682 branch: turn completes but process input is not rendered">
+    <figcaption><b>PR #1682 branch, thread thr_7mepbbb6s7.</b> Look at: no more "Unhandled Pi event" rows and no spinner (turn completed), but two consecutive "ok" answers with nothing between them — the <code>item/completed userMessage</code> event (seq 13) exists in the event log and is dropped by the timeline projection.</figcaption>
+  </figure>
+  <p><b>Findings</b> (line numbers refer to the PR head <code>53ae25671</code>):</p>
+  <table>
+    <tr><th>Severity</th><th>Where</th><th>Finding</th></tr>
+    <tr><td class="no">High</td><td><code>packages/agent-runtime/src/pi/event-translation.ts:698-746</code></td><td>Emits <code>item/completed</code> with <code>item.type:"userMessage"</code>. No consumer renders provider-emitted <code>userMessage</code> items (thread-view: <code>build-event-projection.ts</code> falls through to the debug bucket; grep for <code>"userMessage"</code> in <code>packages/thread-view/src</code>, <code>apps/app/src</code>, <code>apps/cli</code> is empty). The PR's stated behavior "The process event is visible as turn input" is unmet; verified live and via CLI. Needs a rendering path (thread-view + app + CLI formatter + snapshot test) or a different event.</td></tr>
+    <tr><td class="no">High</td><td><code>event-translation.ts:143-158, 698-746, 909-918</code>, tests <code>event-translation.test.ts</code> ("projects one turn…", "coalesces…", "warns…", "keeps an accepted user prompt…")</td><td>Every new test feeds the notification <em>before</em> <code>agent_start</code>. Real Pi (pi-agent-core <code>agent-loop.js:49-52</code>, and live seq 12→13) emits <code>agent_start</code> first, so <code>state.currentTurnId</code> is already set when <code>message_start</code> arrives: <code>startsProcessTurn</code> is always false, <code>processNotificationTurnId</code> is never set, and the advertised "no text response" warning never fires. Probe test <code>issue-1681-pr1682-order.review.test.ts</code> fails on the PR branch (<code>log</code>). The <code>onTurnFinish</code>/<code>processNotificationTurnId</code>/warning code and the two tests are dead weight; either delete or re-key the feature on "turn had no client input".</td></tr>
+    <tr><td class="unv">Medium</td><td><code>event-translation.ts:143-158</code></td><td>Keys on the third-party literal <code>customType: "ad-process:notification"</code> and a pi-processes-specific <code>details.attention</code>. Any other extension's <code>sendMessage</code> (e.g. <code>pi-background-tasks</code>, or pi-processes changing its type name) still yields "Unhandled Pi event" rows for <code>message_start</code>/<code>message_end</code>. The generic condition is <code>role === "custom"</code> (+ <code>display</code>); the attention gate can be replaced by "is a bb turn currently open" which is what the code effectively does anyway. Also array <code>content</code> (allowed by <code>CustomMessage</code>) is rejected by <code>z.string()</code>.</td></tr>
+    <tr><td class="unv">Medium</td><td><code>event-translation.ts:708-714</code></td><td>Idle <code>context</code> notifications return <code>[]</code>: Pi appends them to the model's context but bb records nothing, so the transcript silently diverges from what the model saw. At least persist them (hidden or as a system row) rather than dropping.</td></tr>
+    <tr><td class="unv">Low</td><td><code>event-translation.ts:589-601</code></td><td><code>isProcessNotification</code> is computed by a second <code>safeParse</code> on every <code>sdk/message</code> to suppress the unhandled fallback; cleaner to mark custom boundaries as <code>noise</code> in <code>visibility.ts</code> so the existing coverage filter does the job.</td></tr>
+    <tr><td class="ok">OK</td><td>layering / protocol</td><td>Change lives in the daemon-side translator (correct layer for provider translation); <code>ThreadEvent</code> shapes are unchanged so no <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump is required. No casts or <code>any</code>. Item ids use the per-session <code>itemIdPrefix</code> (avoids the #1224 resume collision).</td></tr>
+    <tr><td class="ok">OK</td><td>commit <code>79c6d0904</code> (#1663 part)</td><td>The string-content widening is correct and sufficient to unstick extension-triggered turns; it should land regardless (ideally as #1663 alone).</td></tr>
+  </table>
+  <p><b>Verdict: REQUEST CHANGES.</b> Land #1663 (string content) now. For #1682: make the input actually render, test the real event order, generalize beyond the <code>ad-process:notification</code> literal, and drop or fix the dead warning path.</p>
+
+  <h2>Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/1633">#1633</a> — "Pi extension-triggered turn stays working after agent_end": the same string-content root cause, fixed by <a href="https://github.com/get-bb/bb/pull/1663">#1663</a> (open), on which #1682 is stacked.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1224">#1224</a> — Pi item-id collisions across resume (why the translator takes <code>itemIdPrefix</code>).</li>
+    <li>Idle provider-session reaping (30 min) will kill Pi extensions with background processes; no issue filed yet as far as I can see.</li>
+  </ul>
+
+  <h2>Appendix</h2>
+  <h3>Commands run</h3>
+  <pre># worktree at 16ceb3a54
+pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build
+gh issue view 1681 --repo get-bb/bb --json title,body,state,labels,comments ; gh pr view 1682 ; gh pr view 1663 ; gh pr diff 1682 &gt; 1681/pr1682.diff
+npm pack @aliou/pi-processes@0.10.9   # inspected extensions/processes/notification-sender.ts, handlers/notifications.ts, constants.ts
+cd packages/agent-runtime &amp;&amp; pnpm exec vitest run src/pi/issue-1681-process-notification.repro.test.ts   # FAILS on main
+scripts/bb-dev-app current                                     # first attempt: project untrusted, extension not loaded (thr_vhxg6p67r8, control)
+PI_CODING_AGENT_DIR=/tmp/bb-1681-piagent scripts/bb-dev-app current
+curl -s -X POST http://localhost:21268/api/v1/projects … /tmp/bb-1681-scratch … host_s9e9g2aig9   # proj_uhfhsvtirj
+bb thread spawn --project proj_uhfhsvtirj --provider pi --permission-mode full --prompt "Reply only with ok." --json   # thr_jehzdb5b6v
+python3 1681/repro/dump-events.py http://localhost:21268 thr_jehzdb5b6v
+dev-browser --headless … screenshot -&gt; assets/1681-stuck-turn.png
+gh pr checkout 1682 ; git merge --no-ff 16ceb3a54 (local only)
+pnpm exec turbo run test --filter=@bb/agent-runtime --force      # 30 files / 324 tests pass
+pnpm exec vitest run src/pi/issue-1681-process-notification.repro.test.ts   # passes on PR
+pnpm exec vitest run src/pi/issue-1681-pr1682-order.review.test.ts          # FAILS on PR (dead warning path)
+PI_CODING_AGENT_DIR=/tmp/bb-1681-piagent scripts/bb-dev-app current         # PR branch
+bb thread spawn … --provider pi … # thr_7mepbbb6s7 ; dump-events ; bb thread log thr_7mepbbb6s7 ; screenshot -&gt; assets/1681-pr1682-turn.png
+git checkout 16ceb3a54 ; pnpm dev:stop</pre>
+  <h3>Pi SDK evidence</h3>
+  <pre># pi-coding-agent 0.84.0 dist/core/agent-session.js (sendCustomMessage)
+else if (options?.triggerTurn) {            // idle + triggerTurn
+    await this._runAgentPrompt(appMessage); // -&gt; agent_start, message_start(custom), …, agent_end(messages incl. custom)
+} else {                                     // idle, no trigger (attention context/ignore)
+    this.agent.state.messages.push(appMessage);
+    this.sessionManager.appendCustomMessageEntry(...);
+    this._emit({ type: "message_start", message: appMessage });
+    this._emit({ type: "message_end", message: appMessage });
+}
+# pi-agent-core 0.84.0 dist/agent-loop.js
+49:    await emit({ type: "agent_start" });
+50:    await emit({ type: "turn_start" });
+52:        await emit({ type: "message_start", message: prompt });
+# pi-coding-agent dist/core/messages.d.ts:35
+content: string | (TextContent | ImageContent)[];</pre>
+  <h3>Control thread (extension not loaded)</h3>
+  <p><code>thr_vhxg6p67r8</code> was created before the trust file existed; Pi silently skipped <code>.pi/extensions</code>, the thread completed normally and never woke. bb surfaces no diagnostic for "project extensions skipped because untrusted" — worth knowing when a user reports "the wake never happens".</p>
+  <h3>Files</h3>
+  <ul>
+    <li><code>issue-1681-process-notification.repro.test.ts</code>, <code>unit-repro-main.log</code>, <code>unit-repro-pr1682.log</code></li>
+    <li><code>issue-1681-pr1682-order.review.test.ts</code>, <code>pr1682-order-probe.log</code></li>
+    <li><code>fake-processes.extension.ts</code>, <code>pi-agent-trust.json</code>, <code>dump-events.py</code></li>
+    <li><code>live-events-main.txt</code>, <code>live-events-main.raw.json</code>, <code>live-events-pr1682.txt</code>, <code>live-thread-log-pr1682.txt</code></li>
+    <li><code>pr1682.diff</code>, <code>pr1682-agent-runtime-tests.log</code></li>
+  </ul>
+</main></body>
+</html>

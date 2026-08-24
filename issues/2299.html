@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2299 Builtin memory/automations/custom-instructions CLIs silently ignore unknown flags</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2299 · Builtin memory/automations/custom-instructions CLIs silently ignore unknown flags (core bb and tasks reject them)</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill high">Priority: High</span> <span class="pill">Effort: Medium</span> <span class="pill">cli · automations · custom-instructions · provider-retry · memory</span>
+    <a href="https://github.com/get-bb/bb/issues/2299">open on GitHub</a>
+    <span>2026-08-24 · base <code>494f66526</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict no">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>Four builtin plugin CLIs (<code>bb memory</code>, <code>bb automation</code>, <code>bb instructions</code>, <code>bb provider-retry</code>) accept any <code>--whatever</code> flag, ignore it, run the command, and exit 0. Core <code>bb</code> commands (commander), <code>bb tasks</code>, <code>bb workflows</code>, <code>bb docs</code> and <code>bb secret</code> reject unknown flags. The worst consequence is a <em>silent partial write</em>: <code>bb memory update &lt;id&gt; --summary "..." --details-file x.md</code> applies the summary, drops <code>--details-file</code> (the flag does not exist), bumps the version and prints <code>Updated mem_… to v2.</code> — the record now has a new summary over stale details and nothing told the caller. The same happens with <code>bb instructions set</code>, which goes further and persists the unknown flag <em>as instruction text</em>. The cause is purely plugin-side: <code>bb</code> forwards the whole argv to the plugin untouched ("parsing argv is plugin-owned"), and each of these four plugins hand-rolls a parser that collects every <code>--x</code> into a map and only ever <em>reads</em> the names it knows — nothing checks what was left unread. <code>bb tasks</code> uses the same parser lineage but adds <code>assertAllowed()</code> at every verb, which is exactly what is missing. Reproduced end to end on a live instance and with failing unit tests; a 50-line prototype fix for the memory plugin makes both the tests and the live CLI reject the flags.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td><code>bb memory update &lt;id&gt; --summary … --details-file &lt;path&gt;</code> applies the summary, silently discards <code>--details-file</code>, prints <code>Updated … to vN</code>, exits 0; record left with corrected summary over stale details</td><td class="ok">Verified</td><td>Live probe §4 step 3: <code>rc=0</code>, <code>Updated mem_-_ure79ckuw to v2.</code>, then <code>get</code> shows <code>"summary": "corrected summary", "details": "d"</code>. Unit test <code>memory/unknown-flags.repro.test.ts</code> fails the same way.</td></tr>
+    <tr><td>The memory parser never rejects any unknown option (<code>add … --zzz-nonsense zzzval</code> → rc 0, record saved)</td><td class="ok">Verified</td><td>Live: <code>add/search/catalog/get/forget</code> all rc=0 with the probe flag; <code>add</code> returned the saved record. Code: <code>parseArgv</code> L327–349 collects every <code>--x</code>; no consumer validates.</td></tr>
+    <tr><td>core bb (commander) rejects: <code>error: unknown option '--x'</code></td><td class="ok">Verified</td><td><code>bb status --zzz-nonsense zzzval</code> → <code>error: unknown option '--zzz-nonsense'</code>, rc=1.</td></tr>
+    <tr><td>builtin tasks rejects</td><td class="ok">Verified</td><td><code>bb tasks list/show … --zzz-nonsense</code> → <code>unknown option --zzz-nonsense</code>, rc=1. Ordering control confirmed: <code>tasks show DOESNOTEXIST-1 --zzz-nonsense zzzval</code> fails on the flag, the same command without the flag fails with <code>task not found</code>.</td></tr>
+    <tr><td>builtin workflows rejects</td><td class="ok">Verified</td><td><code>bb workflows list --zzz-nonsense zzzval</code> → <code>Unknown option --zzz-nonsense</code>, rc=1 (<code>plugins/workflows/src/cli.ts</code> <code>parseArguments</code> has an allow-list).</td></tr>
+    <tr><td>builtin github errors "for the wrong reason" (<code>Unexpected argument "zzzval"</code>)</td><td class="ok">Verified (from code)</td><td>Not installed on my instance; <code>validateGithubCliArgs</code> (<code>plugins/github/server.ts#L395-L400</code>) treats <code>--zzz-nonsense</code> as the sub-argument and <code>zzzval</code> as an excess positional, so the error names <code>zzzval</code>. Still a rejection, so no silent write.</td></tr>
+    <tr><td>builtin keep-awake errors, prints usage</td><td class="ok">Verified</td><td><code>bb keep-awake status --zzz-nonsense zzzval</code> → usage line, rc=1. It strips <code>--json</code> only and the remaining tokens fail the positional check. Incidental, not a real parser.</td></tr>
+    <tr><td>builtin automations (<code>list/show/update/pause</code>) silent</td><td class="ok">Verified</td><td>With a real project: <code>list/create/show/update/pause/delete … --zzz-nonsense zzzval</code> all rc=0 and performed their action (an automation was created, renamed, paused, deleted with the bogus flag present). Note the command is <code>bb automation</code> (singular). Without <code>--project</code> every verb fails with <code>Missing required option --project</code>, which masks the bug if the probe omits it.</td></tr>
+    <tr><td>builtin custom-instructions (<code>get</code>, <code>set</code>) silent; <code>set</code> swallows the flag into its variadic positional as data</td><td class="ok">Verified</td><td><code>bb instructions set hello world --zzz-nonsense zzzval</code> → rc=0, then <code>get --json</code> → <code>{"instructions":"hello world --zzz-nonsense zzzval"}</code>. The run handler only filters <code>--json</code> and joins the rest with spaces (<code>server.ts#L93-L106</code>).</td></tr>
+    <tr><td>builtin provider-retry <code>status</code> silent</td><td class="ok">Verified</td><td><code>bb provider-retry status --zzz-nonsense zzzval</code> → <code>No provider retries are pending.</code>, rc=0. <code>requestedThreadId</code> only looks for the first non-<code>--</code> token (<code>cli.ts#L5-L12</code>); note that <code>status --zzz-nonsense zzzval</code> also silently treats <code>zzzval</code> as the thread id.</td></tr>
+    <tr><td>Mechanism: memory <code>parseArgv</code> collects every <code>--x</code>; <code>option()/requireOption()</code> only pull known names; tasks has the same lineage plus <code>assertAllowed</code> at ~29 call sites</td><td class="ok">Verified</td><td>Source matches the bundle reading exactly. <code>assertAllowed</code> appears 32 times in <code>plugins/tasks/cli/index.ts</code>. Both parsers share <code>CliError</code>/<code>option</code>/<code>requireOption</code> names; tasks' version is stricter in other ways too (a valued option without a value is an error, duplicates are an error).</td></tr>
+    <tr><td><code>bb memory</code> has no <code>*-file</code> flags; tasks has <code>--description-file</code>/<code>--body-file</code></td><td class="ok">Verified</td><td><code>grep -rn "details-file\|description-file\|body-file"</code>: three hits in <code>plugins/tasks/cli/index.ts</code>, none under <code>plugins/memory</code>. Memory's USAGE (L821–829) lists only <code>--details TEXT</code>.</td></tr>
+    <tr><td>"4 of 9 builtin plugins are not strict"</td><td class="unv">Partially verified</td><td>The four named are confirmed. The repo has more plugins with CLIs than the issue probed: <code>docs</code> and <code>secrets</code> are strict (allow-lists), <code>connect</code> was not probed. So the count is "at least 4".</td></tr>
+    <tr><td>Measured on bb 0.39.0</td><td class="unv">Unverified</td><td>I reproduced on <code>494f66526</code> (main, 2026-08-24). No commit between the report and base touches these parsers; behaviour is identical.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb: commit <code>494f66526913557ab076e048218236f0a6610927</code> (main). <code>git log 494f66526..origin/main</code> is empty at the time of writing, so nothing newer fixes this.</li>
+    <li>macOS 26.5.2 (Darwin 25.5.0, Apple Silicon), Node v22.23.1, pnpm 9.15.0, codex-cli 0.149.1 (not exercised; no agent turns were needed).</li>
+    <li>Own dev instance via <code>scripts/bb-dev-app current</code>: app :11750, server :19750, host daemon :27750, data dir <code>~/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-8-985dfe2ecb70</code> (deleted during cleanup).</li>
+    <li>Plugins on the instance: <code>memory@0.2.0</code> and <code>tasks@0.1.2</code> installed from <code>builtin:</code>, <code>workflows</code> enabled, <code>automations</code>/<code>custom-instructions</code>/<code>provider-retry</code>/<code>keep-awake</code> running by default. <code>github</code> was not installed.</li>
+    <li>Scratch project <code>proj_gcsxf77yek</code> (local path <code>/tmp/bb-2299-scratch</code>) created only for the automations arm.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <p>All commands below were run with <code>BB_SERVER_URL</code> pointing at my dev instance (<code>bb</code> = <code>node packages/scripts/dist/commands/run-cli.js</code>). Full scripts and raw output: <code>2299/repro/</code> (<code>probe.sh</code> → <code>probe-output.txt</code>, <code>probe-automations.sh</code> → <code>probe-automations-output.txt</code>).</p>
+  <ol>
+    <li>Controls — the strict surfaces reject the probe flag:
+<pre>$ bb status --zzz-nonsense zzzval
+[stderr] error: unknown option '--zzz-nonsense'
+rc=1
+
+$ bb tasks list --zzz-nonsense zzzval
+[stderr] unknown option --zzz-nonsense
+rc=1
+
+$ bb workflows list --zzz-nonsense zzzval
+[stderr] Unknown option --zzz-nonsense
+rc=1</pre></li>
+    <li><code>bb memory add</code> with an unknown flag — expected a non-zero exit and no write; actual: record saved, rc=0:
+<pre>$ bb memory add --scope global --name n2299 --summary s --details d --reason r --zzz-nonsense zzzval --json
+{
+  "ok": true,
+  "memory": {
+    "id": "mem_-_ure79ckuw",
+    "scope": "global",
+    "name": "n2299",
+    "summary": "s",
+    "details": "d",
+    ...
+    "version": 1
+  }
+}
+rc=0</pre></li>
+    <li>The silent partial write from the issue — <code>--details-file</code> is not a memory flag. Expected: <code>unknown option --details-file</code>, rc≠0, record untouched. Actual: summary applied, details untouched, version bumped, rc=0:
+<pre>$ printf 'details that should have been written\n' &gt; /tmp/bb-2299-details.md
+$ bb memory update mem_-_ure79ckuw --expected-version 1 --reason "fix summary and details" \
+    --summary "corrected summary" --details-file /tmp/bb-2299-details.md
+Updated mem_-_ure79ckuw to v2.
+rc=0
+
+$ bb memory get mem_-_ure79ckuw --json
+{
+  "ok": true,
+  "memory": {
+    "id": "mem_-_ure79ckuw",
+    "summary": "corrected summary",
+    "details": "d",                      &lt;-- stale; the file was never read
+    "writeReason": "fix summary and details",
+    "version": 2
+  }
+}
+rc=0</pre></li>
+    <li>Every other memory verb accepts the flag too (<code>search</code>, <code>catalog</code>, <code>get</code>, <code>forget</code> all rc=0; <code>forget … --zzz-nonsense zzzval</code> really deleted the record — see <code>probe-output.txt</code>).</li>
+    <li><code>bb instructions</code> — the unknown flag becomes <em>content</em>:
+<pre>$ bb instructions set hello world --zzz-nonsense zzzval
+Custom instructions updated
+rc=0
+
+$ bb instructions get --json
+{"instructions":"hello world --zzz-nonsense zzzval"}
+rc=0</pre></li>
+    <li><code>bb automation</code> (needs a project id; the verbs fail on <code>--project</code> first if you omit it, which hides the bug):
+<pre>$ bb automation create --project proj_gcsxf77yek --name qa2299 --in 1d --script "echo hi" --zzz-nonsense zzzval --json
+{ "id": "auto_ebdgzb3jhu4", "name": "qa2299", ... }
+rc=0
+$ bb automation update auto_ebdgzb3jhu4 --project proj_gcsxf77yek --name qa2299-renamed --zzz-nonsense zzzval
+Automation auto_ebdgzb3jhu4 updated
+rc=0
+$ bb automation pause auto_ebdgzb3jhu4 --project proj_gcsxf77yek --zzz-nonsense zzzval
+Automation auto_ebdgzb3jhu4 paused
+rc=0
+$ bb automation delete auto_ebdgzb3jhu4 --project proj_gcsxf77yek --yes --zzz-nonsense zzzval
+Automation auto_ebdgzb3jhu4 deleted
+rc=0</pre></li>
+    <li><code>bb provider-retry</code>:
+<pre>$ bb provider-retry status --zzz-nonsense zzzval
+No provider retries are pending.
+rc=0</pre></li>
+  </ol>
+
+  <h3>Unit-level repro (fails on 494f66526)</h3>
+  <p><code>plugins/memory/unknown-flags.repro.test.ts</code> — run from <code>plugins/memory</code> with <code>pnpm exec vitest run unknown-flags.repro.test.ts</code>. Both tests fail on base: the first because <code>exitCode</code> is 0 and the record is saved; the second because <code>update</code> exits 0 with <code>"summary": "new summary", "details": "old details", "version": 2</code>. Log: <code>memory-repro-test.log</code>. Saved copy: <code>memory-unknown-flags.repro.test.ts</code>.</p>
+<pre>// Repro for get-bb/bb#2299: the memory plugin's CLI parser never rejects an
+// unknown option. `bb memory update &lt;id&gt; --summary ... --details-file &lt;path&gt;`
+// applies the summary, silently drops --details-file, and exits 0.
+import { describe, expect, it } from "vitest";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import memoryPlugin from "./server";
+
+const ctx = { projectId: "project-a", threadId: "thread-a" };
+
+async function load() {
+  const host = createFakePluginHost({ pluginId: "memory" });
+  await memoryPlugin(host.bb);
+  return host;
+}
+
+describe("#2299 memory CLI ignores unknown flags", () => {
+  it("add: rejects --zzz-nonsense instead of saving the record", async () => {
+    const host = await load();
+    const result = await host.harness.runCli(
+      [
+        "add", "--scope", "global", "--name", "n", "--summary", "s",
+        "--details", "d", "--reason", "r", "--zzz-nonsense", "zzzval", "--json",
+      ],
+      ctx,
+    );
+    // FAILS on 494f66526: exitCode is 0 and the record is saved.
+    expect(result.exitCode, result.stdout).not.toBe(0);
+    expect(result.stderr).toMatch(/unknown option --zzz-nonsense/);
+  });
+
+  it("update: --details-file is dropped, summary applied, version bumped (silent partial write)", async () => {
+    const host = await load();
+    const added = await host.harness.runCli(
+      [
+        "add", "--scope", "global", "--name", "n", "--summary", "old summary",
+        "--details", "old details", "--reason", "r", "--json",
+      ],
+      ctx,
+    );
+    expect(added.exitCode, added.stderr).toBe(0);
+    const { memory } = JSON.parse(added.stdout) as {
+      memory: { id: string; version: number };
+    };
+
+    const updated = await host.harness.runCli(
+      [
+        "update", memory.id, "--expected-version", String(memory.version),
+        "--reason", "fix", "--summary", "new summary",
+        "--details-file", "/tmp/does-not-matter.md", "--json",
+      ],
+      ctx,
+    );
+    const got = await host.harness.runCli(["get", memory.id, "--json"], ctx);
+    const record = JSON.parse(got.stdout).memory as {
+      version: number; summary: string; details: string;
+    };
+
+    // FAILS on 494f66526: exit 0, v2, summary "new summary", details "old details".
+    expect(updated.exitCode, `update exited 0 with stdout ${updated.stdout}; record now ${JSON.stringify(record)}`).not.toBe(0);
+    expect(record.version).toBe(1);
+    expect(record.summary).toBe("old summary");
+  });
+});</pre>
+  <p>A second file, <code>plugins/custom-instructions/unknown-flags.repro.test.ts</code> (<code>copy</code>, <code>log</code>), fails with <code>stored instructions: "hello world --zzz-nonsense zzzval"</code>.</p>
+
+  <h2>5. Root cause</h2>
+  <p><strong>Where argv is parsed.</strong> Plugin commands are not commander commands. <code>apps/cli/src/index.ts</code> only lets commander own core names; an unknown top-level word is looked up in the server's contributions and the raw tail of argv is POSTed to <code>/api/v1/plugins/:id/cli</code> unchanged (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/cli/src/index.ts#L152-L154">index.ts#L152-L154</a>, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/cli/src/plugin-cli-proxy.ts#L410-L431">plugin-cli-proxy.ts#L410-L431</a>). The SDK contract says so explicitly: "Parsing argv is plugin-owned" (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/plugin-sdk/src/backend-contract.ts#L336-L342">backend-contract.ts#L336-L342</a>). So commander's strictness never applies to <code>bb memory …</code>, and each plugin's hand-rolled parser decides.</p>
+  <p><strong>memory</strong> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/memory/server.ts#L327-L359">server.ts#L327-L359</a>): <code>parseArgv</code> puts every <code>--name value</code> into <code>options</code> and every bare <code>--name</code> into <code>flags</code>; <code>option()</code>/<code>requireOption()</code> only read. The dispatcher (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/memory/server.ts#L996-L997">#L996</a>) calls <code>parseArgv(rest)</code> and goes straight to the verb. In <code>update</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/memory/server.ts#L1084-L1133">#L1084-L1133</a>) the "at least one field" check passes because <code>--summary</code> is present, <code>details: option(args, "details")</code> is <code>undefined</code> so the store keeps the old details, and <code>store.update</code> bumps the version. Every guard behaves correctly; the flag simply never reaches anything that could object.</p>
+<pre>function parseArgv(argv: string[]): ParsedArgv {
+  ...
+    const name = token.slice(2);
+    const next = argv[index + 1];
+    if (next === undefined || next.startsWith("--")) {
+      flags.add(name);            // any --x is accepted
+      continue;
+    }
+    const values = options.get(name) ?? [];
+    values.push(next);
+    options.set(name, values);    // any --x value is accepted
+  ...
+}
+function option(args: ParsedArgv, name: string): string | undefined {
+  const values = args.options.get(name);
+  return values?.[values.length - 1];   // nothing ever asks what was NOT read
+}</pre>
+  <p><strong>tasks</strong> has the same parser shape but adds an allow-list check and calls it at the top of every verb (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/tasks/cli/args.ts#L61-L73">args.ts#L61-L73</a>; 32 call sites in <code>cli/index.ts</code>). That single function is the whole difference the issue observed.</p>
+<pre>export function assertAllowed(args, allowedOptions, allowedFlags = []) {
+  const optionNames = new Set(allowedOptions);
+  const flagNames = new Set(["help", "json", ...allowedFlags]);
+  for (const name of args.options.keys())
+    if (!optionNames.has(name)) throw new CliError(`unknown option --${name}`);
+  for (const name of args.flags)
+    if (!flagNames.has(name)) throw new CliError(`unknown option --${name}`);
+}</pre>
+  <p><strong>automations</strong> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/automations/src/cli.ts#L49-L90">cli.ts#L49-L90</a>): same pattern — <code>parseArgs</code> fills a <code>flags</code> map from every <code>--x[=v]</code>; <code>flag()/requireFlag()/boolFlag()</code> read; no verb checks for leftovers. <strong>custom-instructions</strong> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/custom-instructions/server.ts#L92-L106">server.ts#L92-L106</a>) has no parser at all: it removes <code>--json</code> and joins whatever remains into the instruction text, so an unknown flag is persisted as data. <strong>provider-retry</strong> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-retry/src/cli.ts#L5-L12">cli.ts#L5-L12</a>) picks the first non-<code>--</code> token as the thread id and checks <code>args.includes("--json")</code>; anything else is ignored (and <code>--zzz-nonsense zzzval</code> makes <code>zzzval</code> the thread id).</p>
+  <p><strong>Why it matters beyond the probe.</strong> A memory record is the agent's durable knowledge; a summary that claims something its details do not contain is exactly the failure the issue describes, and it is invisible to <code>--expected-version</code>, to the exit code, and to the version bump. For <code>bb instructions set</code> the ignored flag is injected into every future agent prompt. Each plugin built its own parser because the SDK gives plugin authors nothing shared here; the docs and secrets plugins each wrote their own allow-list too. The deeper issue is that there is no common, strict argv helper in <code>@get-bb/plugin-sdk</code>, so strictness depends on whoever wrote each plugin.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p><strong>Immediate (per plugin, no wire change, no protocol bump):</strong> reject unread options at the top of each verb.</p>
+  <ul>
+    <li><strong>memory</strong> — add a per-verb allow-list and an <code>assertKnownOptions(command, args)</code> call right after <code>parseArgv(rest)</code>. I prototyped this (<code>memory-fix.patch</code>, 50 lines): the two repro tests pass, the 8 existing memory tests still pass (<code>log</code>), and after rebuilding the bundle and <code>bb plugin reload memory</code> the live CLI now prints <code>unknown option --details-file</code> + usage and exits 1 with the record untouched (<code>probe-with-fix-output.txt</code>). Care point: <code>--pinned</code> is a bare flag on <code>add</code> and a valued option on <code>update</code>; because memory's parser infers value-vs-flag from the next token, the allow-list must accept the name in either shape, which the patch does by checking one name set against both maps.</li>
+    <li><strong>automations</strong> — same approach on <code>parseArgs</code>: a per-verb allow-list (the verbs already enumerate their flags in <code>helpText()</code>); throw before any <code>service.*</code> call. This also addresses the related #2323 (<code>update --help</code> executes the update) if <code>help</code>/<code>--help</code> is treated as a flag that short-circuits to usage.</li>
+    <li><strong>custom-instructions</strong> — treat any token starting with <code>--</code> other than <code>--json</code> as an error (or require <code>--</code> to pass literal text starting with dashes). This is a small behaviour change: someone intentionally passing prose that begins with <code>--</code> must now use <code>--</code>; that is the standard convention and much safer than persisting stray flags.</li>
+    <li><strong>provider-retry</strong> — only accept <code>--json</code>; reject other <code>--</code> tokens and more than one positional.</li>
+  </ul>
+  <p><strong>Structural:</strong> ship one strict argv helper in <code>@get-bb/plugin-sdk</code> (shape of <code>tasks/cli/args.ts</code>: <code>parseArgs</code> + <code>assertAllowed</code> + <code>option/requireOption</code>) and move the builtin plugins onto it. Per AGENTS.md any new public SDK export needs an <code>experimental_</code> prefix and an entry in <code>docs/api_to_audit.md</code>. The secondary ask (<code>--details-file</code>/<code>--summary-file</code> for memory) is a separate feature; with strict parsing in place, passing it before it exists becomes a loud error instead of a quiet one.</p>
+  <p>Risks: any script currently passing a misspelled or stale flag to these commands will start failing — which is the point. No server/daemon wire shape changes, so <code>HOST_DAEMON_PROTOCOL_VERSION</code> is not involved.</p>
+
+  <h2>7. PR review</h2>
+  <p>No open PR is linked to this issue (<code>gh pr list --search 2299</code> returns nothing).</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/2323">#2323 automation subcommand --help can execute mutations</a> — same automations parser; a trailing <code>--help</code> is just another accepted-and-ignored flag, so <code>update --help</code> runs the update. A strict allow-list that treats <code>--help</code> as help fixes both.</li>
+    <li>History: memory's <code>parseArgv</code> dates from the plugin's introduction (<code>2fa241b98</code>, #606, 2026-07-10); tasks' <code>assertAllowed</code> was present from its first commit (<code>880d4ebcd</code>, #728, 2026-07-15). The two plugins were written days apart and never converged.</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Artifacts</h3>
+  <ul>
+    <li><code>probe.sh</code> → <code>probe-output.txt</code> (controls, memory, instructions, provider-retry)</li>
+    <li><code>probe-automations.sh</code> → <code>probe-automations-output.txt</code></li>
+    <li><code>probe-with-fix.sh</code> → <code>probe-with-fix-output.txt</code> (memory arm after applying the patch)</li>
+    <li><code>memory-fix.patch</code>, <code>memory-tests-with-fix.log</code></li>
+    <li><code>memory repro test</code> / <code>its failing log on base</code>; <code>custom-instructions repro test</code> / <code>log</code></li>
+    <li><code>install-plugins.sh</code>, <code>enable-plugins.sh</code>, <code>create-project.sh</code> (instance setup)</li>
+    <li><code>issue-body.md</code>, <code>dev-app-start.log</code></li>
+  </ul>
+  <h3>Commands run (abridged)</h3>
+<pre>gh api repos/get-bb/bb/issues/2299 --jq .body
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+git fetch origin main; git log 494f66526..origin/main --oneline        # empty
+scripts/bb-dev-app current                                           # :11750 / :19750 / :27750
+pnpm bb:dev plugin install builtin:memory --yes; ... builtin:tasks --yes; plugin enable workflows
+curl -X POST $BB_SERVER_URL/api/v1/projects ... /tmp/bb-2299-scratch # proj_gcsxf77yek
+2299/repro/probe.sh; PROJECT=proj_gcsxf77yek 2299/repro/probe-automations.sh
+cd plugins/memory &amp;&amp; pnpm exec vitest run unknown-flags.repro.test.ts   # 2 failed (bug)
+cd plugins/custom-instructions &amp;&amp; pnpm exec vitest run unknown-flags.repro.test.ts  # 2 failed (bug)
+git apply 2299/repro/memory-fix.patch; pnpm exec vitest run unknown-flags.repro.test.ts server.test.ts  # 10 passed
+2299/repro/probe-with-fix.sh                                          # live CLI now rejects
+git checkout -- plugins/memory/server.ts
+pnpm dev:stop; rm -rf ~/.bb-dev/&lt;instance&gt; /tmp/bb-2299-scratch</pre>
+  <h3>Full live probe output</h3>
+<pre>########## CONTROLS (expected: reject) ##########
+$ bb status --zzz-nonsense zzzval
+[stderr] error: unknown option '--zzz-nonsense'
+rc=1
+
+$ bb tasks list --zzz-nonsense zzzval
+[stderr] unknown option --zzz-nonsense
+rc=1
+
+$ bb workflows list --zzz-nonsense zzzval
+[stderr] Unknown option --zzz-nonsense
+rc=1
+
+$ bb keep-awake status --zzz-nonsense zzzval
+[stderr] Usage: bb keep-awake &lt;status|enable|disable|hosts&gt; [arguments] [--json]
+rc=1
+
+########## memory ##########
+$ bb memory add --scope global --name n2299 --summary s --details d --reason r --zzz-nonsense zzzval --json
+{ "ok": true, "memory": { "id": "mem_-_ure79ckuw", ..., "version": 1 } }
+rc=0
+
+$ bb memory search n2299 --zzz-nonsense zzzval
+mem_-_ure79ckuw v1 [global/fact] n2299
+rc=0
+
+$ bb memory catalog --zzz-nonsense zzzval
+mem_-_ure79ckuw v1 [global/fact] n2299
+rc=0
+
+$ bb memory get n2299 --zzz-nonsense zzzval
+mem_-_ure79ckuw v1 [global/fact] n2299
+rc=0
+
+$ bb memory update mem_-_ure79ckuw --expected-version 1 --reason "fix summary and details" --summary "corrected summary" --details-file /tmp/bb-2299-details.md
+Updated mem_-_ure79ckuw to v2.
+rc=0
+
+$ bb memory get mem_-_ure79ckuw --json
+{ "ok": true, "memory": { "summary": "corrected summary", "details": "d", "version": 2, ... } }
+rc=0
+
+$ bb memory forget mem_-_ure79ckuw --expected-version 2 --reason cleanup --zzz-nonsense zzzval
+Forgot mem_-_ure79ckuw at v3.
+rc=0
+
+########## automations (command name: automation) ##########
+$ bb automation list --zzz-nonsense zzzval
+[stderr] Missing required option --project &lt;value&gt;.
+rc=1
+(with --project proj_gcsxf77yek: list/create/show/update/pause/delete all rc=0 — see probe-automations-output.txt)
+
+########## custom-instructions (command name: instructions) ##########
+$ bb instructions get --zzz-nonsense zzzval
+rc=0
+
+$ bb instructions set hello world --zzz-nonsense zzzval
+Custom instructions updated
+rc=0
+
+$ bb instructions get --json
+{"instructions":"hello world --zzz-nonsense zzzval"}
+rc=0
+
+########## provider-retry ##########
+$ bb provider-retry status --zzz-nonsense zzzval
+No provider retries are pending.
+rc=0</pre>
+</main></body></html>

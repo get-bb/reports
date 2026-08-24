@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2292 prompt history: empty-array rows persisted then skipped at read</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.low { background:#eef; border-color:#ccd; }
+  .verdict { font-weight:600; }
+  .v-ok { color:var(--ok); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2292 · prompt history: empty-array rows persisted then skipped at read (zod too_small; 11 rows observed)</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill low">Priority: Low</span> <span class="pill">Effort: S (suggested in issue)</span> <span class="pill">threads</span>
+    <a href="https://github.com/get-bb/bb/issues/2292">open on GitHub</a>
+    <span>2026-08-24 · base <code>494f66526</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict v-ok">REPRODUCED</span> (live on a dev instance and with a unit test at the exact write path) · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>bb remembers every prompt a user sends so the composer can recall it later ("prompt history", table <code>prompt_history_entries</code>). A thread can legitimately be started <em>without</em> a prompt: <code>bb thread fork &lt;id&gt;</code> with no <code>--prompt</code>, the SDK's <code>threads.fork</code> without <code>input</code>, or the side-chat panel's launcher fork, all clone the source provider session and leave the new thread idle. For those starts the server still writes a prompt-history row whose stored input is the JSON string <code>[]</code>. When history is read back, the row is parsed with a schema that requires at least one item, so it fails validation, is dropped, and a <code>WARN Skipping malformed prompt history row</code> is logged on every read for as long as the row exists. Nothing crashes and the user sees nothing wrong (the app also drops empty drafts client-side); the defect is a wasted row plus perpetual log noise. The cause is that the single write funnel <code>recordAcceptedPromptHistoryEntry</code> persists <code>args.input</code> unconditionally, and a no-prompt fork is user-initiated and root-level (forks are not hierarchy children), so it resolves to the <code>project</code> scope and is written. PR #2295 adds an <code>input.length === 0</code> guard at that funnel; I verified it fixes the write path in unit tests and live.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Threads started without a first prompt get a prompt-history row with an empty <code>input</code> array</td><td class="ok">Verified</td><td>Live: after <code>bb thread fork thr_kqdsa8qm7t --workspace reuse</code> (no <code>--prompt</code>) the table holds <code>phist_deg4hty4uq | project | thr_hz6xuhkvky | 6 | []</code> (section 4, step 5).</td></tr>
+    <tr><td>Read path validates with <code>z.array(promptInputSchema).min(1)</code>, fails with "Too small", skips the row and logs a warn</td><td class="ok">Verified</td><td><code>storedPromptHistoryInputSchema</code> at <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/prompt-history.ts#L24">prompt-history.ts#L24</a>; server log line in section 4 step 6 shows exactly <code>"code": "too_small", "minimum": 1</code>.</td></tr>
+    <tr><td>Write funnel is <code>recordAcceptedPromptHistoryEntry</code> and all four call sites route through it</td><td class="ok">Verified</td><td><code>grep -rn recordAcceptedPromptHistoryEntry apps/server/src</code>: thread-provisioning.ts:254 and :313, thread-send.ts:366, queued-messages.ts:355. Nothing else inserts into the table in production code.</td></tr>
+    <tr><td><code>createThreadRequestSchema</code> deliberately allows <code>input: []</code> when <code>originKind !== null</code></td><td class="ok">Verified</td><td><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/server-contract/src/api/threads.ts#L113-L117">threads.ts#L113-L117</a> (no <code>.min(1)</code>) and the refinement at <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/server-contract/src/api/threads.ts#L146-L152">#L146-L152</a>. Also <code>forkThreadRequestSchema.input</code> is optional (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/server-contract/src/api/threads.ts#L177">#L177</a>) and <code>thread-fork.ts</code> defaults it to <code>[]</code>.</td></tr>
+    <tr><td>Runtime has a no-input-no-turn guard (thread-lifecycle.ts L733-L744), so the turn never runs but the history row was already written</td><td class="ok">Verified</td><td><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/threads/thread-lifecycle.ts#L731-L744">thread-lifecycle.ts#L731-L744</a>: <code>command.fork &amp;&amp; command.input.length === 0</code> → <code>run.succeeded</code>. Live: the fork thread landed <code>idle</code> with no provider turn; the history row had been written at provision time (request sequence 6).</td></tr>
+    <tr><td>"Source-derived side-chat preloads" are an affected path</td><td class="unv">Partially verified</td><td>Only side chats created <em>without</em> a reply seed hit the user-initiated write. <code>plugins/side-chat/server.ts</code> sends <code>agentContextSeed</code> when an anchor exists; <code>thread-fork.ts#L112-L115</code> then sets <code>startedOnBehalfOf: {initiator: "agent"}</code> and the scope resolver returns <code>null</code> (no row). The launcher tip fork ("no anchor, no seed", <code>plugins/side-chat/app.tsx#L345</code>) and anchors equal to the last message (<code>resolveReplySeedText</code> → null) do reach the write with <code>initiator: "user"</code>, so the claim holds for those. Not driven through the UI here; the CLI idle fork is the same server path.</td></tr>
+    <tr><td>11 malformed rows observed in production data on 2026-08-22, provider <code>acp-omp</code></td><td class="unv">Unverified</td><td>Private database; not available to me. Mechanism confirmed independently, provider-agnostic.</td></tr>
+    <tr><td>Not provider-specific</td><td class="ok">Verified</td><td>Reproduced with <code>codex</code>. The write happens in <code>requestThreadProvision</code> before any provider command is issued.</td></tr>
+    <tr><td>Still present on <code>main</code></td><td class="ok">Verified</td><td>Present at 494f66526. <code>git log 494f66526..origin/main -- apps/server/src/services/prompt-history.ts apps/server/src/services/threads packages/db/src packages/domain/src</code> is empty as of 2026-08-24 (origin/main = 21cb6b68b), so not fixed upstream.</td></tr>
+    <tr><td>Not a duplicate of #2190 / #1321</td><td class="ok">Verified</td><td>#2190 is a SQLite database-reversion incident; #1321 is a merged host-daemon event-delivery fix. Neither concerns prompt-history writes.</td></tr>
+    <tr><td>Low user impact, no workaround needed</td><td class="ok">Verified</td><td>The app's <code>promptHistoryEntriesToDrafts</code> (<code>apps/app/src/lib/prompt-history.ts</code>) skips empty drafts anyway, so even without the read-side guard nothing empty would be shown. The DB fetch window is <code>limit + 50</code> rows (<code>rawPromptHistoryRowLimit</code>), so a handful of bad rows cannot crowd out visible entries. Impact is one wasted row per idle fork and one warn line per history read.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb source at <code>494f66526913557ab076e048218236f0a6610927</code> (main, 2026-08-24), own worktree, detached HEAD.</li>
+    <li>macOS 26.5.2 (Darwin 25.5.0), Apple Silicon; Node v22.23.1; pnpm 9.15.0; codex-cli 0.149.1 (provider <code>codex</code>, model gpt-5.6-sol, permission mode accept-edits).</li>
+    <li>Dev instance from <code>scripts/bb-dev-app current</code>: App <code>http://localhost:15422</code>, Server <code>http://localhost:23422</code>, Host daemon <code>http://127.0.0.1:31422</code>, data dir <code>~/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-63-d4073e0642a3</code> (deleted after the investigation). Host id <code>host_6ntxdnapd7</code>, project <code>proj_ba66tywb3e</code> on scratch repo <code>/tmp/bb-2292-qa</code>.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <h3>4a. Live (CLI + sqlite3), ~1 minute, one tiny codex turn</h3>
+  <ol>
+    <li>Start an isolated dev instance from a checkout of <code>494f66526</code> and create a project on it.
+<pre>pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build
+scripts/bb-dev-app current            # prints App/Server/Host daemon URLs and the data dir
+mkdir -p /tmp/bb-2292-qa &amp;&amp; cd /tmp/bb-2292-qa &amp;&amp; git init -q -b main . &amp;&amp; echo "# qa" &gt; README.md &amp;&amp; git add . &amp;&amp; git commit -qm init
+curl -s http://localhost:23422/api/v1/hosts          # copy the host id
+curl -s -X POST http://localhost:23422/api/v1/projects -H 'content-type: application/json' \
+  -d '{"name":"qa","source":{"type":"local_path","path":"/tmp/bb-2292-qa","hostId":"host_6ntxdnapd7"}}'
+# → {"id":"proj_ba66tywb3e", ...}</pre></li>
+    <li>Spawn a source thread with a provider that supports fork (codex, claude-code, pi) and wait until it is idle.
+<pre>BB_SERVER_URL=http://localhost:23422 BB_HOST_DAEMON_PORT=31422 BB_PROJECT_ID=proj_ba66tywb3e \
+  pnpm bb:dev thread spawn --project proj_ba66tywb3e --provider codex --permission-mode accept-edits \
+  --title "2292 source" --prompt "Reply only with ok." --json
+# → "id": "thr_kqdsa8qm7t"
+curl -s http://localhost:23422/api/v1/threads/thr_kqdsa8qm7t | python3 -c 'import sys,json; print(json.load(sys.stdin)["status"])'
+# → idle</pre></li>
+    <li>Look at the table before forking: one valid row for the source prompt.
+<pre>DB=&lt;data dir&gt;/bb.db
+sqlite3 -header "$DB" "select id, scope, thread_id, request_sequence, input from prompt_history_entries order by created_at"
+id|scope|thread_id|request_sequence|input
+phist_jxd9x97ahk|project|thr_kqdsa8qm7t|1|[{"type":"text","text":"Reply only with ok.","mentions":[]}]</pre></li>
+    <li>Fork the thread <strong>without a prompt</strong> (an "idle fork", exactly what the CLI help offers: <code>--prompt</code> "Optional first prompt; omit for an idle fork").
+<pre>BB_SERVER_URL=http://localhost:23422 BB_HOST_DAEMON_PORT=31422 BB_PROJECT_ID=proj_ba66tywb3e \
+  node packages/scripts/dist/commands/run-cli.js thread fork thr_kqdsa8qm7t --workspace reuse --title "2292 idle fork" --json
+# → "id": "thr_hz6xuhkvky", "parentThreadId": null, "sourceThreadId": "thr_kqdsa8qm7t", "originKind": "fork"</pre></li>
+    <li>Look at the table again.
+<pre>sqlite3 -header "$DB" "select id, scope, thread_id, request_sequence, input from prompt_history_entries order by created_at"
+
+expected: only the one valid row from step 3 (there was no prompt to remember)
+actual:
+id|scope|thread_id|request_sequence|input
+phist_jxd9x97ahk|project|thr_kqdsa8qm7t|1|[{"type":"text","text":"Reply only with ok.","mentions":[]}]
+phist_deg4hty4uq|project|thr_hz6xuhkvky|6|[]</pre></li>
+    <li>Read project prompt history through the API, then look at the server log.
+<pre>curl -s http://localhost:23422/api/v1/projects/proj_ba66tywb3e/prompt-history
+[{"id":"phist_jxd9x97ahk","createdAt":1787597928194,"input":[{"type":"text","text":"Reply only with ok.","mentions":[]}]}]
+
+grep -n "Skipping malformed prompt history row" ~/.bb-dev/launchers/&lt;instance&gt;/dev.log
+111:@bb/server:dev: [11:59:23] WARN: [server] Skipping malformed prompt history row {"entryId":"phist_deg4hty4uq","requestSequence":6,"threadId":"thr_hz6xuhkvky","errorMessage":"[\n  {\n    \"origin\": \"array\",\n    \"code\": \"too_small\",\n    \"minimum\": 1,\n    \"inclusive\": true,\n    \"path\": [],\n    \"message\": \"Too small: expected array to have &gt;=1 items\"\n  }\n]","errorName":"ZodError"}</pre>
+    The API silently omits the <code>[]</code> row and the server warns. Every subsequent read of this project's history (the composer fetches it on open) repeats the warn.</li>
+  </ol>
+  <p>The fork thread's own <code>client/turn/requested</code> event (seq 6, the <code>requestSequence</code> stored on the bad row) carries <code>"initiator": "user"</code>, <code>"input": []</code>, <code>"target": {"kind": "thread-start"}</code> — see <code>2292/repro/fork-event-seq6.json</code>.</p>
+
+  <h3>4b. Unit test at the exact write path (fails on base)</h3>
+  <p>Save as <code>apps/server/test/services/prompt-history-2292.test.ts</code> and run <code>cd apps/server &amp;&amp; pnpm exec vitest run test/services/prompt-history-2292.test.ts</code>. On <code>494f66526</code> the assertion at line 86 fails because the stored inputs contain <code>"[]"</code>; with PR #2295 applied it passes.</p>
+<pre>// Repro for get-bb/bb#2292: a user-initiated thread-start with empty input
+// (an idle fork / side-chat tip fork) persists a prompt_history_entries row
+// whose input is "[]". The read path rejects that row with zod
+// (`z.array(promptInputSchema).min(1)`) and logs a warn on every read.
+//
+// On base 494f66526 the FIRST assertion fails: a row with input "[]" exists.
+import { describe, expect, it, vi } from "vitest";
+import {
+  createConnection,
+  createProject,
+  createThread,
+  migrate,
+  noopNotifier,
+  promptHistoryEntries,
+  upsertHost,
+} from "@bb/db";
+import {
+  listProjectPromptHistory,
+  recordAcceptedPromptHistoryEntry,
+} from "../../src/services/prompt-history.js";
+import { textInput } from "../helpers/prompt-input.js";
+
+describe("#2292 empty-input prompt history rows", () =&gt; {
+  it("does not persist a row for a user-initiated empty-input thread start", () =&gt; {
+    const db = createConnection(":memory:");
+    migrate(db);
+    const host = upsertHost(db, noopNotifier, {
+      name: "test-host",
+      type: "persistent",
+    });
+    const project = createProject(db, noopNotifier, {
+      name: "Project A",
+      source: { type: "local_path", hostId: host.id, path: "/tmp/project-a" },
+    }).project;
+    const logger = {
+      debug: vi.fn(),
+      error: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+    };
+
+    // A forked thread is NOT a hierarchy child (parentThreadId stays null),
+    // so the scope resolver picks "project" for a user-initiated start.
+    const fork = createThread(db, noopNotifier, {
+      projectId: project.id,
+      providerId: "codex",
+      originKind: "fork",
+    });
+    expect(fork.parentThreadId).toBeNull();
+
+    // A valid entry that should still be recalled afterwards.
+    const normal = createThread(db, noopNotifier, {
+      projectId: project.id,
+      providerId: "codex",
+    });
+    recordAcceptedPromptHistoryEntry(
+      { db },
+      {
+        thread: normal,
+        input: textInput("Investigate auth flow"),
+        initiator: "user",
+        target: { kind: "thread-start" },
+        requestSequence: 1,
+      },
+    );
+
+    // Exactly what requestThreadProvision passes for `bb thread fork &lt;id&gt;`
+    // without --prompt, or a side-chat launcher fork with no reply anchor.
+    recordAcceptedPromptHistoryEntry(
+      { db },
+      {
+        thread: fork,
+        input: [],
+        initiator: "user",
+        target: { kind: "thread-start" },
+        requestSequence: 1,
+      },
+    );
+
+    const storedInputs = db
+      .select({ input: promptHistoryEntries.input })
+      .from(promptHistoryEntries)
+      .all()
+      .map((row) =&gt; row.input);
+    // FAILS on 494f66526: storedInputs contains "[]".
+    expect(storedInputs).not.toContain("[]");
+
+    // Read path: the "[]" row is dropped with a warn on every read.
+    const history = listProjectPromptHistory(
+      { db, logger },
+      { projectId: project.id, limit: 50 },
+    );
+    expect(history.map((entry) =&gt; entry.input)).toEqual([
+      textInput("Investigate auth flow"),
+    ]);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+});</pre>
+<pre>$ cd apps/server &amp;&amp; pnpm exec vitest run test/services/prompt-history-2292.test.ts     # at 494f66526
+ FAIL  @bb/server  test/services/prompt-history-2292.test.ts &gt; #2292 empty-input prompt history rows &gt; does not persist a row for a user-initiated empty-input thread start
+AssertionError: expected [ …(2) ] to not include '[]'
+ ❯ test/services/prompt-history-2292.test.ts:86:30
+ Test Files  1 failed (1)
+      Tests  1 failed (1)</pre>
+  <p>Repro files: <code>2292/repro/</code> — <code>prompt-history-2292.test.ts</code>, <code>unit-test-base-494f66526.clean.log</code>, <code>db-after-fork.txt</code>, <code>api-project-prompt-history.json</code>, <code>server-log-warn.txt</code>, <code>fork-event-seq6.json</code>, <code>cli-fork-output.json</code>, <code>pr-2295.diff</code>, <code>unit-test-with-pr-2295.log</code>, <code>cli-fork-with-pr-2295.txt</code>, <code>typecheck-with-pr-2295.log</code>. No screenshots: the bug has no visual surface (the app hides empty drafts; the only observable artefacts are the DB row and the log line).</p>
+
+  <h2>5. Root cause</h2>
+  <p><strong>Mechanism, end to end:</strong></p>
+  <ol>
+    <li>A fork request may carry no prompt. <code>forkThreadRequestSchema.input</code> is <code>.min(1).optional()</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/server-contract/src/api/threads.ts#L177">threads.ts#L177</a>); <code>createThreadForkFromRequest</code> defaults it to <code>[]</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/threads/thread-fork.ts#L109-L115">thread-fork.ts#L109-L115</a>). It only marks the start as agent-initiated (<code>startedOnBehalfOf</code>) when there is an <code>agentContextSeed</code> and no visible input (<code>isSeedOnlyIdleFork</code>, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/threads/thread-fork.ts#L144-L146">#L144-L146</a>). A fork with neither stays <code>initiator: "user"</code>. <code>createThreadRequestSchema</code> accepts the empty array because <code>originKind !== null</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/server-contract/src/api/threads.ts#L146-L152">#L146-L152</a>).</li>
+    <li>Forks are not hierarchy children. <code>createThreadFromRequest</code> sets <code>hierarchyParentThreadId = originKind === null ? requestInput.parentThreadId : undefined</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/threads/thread-create.ts#L612-L617">thread-create.ts#L612-L617</a>; comment at <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/threads/thread-create.ts#L644">#L644</a>: "Forks and side chats are not hierarchy children"). The new thread therefore has <code>parentThreadId: null</code> — confirmed in the live output.</li>
+    <li><code>requestThreadProvision</code> appends the <code>client/turn/requested</code> event and then unconditionally calls the history funnel with the same input (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/threads/thread-provisioning.ts#L254-L260">thread-provisioning.ts#L254-L260</a>).</li>
+    <li><code>recordAcceptedPromptHistoryEntry</code> decides the scope purely from <code>initiator</code>, <code>target.kind</code> and <code>parentThreadId</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/prompt-history.ts#L159-L175">prompt-history.ts#L159-L175</a>): user + thread-start + root → <code>"project"</code>. It never looks at the input, and persists it as-is (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/prompt-history.ts#L249-L270">#L249-L270</a>); <code>createPromptHistoryEntry</code> JSON-stringifies <code>[]</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/db/src/data/prompt-history.ts#L51-L75">db/prompt-history.ts#L51-L75</a>).</li>
+    <li>Reads parse every row with <code>z.array(promptInputSchema).min(1)</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/prompt-history.ts#L24">#L24</a>) inside <code>buildPromptHistoryEntries</code>, whose catch block drops the row and logs the warn (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/prompt-history.ts#L134-L157">#L134-L157</a>). The row is never cleaned up, so the warn repeats on every read.</li>
+  </ol>
+  <p><strong>Why this is the real cause and not a read-side bug:</strong> the write and read sides disagree on the invariant. The read side encodes "a remembered prompt has at least one item" (which is the right invariant: there is nothing to recall from an empty prompt, and the runtime never even runs a turn for it — <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/threads/thread-lifecycle.ts#L731-L736">thread-lifecycle.ts#L731-L736</a>). The write side treats "a user-initiated thread-start request was accepted" as sufficient, which became false when empty-input forks were introduced. Per AGENTS.md ("validate at the boundary, then pass typed values"), the row should never be written.</p>
+  <p><strong>Which real surfaces trigger it:</strong> <code>bb thread fork &lt;id&gt;</code> without <code>--prompt</code>/<code>--file</code>/<code>--image</code>/<code>--agent-context-seed</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/cli/src/commands/thread/fork.ts#L72">fork.ts#L72</a>); SDK <code>threads.fork({sourceThreadId})</code>; the side-chat launcher fork ("no anchor, no seed", <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/side-chat/app.tsx#L345">side-chat/app.tsx#L345</a>) and any side chat whose anchor equals the source's last message (<code>resolveReplySeedText</code> returns null → no seed, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/side-chat/server.ts#L201-L213">side-chat/server.ts#L201-L213</a>). Side chats that do get a seed start as <code>initiator: "agent"</code> and never write a row. The web app's "fork from message" flow navigates to the composer and submits a real prompt, so it is not affected.</p>
+  <p><strong>Deeper observation (not this bug):</strong> the same funnel records the <em>full</em> input, so a fork that carries both an <code>agentContextSeed</code> and a visible prompt stores the agent-only seed item in project prompt history. <code>promptInputToDraft</code> does not appear to filter on <code>visibility</code> (only <code>threadQueuedMessages.ts</code> does). I did not drive that path; it is a candidate for a separate issue if recall of agent-only text is undesirable.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>Reject empty input at the single write funnel — exactly what PR #2295 does — so every call site (provisioning, reprovisioning, send, queued flush) is covered and the stored invariant matches the read schema:</p>
+<pre>// apps/server/src/services/prompt-history.ts, recordAcceptedPromptHistoryEntry
+if (args.input.length === 0) {
+  return false; // no prompt was sent, so there is nothing to recall
+}</pre>
+  <p>Keep the read-side skip as defense in depth for rows that already exist. Optionally add a one-off Drizzle migration <code>DELETE FROM prompt_history_entries WHERE input = '[]'</code> so users who already have bad rows (the issue's 11) stop getting a warn on every history read; the rows carry no information, so deleting them cannot lose anything. What could go wrong: nothing observable — the return value is ignored by all callers (<code>grep</code> confirms no caller reads it), <code>new-turn</code> targets already require <code>min(1)</code> input at the API boundary, and the guard does not alter scope resolution. No wire shape changes, so <code>HOST_DAEMON_PROTOCOL_VERSION</code> does not need a bump.</p>
+
+  <h2>7. PR review</h2>
+  <h3>PR #2295 — "fix(server): never persist empty-input prompt history rows" (bradhallett, cross-repo fork, head 32ce011bf)</h3>
+  <p><strong>What it changes:</strong> +11 lines in <code>apps/server/src/services/prompt-history.ts</code> adding the <code>args.input.length === 0 → return false</code> guard before scope resolution, and +36 lines in <code>apps/server/test/services/prompt-history.test.ts</code> ("does not persist empty-input turns as prompt history rows") asserting the funnel returns false, the table stays empty, <code>listProjectPromptHistory</code> returns <code>[]</code>, and no warn is logged. No other files. Diff saved at <code>2292/repro/pr-2295.diff</code>.</p>
+  <p><strong>Root cause or symptom?</strong> Root cause. The guard sits at the only production writer, so no path can persist an empty array, and the stored invariant now matches the read schema. Layer is correct (server owns prompt-history policy; nothing crosses the daemon boundary). No casts, no <code>unknown</code>, no accepted-but-ignored fields, no wire change.</p>
+  <p><strong>What I ran (PR diff applied onto 494f66526 with <code>git apply</code>; applies cleanly):</strong></p>
+  <ul>
+    <li><code>pnpm exec vitest run test/services/prompt-history.test.ts test/services/prompt-history-2292.test.ts</code> → 2 files, 9 tests passed, including the PR's new test and my repro (which fails on base). Log: <code>unit-test-with-pr-2295.log</code>.</li>
+    <li><code>pnpm exec turbo run typecheck --filter=@bb/server</code> → green. Log: <code>typecheck-with-pr-2295.log</code>.</li>
+    <li>Live: restarted my dev instance from the patched tree and repeated step 4 of the repro (<code>bb thread fork thr_kqdsa8qm7t</code>, no prompt). New thread <code>thr_4cbfetdhjw</code> was created, landed idle, and <strong>no</strong> <code>prompt_history_entries</code> row was written (table still holds exactly the original valid row plus the pre-fix <code>[]</code> row). Output: <code>cli-fork-with-pr-2295.txt</code>.</li>
+    <li>Mutation check: with the PR's test file applied but the source guard reverted to base, the PR's test fails at <code>prompt-history.test.ts:512</code> (<code>AssertionError: expected true to be false</code> — the funnel returned <code>true</code> and wrote the row); my repro fails at its <code>not.toContain("[]")</code> assertion. Both pass with the guard restored.</li>
+  </ul>
+  <p><strong>Findings:</strong></p>
+  <table><tr><th>Location</th><th>Severity</th><th>Finding</th></tr>
+    <tr><td><code>apps/server/src/services/prompt-history.ts:253-262</code></td><td>low</td><td>No cleanup of rows that already exist. Users who have the bad rows (the issue's 11) will keep getting a <code>WARN Skipping malformed prompt history row</code> on every project-history read indefinitely. A Drizzle migration deleting <code>input = '[]'</code> rows would finish the job; the PR description explicitly chose to leave them. Not blocking, but worth a follow-up.</td></tr>
+    <tr><td><code>apps/server/src/services/prompt-history.ts:253-259</code> (comment)</td><td>nit</td><td>The comment says "a side-chat or fork preload starts the provider session before the first message". Seeded side chats never reach this write as <code>initiator: "user"</code> (they are <code>startedOnBehalfOf</code> agent starts and fail the scope check first); only unseeded forks do. Accurate enough for intent; could say "an idle fork with no prompt" to avoid misleading a future reader into thinking seeded side chats were writing rows.</td></tr>
+    <tr><td><code>apps/server/test/services/prompt-history.test.ts:490-525</code></td><td>nit</td><td>The test uses a plain root thread rather than one with <code>originKind: "fork"</code>. The scope path is identical (both have <code>parentThreadId: null</code>), so coverage is fine, but creating the thread with <code>originKind: "fork"</code> would document the real trigger. It also does not keep a valid sibling row to prove non-empty input is unaffected; the pre-existing tests cover that.</td></tr>
+    <tr><td>PR metadata</td><td>info</td><td><code>mergeStateStatus: UNSTABLE</code>, "no checks reported" — CI has not run because this is a cross-repository PR. A maintainer needs to approve workflows. No reviews yet.</td></tr>
+    <tr><td>PR description</td><td>info</td><td>Claims verified: "fails before the fix by construction" (true — my equivalent test fails on base), "single write funnel for all four call sites" (true), "no wire, schema, or API changes" (true), "existing coverage retained" (the two named tests exist at lines 309 and 432 and pass). The description's test-run numbers (1923 tests) are from the author's environment and were not re-run in full here.</td></tr>
+  </table>
+  <p><strong>Verdict: MERGE</strong> (after CI is approved and green). The change is minimal, at the right layer, addresses the root cause, and is verified by a test that fails without it. The only substantive gap is the missing one-off cleanup of already-persisted rows, which can be a follow-up.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/pull/2295">#2295</a> — the fix PR reviewed above.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/2190">#2190</a> (open) — SQLite db silently reverted to a 2-week-old state; the issue explicitly rules it out as a duplicate. Agreed: unrelated.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1321">#1321</a> (merged PR) — host-daemon undeliverable-event fix; unrelated.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/2052">#2052</a> (open) — CLI human output of <code>thread history</code>/<code>project history</code> is raw JSON; touches the same history surfaces but a different defect.</li>
+    <li>Candidate follow-up (not filed): agent-only <code>agentContextSeed</code> items are stored in prompt history for forks that also carry a visible prompt (section 5, "deeper observation").</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Commands run (in order)</h3>
+<pre>gh issue view 2292 --json number,title,body,labels,state,createdAt,author,comments
+gh pr view 2295 &amp;&amp; gh pr diff 2295
+pnpm install --frozen-lockfile --prefer-offline; pnpm exec turbo run build        # 18/18 tasks, cached
+git checkout 494f66526; git fetch origin main
+git log --oneline 494f66526..origin/main -- apps/server/src/services/prompt-history.ts apps/server/src/routes apps/server/src/services/threads packages/db/src packages/domain/src   # empty
+grep -rn recordAcceptedPromptHistoryEntry apps/server/src                          # 4 call sites
+scripts/bb-dev-app current; scripts/bb-dev-app env
+curl -s http://localhost:23422/api/v1/hosts
+curl -s -X POST http://localhost:23422/api/v1/projects ... (qa project on /tmp/bb-2292-qa)
+pnpm bb:dev thread spawn --project proj_ba66tywb3e --provider codex --permission-mode accept-edits --title "2292 source" --prompt "Reply only with ok." --json
+cd apps/server &amp;&amp; pnpm exec vitest run test/services/prompt-history-2292.test.ts   # FAILS on base (expected)
+sqlite3 -header $DB "select ... from prompt_history_entries"                      # before fork: 1 row
+node packages/scripts/dist/commands/run-cli.js thread fork thr_kqdsa8qm7t --workspace reuse --title "2292 idle fork" --json
+sqlite3 -header $DB "select ... from prompt_history_entries"                      # after fork: 2 rows, second is []
+curl -s http://localhost:23422/api/v1/projects/proj_ba66tywb3e/prompt-history     # 1 entry returned
+curl -s http://localhost:23422/api/v1/threads/thr_hz6xuhkvky/events?limit=50      # seq 6: initiator user, input []
+grep -n "Skipping malformed prompt history row" ~/.bb-dev/launchers/&lt;instance&gt;/dev.log
+gh pr diff 2295 &gt; pr-2295.diff; git apply --check pr-2295.diff; git apply pr-2295.diff
+cd apps/server &amp;&amp; pnpm exec vitest run test/services/prompt-history.test.ts test/services/prompt-history-2292.test.ts   # 9 passed
+pnpm exec turbo run typecheck --filter=@bb/server                                 # green
+scripts/bb-dev-app current                                                        # restart on patched tree
+node packages/scripts/dist/commands/run-cli.js thread fork thr_kqdsa8qm7t --workspace reuse --title "2292 idle fork with PR" --json
+sqlite3 -header $DB "select ... from prompt_history_entries"                      # still 2 rows: no new [] row
+git checkout -- apps/server/src/services/prompt-history.ts apps/server/test/services/prompt-history.test.ts; rm apps/server/test/services/prompt-history-2292.test.ts
+pnpm dev:stop; pkill -f wf_846839f8-f8a-63; rm -rf ~/.bb-dev/...-wf_846839f8-f8a-63-d4073e0642a3 /tmp/bb-2292-qa; lsof -nP -iTCP -sTCP:LISTEN | grep -E ":15422|:23422|:31422"   # ports free</pre>
+  <h3>Thread rows on the dev instance after both forks</h3>
+<pre>id|parent_thread_id|source_thread_id|origin_kind|status
+thr_kqdsa8qm7t||||idle
+thr_hz6xuhkvky||thr_kqdsa8qm7t|fork|idle          # created at base: wrote the [] row
+thr_4cbfetdhjw||thr_kqdsa8qm7t|fork|starting→idle # created with PR #2295 applied: no row</pre>
+  <h3>Fork thread event types (base run)</h3>
+<pre>1 client/turn/requested   (inherited from source)
+2 turn/started
+3 turn/input/accepted
+4 item/completed
+5 turn/completed
+6 client/turn/requested   initiator=user, input=[], target=thread-start   ← requestSequence of the bad row
+7 client/thread/start
+8 thread/identity
+9 thread/contextWindowUsage/updated
+10 thread/started
+11 thread/identity
+12 thread/name/updated
+13 system/thread-provisioning</pre>
+  <h3>Scope resolver (base)</h3>
+<pre>function resolveAcceptedPromptHistoryScope(args) {
+  if (args.initiator !== "user") return null;
+  if (args.target.kind !== "thread-start") return "thread";
+  if (args.thread.parentThreadId !== null) return null;   // forks have parentThreadId === null → falls through
+  return "project";
+}</pre>
+  <p>Other logs: <code>dev instance start</code>, <code>restart on patched tree</code>, <code>turbo build</code>.</p>
+</main></body></html>

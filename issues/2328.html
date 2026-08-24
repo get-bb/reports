@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2328 Automatic recovery storms a dead Codex thread with repeated no-active-session errors</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-repro { color:var(--high); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:18px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:6px; }
+  .note { background:#fff8e6; border:1px solid #f0d9a0; border-radius:6px; padding:10px 12px; font-size:14px; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2328 · Automatic recovery storms a dead Codex thread with repeated no-active-session errors</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill high">Priority: High</span> <span class="pill">Effort: not set</span> <span class="pill">providers</span> <span class="pill">threads</span> <span class="pill">provider-codex</span>
+    <a href="https://github.com/get-bb/bb/issues/2328">open on GitHub</a>
+    <span>2026-08-24 · base <code>494f66526</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict v-repro">REPRODUCED</span> (the bb-side wedge and the unbounded identical-rejection storm; the "automatic recovery" sender is the reporter's own plugin, not bb) · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>A Codex thread gets into a state where every new message is rejected within ~25 ms with <code>No active codex session for thread "&lt;id&gt;"</code>, producing one <code>client/turn/rejected</code> plus one <code>system/error</code> per attempt and flipping the thread to <code>error</code>, forever. The thread is not actually dead: its rollout is intact and a <code>bb thread stop</code> followed by one more message resumes it fine. What is broken is a split-brain between two daemon-side components: the host daemon's agent-runtime still has the thread <em>registered</em> (so it never asks the codex bridge to resume the session), while the codex bridge has already <em>released</em> the session (so it refuses every <code>turn/start</code>). Nothing in bb notices or repairs this divergence; the rejection is a generic <code>-32000</code> error with no typed code or recovery hint, so the runtime cannot tell "no session" from any other failure.</p>
+  <p>I reproduced one concrete way the split-brain arises with real Codex on a dev instance: the runtime's generic JSON-RPC timeout for <code>thread/stop</code> is 30 s, but the codex bridge's interrupt path may legitimately take up to 60 s (child <code>turn/interrupt</code>) + 5 s (settlement) before it releases the session and answers. When the app-server is slow to answer the interrupt (here: paused for 43 s; in the wild: a hung or heavily loaded app-server mid-command, cf. the reporter's sibling issue #2327), the runtime gives up at 30 s and keeps the thread registered; the bridge finishes the interrupt later and releases the session. From then on the thread is wedged.</p>
+  <p>The "RECOVERY WAKE" messages themselves are not sent by bb. They come from the reporter's own plugin <a href="https://github.com/pixexid/bb-collab">pixexid/bb-collab</a>, whose <code>thread.failed</code> handler sends one agent-only wake every time the thread enters <code>error</code>, with no per-failure dedup or backoff. bb's contribution to the storm is that each rejected send emits <code>run.failed</code> → <code>thread.failed</code> again, so the plugin re-arms itself on bb's own rejection of its previous attempt. bb's first-party provider-retry plugin does not participate (it only retries rate-limit failures, bounded per reset window).</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>An errored Codex thread receives repeated automatic agent-only <code>RECOVERY WAKE</code> new-turn requests.</td><td class="unv">Partially refuted</td><td>The string <code>RECOVERY WAKE</code> does not exist in get-bb/bb. It is emitted by the reporter's plugin <code>pixexid/bb-collab</code> (<code>server.ts</code>, <code>recoverErroredThread</code>, triggered from <code>bb.events.on("thread.failed")</code>). bb's only first-party automatic retry (<code>plugins/provider-retry</code>) sends "Please continue." only for subscription rate-limit failures and is bounded by <code>attemptedWindows</code>. The repeated sends are external; the repeated rejections are bb's.</td></tr>
+    <tr><td>Every request is rejected with <code>No active codex session</code>, immediately followed by <code>system/error</code>.</td><td class="ok">Verified</td><td>Live: 9 wakes → 9 × (<code>client/turn/rejected</code> + <code>system/error</code>) with that exact message; thread status <code>error</code> after each (<code>storm-events.json</code>, screenshots below). Source: <code>settleThreadCommandFailure</code> appends both events for a failed <code>turn.submit</code>.</td></tr>
+    <tr><td>The recovery mechanism keeps retrying the same unrecoverable thread.</td><td class="ok">Verified (mechanism is external, the re-arm is bb's)</td><td>bb-collab dedups only while a send is in flight (<code>recoveryInFlight</code>). bb emits <code>thread.failed</code> on every applied transition into <code>error</code> (<code>emitPluginThreadLifecycleOutcome</code>), including a rejected start that never reached the provider, so the loop is closed by bb's own rejection.</td></tr>
+    <tr><td>Thread status <code>error</code>, environment ready, zero queued messages, last <code>turn/completed</code> preserved.</td><td class="ok">Verified</td><td>Same state in my repro: environment <code>ready</code>, last <code>turn/completed {status: interrupted}</code> at seq 65, no queued messages, status <code>error</code>.</td></tr>
+    <tr><td>The thread is "dead" / unrecoverable.</td><td class="no">Refuted</td><td>The provider session is restorable. <code>bb thread stop</code> on the errored thread (server release path → runtime forgets the thread) followed by one message resumed the rollout and ran a normal turn (<code>heal-events.json</code>, screenshot 5). The thread is wedged, not dead.</td></tr>
+    <tr><td>After <code>threads.stop</code> the storm continued; the next recovery was rejected with <code>already has an active writer</code>.</td><td class="unv">Unverified (consistent with the mechanism)</td><td><code>already has an active writer</code> is a Codex app-server error (present in the codex 0.149.1 binary, absent from bb). After a stop the runtime forgets the thread, the next send resumes a fresh app-server from the rollout; whether Codex then rejects <code>turn/start</code> is Codex-side state (see #2327). In my repro the post-stop send succeeded.</td></tr>
+    <tr><td>Archiving the thread stopped the storm.</td><td class="ok">Verified by code</td><td><code>ensureThreadIsWritable</code> rejects sends to archived threads before any dispatch, and bb-collab checks <code>archivedAt</code> before sending. Not a fix, just removes the target.</td></tr>
+    <tr><td>38 recovery requests, 10 within ~3 minutes.</td><td class="unv">Unverified</td><td>Reporter's counts; I did not have their data. My run shows the cadence is bounded only by the sender: each rejection takes the daemon ~11–70 ms.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb <code>494f66526913557ab076e048218236f0a6610927</code> (main as of 2026-08-24); origin/main had no newer commits at investigation time.</li>
+    <li>macOS 26.5.2 (Darwin 25.5.0, arm64), Node v22.23.1, pnpm via repo; Codex CLI 0.149.1 (<code>codex app-server</code>).</li>
+    <li>Own dev instance from <code>scripts/bb-dev-app current</code>: App <code>http://localhost:14670</code>, Server <code>http://localhost:22670</code>, Host daemon <code>127.0.0.1:30670</code>, data dir <code>~/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-23-b240de56546a</code>. Project <code>proj_t3vmhnnusn</code> (local path <code>/tmp/bb-2328-qa-repo</code>), thread <code>thr_6932zwarfj</code>, provider codex, permission mode full.</li>
+    <li>Unit repro: <code>packages/agent-runtime</code> vitest with a purpose-built test bridge.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <h3>4a. Unit-level (deterministic, no Codex needed)</h3>
+  <p>A minimal provider bridge models the two codex-bridge behaviours involved: <code>thread/stop</code> releases the session immediately but answers late; <code>turn/start</code> with no session answers <code>-32000 "No active codex session for thread …"</code> (same code path shape as <code>requireLiveSessionForTurn</code>). The test drives the real <code>@bb/agent-runtime</code> through a stop whose reply arrives after the runtime's 30 s timer.</p>
+  <ol>
+    <li>Copy <code>slow-stop-no-session-bridge.ts</code> to <code>packages/agent-runtime/src/test/bridges/</code> and <code>runtime.issue-2328-no-session-wedge.test.ts</code> to <code>packages/agent-runtime/src/</code>.</li>
+    <li>Run from the package: <pre>cd packages/agent-runtime &amp;&amp; pnpm exec vitest run src/runtime.issue-2328-no-session-wedge.test.ts</pre></li>
+    <li>Result on 494f66526 (<code>vitest-output.txt</code>): <pre>✓ keeps the thread registered after a timed-out stop, then rejects every turn without ever re-resuming
+× EXPECTED (fails today): a timed-out stop leaves no stale registration behind
+  AssertionError: expected true to be false   // runtime.hasThread("t2") is still true after the stop timed out</pre>
+    The first test passes <em>because it asserts the buggy behaviour</em>: after <code>stopThread</code> rejects with <code>JSON-RPC request timed out: thread/stop</code>, <code>hasThread</code> stays <code>true</code>, five <code>runTurn</code> calls are each rejected with <code>/No active codex session/</code>, and the bridge's request record shows five <code>turn/start</code> and zero <code>thread/resume</code>. An explicit <code>resumeThread</code> then makes the same turn succeed. The second test asserts the desired invariant and fails on main.</li>
+  </ol>
+  <h3>4b. Live end-to-end with real Codex (what a user hits)</h3>
+  <ol>
+    <li>Start a dev instance, create a project on a scratch repo, spawn a codex thread that runs a long command: <pre>bb thread spawn --project &lt;proj&gt; --provider codex --permission-mode full --title "2328 repro" \
+  --prompt "Run the shell command 'sleep 300' and wait for it to finish. Then reply only with ok." --json</pre> Wait until the event log shows <code>item/started commandExecution … sleep 300</code>.</li>
+    <li>Find the thread's <code>codex app-server</code> process under <em>your</em> host daemon (daemon → bridge → <code>node …/codex app-server</code> → vendor <code>codex app-server</code> binary). Make it slow to answer the interrupt, then stop the thread, wait so that the runtime's 30 s timer fires but the bridge's 60 s child timer does not, and let the app-server continue (<code>live-stop-sequence.sh</code>): <pre>kill -STOP &lt;app-server pid&gt;
+bb thread stop thr_6932zwarfj --json        # returns {"ok":true} after 30 s (see note)
+sleep 12                                     # total pause ≈ 43 s: &gt; 30 s runtime timeout, &lt; 60 s bridge child timeout
+kill -CONT &lt;app-server pid&gt;</pre>
+    Expected: the stop interrupts the turn and the thread is idle and usable.<br>
+    Actual (<code>log</code>, <code>dev log</code>): <pre>t0 10:10:34 kill -STOP 79592 (codex app-server)
+t1 10:10:34 bb thread stop thr_6932zwarfj
+{ "ok": true, "threadId": "thr_6932zwarfj" }
+t2 10:11:05 stop command returned; waiting 12s
+t3 10:11:17 kill -CONT 79592
+
+[host-daemon] online host RPC failed {"type":"thread.stop"}  err: "JSON-RPC request timed out: thread/stop"
+[host-daemon] Online host RPC {"commandType":"thread.stop","errorCode":"command_failed","handlerMs":30002.3,"ok":false}
+[server] Awaited thread stop command failed {"intent":"interrupt","threadId":"thr_6932zwarfj"}
+# after SIGCONT the interrupt lands: seq 61 system/thread/interrupted {reason: manual-stop}, seq 65 turn/completed {status: interrupted}; thread status: idle</pre></li>
+    <li>Send any message (this is what bb-collab's wake does: <code>threads.send</code> with <code>mode: "auto"</code>): <pre>bb thread tell thr_6932zwarfj --mode auto --json "RECOVERY WAKE 1 - reconcile state before resuming."</pre>
+    Expected: the turn runs (the session is resumable from its rollout).<br>
+    Actual: <pre>66 client/turn/requested
+67 client/turn/rejected  {reason: command_failed, message: 'No active codex session for thread "thr_6932zwarfj"'}
+68 system/error          {code: thread_command_failed, message: 'Command turn.submit failed', detail: 'No active codex session for thread "thr_6932zwarfj"'}
+status after wake 1: error
+[host-daemon] Online host RPC {"commandType":"turn.submit","errorCode":"command_failed","handlerMs":32.9,"ok":false}</pre></li>
+    <li>Repeat the send 8 more times, each after the previous one settles (<code>storm.sh</code>; this is the shape of bb-collab's <code>thread.failed</code> → send loop). Actual (<code>storm-output.txt</code>, <code>storm-events.json</code>): <pre>Counter({'client/turn/requested': 9, 'client/turn/rejected': 9, 'system/error': 9})
+status after wake 1..9: error (×9)
+turn.submit handlerMs: 32.9, 29.1, 17.8, 25.4, 11.1, 17.4, 25.8, 70, 12.9   # no resume is ever attempted</pre></li>
+    <li>Heal check (proves the runtime registration was the stale side): <pre>bb thread stop thr_6932zwarfj --json     # thread is in status error → server takes the release path
+bb thread tell thr_6932zwarfj --mode auto --json "RECOVERY WAKE 1 - reconcile state before resuming."</pre> Actual: seq 94 <code>thread/identity</code> (a fresh <code>thread/resume</code> of the same rollout), seq 97 <code>turn/started</code>, the agent answers normally; daemon <code>turn.submit … handlerMs 1919.9, ok:true</code>.</li>
+  </ol>
+  <figure><img src="assets/2328-02-idle-after-second-stop-timeout.png" alt="Thread idle after the stop that timed out on the runtime side"><figcaption>Step 2: after the 43 s pause the interrupt landed ("Worked for 1m 3s · Stopped manually"); the thread looks idle and healthy. The runtime's stop RPC has already timed out at 30 s.</figcaption></figure>
+  <figure><img src="assets/2328-03-first-wake-rejected.png" alt="First wake rejected with No active codex session"><figcaption>Step 3: the first follow-up is rejected: "Command turn.submit failed — No active codex session for thread "thr_6932zwarfj"". The composer now says "Retry by sending a follow-up message", which will fail identically.</figcaption></figure>
+  <figure><img src="assets/2328-04-storm-nine-rejections.png" alt="Nine wakes, nine identical rejections"><figcaption>Step 4: the storm. Every wake produces one identical rejection pair; nothing changes between attempts because no component ever tries to rebuild the session.</figcaption></figure>
+  <figure><img src="assets/2328-05-after-stop-release-wake-succeeds.png" alt="After bb thread stop the next wake runs"><figcaption>Step 5: after <code>bb thread stop</code> on the errored thread, the very next wake resumes the rollout and runs (the agent even finds the original <code>sleep 300</code> still alive). Same thread, same rollout: it was never dead.</figcaption></figure>
+  <p class="note">Note on step 2: the CLI and the <code>POST /threads/:id/stop</code> route report <code>{"ok": true}</code> even though the daemon stop timed out, because an interrupt-intent stop swallows its failure (<code>runAwaitedThreadStopCommand</code>: "An interrupt swallows a failure: its stopping status is durable"). The user has no signal that the runtime/bridge just diverged.</p>
+  <p>Repro files: <code>2328/repro/</code> (bridge, test, scripts, event dumps, full dev log, candidate-fix diff).</p>
+
+  <h2>5. Root cause</h2>
+  <h3>5a. The wedge: runtime registration outlives the bridge session, and nothing reconciles them</h3>
+  <p>On the host daemon, two components hold per-thread session state:</p>
+  <ul>
+    <li>The agent-runtime's identity registry. <code>hasThread(threadId)</code> is true when the registry has a provider session for the thread (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L2658-L2660">runtime.ts#L2658-L2660</a>).</li>
+    <li>The codex bridge's <code>sessionsByBbThreadId</code> map. <code>turn/start</code> requires an entry (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-codex/src/bridge/bridge.ts#L1565-L1570">bridge.ts#L1565-L1570</a>):
+<pre>let session = sessionsByBbThreadId.get(params.threadId);
+if (!session || session.closing) {
+  throw new Error(`No active codex session for thread "${params.threadId}"`);
+}</pre></li>
+  </ul>
+  <p>The daemon decides whether to resume a session purely from the runtime's view (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/command-handlers/thread.ts#L168-L175">command-handlers/thread.ts#L168-L175</a>):</p>
+<pre>async function resumeThreadRuntimeIfMissing(args) {
+  if (entry.runtime.hasThread(command.threadId)) {
+    return;                       // ← never asks the bridge
+  }
+  …
+  await entry.runtime.resumeThread({ … providerThreadId: resumeContext.providerThreadId … });
+}</pre>
+  <p>So whenever the registry says "registered" but the bridge has no entry, every <code>turn.submit</code> goes straight to <code>turn/start</code> and is rejected. The rejection is a generic <code>BRIDGE_ERROR (-32000)</code> with no recovery hint (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-codex/src/bridge/bridge.ts#L1661-L1670">handleTurnStart</a> → <code>rejectWithCodexError</code>), and <code>runTurn</code>'s catch only clears the pending-start marker and marks the session idle (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L2186-L2192">runtime.ts#L2186-L2192</a>); it never drops the registration. Compare <code>steerTurn</code>, which has a typed <code>NO_ACTIVE_TURN</code> to act on; there is no typed "no session" code in <code>BRIDGE_JSON_RPC_ERRORS</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/provider-bridge-protocol/src/errors.ts#L13-L26">errors.ts#L13-L26</a>). The daemon's idle-session reaper cannot heal it either: it calls <code>stopThread</code>, which requires a live process and only runs after the idle window, and the server never sends a release for an <code>error</code> thread on its own.</p>
+  <p>Every rejected submit is settled by the server as a failed command: <code>client/turn/rejected</code> + <code>system/error</code> + <code>run.failed</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/threads/thread-lifecycle.ts#L771-L810">thread-lifecycle.ts#L771-L810</a>), and <code>run.failed</code> into <code>error</code> emits the plugin event <code>thread.failed</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/plugins/plugin-thread-events.ts#L43-L56">plugin-thread-events.ts#L43-L56</a>). That is the re-arm signal bb-collab listens to.</p>
+
+  <h3>5b. One proven way the divergence is created: stop timeout asymmetry</h3>
+  <p>The runtime's generic JSON-RPC timeout is 30 s (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/provider-bridge-protocol/src/bridge-kit/runtime-json-rpc.ts#L324-L334">runtime-json-rpc.ts#L324-L334</a>, <code>args.timeoutMs ?? 30_000</code>) and <code>stopThread</code> does not override it (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L2302-L2340">runtime.ts#L2302-L2340</a>). On success it forgets the thread; on any failure it rethrows <em>without</em> forgetting. The codex bridge's interrupt path (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-codex/src/bridge/bridge.ts#L1789-L1869">handleThreadStop</a>) sends <code>turn/interrupt</code> to the app-server with <code>CHILD_REQUEST_TIMEOUT_MS = 60_000</code>, then waits up to <code>INTERRUPT_SETTLEMENT_TIMEOUT_MS = 5_000</code>, and only then calls <code>releaseSession(session)</code> and answers. Any interrupt that takes between 30 s and 65 s therefore ends with: runtime timed out (registration kept), bridge released (session gone). The live repro above hits exactly this window (app-server paused 43 s). A real app-server can be that slow when it is wedged inside a long command execution, which is precisely the sibling report #2327 from the same reporter ("turn/completed can precede command completion…" followed by the same two errors).</p>
+  <p>Other divergence paths exist with the same symptom and are not covered by a timeout fix alone: any lost/late <code>thread/stop</code> reply (bridge stdout hiccup, daemon event-loop stall), and any future bridge-side release that the runtime does not observe. The underlying defect is that the runtime treats its registry as the truth and the protocol gives it no typed way to learn it is wrong.</p>
+
+  <h3>5c. Why it looks like "automatic recovery storms the thread"</h3>
+  <p>bb-collab's <code>recoverErroredThread</code> (<a href="https://github.com/pixexid/bb-collab/blob/main/server.ts">server.ts</a>) runs on every <code>thread.failed</code> whose thread has <code>status === "error"</code>, guards only against a concurrent in-flight send, and calls <code>bb.sdk.threads.send({mode: "auto", input: [{visibility: "agent-only", text: "RECOVERY WAKE — …"}]})</code>. bb rejects in ~25 ms, emits <code>thread.failed</code>, the plugin sends again. The cadence the reporter saw ("sub-10-second") is the plugin's own <code>threads.get</code>/<code>environments.status</code> round trips; bb imposes no bound.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <ol>
+    <li><strong>Make "no session" a typed protocol outcome and act on it in the runtime (root cause).</strong> Add e.g. <code>SESSION_NOT_FOUND: -32004</code> to <code>BRIDGE_JSON_RPC_ERRORS</code> (provider-bridge-protocol) and return it from the codex bridge's <code>requireLiveSessionForTurn</code> / <code>handleTurnSteer</code> (and the pi/ACP equivalents) instead of the generic <code>BRIDGE_ERROR</code>. In <code>runtime.runTurn</code>/<code>steerTurn</code>, on that code: <code>forgetThreadRuntimeStateForProviderState(proc.identity, threadId)</code> before rethrowing, so the daemon's next <code>turn.submit</code> takes the <code>resumeThreadRuntimeIfMissing</code> path and rebuilds the session from the rollout (a resume replaces whatever the bridge still holds, see <code>constructThreadSession</code>). This heals every divergence cause, not just the timeout. Risk: a bridge that wrongly reports no-session for a live turn would cause a resume that kills that turn; the code should only be emitted when the bridge truly holds nothing. This changes the bridge wire contract (new error code), so document it in <code>docs/provider-bridge-protocol.md</code>; it does not change server↔daemon payloads, so no <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump is needed for this part.</li>
+    <li><strong>Do not keep a registration the runtime cannot vouch for after a stop it gave up on.</strong> In <code>stopThread</code>, distinguish a bridge <em>rejection</em> (<code>JsonRpcResponseError</code>: the bridge answered and still owns the session — keep state; two existing tests depend on this) from <em>no answer</em> (timeout / process exit): forget the thread so the next command resumes. I validated this variant: with <code>candidate-fix-runtime-stop-timeout.diff</code> the "EXPECTED" test passes, the buggy-behaviour test fails at its <code>hasThread</code> assertion as intended, and the four existing runtime suites pass (<code>115/115</code>). A naive "forget on any stop failure" breaks <code>preserves active turn state when the stop request fails</code> and <code>keeps releasing later sessions after one release fails</code> (<code>log</code>). Additionally give <code>thread/stop</code> a request timeout that covers the bridge's documented interrupt budget (≥ 65 s for codex) so the common case does not race at all.</li>
+    <li><strong>Do not re-arm external recovery on bb's own rejection (server policy).</strong> A <code>turn.submit</code> that never produced a provider turn (rejected before <code>turn/input/accepted</code>) is a command failure, not a provider failure; consider not emitting a fresh <code>thread.failed</code> when the thread was already in <code>error</code> with the same error detail, or include <code>error</code>/<code>requestId</code> context so plugins can dedup. Expose a recovery-disposition (or at least <code>bb thread stop</code>'s release semantics) as the documented "start a fresh provider session" action; today the user-facing composer hint "Retry by sending a follow-up message" is wrong for this state.</li>
+    <li><strong>Surface stop failures.</strong> <code>POST /threads/:id/stop</code> returns <code>{ok:true}</code> after a 30 s daemon timeout; log at warn is not enough when the consequence is a wedged thread.</li>
+  </ol>
+  <p>The plugin-side bound (single-flight per interruption identity, backoff, terminal disposition) the issue asks for is bb-collab's responsibility; items 1–2 remove the state that makes its retries pointless, item 3 stops bb from feeding the loop.</p>
+
+  <h2>7. PR review</h2>
+  <p>No open pull request is linked to this issue.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/2327">#2327</a> — same reporter, same day: turn/completed preceding command completion, then alternating <code>already has an active writer</code> / <code>No active codex session</code>. The second error is this wedge; the first is Codex app-server state after a resume and is outside this report.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/2275">#2275</a>, <a href="https://github.com/get-bb/bb/issues/1706">#1706</a>, <a href="https://github.com/get-bb/bb/issues/1789">#1789</a> — earlier queued-message / dead-environment delivery reports from the same orchestration setup.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1874">#1874</a> — removal of <code>threads.rateLimitRecovery</code>; the reporter's plugin since carries its own recovery logic.</li>
+    <li><code>plugins/provider-codex/src/bridge/bridge.archived-rebuild.test.ts</code> (added in <a href="https://github.com/get-bb/bb/commit/c5b53caab">c5b53caab</a>) documents the same failure class from the bridge side: "a thread the bridge forgot would fail every later turn with No active codex session while the runtime still believes it has a live session". That fix kept a resumable entry after a failed rebuild; it did not make the runtime resilient to the bridge forgetting for any other reason.</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Daemon RPC outcomes for the live thread (from <code>dev-instance-full.log</code>)</h3>
+<pre>thread.start   handlerMs 5422.6   ok:true
+thread.stop    handlerMs 30000.9  errorCode command_failed   (attempt 1: pause 67 s &gt; 60 s child timeout → bridge's interrupt errored, no release, next wake SUCCEEDED — control case)
+thread.stop    handlerMs 30002.3  errorCode command_failed   (attempt 2: pause 43 s → bridge released after the runtime gave up)
+turn.submit    handlerMs 32.9 / 29.1 / 17.8 / 25.4 / 11.1 / 17.4 / 25.8 / 70 / 12.9   errorCode command_failed  (9 wakes)
+turn.submit    handlerMs 1919.9   ok:true   (after bb thread stop: resume + turn)</pre>
+  <p>Control case screenshot (attempt 1, wake succeeded because the pause exceeded the bridge's own 60 s timeout): <a href="assets/2328-02-first-wake-rejected.png">assets/2328-02-first-wake-rejected.png</a> (file name predates the result; it shows the "ok" reply). <a href="assets/2328-01-idle-after-stop-timeout.png">assets/2328-01-idle-after-stop-timeout.png</a> is the idle state after attempt 1.</p>
+  <h3>Bridge-side error message in the daemon log</h3>
+<pre>[host-daemon] online host RPC failed {"type":"turn.submit"}
+  err: { "type": "JsonRpcResponseError", "message": "No active codex session for thread \"thr_6932zwarfj\"",
+         at jsonRpcResponseError (packages/provider-bridge-protocol/src/bridge-kit/runtime-json-rpc.ts:178)
+         at settleJsonRpcResponse (…/runtime-json-rpc.ts:296)
+         at handleStdoutLine (packages/agent-runtime/src/runtime.ts:1463) }
+[server] … "status": 502, "body": { "message": "No active codex session for thread \"thr_6932zwarfj\"", "code": "command_failed", "retryable": false }</pre>
+  <h3>Where the reporter's wake comes from (pixexid/bb-collab server.ts, excerpt)</h3>
+<pre>bb.events.on("thread.failed", async (payload) => {
+  …
+  if (status === "error") { … await recoverErroredThread(id, payload.thread.projectId, identity.holder, identity.lane); }
+});
+const recoverErroredThread = async (threadId, projectId, holder, lane) => {
+  if (recoveryInFlight.has(recoveryKey)) { bb.log.warn(`error-recovery wake suppressed: … reason=recovery-in-flight`); return null; }
+  …
+  await withRecoverySendTimeout(threadId, () => bb.sdk.threads.send({
+    threadId, mode: "auto",
+    input: [{ type: "text", visibility: "agent-only", text: `RECOVERY WAKE — reconcile state before resuming. …`, mentions: [] }],
+  }));
+  …
+};</pre>
+  <h3>Commands run (abridged)</h3>
+<pre>gh issue view 2328 --comments ; gh issue view 2327 --json title,body
+git grep -n "RECOVERY WAKE" ; git grep -n "No active codex session" ; gh search code "RECOVERY WAKE" --repo pixexid/bb-collab
+strings …/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex | grep "active writer"   # → " already has an active writer"
+pnpm install --frozen-lockfile --prefer-offline ; pnpm exec turbo run build
+cd packages/agent-runtime &amp;&amp; pnpm exec vitest run src/runtime.issue-2328-no-session-wedge.test.ts
+pnpm exec turbo run typecheck --filter=@bb/agent-runtime
+scripts/bb-dev-app current ; curl -X POST $BB_SERVER_URL/api/v1/projects … ; bb thread spawn … ; live-stop-sequence.sh 79592 thr_6932zwarfj 12 ; storm.sh thr_6932zwarfj 8 ; heal.sh thr_6932zwarfj
+git diff packages/agent-runtime/src/runtime.ts &gt; candidate-fix-runtime-stop-timeout.diff ; git checkout -- packages/agent-runtime/src/runtime.ts
+pnpm dev:stop</pre>
+</main></body></html>

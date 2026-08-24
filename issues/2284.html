@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2284 Workflows plugin: finished unstructured worker threads are never stopped, leaking idle provider processes</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:6px; }
+  .note { background:#fff8e6; border:1px solid #f0d48a; border-radius:6px; padding:10px 12px; font-size:14px; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2284 · Workflows plugin: finished unstructured worker threads are never stopped, leaking idle provider processes</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill high">Priority: High</span> <span class="pill">Effort: Small</span> <span class="pill">perf</span> <span class="pill">threads</span> <span class="pill">workflows</span>
+    <a href="https://github.com/get-bb/bb/issues/2284">open on GitHub</a>
+    <span>2026-08-24 · base <code>494f66526</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>A bb workflow (the built-in <code>workflows</code> plugin) runs each <code>agent()</code> call in a hidden child thread. When the child is a plain, unstructured call (no <code>outputSchema</code>), the plugin records its final text as the call result, marks the call <code>succeeded</code>, wakes the orchestrator, and then does nothing with the child thread: <code>handleThreadIdle</code> in <code>plugins/workflows/src/service.ts</code> never calls <code>stopChild(threadId)</code> on that path, while the structured-result path (<code>submitStructuredResult</code>) does. An idle hidden thread keeps its provider session loaded on the host daemon, and for ACP providers that session is one OS process per thread (<code>opencode acp</code> here, 500–850 MB RSS each). Nothing else in the plugin stops those children later either: run settlement, cancellation and plugin shutdown only stop calls that are still <code>queued</code>/<code>running</code>. The daemon's 30-minute idle reaper does not help: under default settings (<code>providerSessionReaping</code> experiment off) it only ever releases Codex sessions. I reproduced this on a dev instance with the exact provider from the issue: a 6-call batch limited to 2 concurrent agents held 6 live <code>opencode acp</code> processes (3.4 GB) while only 1–2 calls were running, and <code>bb thread stop</code> on a finished worker released its process immediately without touching the running ones, exactly as the reporter described. The omission has existed since the plugin was introduced (#733). PR #2090 is not a fix for this issue.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Unstructured workers are settled <code>succeeded</code> in <code>handleThreadIdle</code> and wake the orchestrator, but <code>stopChild(threadId)</code> is never called.</td><td class="ok">Verified</td><td>Code: <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/workflows/src/service.ts#L1017-L1026">service.ts#L1017-L1026</a>. Unit test <code>issue-2284-idle-worker-stop.test.ts</code> fails on base: <code>threads.stop</code> is called 0 times for each of three unstructured workers (section 4, step 1). Host-daemon log of the live run shows 3 <code>thread.start</code> commands and no <code>thread.stop</code>.</td></tr>
+    <tr><td>The code excerpt in the issue (from <code>dist/server.js</code>) reflects the real source.</td><td class="ok">Verified</td><td>Identical control flow in <code>plugins/workflows/src/service.ts</code> at base (structured branch at L1086-L1091 calls <code>await stopChild(threadId)</code>; unstructured <code>else</code> at L1017-L1023 does not).</td></tr>
+    <tr><td>BB keeps provider connections alive while threads remain open, so completed worker threads retain their subprocess indefinitely.</td><td class="ok">Verified (with one nuance)</td><td>Live: finished workers' <code>opencode acp</code> processes stayed alive for as long as the batch kept running (runs 2 and 3). No plugin or server code path ever stops a <code>succeeded</code> call's child; the daemon reaper skips non-Codex providers by default (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L1007-L1017">runtime.ts#L1007-L1017</a>, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/domain/src/experiments.ts#L34">experiments.ts#L34</a>). Nuance: in my runs the leaked processes did die a few seconds after the <em>run ended</em>, because the origin thread's completion-notification turn made the daemon swap the (by then fully idle) environment runtime for a different skill catalog (section 5, "what finally killed them"). That can only happen once no worker is active, so it cannot relieve a batch in progress, and it is not a plugin action.</td></tr>
+    <tr><td>With concurrency 4 and 40 completed tasks, 48 <code>opencode acp</code> processes (~560 MB RSS each, ~26 GB) were alive.</td><td class="ok">Verified at smaller scale</td><td>Run 2 (6 calls, <code>maxConcurrentAgents=2</code>): at 09:25:19 six processes, 3.1–3.4 GB total, with 5 succeeded + 1 running; per-process RSS 460–850 MB (<code>run2-census-timeline.txt</code>). Linear in completed calls: 48 × ~560 MB ≈ 27 GB is consistent.</td></tr>
+    <tr><td><code>bb thread stop &lt;thread-id&gt;</code> on the idle workers released the processes without disturbing the active workers.</td><td class="ok">Verified</td><td>Run 3: stopping finished worker <code>thr_7zx3kkwyr6</code> mid-batch removed only its process; the other finished worker and the two running ones stayed (<code>run3-stop-one-child.out</code>). Server side, a stop of an idle thread is a runtime <em>release</em>, not an interruption (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/threads/thread-lifecycle.ts#L1393-L1445">thread-lifecycle.ts#L1393-L1445</a>).</td></tr>
+    <tr><td>PR #2090 "adds host-daemon idle session reaping with a 30-minute timeout".</td><td class="unv">Partially accurate</td><td>The 30-min/5-min reaper already exists at base (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/app.ts#L65-L66">app.ts#L65-L66</a>); #2090 only removes the experiment gate so non-Codex restorable sessions are eligible. The reporter's conclusion stands: a 30-minute sweep cannot help a batch that exhausts RAM in minutes.</td></tr>
+    <tr><td>Proposed fix: call <code>await stopChild(threadId)</code> in <code>handleThreadIdle</code> when settling an unstructured task.</td><td class="ok">Verified sufficient for the reported path; one more gap</td><td>With that change the repro test passes and the plugin suite (226 tests) stays green (section 6). The structured <em>fallback</em> path (worker returned valid JSON as text instead of calling <code>bb_workflow_result</code>, L959-L969) has the same omission and needs the same call; the issue does not mention it.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb monorepo at <code>494f66526913557ab076e048218236f0a6610927</code> (version 0.39.0, branch main as of 2026-08-24). <code>git log 494f66526..origin/main -- plugins/workflows</code> is empty: not fixed upstream.</li>
+    <li>macOS 26.5.2 (Darwin 25.5.0, Apple Silicon, 14 cores, 36 GB). Node v22.23.1, pnpm 9.15.0.</li>
+    <li>Providers: opencode 1.18.10 (<code>acp-opencode</code>, model <code>opencode/big-pickle</code>, reasoning <code>medium</code>), Claude Code 2.1.241 (origin thread of runs 1–2), codex-cli 0.149.1, pi 0.84.2.</li>
+    <li>Dev instance from this worktree via <code>scripts/bb-dev-app current</code>: app <code>:13252</code>, server <code>:21252</code>, host daemon <code>:29252</code>, data dir <code>~/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-2-bbe8290c3b26</code> (deleted after the investigation). Experiments at default: <code>{"providerSessionReaping":false,…}</code> (from <code>GET /api/v1/system/config</code>).</li>
+    <li>Workflows plugin settings: defaults except <code>maxConcurrentAgents=2</code> for runs 2 and 3 (set with <code>PUT /api/v1/plugins/workflows/settings</code>).</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <h3>Step 1 — unit level (no provider needed): the plugin never stops an unstructured worker</h3>
+  <ol>
+    <li>Copy <code>issue-2284-idle-worker-stop.test.ts</code> to <code>plugins/workflows/src/</code> and run it from the repo root:
+<pre>pnpm -C plugins/workflows exec vitest run src/issue-2284-idle-worker-stop.test.ts</pre>
+    It builds the real <code>createWorkflowService</code> on an in-memory plugin DB (<code>createFakePluginHost</code> from <code>@get-bb/plugin-sdk/testing</code>), starts a run with three sequential <code>agent()</code> calls, feeds each spawned child an idle event with output <code>"result N"</code>, and counts <code>threads.stop</code> calls per child.
+<pre>expected: each finished worker gets exactly one threads.stop
+actual (base 494f66526):
+ ❯ src/issue-2284-idle-worker-stop.test.ts (3 tests | 2 failed)
+   × stops an unstructured worker as soon as its call is settled
+     AssertionError: expected +0 to be 1   // stopsFor(harness, "child-1") stays 0
+   × stops a structured worker settled via the freeform JSON fallback
+     AssertionError: expected +0 to be 1
+   ✓ control: a worker that submits bb_workflow_result IS stopped (existing behavior)</pre>
+    Full output: <code>repro-test-base.log</code>. The control test shows the structured tool path already stops its worker, pinning the asymmetry.</li>
+  </ol>
+
+  <h3>Step 2 — live: one leaked <code>opencode acp</code> process per finished call</h3>
+  <ol>
+    <li>Start a dev instance from a checkout at <code>494f66526</code> and note its URLs/data dir (<code>scripts/bb-dev-app current</code>, then <code>scripts/bb-dev-app env</code>). Make sure <code>opencode</code> is on PATH so the <code>acp-opencode</code> provider is listed (<code>pnpm bb:dev provider list</code>). The workflows plugin ships disabled; switch it on and lower the per-run concurrency so the batch is larger than the concurrency:
+<pre>BB_SERVER_URL=http://localhost:21252 bash 2284/repro/plugin-ctl.sh on workflows
+curl -s -X PUT $BB_SERVER_URL/api/v1/plugins/workflows/settings -H 'content-type: application/json' \
+  -d '{"values":{"maxConcurrentAgents":"2"}}'</pre></li>
+    <li>Create a scratch git repo and a project on it (host id from <code>pnpm bb:dev machine list --json</code>), then spawn one cheap origin thread in that project (a workflow needs an origin thread with an environment):
+<pre>mkdir -p /tmp/bb-2284-qa && git -C /tmp/bb-2284-qa init -q && touch /tmp/bb-2284-qa/README.md \
+  && git -C /tmp/bb-2284-qa add -A && git -C /tmp/bb-2284-qa -c user.name=qa -c user.email=qa@example.com commit -qm init
+curl -s -X POST $BB_SERVER_URL/api/v1/projects -H 'content-type: application/json' \
+  -d '{"name":"qa","source":{"type":"local_path","path":"/tmp/bb-2284-qa","hostId":"&lt;host id&gt;"}}'
+pnpm bb:dev thread spawn --project &lt;project id&gt; --provider acp-opencode --model opencode/big-pickle \
+  --permission-mode full --title "origin 2284" --prompt "Reply only with ok." --json      # note the thread id
+pnpm bb:dev thread wait &lt;origin thread id&gt;</pre></li>
+    <li>Start the batch workflow (<code>batch-workflow.js</code>: six unstructured <code>agent("Reply only with the word ok.")</code> calls on <code>acp-opencode</code> inside <code>parallel()</code>) through the plugin CLI endpoint — the same path as <code>bb workflows run --script</code> from inside a thread — and start a 3-second process census next to it:
+<pre>export BB_SERVER_URL=http://localhost:21252 ORIGIN_THREAD=&lt;origin thread id&gt; PROJECT_ID=&lt;project id&gt;
+bash 2284/repro/run-workflow.sh 2284/repro/batch-workflow.js
+# → {"exitCode":0,"stdout":"{\"runId\":\"wfr_066a2bfe-05bf-4907-a86e-756005690469\",\"name\":\"issue-2284-batch\",\"status\":\"queued\"}\n"}
+bash 2284/repro/census-loop.sh wfr_066a2bfe-05bf-4907-a86e-756005690469 run2-census-timeline.txt 3 150</pre>
+    <code>census.sh</code> lists every live <code>opencode acp</code> process with RSS and the <code>BB_THREAD_ID</code> the daemon put in its environment (macOS <code>ps -E</code>).</li>
+    <li>Compare the census with the run's call counters at the same instant.
+<pre>expected: live opencode processes == calls still RUNNING (≤ 2)
+actual (2284/repro/run2-census-timeline.txt):
+=== 09:25:19 run: running calls={"total":6,"queued":0,"running":1,"succeeded":5,"failed":0,"cancelled":0}
+83691   499536    00:57      thr_bmn6hk7iwf     opencode acp
+83699   491104    00:57      thr_5ydc7srqsd     opencode acp
+84676   602032    00:46      thr_2wu7iq3cqq     opencode acp
+84847   645072    00:45      thr_avb9qm9vun     opencode acp
+86074   463408    00:34      thr_ggpgqttx3h     opencode acp
+86198   468224    00:34      thr_qvjnz4b6ei     opencode acp
+total: 6 process(es), 3095 MB RSS</pre>
+    Five calls are finished (their rows in the plugin DB are <code>succeeded</code> with <code>finished_at</code> set — <code>run2-workflow-calls.txt</code>) and their threads are <code>idle</code>/<code>hidden</code> (<code>run2-threads.txt</code>), yet all six agent processes are resident. The host-daemon log for the whole session contains only <code>thread.start</code> commands, never a <code>thread.stop</code>.</li>
+    <li>(The reporter's workaround.) Run 3 repeats the batch and, as soon as two calls have succeeded while two are running, stops one finished worker with the CLI (<code>stop-one-child.sh</code>):
+<pre>09:28:06 run status: succeeded=2 running=2; stopping finished worker thr_7zx3kkwyr6
+--- census BEFORE stop:
+4639    632320    00:17      thr_7zx3kkwyr6     opencode acp      ← finished (succeeded)
+4764    627024    00:15      thr_utph6c3kdc     opencode acp      ← finished (succeeded)
+6752    336784    00:01      thr_qzdenzmj3p     opencode acp      ← running
+7065    47824     00:00      thr_32ugrpy25v     opencode acp      ← running
+Thread thr_7zx3kkwyr6 stopped
+--- census AFTER stop (09:28:09):
+4764    626768    00:18      thr_utph6c3kdc     opencode acp      ← still leaked
+6752    775104    00:04      thr_qzdenzmj3p     opencode acp
+7065    564736    00:03      thr_32ugrpy25v     opencode acp</pre>
+    <code>bb thread stop</code> on an idle thread is a pure runtime release, so the stopped worker's process is gone and the running workers are untouched; the other finished worker stays leaked because nothing asks for it to be released.</li>
+  </ol>
+  <figure><img src="assets/2284-origin-thread.png" alt="The origin thread in the dev app after runs 1 and 2, showing the two workflow completion notifications"><figcaption>The origin thread (claude-code) in the dev app after runs 1 and 2. The bug is not visual; this shows where the workflow completion notifications land. The prose under each notification is the origin thread's own agent replying to the notification (it ran its own ad-hoc checks; its remarks about a "bridge-worker pool" are its guesses, not evidence used here).</figcaption></figure>
+  <p>Repro files: <code>2284/repro/</code> (workflow scripts, helper shell scripts, the vitest file, census timelines for all three runs, plugin-DB and thread-table dumps, proposed-fix diff).</p>
+
+  <h2>5. Root cause</h2>
+  <p><strong>The omission.</strong> <code>handleThreadIdle</code> is the only place an unstructured call is settled. Its <code>else</code> branch records the worker's final text and wakes the waiter, and returns without releasing the child thread (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/workflows/src/service.ts#L914-L1026">service.ts#L914-L1026</a>):</p>
+<pre>    } else {
+      settleCall(db, {
+        id: call.id,
+        status: "succeeded",
+        result: output ?? "",
+        error: null,
+      });
+    }
+    wakeCall(call);
+  }                                   // ← no stopChild(threadId)</pre>
+  <p>Every terminal path for a <em>structured</em> call does release the worker: <code>submitStructuredResult</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/workflows/src/service.ts#L1086-L1095">L1086-L1095</a>) and the repair-exhausted / correction-failed branches of <code>handleThreadIdle</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/workflows/src/service.ts#L984-L988">L984-L988</a>, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/workflows/src/service.ts#L1012-L1016">L1012-L1016</a>). Two paths do not: the unstructured <code>else</code> above, and the structured <em>fallback</em> that accepts valid JSON from the worker's plain text (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/workflows/src/service.ts#L959-L970">L959-L970</a>). <code>git log -S stopChild</code> shows the asymmetry has been there since the plugin landed in #733 (<code>57a027724</code>); the only later change (#826, <code>ef8c867a6</code>) removed a stall watchdog that used to stop stalled workers.</p>
+  <p><strong>Why nothing cleans up later.</strong> Run-level cleanup only targets calls that are still open: <code>settleRunAndStopOutstanding</code> stops the children of <code>settleRun</code>'s returned rows, which are <code>queued</code>/<code>running</code> only (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/workflows/src/service.ts#L1206-L1220">service.ts#L1206-L1220</a>, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/workflows/src/data.ts#L343-L372">data.ts#L343-L372</a>); <code>stop(runId)</code> uses <code>activeChildThreadsForRun</code>, same filter (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/workflows/src/data.ts#L773-L783">data.ts#L773-L783</a>); shutdown/recovery uses <code>recoverInterruptedRuns</code>, also <code>running</code> only. A child whose call already reads <code>succeeded</code> is invisible to all of them.</p>
+  <p><strong>Why an idle hidden thread costs a whole process.</strong> The server keeps a thread's runtime loaded after its turn; only an explicit stop releases it (<code>stopThreadForCurrentState</code> → <code>releaseIdleThreadRuntime</code> → daemon <code>thread.stop {intent:"release"}</code>, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/threads/thread-lifecycle.ts#L1393-L1473">thread-lifecycle.ts#L1393-L1473</a>). In the ACP bridge each bb thread owns one spawned agent process (<code>sessionsByBbThreadId</code>, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/provider-bridge-acp/src/bridge/bridge.ts#L202-L203">bridge.ts#L202-L203</a>; release path <code>releaseSession</code> → <code>connection.kill()</code>, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/provider-bridge-acp/src/bridge/bridge.ts#L2088-L2104">L2088-L2104</a>). Claude Code and Pi are also one process per thread. The daemon's periodic reaper (every 5 min, sessions idle ≥ 30 min, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/app.ts#L65-L66">app.ts#L65-L66</a>) considers non-Codex sessions only when the <code>providerSessionReaping</code> experiment is on (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L1007-L1017">runtime.ts#L1007-L1017</a>), and it defaults to off (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/domain/src/experiments.ts#L34">experiments.ts#L34</a>) — that is issue #1604. So for the reporter's <code>acp-opencode</code> workers the only thing that ever releases a finished worker is a human running <code>bb thread stop</code>.</p>
+  <p><strong>What finally killed the processes in my runs (not a fix, but worth knowing).</strong> In all three runs every leaked process disappeared 1–3 s after the run reached <code>succeeded</code>. The host-daemon log shows the cause each time (<code>run2-devlog-at-end.txt</code>): the plugin's completion notification starts a turn on the origin thread, which carries a different injected-skill catalog than the workers (workers get <code>skills: []</code> from <code>bb.agents.configure</code>). The daemon's <code>RuntimeManager</code> then replaces the environment's runtime to switch catalogs, which is allowed only when the environment has no active runtime work, and shuts the old runtime down — taking the ACP bridge and all its idle agent subprocesses with it (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/runtime-manager.ts#L765-L784">runtime-manager.ts#L765-L784</a>, "Removing unused injected skill staging directory" at 09:18:20 / 09:25:20 / 09:28:33). That swap cannot happen while any worker is still running, so it never relieves a batch in progress, and it is incidental: a workflow whose origin is not notified, or whose completion coincides with other activity in the environment, keeps the processes. It also explains why the reporter saw the leak "resolve" only by stopping threads manually.</p>
+  <p><strong>Deeper issue.</strong> The plugin SDK has no "this worker is done, release it" primitive, and the server keeps sessions of hidden plugin-owned threads loaded with the same policy as user-visible threads. The workflows plugin therefore has to remember to stop every child itself, and it forgot the most common path. A server-side policy (release the runtime of a hidden, plugin-originated thread as soon as it goes idle, unless its owner keeps it) would remove the class of bug; that is a larger change than this issue needs.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>Stop the worker on the two settle paths that forget it. Minimal patch against base (<code>proposed-fix.diff</code>):</p>
+<pre>--- a/plugins/workflows/src/service.ts
++++ b/plugins/workflows/src/service.ts
+@@ -966,6 +966,9 @@ export function createWorkflowService(
+             error: null,
+           });
+           wakeCall(call);
++          // The worker is finished; release its provider session so the host
++          // does not keep one idle agent process per completed call (#2284).
++          await stopChild(threadId);
+           return;
+         }
+       }
+@@ -1021,6 +1024,11 @@ export function createWorkflowService(
+         result: output ?? "",
+         error: null,
+       });
++      wakeCall(call);
++      // Unstructured calls settle here and nowhere else: stop the finished
++      // worker so its provider process is released (#2284).
++      await stopChild(threadId);
++      return;
+     }
+     wakeCall(call);
+   }</pre>
+  <p>Verification: with the patch applied, the repro test passes (3/3, <code>repro-test-with-fix.log</code>) and the whole workflows plugin suite passes (14 files, 226 tests, <code>workflows-suite-with-fix.log</code>). The patch was reverted afterwards; the test file is left in the worktree for the fix PR to adopt.</p>
+  <p>What to watch: <code>wakeCall</code> must stay before <code>stopChild</code> so the orchestrator continues while the release round-trips to the daemon (the handler task is tracked in <code>handlerTasks</code>, so shutdown still awaits it). <code>stopChild</code> tolerates a thread that is already gone (<code>isMissingThread</code>) and dedupes concurrent stops, so calling it from the idle handler cannot double-stop the structured-tool path (<code>submitStructuredResult</code> already stopped that worker; its later idle event hits the <code>call.resultJson !== null</code> branch, which does not call it again). Stopping an idle thread is a release, not an interruption, so the worker's timeline and final output remain readable for <code>bb workflows history</code>. One behavioral change: a finished worker can no longer be "talked to" cheaply (its session is unloaded, resuming restarts the agent), which is the intended trade-off. Keep the workers' <code>sessionRestorable</code> semantics in mind if someone later adds a "retry last call in the same thread" feature. Also consider a belt-and-braces <code>stopChildren</code> of <em>all</em> children when a run settles (not only queued/running), so a future settle path cannot reintroduce the leak.</p>
+
+  <h2>7. PR review</h2>
+  <h3>#2090 · Graduate idle provider session reaping (ScaleLeanChris, branch <code>fix/provider-session-reaping-default</code>, head <code>d73645726</code>)</h3>
+  <p><strong>What it changes.</strong> Removes the <code>providerSessionReaping</code> experiment (domain key, DB default, web/mobile/desktop settings UI, docs, fixtures), removes the server's <code>/internal/runtime-policy</code> endpoint and the daemon's <code>getRuntimePolicy</code>, makes the daemon's 30-minute reaper consider every provider session that reports <code>sessionRestorable</code> (Codex keeps its legacy thread-scoped fallback), keeps the open-work guards (<code>backgroundWorkState.hasOpenThreadWork</code>, adapter <code>hasOpenThreadWork</code>), and bumps <code>HOST_DAEMON_PROTOCOL_VERSION</code> 146 → 147. 31 files, +34/−241. It claims <code>Fixes #1604</code>; the reporter of #2284 commented on it but it is not linked as a fix for #2284.</p>
+  <p><strong>Does it address this issue's root cause?</strong> No. It does not touch <code>plugins/workflows</code>. At best it turns "never released" into "released 30–35 minutes after the worker went idle", and only for ACP agents whose bridge reports <code>sessionRestorable</code> (ACP sets it from the agent's <code>session/load</code> support, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/provider-bridge-acp/src/bridge/bridge.ts#L2006">bridge.ts#L2006</a>; whether <code>opencode acp</code> advertises it was not verified here). A 40-task batch at concurrency 4 finishes its first 36 idle workers in far less than 30 minutes, so RAM is exhausted before the first sweep could act. The reporter's assessment in the issue is correct.</p>
+  <p><strong>Findings.</strong></p>
+  <table><tr><th>Where</th><th>Severity</th><th>Finding</th></tr>
+    <tr><td><code>packages/host-daemon-contract/src/protocol.ts:118</code></td><td class="no">High</td><td>Bumps the protocol to 147, but main is already at <strong>164</strong> (base <code>494f66526</code>). The branch is 82 commits behind (merge base <code>c942421a4</code>) and <code>git merge-tree</code> reports content conflicts in <code>runtime.ts</code>, <code>runtime.process-lifecycle.test.ts</code>, <code>protocol.ts</code> and <code>contract.test.ts</code> (GitHub: <code>mergeable: CONFLICTING</code>). After a rebase the bump must become 165 with a fresh changelog comment, and the runtime diff must be re-derived against the post-#2325 provider-plugin runtime, not just conflict-resolved.</td></tr>
+    <tr><td><code>packages/agent-runtime/src/runtime.ts</code> (reaper gating)</td><td class="unv">Medium</td><td>Behavior change without an off switch: every restorable Claude Code / Pi / ACP session is now unloaded after 30 idle minutes for every installation, and the PR deletes the only knob. #1604's own report suggested flipping the default rather than deleting the setting. Silent for users who rely on warm sessions; at minimum the release note / docs should say so, and a config knob (not an "experiment") to disable or tune the window would be prudent.</td></tr>
+    <tr><td><code>packages/domain/src/experiments.ts</code> + <code>experimentsSchema</code> (strict key enum)</td><td class="unv">Medium-low</td><td>Removing the key makes <code>PUT /api/v1/settings/experiments</code> reject any client that still sends <code>providerSessionReaping</code> (z.record over <code>experimentKeySchema</code>). The web app is served by the same server so it is fine; an older installed mobile app build (separately released) sending the key will get 400 on every experiments save until updated. Reading persisted rows is safe (<code>getExperiments</code> filters by known keys).</td></tr>
+    <tr><td><code>apps/host-daemon/src/app.ts</code> / <code>server-client.ts</code></td><td class="ok">OK</td><td>Removing <code>/internal/runtime-policy</code> together with the protocol bump is correct: an older daemon is forced to update instead of looping on the missing endpoint.</td></tr>
+    <tr><td>Tests</td><td class="ok">OK on its own base</td><td>Checked out in my worktree and ran <code>pnpm exec turbo run test --filter=@bb/agent-runtime --filter=@bb/host-daemon --filter=@bb/host-daemon-contract</code>: 7 tasks successful (<code>pr-2090-tests.log</code>). The added lifecycle regression ("reaps a restorable non-Codex session") is meaningful. Nothing in the PR exercises a hidden workflow worker or the burst scenario of #2284.</td></tr>
+    <tr><td>Layering</td><td class="ok">OK</td><td>Policy stays where it was (daemon reaper, server no longer distributes a toggle). No casts or <code>unknown</code> smuggling introduced.</td></tr>
+  </table>
+  <p><strong>Verdict: REQUEST CHANGES</strong> — as a #1604 change it needs a rebase onto current main, a protocol bump to 165, and a decision about an opt-out; as a response to #2284 it should not be considered at all. #2284 needs the one-line plugin fix in section 6.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/1604">#1604</a> — Idle agent processes are never reclaimed for non-Codex providers (the daemon-level half of this problem; report at <a href="1604.html">1604.html</a>). Even with #1604 fixed, #2284 still leaks for up to 30 minutes per worker.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1573">#1573</a> / <a href="https://github.com/get-bb/bb/pull/1584">#1584</a> — the manual "release" stop intent that <code>bb thread stop</code> uses on an idle thread; it is what the workaround and the proposed fix rely on.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1131">#1131</a> — event-loop stalls that memory pressure from retained agents makes worse.</li>
+    <li><a href="https://github.com/get-bb/bb/pull/733">#733</a> (plugin introduced with this asymmetry), <a href="https://github.com/get-bb/bb/pull/826">#826</a> (removed the stall watchdog that used to stop stalled workers), <a href="https://github.com/get-bb/bb/pull/1104">#1104</a> (structured fallback settlement — the second path that forgets to stop).</li>
+    <li>Side observation, not filed: the daemon's skill-catalog runtime swap silently unloads every idle session in an environment (including a user's idle visible thread) whenever a thread with a different catalog starts there; hidden workflow workers and their origin thread always have different catalogs, so each workflow run swaps the origin's session out and back. Worth its own look if session warmth matters.</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Commands run (in order)</h3>
+<pre>gh issue view 2284 --repo get-bb/bb --json ...            # issue text, no comments
+pnpm install --frozen-lockfile --prefer-offline; pnpm exec turbo run build
+pnpm -C plugins/workflows exec vitest run src/issue-2284-idle-worker-stop.test.ts   # fails on base
+git fetch origin main; git log 494f66526..origin/main -- plugins/workflows           # empty
+gh pr view 2090 --json ...; gh pr diff 2090 &gt; 2284/pr-2090.diff
+scripts/bb-dev-app current; scripts/bb-dev-app env
+pnpm bb:dev provider list --json; pnpm bb:dev machine list --json; pnpm bb:dev project list --json
+curl $BB_SERVER_URL/api/v1/system/config                   # experiments.providerSessionReaping=false
+bash 2284/repro/plugin-ctl.sh on workflows
+bash 2284/repro/run-workflow.sh 2284/repro/leak-workflow.js         # run 1: wfr_91201162-…
+bash 2284/repro/wait-for-run.sh wfr_91201162-…; bash 2284/repro/census.sh (mid-run and after)
+sqlite3 &lt;data&gt;/bb.db "select id,status,provider_id,visibility,title from threads"
+sqlite3 &lt;data&gt;/plugins/workflows/data.db "select call_index,status,child_thread_id,… from workflow_calls where run_id=…"
+curl -X PUT $BB_SERVER_URL/api/v1/plugins/workflows/settings -d '{"values":{"maxConcurrentAgents":"2"}}'
+bash 2284/repro/run-workflow.sh 2284/repro/batch-workflow.js        # run 2: wfr_066a2bfe-…
+bash 2284/repro/census-loop.sh wfr_066a2bfe-… run2-census-timeline.txt 3 150
+pnpm bb:dev thread spawn --provider acp-opencode --model opencode/big-pickle … # cheap origin for run 3
+bash 2284/repro/run-workflow.sh 2284/repro/batch-workflow.js        # run 3: wfr_66ae9e12-…
+bash 2284/repro/stop-one-child.sh wfr_66ae9e12-…                      # bb thread stop on a finished worker
+doobie --headless &lt; 2284/repro/screenshot-origin.js                 # assets/2284-origin-thread.png
+pnpm dev:stop
+(apply proposed-fix.diff) pnpm -C plugins/workflows exec vitest run    # 226 passed; then git checkout -- service.ts
+git fetch origin pull/2090/head:pr-2090; git merge-tree --write-tree 494f66526 pr-2090   # 4 CONFLICTs
+git checkout pr-2090; pnpm install; pnpm exec turbo run test --filter=@bb/agent-runtime --filter=@bb/host-daemon --filter=@bb/host-daemon-contract
+git checkout worktree-wf_846839f8-f8a-2; pnpm install; rm -rf &lt;data dir&gt; /tmp/bb-2284-qa</pre>
+
+  <h3>Run 1 (sequential, 3 calls) — census while call 3 was running</h3>
+<pre>PID     RSS_KB    ELAPSED    BB_THREAD_ID       COMMAND
+65323   847552    00:48      thr_s44tzchsc5     opencode acp      ← call 0 succeeded 09:17:58
+65876   656528    00:21      thr_zciq2rj2ua     opencode acp      ← call 1 succeeded 09:18:09
+66895   588464    00:10      thr_ixm4x5q5zy     opencode acp      ← call 2 running
+total: 3 process(es), 2043 MB RSS</pre>
+  <p>Run status afterwards: <code>run-final-status.json</code> (<code>"result":["ok","ok","ok"]</code>). Host-daemon RPC command types for the session (from <code>dev.log</code>): <code>4 host.read_file, 3 thread.start, 1 provider.list_models</code> — no <code>thread.stop</code>.</p>
+
+  <h3>Run 2 — dev.log at the moment the processes vanished</h3>
+<pre>[09:25:20] DEBUG: [host-daemon] Online host RPC {"commandType":"host.read_file","errorCode":"ENOENT",…}
+[09:25:20] DEBUG: [host-daemon] Removing unused injected skill staging directory {"catalogHash":"5b68f779…","stagingRootPath":"…/runtime/global-skills"}
+[09:25:20] DEBUG: [host-daemon] Using cached host artifact {"cacheDir":"…/plugin-host-artifacts/provider-claude-code",…}</pre>
+  <p>The same three lines appeared at 09:18:20 (run 1) and at the end of run 3 (origin on opencode): the origin's notification turn starts, <code>ensureCompatibleEntry</code> sees a different skill catalog on an environment with no active work, <code>replaceEntryForSkillCatalog</code> shuts the old runtime down (and its ACP agent subprocesses with it), and the new runtime launches the origin's provider bridge.</p>
+
+  <h3>PR 2090 merge-tree against base</h3>
+<pre>CONFLICT (content): Merge conflict in packages/agent-runtime/src/runtime.process-lifecycle.test.ts
+CONFLICT (content): Merge conflict in packages/agent-runtime/src/runtime.ts
+CONFLICT (content): Merge conflict in packages/host-daemon-contract/src/protocol.ts
+CONFLICT (content): Merge conflict in packages/host-daemon-contract/test/contract.test.ts</pre>
+
+  <h3>Repro test (inline)</h3>
+<pre>// Repro for get-bb/bb#2284: a workflow worker that finishes an UNSTRUCTURED
+// agent() call (no outputSchema) is settled as `succeeded` in
+// handleThreadIdle, but the plugin never calls `threads.stop` for it, so the
+// hidden worker thread keeps its provider process alive until something else
+// (run cancellation, plugin shutdown, or the daemon's idle reaper) stops it.
+//
+// Structured calls that come back through `bb_workflow_result`
+// (submitStructuredResult) DO call stopChild; this test pins the gap.
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import { afterEach, describe, expect, it } from "vitest";
+import { getCall, getRunRequired, migrations } from "./data.js";
+import { createWorkflowService } from "./service.js";
+import { DEFAULT_WORKFLOW_SETTINGS } from "./settings.js";
+
+async function eventually(assertion: () =&gt; void | Promise&lt;void&gt;, timeoutMs = 4_000): Promise&lt;void&gt; {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try { await assertion(); return; }
+    catch (error) { if (Date.now() &gt;= deadline) throw error; await new Promise((r) =&gt; setTimeout(r, 10)); }
+  }
+}
+
+function source(body: string, name: string): string {
+  return `export const meta = { name: ${JSON.stringify(name)}, description: "issue 2284" };
+  ${body}`;
+}
+
+function setup() {
+  let childCount = 0;
+  const { bb, harness } = createFakePluginHost({
+    pluginId: "workflows",
+    sdk: {
+      threads: {
+        get: async ({ threadId }) =&gt; ({ id: threadId, environmentId: "environment-1", providerId: "acp-opencode",
+          status: threadId === "origin" ? "idle" : "active" }) as never,
+        output: async () =&gt; ({ output: null }),
+        defaultExecutionOptions: async () =&gt; ({ model: "gpt-test", reasoningLevel: "medium", permissionMode: "full",
+          serviceTier: "default", source: "default" }),
+        spawn: async () =&gt; { childCount += 1; return { id: `child-${childCount}` } as never; },
+        send: async () =&gt; ({ ok: true }),
+        stop: async () =&gt; ({ ok: true }),
+      },
+      providers: {
+        list: async () =&gt; [{ id: "acp-opencode", displayName: "OpenCode", logoUrl: null, available: true,
+          capabilities: { supportsThreadArchive: true, supportsThreadRename: true, supportsServiceTier: true,
+            supportsNativeUserQuestion: false, supportsFork: true, permissionModes: ["full"] }, composerActions: [] }],
+        models: async () =&gt; ({ providers: [], models: [{ id: "gpt-test", model: "gpt-test", displayName: "GPT Test",
+          description: "test", supportedReasoningEfforts: [{ reasoningEffort: "medium", description: "test" }],
+          defaultReasoningEffort: "medium", isDefault: true }], selectedOnlyModels: [], modelLoadError: null }),
+      },
+      environments: { get: async () =&gt; ({ id: "environment-1", projectId: "project-test", hostId: "host-1", path: "/workspace" }) as never },
+    },
+  });
+  const db = bb.storage.database();
+  bb.storage.migrate(db, migrations);
+  const service = createWorkflowService(bb, db, DEFAULT_WORKFLOW_SETTINGS);
+  return { harness, db, service, childCount: () =&gt; childCount };
+}
+
+function stopsFor(harness: ReturnType&lt;typeof setup&gt;["harness"], threadId: string): number {
+  return harness.sdk.callsTo("threads.stop")
+    .filter(([input]) =&gt; (input as { threadId: string }).threadId === threadId).length;
+}
+
+describe("issue #2284: finished workers release their provider session", () =&gt; {
+  const harnesses: Array&lt;ReturnType&lt;typeof setup&gt;["harness"]&gt; = [];
+  afterEach(async () =&gt; { await Promise.all(harnesses.map((h) =&gt; h.dispose())); harnesses.length = 0; });
+
+  it("stops an unstructured worker as soon as its call is settled", async () =&gt; {
+    const test = setup(); harnesses.push(test.harness);
+    const run = await test.service.start({ projectId: "project-test", originThreadId: "origin",
+      source: source(`const a = await agent("one"); const b = await agent("two"); const c = await agent("three"); return [a, b, c];`, "issue-2284"),
+      args: null, resumedFromRunId: null });
+    const controller = new AbortController();
+    const worker = test.service.runWorker(controller.signal);
+    try {
+      for (const n of [1, 2, 3]) {
+        await eventually(() =&gt; expect(test.childCount()).toBe(n));
+        test.service.onThreadIdle(`child-${n}`, `result ${n}`);
+        await eventually(() =&gt; expect(getCall(test.db, run.id, n - 1)?.status).toBe("succeeded"));
+        // BUG: on 494f66526 this stays 0 for every unstructured worker.
+        await eventually(() =&gt; expect(stopsFor(test.harness, `child-${n}`)).toBe(1), 500);
+      }
+      await eventually(() =&gt; expect(getRunRequired(test.db, run.id).status).toBe("succeeded"));
+    } finally { controller.abort(); await worker; }
+  });
+
+  it("stops a structured worker settled via the freeform JSON fallback", async () =&gt; {
+    const test = setup(); harnesses.push(test.harness);
+    const run = await test.service.start({ projectId: "project-test", originThreadId: "origin",
+      source: source(`return await agent("give me json", { outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] } });`, "issue-2284-structured-fallback"),
+      args: null, resumedFromRunId: null });
+    const controller = new AbortController();
+    const worker = test.service.runWorker(controller.signal);
+    try {
+      await eventually(() =&gt; expect(test.childCount()).toBe(1));
+      test.service.onThreadIdle("child-1", '{"ok": true}');   // valid JSON as plain text, no bb_workflow_result call
+      await eventually(() =&gt; expect(getRunRequired(test.db, run.id).status).toBe("succeeded"));
+      // BUG: the fallback-accepted branch also returns without stopChild.
+      await eventually(() =&gt; expect(stopsFor(test.harness, "child-1")).toBe(1), 500);
+    } finally { controller.abort(); await worker; }
+  });
+
+  it("control: a worker that submits bb_workflow_result IS stopped (existing behavior)", async () =&gt; {
+    const test = setup(); harnesses.push(test.harness);
+    await test.service.start({ projectId: "project-test", originThreadId: "origin",
+      source: source(`return await agent("give me json", { outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] } });`, "issue-2284-structured-tool"),
+      args: null, resumedFromRunId: null });
+    const controller = new AbortController();
+    const worker = test.service.runWorker(controller.signal);
+    try {
+      await eventually(() =&gt; expect(test.childCount()).toBe(1));
+      await expect(test.service.submitStructuredResult("child-1", { ok: true })).resolves.toEqual({ ok: true });
+      expect(stopsFor(test.harness, "child-1")).toBe(1);
+    } finally { controller.abort(); await worker; }
+  });
+});</pre>
+  <p>(The file in <code>2284/repro/</code> is the exact, formatted version that was run.)</p>
+
+  <h3>Cleanup performed</h3>
+  <p><code>pnpm dev:stop</code> in the worktree; ports 13252/21252/29252 verified free with <code>lsof</code>; dev data dir under <code>~/.bb-dev/</code> and <code>/tmp/bb-2284-qa</code> deleted; doobie browsers stopped; worktree returned to <code>494f66526</code> on branch <code>worktree-wf_846839f8-f8a-2</code> with only the untracked repro test file; local <code>pr-2090</code> branch deleted. The user's packaged bb (<code>:38886/:38887</code>, <code>~/.bb</code>) and the <code>:38930</code> server were not touched.</p>
+</main></body></html>

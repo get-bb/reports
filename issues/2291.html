@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2291 provider.list_models startup probe logs "ACP agent is not authenticated." at warn on every daemon start</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.low { background:#e8e8e4; }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2291 · provider.list_models startup probe logs "ACP agent is not authenticated." at warn on every daemon start</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill low">Priority: Low</span> <span class="pill">Effort: small</span> <span class="pill">providers · provider-acp · host</span>
+    <a href="https://github.com/get-bb/bb/issues/2291">open on GitHub</a>
+    <span>2026-08-24 · base <code>494f66526</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict v-partial">PARTIALLY REPRODUCED</span> · <strong>Root-cause confidence:</strong> high (for the log line) · <strong>Issue's "startup race" theory:</strong> refuted on this machine, unverifiable on the reporter's.</p>
+
+  <h2>1. TL;DR</h2>
+  <p>When an ACP provider's model-list CLI (for Cursor: <code>cursor-agent --list-models</code>) answers "Authentication required", the ACP bridge rejects <code>model/list</code> with a typed <code>authRequired</code> recovery hint, the agent runtime turns it into <code>AgentRuntimeRecoveryError { code: "auth_required" }</code>, and the host daemon's <code>CommandRouter.handleOnlineRpcRequest</code> logs <code>online host RPC failed</code> at warn level, stack trace and all, before returning the same outcome to the server as <code>{ ok:false, errorCode:"auth_required" }</code>. The server then logs its own warn (<code>Failed to resolve provider models</code>) and surfaces <code>modelLoadError: auth_required</code> to the UI. So the daemon line is indeed a duplicate of a condition the server already reports. That part reproduces exactly, both in a unit test at the router and live on my dev instance.</p>
+  <p>What does <em>not</em> hold up is the issue's causal story. The probe does not "race the ACP agent's auth handshake": the model probe never talks to an ACP agent process at all — it <code>execFile</code>s the agent's list command as a plain subprocess. On this machine the Cursor CLI reports "Logged in" yet <code>--list-models</code> fails with "Authentication required" on every run, with no bb involved, so the warn fires on <em>every</em> execution-options read (4 reads → 4 daemon warns + 4 server warns), not once per daemon start. The issue's "one per session, later probes succeed" observation is unverifiable from here, and its "picker falls back to declared models" claim is wrong at base: <code>auth_required</code> deliberately returns an empty model list. Linked PR #2294 makes the right one-line change, but its regression test no longer compiles against main's intent (it relies on a regex classifier removed in e42a4ef48) and the test file conflicts; it needs a rebase and a new test.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>The daemon logs warn-level <code>online host RPC failed</code> for <code>provider.list_models</code> with "ACP agent is not authenticated."</td><td class="ok">Verified</td><td>Live: <code>daemon-warn-lines.jsonl</code> (4 lines, <code>level:40</code>, <code>type:"provider.list_models"</code>). Unit: <code>repro test</code> fails on base at the "no warn" assertion (<code>output</code>).</td></tr>
+    <tr><td>Each daemon warn is mirrored 1:1 by a server-side <code>Failed to resolve provider models</code> warn carrying <code>errorCode</code>, <code>hostId</code>, <code>providerId</code>.</td><td class="ok">Verified</td><td><code>server-warn-lines.jsonl</code>: 4 server lines, timestamps within 1–8 ms of the 4 daemon lines.</td></tr>
+    <tr><td><code>auth_required</code> is not in <code>EXPECTED_ONLINE_RPC_FAILURE_CODES</code> (only <code>file_too_large</code>, <code>provision_cancelled</code>).</td><td class="ok">Verified</td><td><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/command-dispatch-support.ts#L123-L133">command-dispatch-support.ts#L123-L133</a>.</td></tr>
+    <tr><td>The daemon's <code>getErrorCode</code> maps the <em>message text</em> to <code>auth_required</code> via a regex (issue cites L149-L150 at fff3ae8).</td><td class="no">Refuted at base</td><td>True at fff3ae8, but commit <a href="https://github.com/get-bb/bb/commit/e42a4ef485dd1908e2e3114e27f09b3ab3f958d7">e42a4ef48</a> (in base) deleted <code>ACP_AUTH_REQUIRED_PATTERN</code>. At base the code arrives typed: <code>AgentRuntimeRecoveryError.code === "auth_required"</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L155-L176">runtime.ts#L155-L176</a>) and <code>getErrorCode</code> reads the string <code>code</code> property (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/command-dispatch-support.ts#L195-L212">#L195-L212</a>). The symptom is unchanged; the mechanism the issue and PR #2294's test rely on is gone.</td></tr>
+    <tr><td>The probe "fires before the ACP agent has finished its auth handshake" (a startup race; measured +640…+888 ms after the ready banner).</td><td class="no">Refuted (mechanism)</td><td>The list-command path never starts an ACP agent or performs a handshake: <code>loadAgentModelCatalog</code> runs <code>execFile(listCommand.command, listCommand.args)</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/provider-bridge-acp/src/bridge/bridge.ts#L786-L815">bridge.ts#L786-L815</a>); <code>authenticateAcpAgent</code> is only called on session creation. The 0.4–1.0 s is simply the CLI's own runtime: standalone <code>cursor-agent --list-models</code> takes 0.41–1.42 s (<code>log</code>), and the daemon's <code>handlerMs</code> for the probe was 1036.7 / 420 / 389.8 / 569.6 ms.</td></tr>
+    <tr><td>The warn appears once per daemon session; "later probes succeed once the agent's auth state settles".</td><td class="unv">Unverified, contradicted here</td><td>On this Mac the failure is persistent: 4 standalone CLI runs 3 s apart all fail, and 4 execution-options reads 4 s apart each produced a fresh daemon + server warn (<code>trigger-probes-run1.log</code>). Nothing in the code limits the warn to the first probe — failures are not memoized (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/system/execution-options.ts#L607-L641">execution-options.ts#L607-L641</a>), so a persistently logged-out agent warns on every read. The reporter's one-per-start pattern is consistent with the desktop app resolving execution options once on reconnect and the user not opening the picker again; it is not evidence of a transient failure.</td></tr>
+    <tr><td>"The model picker falls back to declared/synthetic models" on this failure.</td><td class="no">Refuted</td><td><code>listFallbackModelsForLoadError</code> returns <code>[]</code> for <code>auth_required</code> on purpose (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/system/execution-options.ts#L643-L667">#L643-L667</a>). Live response: <code>{"modelLoadError":{"providerId":"acp-cursor","code":"auth_required"}, "models":[]}</code> (<code>execution-options-1.json</code>).</td></tr>
+    <tr><td>Not a bridge misclassification; the bridge must keep failing the probe when the CLI reports auth-required.</td><td class="ok">Verified</td><td>The CLI really does say "Authentication required" (<code>cursor-list-models-1.txt</code>); the bridge's prose rule in <code>isAcpAuthRequiredText</code> matches it correctly.</td></tr>
+    <tr><td>Benign, log noise only; no functional damage.</td><td class="unv">Partially</td><td>The log line is noise <em>given</em> the server's own warn. But the underlying state (Cursor's list-models endpoint rejecting a "logged in" CLI) is a real user-facing failure — empty Cursor model list and an "Authentication is required" message in the picker — that the daemon warn is accurately reporting. Hiding it changes nothing for the user.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb base commit <code>494f66526913557ab076e048218236f0a6610927</code> (main, 2026-08-24); no later commit on origin/main touches the daemon router, dispatch support, ACP bridge, or execution-options (checked <code>git log 494f66526..origin/main</code>).</li>
+    <li>macOS 26.5.2 (25F84), Apple Silicon; Node v22.23.1; pnpm 9.15.0.</li>
+    <li>Cursor CLI <code>cursor-agent 2026.06.19-20-24-33-653a7fb</code> at <code>~/.local/bin/cursor-agent</code>; <code>cursor-agent status</code> prints "Logged in (unable to fetch user details)"; <code>cursor-agent --list-models</code> exits 1 with "Error: Authentication required. Run 'agent login', …".</li>
+    <li>My dev instance (from <code>scripts/bb-dev-app current</code> in my worktree): App :11723, Server :19723, Host daemon :27723, data dir <code>~/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-62-52752453907a</code>, host id <code>host_f5y3w5zzsd</code>. Stopped and deleted after the investigation.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <h3>4a. Unit level (no CLI or account needed) — fails on base</h3>
+  <ol>
+    <li>Save <code>command-router.issue-2291.test.ts</code> as <code>apps/host-daemon/src/command-router.issue-2291.test.ts</code>. It builds a real <code>CommandRouter</code> whose <code>listModels</code> throws the exact <code>AgentRuntimeRecoveryError</code> the runtime produces for an ACP <code>authRequired</code> rejection, then sends a <code>provider.list_models</code> online RPC.</li>
+    <li>Run it: <pre>cd apps/host-daemon &amp;&amp; pnpm exec vitest run src/command-router.issue-2291.test.ts</pre></li>
+    <li>Expected: the response is <code>{ ok:false, errorCode:"auth_required" }</code>, the debug accounting line fires, and <code>logger.warn</code> is never called. Actual on 494f66526 (<code>full output</code>):
+<pre>AssertionError: expected [ { fields: { …(2) }, …(1) } ] to deeply equal []
++ [
++   {
++     "fields": {
++       "err": AgentRuntimeRecoveryError {
++         "message": "ACP agent is not authenticated.",
++         "code": "auth_required",
++         "recovery": { "kind": "authRequired", "providerId": "acp-cursor", "retryable": false, … },
++       },
++       "type": "provider.list_models",
++     },
++     "message": "online host RPC failed",
++   },
++ ]
+ ❯ src/command-router.issue-2291.test.ts:93:23</pre>
+    The first two assertions (typed response, debug line) pass — only the warn is wrong.</li>
+  </ol>
+  <pre>/**
+ * Issue #2291 reproduction.
+ *
+ * The ACP bridge rejects `model/list` with a typed `authRequired` recovery
+ * hint when the agent's model-list CLI reports "Authentication required".
+ * The agent runtime turns that into `AgentRuntimeRecoveryError` with
+ * `code: "auth_required"`, which the daemon's `CommandRouter` receives from
+ * `provider.list_models`. This test drives the router through exactly that
+ * failure and checks what it logs.
+ *
+ * On 494f66526 (main) the second assertion FAILS: the router logs
+ * `online host RPC failed` at warn level for the auth_required outcome even
+ * though the same outcome is returned to the server as a typed
+ * `{ ok: false, errorCode: "auth_required" }` response and logged there.
+ */
+import { AgentRuntimeRecoveryError } from "@bb/agent-runtime";
+import { describe, expect, it, vi } from "vitest";
+import {
+  DISPATCH_TEST_BRIDGE_LAUNCH,
+  fetchDispatchTestArtifact,
+  makeTempDir,
+  unexpectedProjectAttachmentFetch,
+  unexpectedProviderMaintenance,
+} from "../test/command/dispatch-helpers.js";
+import { CommandRouter } from "./command-router.js";
+import { noopEventSink } from "./command-dispatch-support.js";
+import type { RuntimeManager } from "./runtime-manager.js";
+
+const ACP_MODEL_LIST_AUTH_MESSAGE = "ACP agent is not authenticated.";
+
+describe("issue #2291: provider.list_models auth_required logging", () =&gt; {
+  it("returns auth_required to the server and does not warn for it", async () =&gt; {
+    const dataDir = await makeTempDir("bb-issue-2291-");
+    const logger = { debug: vi.fn(), warn: vi.fn() };
+    const router = new CommandRouter({
+      dataDir,
+      fetchProjectAttachment: unexpectedProjectAttachmentFetch,
+      fetchPluginHostArtifact: fetchDispatchTestArtifact,
+      // provider.list_models never touches the runtime manager.
+      runtimeManager: {} as RuntimeManager,
+      eventSink: noopEventSink,
+      ...unexpectedProviderMaintenance,
+      listModels: async () =&gt; {
+        // What `@bb/agent-runtime` throws when the bridge rejects with
+        // `error.data.recovery = { kind: "authRequired" }`.
+        throw new AgentRuntimeRecoveryError({
+          code: "auth_required",
+          message: ACP_MODEL_LIST_AUTH_MESSAGE,
+          recovery: {
+            kind: "authRequired",
+            message: ACP_MODEL_LIST_AUTH_MESSAGE,
+            retryable: false,
+            providerId: "acp-cursor",
+          },
+          cause: new Error(ACP_MODEL_LIST_AUTH_MESSAGE),
+        });
+      },
+      threadStorageRootPath: dataDir,
+      logger,
+    });
+
+    const response = await router.handleOnlineRpcRequest({
+      type: "host-rpc.request",
+      requestId: "issue-2291",
+      command: {
+        type: "provider.list_models",
+        providerId: "acp-cursor",
+        bridgeLaunch: DISPATCH_TEST_BRIDGE_LAUNCH,
+      },
+    });
+
+    // The typed outcome reaches the server intact (this part already works).
+    expect(response).toMatchObject({
+      ok: false,
+      commandType: "provider.list_models",
+      errorCode: "auth_required",
+      errorMessage: ACP_MODEL_LIST_AUTH_MESSAGE,
+    });
+    // The debug-level failure accounting still fires.
+    expect(logger.debug).toHaveBeenCalledWith(
+      expect.objectContaining({
+        commandType: "provider.list_models",
+        errorCode: "auth_required",
+        ok: false,
+      }),
+      "Online host RPC",
+    );
+    // Issue #2291: on main this assertion fails because the router also
+    // warns "online host RPC failed" for the auth_required outcome.
+    const warnCalls = logger.warn.mock.calls.map(
+      ([fields, message]) =&gt; ({ fields, message }),
+    );
+    expect(warnCalls).toEqual([]);
+  });
+});</pre>
+
+  <h3>4b. Live (needs a Cursor CLI whose <code>--list-models</code> is rejected)</h3>
+  <ol>
+    <li>Confirm the CLI state with no bb involved (<code>cursor-list-models-persistence.sh</code>):
+<pre>$ zsh cursor-list-models-persistence.sh
+cursor-agent version: 2026.06.19-20-24-33-653a7fb
+cursor-agent status:  ✓ Login successful! Logged in (unable to fetch user details)
+run 1 exit=1 elapsed=1.42s :: Error: Authentication required. Run 'agent login', pass --api-key/--auth-token, or set CURSOR_API_KEY/CURSOR_AUTH_TOKEN.
+run 2 exit=1 elapsed=0.41s :: Error: Authentication required. …
+run 3 exit=1 elapsed=0.44s :: Error: Authentication required. …
+run 4 exit=1 elapsed=0.41s :: Error: Authentication required. …</pre></li>
+    <li>Start a dev instance from the worktree: <code>scripts/bb-dev-app current</code>, then <code>eval "$(scripts/bb-dev-app env)"</code>. Note: no warn appears on daemon start by itself (<code>inspect-dev-instance.sh</code> showed zero warn lines 100 s after "Host plugin worker ready"); the probe is driven by a client reading execution options, which the desktop app does immediately on (re)connect.</li>
+    <li>Read execution options for Cursor four times, 4 s apart (<code>trigger-probes.sh</code>):
+<pre>$ curl -s "$BB_SERVER_URL/api/v1/system/execution-options?providerId=acp-cursor"
+read 1: 1066ms :: modelLoadError={'providerId': 'acp-cursor', 'code': 'auth_required'} models=[] :: daemon warns so far=0 server warns so far=0
+read 2:  448ms :: modelLoadError={'providerId': 'acp-cursor', 'code': 'auth_required'} models=[] :: daemon warns so far=1 server warns so far=1
+read 3:  421ms :: modelLoadError={'providerId': 'acp-cursor', 'code': 'auth_required'} models=[] :: daemon warns so far=3 server warns so far=2
+read 4:  596ms :: modelLoadError={'providerId': 'acp-cursor', 'code': 'auth_required'} models=[] :: daemon warns so far=3 server warns so far=3
+(counts lag by one line because grep ran before the last pino flush; final totals below are 4 and 4)</pre>
+    Expected (per the issue): at most one daemon warn per daemon session, and a model list populated from declared fallbacks. Actual: one daemon warn <em>and</em> one server warn per read, <code>models: []</code> every time:
+<pre>host-daemon.1.log:
+{"level":40,"time":1787597947647,"component":"host-daemon","type":"provider.list_models","err":{"type":"AgentRuntimeRecoveryError","message":"ACP agent is not authenticated.","code":"auth_required","recovery":{"kind":"authRequired","providerId":"acp-cursor","retryable":false},"cause":{"type":"JsonRpcResponseError","code":-32000,…}},"msg":"online host RPC failed"}
+{"level":40,"time":1787597952214, … "msg":"online host RPC failed"}
+{"level":40,"time":1787597956767, … "msg":"online host RPC failed"}
+{"level":40,"time":1787597961474, … "msg":"online host RPC failed"}
+server.1.log:
+{"level":40,"time":1787597947655,"component":"server","errorCode":"auth_required","errorMessage":"ACP agent is not authenticated.","errorStatus":502,"errorRetryable":false,"hostId":"host_f5y3w5zzsd","providerId":"acp-cursor","msg":"Failed to resolve provider models"}
+… ×4</pre></li>
+  </ol>
+  <p>Repro files: <code>2291/repro/</code> · raw logs: <code>2291/</code></p>
+
+  <h2>5. Root cause</h2>
+  <p><strong>The log line.</strong> The daemon router warns for every online-RPC failure except an allow-list of two codes:</p>
+  <pre>// apps/host-daemon/src/command-dispatch-support.ts#L123-L133
+const EXPECTED_ONLINE_RPC_FAILURE_CODES = new Set([
+  "file_too_large",
+  "provision_cancelled",
+]);
+export function isExpectedOnlineRpcFailureError(error: unknown): boolean {
+  return isExpectedCommandDispatchError(error) ||
+    EXPECTED_ONLINE_RPC_FAILURE_CODES.has(getErrorCode(error));
+}
+
+// apps/host-daemon/src/command-router.ts#L129-L152
+} catch (error) {
+  const errorCode = getErrorCode(error);
+  if (!isExpectedOnlineRpcFailureError(error)) {
+    this.logger.warn({ type: message.command.type, err: error }, "online host RPC failed");
+  }
+  this.logOnlineRpc({ commandType, errorCode, handlerMs, ok: false });
+  return { type: "host-rpc.response", …, ok: false, errorCode, errorMessage };
+}</pre>
+  <p>Links: <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/command-dispatch-support.ts#L123-L133">dispatch-support#L123-L133</a>, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/command-router.ts#L111-L152">command-router#L111-L152</a>. The chain that produces the <code>auth_required</code> code at base is fully typed, no regex: bridge <code>AcpModelListAuthRequiredError</code> → JSON-RPC error with <code>data.recovery = { kind:"authRequired" }</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/provider-bridge-acp/src/bridge/bridge.ts#L1035-L1053">bridge.ts#L1035-L1053</a>) → <code>JsonRpcResponseError.recovery</code> → runtime <code>actOnRejection</code> case <code>authRequired</code> throws <code>AgentRuntimeRecoveryError({ code:"auth_required" })</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L625-L628">runtime.ts#L625-L628</a>) → daemon <code>getErrorCode</code> reads <code>error.code</code>. Since the server turns the response into a 502 <code>ApiError</code> with the same code and logs it with host/provider context (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/system/execution-options.ts#L575-L597">execution-options.ts#L575-L597</a>), the daemon warn carries no information the server line lacks — it is duplicate, and uglier (it dumps two nested stacks).</p>
+  <p><strong>Why it fires "on every daemon start".</strong> The server's model-probe memo key includes the daemon session id and never memoizes failures (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/system/execution-options.ts#L607-L641">#L607-L641</a>), and the app reads execution options on every thread open / focus / reconnect. A fresh daemon session therefore always gets a fresh probe as soon as a client is connected, and an agent whose list command is rejected fails that probe every time. This is not a startup race: the probe's only external dependency is the agent's list CLI, run via <code>execFile</code> with no ACP session, no <code>initialize</code>, no <code>authenticate</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/provider-bridge-acp/src/bridge/bridge.ts#L786-L815">bridge.ts#L786-L815</a>). The issue's "+650 ms" is the CLI's own runtime.</p>
+  <p><strong>Deeper/underlying issue (outside bb's code).</strong> On this machine the Cursor CLI is in a split state: <code>cursor-agent status</code> says "Logged in" but cannot fetch user details, and <code>--list-models</code> is rejected. That is a stale/expired Cursor credential, which bb correctly reports as <code>auth_required</code>; the Cursor row in the picker shows "Authentication is required" and no models. The reporter's "next probe succeeds" would need a Cursor-side token refresh that happens between probes — possible, but nothing in bb waits for or causes it. If it is real on the reporter's host, a retry-with-backoff in the server would be the fix for the <em>symptom they care about</em> (empty picker until the next open), and the daemon warn would be a side-effect of that.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>Confident about the log line. The daemon should not warn for a failure it has already classified into a typed code that the server owns the policy for. Two options, smallest first:</p>
+  <ol>
+    <li><strong>Allow-list the typed code</strong> (what PR #2294 does): add <code>"auth_required"</code> (and, by the same logic, <code>"rate_limited"</code>, the only other <code>AgentRuntimeRecoveryError</code> code) to <code>EXPECTED_ONLINE_RPC_FAILURE_CODES</code> in <code>apps/host-daemon/src/command-dispatch-support.ts</code>. Risk: it silences the daemon warn for every online RPC type that throws that code, not just <code>provider.list_models</code> — today that is the provider maintenance commands (<code>provider.list_models/usage/installation.*</code>) and any <code>plugin.host.call</code> whose error object happens to carry <code>code === "auth_required"</code>. All of those return the code to the server, which logs or surfaces it, so this is acceptable, but it should be stated.</li>
+    <li><strong>Type-based</strong>: treat <code>error instanceof AgentRuntimeRecoveryError</code> as expected in <code>isExpectedOnlineRpcFailureError</code>. Narrower (only runtime-typed recovery rejections, which by construction are user/provider state, never daemon bugs) and does not depend on a string code that other layers could reuse. The daemon already imports from <code>@bb/agent-runtime</code>.</li>
+  </ol>
+  <p>Either way the regression test must construct the error the way the runtime does (a typed <code>code</code> property), not a bare <code>new Error("ACP agent is not authenticated.")</code> — the message-regex classifier was removed in e42a4ef48 and must not come back. The repro test above is a suitable regression test as-is (it passes with either fix; verified for option 1). No wire change, so no <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump. Do not touch the server's warn or the <code>auth_required</code> fallback policy.</p>
+
+  <h2>7. PR review</h2>
+  <h3>PR #2294 · "Treat auth-required probe failures as expected online RPC failures" (head 192a39a20, based on fff3ae8)</h3>
+  <p><strong>What it changes:</strong> adds <code>"auth_required"</code> to <code>EXPECTED_ONLINE_RPC_FAILURE_CODES</code> with a comment (6 lines), and adds one test asserting <code>isExpectedOnlineRpcFailureError(new Error("ACP agent is not authenticated."))</code> and the Cursor CLI prose are <code>true</code>.</p>
+  <p><strong>Root cause vs symptom:</strong> the source change is the correct, minimal fix for the duplicate log line (option 1 above) and is at the right layer (daemon owns its own logging; server keeps the policy). It does not, and does not claim to, address the "first probe fails, second succeeds" behaviour, which I could not confirm exists.</p>
+  <table><tr><th>Finding</th><th>Severity</th><th>Where</th></tr>
+    <tr><td><strong>Test is dead on arrival against main.</strong> Both assertions pass a plain <code>Error</code> with no <code>code</code> property and rely on the daemon's <code>ACP_AUTH_REQUIRED_PATTERN</code> regex to classify the message. That regex was deleted in e42a4ef48 (merged 2026-08-23, after the PR was opened), so on base <code>getErrorCode</code> returns <code>"command_failed"</code> and the test fails. Verified: cherry-picked onto 494f66526, resolved the conflict, ran it → <code>expected false to be true</code> at <code>command-dispatch-support.test.ts:21</code> (<code>log</code>). The PR description's claim that "the sibling test at the same site already pins getErrorCode(…) to auth_required" is also stale: that sibling test no longer exists.</td><td>Blocker</td><td>apps/host-daemon/src/command-dispatch-support.test.ts:145-158 (PR head)</td></tr>
+    <tr><td><strong>Merge conflict.</strong> <code>git merge-tree 494f66526 pr-2294</code> reports <code>CONFLICT (content)</code> in the test file; e42a4ef48 reduced it from ~330 lines to 15. Needs a rebase.</td><td>Blocker</td><td>apps/host-daemon/src/command-dispatch-support.test.ts</td></tr>
+    <tr><td><strong>Test exercises the wrong unit.</strong> Even after rebasing, a test of <code>isExpectedOnlineRpcFailureError</code> with a hand-made error does not prove the router stops warning for the real <code>AgentRuntimeRecoveryError</code>. A router-level test (see §4a) covers the actual path and also pins that the typed <code>errorCode</code> and the debug accounting line survive.</td><td>Medium</td><td>same file</td></tr>
+    <tr><td><strong>Blast radius not stated.</strong> The allow-list is consulted for every online RPC type; the change also silences <code>provider.usage</code>, <code>provider.installation.*</code> and any <code>plugin.host.call</code> error with <code>code === "auth_required"</code>. Acceptable (the code always reaches the server), but the comment says "the startup provider.list_models probe", which is narrower than what the line does. Consider naming <code>rate_limited</code> in the same breath or switching to the type-based check.</td><td>Low</td><td>apps/host-daemon/src/command-dispatch-support.ts:138-143 (PR head)</td></tr>
+    <tr><td><strong>Description repeats unverified claims as fact</strong>: "lands before the ACP agent's auth handshake/login state has settled" — the probe has no handshake (see §5). Harmless for the code change, misleading for future readers of <code>git log</code>.</td><td>Low</td><td>PR body / commit message</td></tr>
+    <tr><td>No wire shape change → no <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump needed. No casts, no behaviour change for other codes. OK.</td><td>—</td><td>—</td></tr>
+  </table>
+  <p><strong>Tests I ran:</strong> <code>git cherry-pick pr-2294</code> onto 494f66526 (conflict in the test file; resolved by keeping base content + the PR's new test, saved as <code>pr-2294-command-dispatch-support.test.resolved.ts</code>); <code>pnpm exec vitest run src/command-dispatch-support.test.ts src/command-router.issue-2291.test.ts</code> → PR test <span class="no">1 failed</span>, my router repro <span class="ok">passed</span> (so the 1-line source change does silence the warn on main). CI on the PR: no checks recorded (<code>statusCheckRollup: []</code>, mergeable UNKNOWN at review time).</p>
+  <p><strong>Verdict: REQUEST CHANGES.</strong> Keep the one-line source change (or switch to the <code>instanceof AgentRuntimeRecoveryError</code> form), rebase onto main, replace the test with one that throws a typed <code>auth_required</code> error through the router, and drop the "auth handshake race" wording.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/1688">#1688</a> (closed) Cursor Grok 4.6 hidden from the primary picker — same <code>cursor-agent --list-models</code> probe path (fixture <code>issue-1688-cursor-list-models.txt</code> in the ACP bridge).</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1758">#1758</a> (closed) github plugin latched needs-configuration on one transient auth failure — the opposite failure mode; relevant if the server ever starts memoizing <code>auth_required</code> probe failures.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/2306">#2306</a> (open) Spawn falls back to Codex when a project has no remembered provider even if Codex has no models — another consumer of <code>modelLoadError</code>/empty model lists.</li>
+    <li><a href="https://github.com/get-bb/bb/pull/2325">#2325</a> (merged, e42a4ef48) Provider plugins: one API — removed the daemon's message regex that PR #2294's test depends on; introduced the typed <code>AgentRuntimeRecoveryError</code>.</li>
+    <li>Precedent for the allow-list: commit <code>4c7d2a97d</code> "fix: silence expected provision cancellation RPC failures" (2026-06-10) introduced <code>EXPECTED_ONLINE_RPC_FAILURE_CODES</code>.</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Files</h3>
+  <ul>
+    <li><code>repro/command-router.issue-2291.test.ts</code> — unit repro (fails on base, passes with PR #2294's source change).</li>
+    <li><code>repro/repro-test-base-output.txt</code> — vitest output on base.</li>
+    <li><code>repro/cursor-list-models-persistence.sh</code>, <code>cursor-list-models-persistence.log</code>, <code>cursor-list-models-{1..4}.txt</code> — standalone CLI runs.</li>
+    <li><code>repro/inspect-dev-instance.sh</code>, <code>repro/trigger-probes.sh</code>, <code>trigger-probes-run1.log</code>, <code>execution-options-{1..4}.json</code> — live repro.</li>
+    <li><code>daemon-warn-lines.jsonl</code>, <code>server-warn-lines.jsonl</code> — the warn lines from my instance's logs.</li>
+    <li><code>pr-2294-tests-on-base.log</code>, <code>repro/pr-2294-command-dispatch-support.test.resolved.ts</code> — PR review evidence.</li>
+    <li><code>install.log</code>, <code>build.log</code>, <code>dev-app-start.log</code>, <code>dev-stop.log</code>.</li>
+  </ul>
+  <h3>Full first daemon warn entry (stacks trimmed)</h3>
+  <pre>{
+ "level": 40, "time": 1787597947647, "component": "host-daemon", "serverUrl": "http://127.0.0.1:19723",
+ "type": "provider.list_models",
+ "err": {
+  "type": "AgentRuntimeRecoveryError", "message": "ACP agent is not authenticated.",
+  "stack": "AgentRuntimeRecoveryError: ACP agent is not authenticated.\n    at toRecoveryError (packages/agent-runtime/src/runtime.ts:663:12)\n    at actOnRejection (packages/agent-runtime/src/runtime.ts:627:15)\n    at sendRequestWithRecovery (packages/agent-runtime/src/runtime.ts:580:20)\n    at async Object.listModels (packages/agent-runtime/src/runtime.ts:2472:22)\n    at async RuntimeManager.withProviderMaintenanceRuntime (…)",
+  "cause": {
+   "type": "JsonRpcResponseError", "message": "ACP agent is not authenticated.", "code": -32000,
+   "recovery": { "message": "ACP agent is not authenticated.", "kind": "authRequired", "retryable": false }
+  },
+  "code": "auth_required",
+  "recovery": { "message": "ACP agent is not authenticated.", "providerId": "acp-cursor", "kind": "authRequired", "retryable": false }
+ },
+ "msg": "online host RPC failed"
+}</pre>
+  <h3>Daemon debug accounting lines for the same four probes</h3>
+  <pre>{"level":20,"time":1787597947654,"commandType":"provider.list_models","errorCode":"auth_required","handlerMs":1036.7,"ok":false,"msg":"Online host RPC"}
+{"level":20,"time":1787597952214,"commandType":"provider.list_models","errorCode":"auth_required","handlerMs":420,"ok":false,"msg":"Online host RPC"}
+{"level":20,"time":1787597956767,"commandType":"provider.list_models","errorCode":"auth_required","handlerMs":389.8,"ok":false,"msg":"Online host RPC"}
+{"level":20,"time":1787597961474,"commandType":"provider.list_models","errorCode":"auth_required","handlerMs":569.6,"ok":false,"msg":"Online host RPC"}</pre>
+  <h3>Commands run (in order)</h3>
+  <pre>gh issue view 2291 --repo get-bb/bb --json …   # no comments on the issue
+pnpm install --frozen-lockfile --prefer-offline
+git checkout 494f66526 &amp;&amp; pnpm exec turbo run build
+gh pr view 2294 --json … ; gh pr diff 2294
+git log -S auth_required -- apps/host-daemon/src/command-dispatch-support.ts   # e42a4ef48, 0a62319b8
+git show e42a4ef48 -- apps/host-daemon/src/command-dispatch-support.ts         # ACP_AUTH_REQUIRED_PATTERN removed
+git fetch origin main; git log 494f66526..origin/main -- &lt;relevant paths&gt;     # empty
+git fetch origin pull/2294/head:pr-2294; git merge-tree --write-tree --name-only 494f66526 pr-2294   # CONFLICT in test file
+cursor-agent status; cursor-agent --list-models (×5)
+cd apps/host-daemon &amp;&amp; pnpm exec vitest run src/command-router.issue-2291.test.ts     # FAIL on base (expected)
+scripts/bb-dev-app current; eval "$(scripts/bb-dev-app env)"
+zsh inspect-dev-instance.sh; zsh trigger-probes.sh 4 4
+git checkout -b issue-2291-pr-2294-on-base 494f66526; git cherry-pick pr-2294  # conflict; resolved
+pnpm exec vitest run src/command-dispatch-support.test.ts src/command-router.issue-2291.test.ts   # PR test fails, repro passes
+git cherry-pick --abort; git checkout 494f66526
+gh search issues --repo get-bb/bb "not authenticated" / "auth_required" / "list_models cursor"
+pnpm dev:stop; rm -rf &lt;my dev data dir&gt;; lsof -nP -iTCP -sTCP:LISTEN | grep -E '11723|19723|27723'</pre>
+</main></body></html>

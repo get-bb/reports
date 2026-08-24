@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1939 Autocompact is thrashing (Claude)</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.med { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:18px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:6px; }
+  .note { background:#fff7e6; border:1px solid #f0d9a8; border-radius:6px; padding:10px 12px; font-size:14px; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1939 · Autocompact is thrashing (Claude)</h1>
+  <p class="meta">
+    <span class="pill">Type: bug (untyped on GitHub)</span> <span class="pill med">Priority: Medium</span> <span class="pill">Effort: not set</span> <span class="pill">needs-more-info</span> <span class="pill">providers</span> <span class="pill">provider-claude-code</span>
+    <a href="https://github.com/get-bb/bb/issues/1939">open on GitHub</a>
+    <span>2026-08-24 · base <code>494f66526</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict">REPRODUCED</span> (the exact error surface, on a real Claude Code session driven by bb) · <strong>Root-cause confidence:</strong> <strong>high</strong> for the mechanism that produces the message; <strong>medium</strong> for what refilled the reporter's context, because the issue contains no session details.</p>
+
+  <h2>1. TL;DR</h2>
+  <p>The text the user sees ("Autocompact is thrashing: the context refilled to the limit within 3 turns of the previous compact, 3 times in a row…") is not produced by bb. It is a safety breaker inside the Claude Code CLI (added in Claude Code 2.1.89, present in the 2.1.241 installed here and in the 2.1.197 the pinned Agent SDK bundles). Inside one prompt, the CLI auto-compacts when the context hits its threshold; if the context is back at the threshold within fewer than three API round-trips after a compaction, three compactions in a row, the CLI aborts the prompt with a synthetic <code>assistant</code> message (<code>error: "invalid_request"</code>) and a <code>result</code> that is <code>subtype: "success"</code> but <code>is_error: true</code>. bb's Claude bridge treats any <code>is_error</code> result as a failed turn, relays the CLI text verbatim as "Provider error", and puts the thread in status <code>error</code>.</p>
+  <p>I reproduced this end to end on a bb dev instance by using the CLI's own test knobs (<code>CLAUDE_CODE_AUTO_COMPACT_WINDOW=100k</code> + <code>CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=1</code>) so that the ~23k-token fixed prefix alone exceeds the compaction threshold; a single prompt with six sequential Bash calls produced three auto-compactions and then the breaker. The breaker state is per prompt, not per session: a follow-up message on the errored thread ran normally (one compaction, then "ok"), and manual <code>/compact</code> also works. bb does not wedge the thread, but it also does nothing to help: the error carries no <code>errorInfo</code> category (so no context-window-specific hint or retry policy), the timeline shows one "Context compacted" banner where three compactions happened, there is no <code>/clear</code> for Claude Code even though the CLI text recommends it, and <code>bb thread tell</code> in its default mode rejects errored threads with HTTP 409.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>"Provider error / error / Autocompact is thrashing: …" appears on a Claude thread.</td><td class="ok">Verified</td><td>Thread <code>thr_q2h7z2q9e6</code> on my instance reached status <code>error</code> with exactly that text (<code>thread log</code>, <a href="assets/1939-error-state.png">screenshot</a>). The text is the CLI constant <code>W2a</code> in the Claude Code binary; bb relays it through <code>getClaudeResultErrorDetail</code>.</td></tr>
+    <tr><td>"It's stopping Claude threads from working for me once they are large."</td><td class="unv">Partially verified</td><td>The breaker ends the current prompt and bb marks the thread <code>error</code>. Size alone does not trigger it: it needs three consecutive auto-compactions each refilled within &lt;3 API calls <em>inside one prompt</em>. The CLI resets its breaker counter per prompt (<code>compactTracking: void 0</code> at query start), and a follow-up on the errored thread worked here (section 4, step 6). If the agent's task re-reads the oversized content it will trip again, so from the user's point of view a large thread can look dead.</td></tr>
+    <tr><td>Acceptance: "Autocompact is thrashing error does not occur."</td><td class="unv">Unverifiable as stated</td><td>bb cannot prevent the CLI's breaker; it fires inside the Claude Code process on conditions bb does not control. bb can (a) classify it as a context-window failure, (b) offer a recovery action (/clear or fresh session), (c) show the repeated compactions. See section 6.</td></tr>
+    <tr><td>Implicit: this is a bb bug.</td><td class="no">Refuted (mostly)</td><td>The message originates in the Claude Code CLI (changelog 2.1.89: "Fixed autocompact thrash loop — now detects when context refills to the limit immediately after compacting three times in a row and stops with an actionable error"). bb's contribution to the fixed prefix in my run was 0 instruction chars and one MCP tool; the 23k-token prefix was Claude Code's own system prompt plus the host user's tools/MCP servers/skills.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb <code>0.39.0</code> at <code>494f66526913557ab076e048218236f0a6610927</code> (origin/main at <code>b735da19e</code> has no later commits under <code>plugins/provider-claude-code</code>; nothing fixes this).</li>
+    <li>macOS 26.5.2 (Darwin 25.5.0) arm64, Node v22.23.1.</li>
+    <li>Claude Code CLI <code>2.1.241</code> at <code>~/.local/bin/claude</code> (bb prefers the PATH binary: <code>resolveClaudeCodeExecutable</code>). The pinned <code>@anthropic-ai/claude-agent-sdk@0.3.197</code> bundles CLI <code>2.1.197</code>, which also contains the breaker.</li>
+    <li>Model: <code>claude-opus-5[1m]</code> (bb's default for the provider on this machine; 1M context window).</li>
+    <li>Dev instance: App <code>http://localhost:17648</code>, Server <code>http://localhost:25648</code>, Host daemon <code>http://127.0.0.1:33648</code>, data dir <code>~/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-26-09d74438f049</code> (deleted after the run).</li>
+    <li>Bridge recordings were captured with <code>BB_PROVIDER_BRIDGE_RECORD_DIR</code>; redacted copies are in <code>1939/repro/recordings-redacted/</code>.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <div class="note">Why the env overrides: a real trigger needs three compactions of a full context inside one prompt, which is expensive and slow. The CLI ships two test knobs that shrink the threshold without changing the breaker code path. Two are needed: with the default window source <code>auto</code>, CLI 2.1.241 skips threshold-based autocompaction entirely (<code>Y4T</code>: <code>if (Jve() &amp;&amp; !Xqe(model, window)) return false</code>, i.e. it relies on reactive compaction after an API "prompt too long" error), so <code>CLAUDE_CODE_AUTO_COMPACT_WINDOW=100k</code> makes the source <code>env</code>; then <code>CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=1</code> sets the threshold to <code>min(floor(100000 × 1%), 100000 − 13000) = 1,000</code> tokens, far below the ~23k-token fixed prefix, so every API round-trip is a "refill to the limit".</div>
+  <ol>
+    <li>Start a dev instance with the overrides and bridge recording (from a worktree at <code>494f66526</code>, after <code>pnpm install</code> and <code>pnpm exec turbo run build</code>):
+<pre>CLAUDE_CODE_AUTO_COMPACT_WINDOW=100k CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=1 \
+BB_PROVIDER_BRIDGE_RECORD_DIR=/tmp/bb-1939-recordings scripts/bb-dev-app current
+eval "$(scripts/bb-dev-app env)"   # BB_SERVER_URL=http://localhost:25648 here</pre>
+      The launcher's <code>screen</code> session inherits the environment; the bridge copies <code>process.env</code> into the spawned CLI (<code>buildSessionEnv</code>). I confirmed with <code>ps -E</code> that the host daemon carried <code>CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=1</code>.</li>
+    <li>Create a scratch project:
+<pre>mkdir -p /tmp/bb-1939-qa &amp;&amp; cd /tmp/bb-1939-qa &amp;&amp; git init -q &amp;&amp; echo hello &gt; README.md &amp;&amp; git add . &amp;&amp; git commit -qm init
+curl -s -X POST $BB_SERVER_URL/api/v1/projects -H 'content-type: application/json' \
+  -d '{"name":"qa","source":{"type":"local_path","path":"/tmp/bb-1939-qa","hostId":"host_8knjimidn9"}}'
+# → {"id":"proj_tmjmnavk94", ...}</pre></li>
+    <li>Spawn a Claude Code thread whose single prompt needs at least five API round-trips:
+<pre>pnpm bb:dev thread spawn --project proj_tmjmnavk94 --provider claude-code --permission-mode auto \
+  --title "1939 thrash repro 2" --json \
+  --prompt "Run these six shell commands one at a time, each as its own separate Bash tool call, waiting for each result before starting the next: echo one; echo two; echo three; echo four; echo five; echo six. After the sixth result, reply only with: done"
+# → {"id":"thr_q2h7z2q9e6","status":"starting","providerId":"claude-code"}
+pnpm bb:dev thread wait thr_q2h7z2q9e6 --status idle --timeout 240</pre>
+<pre>expected: thread reaches idle, assistant replies "done"
+actual:   Error: Thread thr_q2h7z2q9e6 is in status error and will not reach idle by waiting alone. Inspect it with 'bb thread show thr_q2h7z2q9e6' and recover by sending a follow-up.</pre></li>
+    <li><code>pnpm bb:dev thread log thr_q2h7z2q9e6</code> (verbatim):
+<pre>── User ────────────────────────────────────────────────────
+Run these six shell commands one at a time, each as its own separate Bash tool call, waiting for each result before starting the next: echo one; echo two; echo three; echo four; echo five; echo six. After the sixth result, reply only with: done
+
+── Worked for (1m 12s) ─────────────────────────────────────
+
+── Error ───────────────────────────────────────────────────
+  Provider error
+  Autocompact is thrashing: the context refilled to the limit within 3 turns of the previous compact, 3 times in a row. A file being read or a tool output is likely too large for the context window. Try reading in smaller chunks, or use /clear to start fresh.</pre>
+      <figure><img src="assets/1939-error-state.png" alt="bb thread view showing Provider error with the Autocompact is thrashing text"><figcaption>The thread right after the breaker tripped: "Worked for 1m 12s", "Provider error · error", the CLI's text verbatim, and the composer placeholder "Retry by sending a follow-up message". Note that none of the five <code>echo</code> commands or the three compactions are visible in the collapsed turn.</figcaption></figure></li>
+    <li>What the CLI actually sent (from the bridge recording, <code>sdk-messages-thr_q2h7z2q9e6.ndjson</code>; cache_read 23,059 tokens is the fixed prefix on every call):
+<pre>{"type":"assistant","tool":"Bash","usage":{"cache_creation_input_tokens":7956,"cache_read_input_tokens":23059}}   # echo one
+{"type":"assistant","tool":"Bash","usage":{"cache_creation_input_tokens":1204,"cache_read_input_tokens":31015}}   # echo two
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":32317,"post_tokens":2735}}
+{"type":"assistant","tool":"Bash","usage":{"cache_creation_input_tokens":4207,"cache_read_input_tokens":23059}}   # echo three
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":27612,"post_tokens":3084}}
+{"type":"assistant","tool":"Bash","usage":{"cache_creation_input_tokens":4647,"cache_read_input_tokens":23059}}   # echo four
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":27804,"post_tokens":2968}}
+{"type":"assistant","tool":"Bash","usage":{"cache_creation_input_tokens":4536,"cache_read_input_tokens":23059}}   # echo five
+{"type":"assistant","error":"invalid_request","model":"&lt;synthetic&gt;","text":"Autocompact is thrashing: the context refilled to the limit …"}
+{"type":"result","subtype":"success","is_error":true,"result":"Autocompact is thrashing: the context refilled to the limit …"}</pre>
+      bb's bridge turned that into (<code>bridge-deltas</code>): <code>context.compacted</code> ×3, then one batch <code>turn.open, contextWindow, usage, provider.error{message:"Provider error", detail:&lt;CLI text&gt;, errorInfo: null}, turn.boundary{status:"failed"}</code>. Stored events (<code>events</code>): <code>thread/compacted</code> at seq 17, 22, 27, <code>provider/error</code> at 33, <code>turn/completed failed</code> at 34.</li>
+    <li>Recovery experiment. The default CLI mode is rejected; <code>--mode auto</code> works and the breaker does not re-trip on a short prompt:
+<pre>$ pnpm bb:dev thread tell thr_q2h7z2q9e6 "Reply only with: ok"
+Error: HTTP 409: Thread is not active            # default --mode steer requires status active/idle (thread-send.ts resolveSendMode)
+$ pnpm bb:dev thread tell thr_q2h7z2q9e6 "Reply only with: ok" --mode auto
+{"threadId":"thr_q2h7z2q9e6","ok":true,"mode":"auto"}
+$ pnpm bb:dev thread wait thr_q2h7z2q9e6 --status idle --timeout 180
+{"threadId":"thr_q2h7z2q9e6","matched":true,"target":{"kind":"status","status":"idle"}}</pre>
+      Recording for the follow-up, same CLI process (same <code>run</code> id): <code>system/init</code>, one <code>compact_boundary</code> (<code>pre 28032 → post 3108</code>), assistant "ok", <code>result success is_error:false</code>.
+      <figure><img src="assets/1939-recovered-after-followup.png" alt="bb thread view after the follow-up: Context compacted banner and assistant reply ok"><figcaption>After <code>tell --mode auto</code>: one "Context compacted 25s" banner, then "ok". The thread is idle again; the earlier failed turn stays collapsed as "Provider error".</figcaption></figure></li>
+    <li>Control and manual compaction. The same four-echo prompt with only <code>CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=1</code> (window source still <code>auto</code>) never compacted and finished with "done" (thread <code>thr_7rzwcqg9m8</code>, <code>log</code>), which is what led me to the <code>Y4T</code> gate above. <code>pnpm bb:dev thread compact thr_7rzwcqg9m8</code> on that idle thread produced <code>compact_boundary{trigger:"manual", pre 32106 → post 2810}</code> and a successful result: manual compaction does not pass through the breaker.</li>
+  </ol>
+  <h3>Replay test (bb's surfacing path, passes on <code>494f66526</code>)</h3>
+  <p>This pins how bb translates the recorded sequence. It is not a failing test: bb's translation is doing what it was written to do; the test documents the gap (<code>errorInfo</code> undefined) that section 6 proposes to close. File: <code>1939/repro/delta-translation.autocompact-breaker.test.ts</code> (drop into <code>plugins/provider-claude-code/src/</code> and run <code>pnpm exec vitest run src/delta-translation.autocompact-breaker.test.ts</code> from the plugin dir; result: 1 passed).</p>
+<pre>import { describe, expect, it } from "vitest";
+import type { ThreadEvent } from "@bb/domain";
+import { TURN_1, createClaudeDeltaHarness } from "./delta-test-harness.js";
+
+const THREAD_ID = "thr_1939_breaker";
+const SESSION_ID = "140f4c19-d09e-47dd-ab05-01a345f00f9d";
+const BREAKER_TEXT =
+  "Autocompact is thrashing: the context refilled to the limit within 3 turns of the previous compact, 3 times in a row. A file being read or a tool output is likely too large for the context window. Try reading in smaller chunks, or use /clear to start fresh.";
+
+function sdkMessage(message: Record&lt;string, unknown&gt;): Record&lt;string, unknown&gt; {
+  return { jsonrpc: "2.0", method: "sdk/message", params: { threadId: THREAD_ID, message } };
+}
+function compactBoundary(pre: number, post: number, dropped: number) {
+  return sdkMessage({
+    type: "system", subtype: "compact_boundary",
+    compact_metadata: { trigger: "auto", pre_tokens: pre, post_tokens: post, cumulative_dropped_tokens: dropped, duration_ms: 20_000 },
+    uuid: `compact-${dropped}`, session_id: SESSION_ID,
+  });
+}
+function ofType(events: readonly ThreadEvent[], type: ThreadEvent["type"]) {
+  return events.filter((event) =&gt; event.type === type);
+}
+
+describe("#1939 Claude autocompact rapid-refill breaker (delta path)", () =&gt; {
+  it("surfaces the breaker as one uncategorized provider/error and a failed turn", () =&gt; {
+    const harness = createClaudeDeltaHarness();
+    const all: ThreadEvent[] = [];
+    const push = (events: ThreadEvent[]) =&gt; { all.push(...events); return events; };
+
+    push(harness.acceptInput("creq_1939", THREAD_ID));
+    push(harness.translate(sdkMessage({
+      type: "assistant",
+      message: { id: "msg_1", role: "assistant", model: "claude-opus-5",
+        content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "echo one" } }],
+        stop_reason: null,
+        usage: { input_tokens: 2, cache_creation_input_tokens: 7956, cache_read_input_tokens: 23059, output_tokens: 90 } },
+      parent_tool_use_id: null, session_id: SESSION_ID, uuid: "assistant-1",
+    }), { threadId: THREAD_ID }));
+    push(harness.translate(sdkMessage({
+      type: "user",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "one" }] },
+      parent_tool_use_id: null, session_id: SESSION_ID, uuid: "user-1",
+    }), { threadId: THREAD_ID }));
+    push(harness.translate(compactBoundary(32317, 2735, 29582), { threadId: THREAD_ID }));
+    push(harness.translate(compactBoundary(27612, 3084, 54110), { threadId: THREAD_ID }));
+    push(harness.translate(compactBoundary(27804, 2968, 78946), { threadId: THREAD_ID }));
+
+    const errorAssistant = push(harness.translate(sdkMessage({
+      type: "assistant",
+      message: { id: "9b4f6e2e-breaker", role: "assistant", model: "&lt;synthetic&gt;",
+        content: [{ type: "text", text: BREAKER_TEXT }], stop_reason: "stop_sequence",
+        usage: { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 } },
+      error: "invalid_request", parent_tool_use_id: null, session_id: SESSION_ID, uuid: "assistant-breaker",
+    }), { threadId: THREAD_ID }));
+    const result = push(harness.translate(sdkMessage({
+      type: "result", subtype: "success", is_error: true,
+      duration_ms: 72_000, duration_api_ms: 60_000, num_turns: 9, result: BREAKER_TEXT, stop_reason: null, total_cost_usd: 0.5,
+      usage: { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 },
+      modelUsage: {}, permission_denials: [], session_id: SESSION_ID, uuid: "result-breaker",
+    }), { threadId: THREAD_ID }));
+
+    expect(ofType(all, "thread/compacted")).toHaveLength(3);
+    expect(errorAssistant.map((event) =&gt; event.type)).toContain("item/completed");
+    const providerErrors = ofType(result, "provider/error");
+    expect(providerErrors).toEqual([
+      expect.objectContaining({ type: "provider/error", message: "Provider error", detail: BREAKER_TEXT }),
+    ]);
+    // Documented gap: nothing tells the app this is a context-limit failure.
+    expect((providerErrors[0] as { errorInfo?: unknown }).errorInfo).toBeUndefined();
+    expect(result).toContainEqual(
+      expect.objectContaining({ type: "turn/completed", status: "failed", scope: expect.objectContaining({ turnId: TURN_1 }) }),
+    );
+  });
+});</pre>
+  <p>Repro files: <code>1939/repro/</code> (thread logs, parsed SDK messages, bridge deltas, stored events, redacted raw recordings, the CLI wrapper and doobie scripts used).</p>
+
+  <h2>5. Root cause</h2>
+  <h3>5.1 Where the message comes from: the Claude Code CLI's rapid-refill breaker</h3>
+  <p>Extracted from the <code>2.1.241</code> binary (<code>strings</code> on the Mach-O; identifiers are the bundle's minified names). The tracker is created after every successful auto-compaction and counts API round-trips since then:</p>
+<pre>// reset after each compaction; carries the consecutive-rapid-refill count forward
+function q2a(turnId, consecutiveRapidRefills) {
+  return { compacted: true, turnId, turnCounter: 0, consecutiveFailures: 0, consecutiveRapidRefills };
+}
+// "rapid refill" = another compaction is needed while fewer than 3 round-trips have run since the last one
+function l5S(e) { return e?.compacted === true &amp;&amp; e.turnCounter &lt; 3 ? (e?.consecutiveRapidRefills ?? 0) + 1 : 0; }
+function dyi(e) { const t = l5S(e); return { action: t &gt;= 3 ? "trip" : "proceed", consecutiveRapidRefills: t }; }
+var yNp = 3, W2a = "Autocompact is thrashing: the context refilled to the limit within 3 turns of the previous compact, 3 times in a row. A file being read or a tool output is likely too large for the context window. Try reading in smaller chunks, or use /clear to start fresh.";
+
+// in the autocompact decision (nSl):
+let d = dyi(o);
+if (d.action === "trip") { …log("autocompact: rapid-refill breaker tripped …"); return { kind: "rapid_refill_breaker_tripped" }; }
+
+// in the query loop, when autocompact reports the trip:
+if (We.kind === "rapid_refill_breaker_tripped") {
+  let xr = Jd({ content: W2a, error: "invalid_request", now: m.now, uuid: m.uuid });   // synthetic assistant API-error message
+  return yield xr, BWe(J, l, xr), { reason: "rapid_refill_breaker" };
+}
+// per round-trip: if (Ue?.compacted) Ue.turnCounter++;
+// per prompt:     y = { …, compactTracking: void 0, … }   ← the tracker starts empty on every new user prompt</pre>
+  <p>Consequences that matter for bb:</p>
+  <ul>
+    <li><strong>The unit is the API round-trip inside one prompt, not bb turns.</strong> "3 turns" in the message means three model calls. A prompt that compacts, then makes tool calls that immediately bring the context back to the threshold, compacts again, and does that three times, trips. The same reactive path (<code>if (oo || Kr) { let No = dyi(Ue); … }</code>) trips when the API itself returns prompt-too-long after compaction.</li>
+    <li><strong>The tracker is reset on every prompt</strong> (<code>compactTracking: void 0</code>), so the errored thread is not poisoned at the CLI level; a new prompt gets three fresh compactions. This matches the recovery experiment. It also means the user can hit the breaker again immediately if the task requires the same oversized content.</li>
+    <li>The CLI emits the trip as <code>assistant{error:"invalid_request"}</code> followed by <code>result{subtype:"success", is_error:true}</code>. The CLI's own UI maps reason <code>rapid_refill_breaker</code> to a <code>context_limit</code> category (<code>xyT</code>); that classification is not transmitted to SDK consumers.</li>
+    <li>Autocompaction itself is governed by: <code>autoCompactEnabled</code> (settings), window <code>CLAUDE_CODE_AUTO_COMPACT_WINDOW</code> / <code>--autocompact</code> / settings <code>autoCompactWindow</code>, and the test knobs <code>CLAUDE_AUTOCOMPACT_PCT_OVERRIDE</code> and <code>CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE</code>. With window source <code>auto</code> (the default, and what bb uses) threshold compaction is skipped in favor of reactive compaction; the breaker is reachable from both paths.</li>
+  </ul>
+
+  <h3>5.2 What bb does with it</h3>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-claude-code/src/delta-translation.ts#L418-L437"><code>delta-translation.ts#L418-L437</code></a>: <code>isClaudeResultFailure</code> returns true for <code>is_error === true</code> regardless of subtype; <code>getClaudeResultErrorDetail</code> returns <code>message.result</code> verbatim, which is the CLI text.</li>
+    <li><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-claude-code/src/delta-translation.ts#L1233-L1280"><code>delta-translation.ts#L1233-L1280</code></a>: the failed result emits <code>provider.error{message:"Provider error", detail}</code> and a <code>turn.boundary{status:"failed"}</code>. The thread's status becomes <code>error</code> (the "Worked for 1m 12s / Provider error" rows in the screenshot).</li>
+    <li><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-claude-code/src/error-info.ts#L116-L139"><code>error-info.ts#L116-L139</code></a>: <code>buildClaudeProviderErrorInfo({ httpStatusCode: null, resultSubtype: "success" })</code> returns <code>null</code>: subtype <code>success</code> maps to category <code>unknown</code>, there is no HTTP status, and the <code>invalid_request</code> code on the preceding synthetic assistant message is not consulted on the result path. So the event has no <code>errorInfo</code>, even though bb already has a <code>context-window-exceeded</code> category (<code>packages/domain/src/provider-event.ts</code>, used by the Codex bridge at <code>plugins/provider-codex/src/delta-translation.ts#L329</code>).</li>
+    <li><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-claude-code/src/delta-translation.ts#L800-L812"><code>delta-translation.ts#L800-L812</code></a>: every <code>compact_boundary</code> becomes a <code>context.compacted</code> delta (three stored <code>thread/compacted</code> events here), but <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/threads/timeline.ts#L1174-L1179"><code>timeline.ts#L1174-L1179</code></a> keys the compaction banner by turn id on purpose, so the timeline shows one banner per turn. In this thread the nested rows were: <em>compaction, echo one … echo five, assistant text</em>: one banner, placed before the first command, for three compactions that happened after the second, third and fourth commands. The user cannot see the thrash happening.</li>
+    <li><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-claude-code/server.ts#L65-L74"><code>server.ts#L65-L74</code></a>: capabilities advertise <code>supportsManualCompaction: true</code>; there is no context-clear capability for Claude Code, so the CLI's advice "use /clear to start fresh" has no bb equivalent other than a new thread or a fork.</li>
+    <li><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/threads/thread-send.ts#L177-L203"><code>thread-send.ts#L177-L203</code></a>: <code>resolveSendMode</code> rejects <code>steer</code> (the CLI's default for <code>bb thread tell</code>) on an errored thread with "Thread is not active"; <code>auto</code> starts a new turn. The web composer uses a mode that works ("Retry by sending a follow-up message"); the CLI default does not.</li>
+    <li>Env propagation, relevant for the repro and for users who want to tune autocompaction: <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-claude-code/src/bridge/bridge.ts#L1551-L1560"><code>bridge.ts#L1551-L1560</code></a> copies the bridge's <code>process.env</code> plus per-session <code>envVars</code> into the CLI; <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-claude-code/src/bridge/session-options.ts#L291-L324"><code>session-options.ts#L291-L324</code></a> picks the PATH <code>claude</code> over the SDK's bundled binary, so the host's installed CLI version decides whether the breaker exists and how it behaves.</li>
+  </ul>
+
+  <h3>5.3 What refilled the reporter's context (the underlying issue)</h3>
+  <p>Unknown; the issue has no session. The CLI's own diagnosis in the message is the likely one: a tool result or file read that is a large fraction of the effective window, which Claude Code re-reads (or re-attaches, since compaction restores recently read files) right after each compaction. Things I ruled out or measured on bb's side in this run: bb appended 0 characters of instructions (<code>instructionMode: "append"</code>, <code>baseInstructions: ""</code>) and one MCP tool (<code>mcp__bb-bridge__update_environment_directory</code>); the 23,059-token fixed prefix was Claude Code's system prompt plus the host user's 41 tools (including five <code>claude.ai</code> MCP servers), 77 slash commands, 44 skills and 15 agents. bb does not inject per-turn content that grows with the thread. A larger fixed prefix lowers the usable window and makes refills more likely, but on its own it cannot cause three refills within three calls unless it is near the window, and the CLI logs a separate "fixed prefix &gt; threshold — compaction cannot help" warning for that case.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>bb cannot stop the CLI from tripping; the CLI is protecting the user from a loop that would burn API calls. What bb can fix is how it classifies and recovers from the trip. In order of value:</p>
+  <ol>
+    <li><strong>Classify it as a context-window failure</strong> (<code>plugins/provider-claude-code/src/delta-translation.ts</code>, <code>translateResultMessage</code>; <code>error-info.ts</code>). Remember the last synthetic assistant error code in the per-thread dialect state when an <code>assistant</code> message carries <code>error</code> (the schema already parses <code>ClaudeAssistantMessageError</code>), and pass it as <code>code</code> to <code>buildClaudeProviderErrorInfo</code> on the next failed result. Add a dedicated mapping: when the result/assistant text is the breaker message (or, more robustly, when the assistant error is <code>invalid_request</code> with model <code>&lt;synthetic&gt;</code> and the text starts with "Autocompact is thrashing"), emit <code>errorInfo: { category: "context-window-exceeded", providerCode: "rapid_refill_breaker", httpStatusCode: null }</code>. The CLI also reports the API's real prompt-too-long as <code>invalid_request</code>; map that to the same category. Risk: text matching is brittle across CLI versions; keep the code-based classification as the primary signal and the text match as the refinement. Add the replay test above with the new expectation (it fails today on <code>errorInfo</code>).</li>
+    <li><strong>Give the user the recovery the CLI asks for.</strong> The CLI text says "use /clear". The Agent SDK has no clear command, but the bridge already has a session-replacement path (<code>emitSessionReplacement</code>, <code>contextLost: true</code>) used for resume fallback. A <code>thread/context/clear</code> for Claude Code can be implemented as: stop the live session, start a new CLI session (new <code>sessionId</code>) bound to the same bb thread, emit <code>context.cleared</code>. That keeps bb history and drops the provider context. This is a new capability flag (<code>supportsContextClear</code>) on the provider contract and needs a <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump if the wire shape changes. Short of that, the error row for <code>context-window-exceeded</code> should offer "Compact" (manual compaction works and does not trip, section 4 step 7) and "Fork a new thread from here".</li>
+    <li><strong>Show the thrash.</strong> <code>timeline.ts</code> intentionally renders one compaction banner per turn; for a turn with N compactions show "Context compacted ×N" (count the <code>thread/compacted</code> events under the turn) so the user can see the loop before the breaker trips. Low risk: the row id stays turn-keyed, only the label changes.</li>
+    <li><strong>CLI ergonomics.</strong> <code>bb thread tell</code> defaults to <code>--mode steer</code>, which 409s on errored threads even though the web composer recovers them. Default to <code>auto</code>, or special-case <code>error</code> to start a turn. Document in the CLI guide.</li>
+    <li><strong>Mitigation users can apply today</strong> (for the issue reply): keep tool outputs small (pipe to <code>head</code>, read files in chunks), remove unused MCP servers from <code>~/.claude</code> to shrink the fixed prefix, send a follow-up to the errored thread (it works), or <code>/compact</code> before the context gets large. Setting <code>autoCompactEnabled: false</code> avoids the breaker but then the API's prompt-too-long error ends the turn instead.</li>
+  </ol>
+
+  <h2>7. PR review</h2>
+  <p>No open pull requests are linked to this issue; nothing on <code>origin/main</code> after <code>494f66526</code> touches <code>plugins/provider-claude-code</code>.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/2224">#2224</a> Claude Code provider: unknown <code>sdk/system</code> subtypes fall into <code>assertNever</code>; same translator, same class of "CLI emits something bb has no mapping for".</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1408">#1408</a> (closed) hard rate-limit rejection deferred onto the result: the pattern to reuse for carrying the synthetic assistant error code onto the result's <code>errorInfo</code>.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1721">#1721</a>, <a href="https://github.com/get-bb/bb/issues/1807">#1807</a> (closed) Pi compaction refusal surfaced as a failed turn; the compaction-warning path those fixes added is a model for a non-fatal "compaction skipped" surface.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/2290">#2290</a> <code>compactThread</code> returns 409 for acp-omp; related to which providers expose compaction/clear affordances.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/2160">#2160</a> Pi keeps the previous model until <code>/compact</code>; another case where compaction is the only in-thread recovery knob.</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>9.1 Claude Code changelog entry (upstream)</h3>
+<pre>## 2.1.89
+- Fixed autocompact thrash loop — now detects when context refills to the limit immediately after compacting three times in a row and stops with an actionable error instead of burning API calls</pre>
+  <h3>9.2 Threshold math in the CLI (for the override values used)</h3>
+<pre>function cyi(window, opts) { let r = window - 13000, n = opts.testPctOverride;
+  if (n !== undefined &amp;&amp; !isNaN(n) &amp;&amp; n &gt; 0 &amp;&amp; n &lt;= 100) return Math.min(Math.floor(window * (n / 100)), r); return r; }
+function _V(model, settingWindow) { … if (process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW) { … return { window: Math.min(modelWindow, c), configured: c, source: "env" }; } … }
+function Xqe(model, window) { return _V(model, window).source !== "auto"; }
+async function Y4T(messages, model, window, …) { … if (!mO()) return false; if (Jve() &amp;&amp; !Xqe(model, window)) return false; … return level === "compact" || level === "blocked"; }</pre>
+  <h3>9.3 Stored events for thr_q2h7z2q9e6 (non-delta types)</h3>
+<pre>1 client/turn/requested · 2 client/thread/start · 3 thread/identity · 4 turn/started · 5 turn/input/accepted
+6–16 item/started,item/completed (echo one, echo two and their results)
+17 thread/compacted · 18–21 items (echo three) · 22 thread/compacted · 23–26 items (echo four) · 27 thread/compacted · 28–30 items (echo five, breaker text as assistant message)
+31 thread/contextWindowUsage/updated · 32 thread/tokenUsage/updated · 33 provider/error "Provider error" · 34 turn/completed failed</pre>
+  <p>Exact sequence: <code>events-thr_q2h7z2q9e6.ndjson</code>. After the follow-up: <code>thread/compacted</code> once, assistant "ok", <code>turn/completed completed</code>; <code>GET /api/v1/threads/thr_q2h7z2q9e6</code> → <code>status: "idle"</code>.</p>
+  <h3>9.4 Commands run (in order)</h3>
+<pre>git checkout 494f66526 &amp;&amp; pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build
+strings ~/.local/share/claude/versions/2.1.241 | grep -o ".{1500}Autocompact is thrashing.{800}"     # plus follow-up greps for l5S/dyi/q2a/compactTracking/_V/cyi/Y4T
+CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=1 BB_PROVIDER_BRIDGE_RECORD_DIR=/tmp/bb-1939-recordings scripts/bb-dev-app current   # run 1 (control)
+curl -s -X POST http://localhost:25648/api/v1/projects … /tmp/bb-1939-qa …
+bb thread spawn … four echo commands … → thr_7rzwcqg9m8 → "done", no compaction
+CLAUDE_CODE_AUTO_COMPACT_WINDOW=100k CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=1 BB_PROVIDER_BRIDGE_RECORD_DIR=/tmp/bb-1939-recordings scripts/bb-dev-app current   # run 2
+bb thread spawn … six echo commands … → thr_q2h7z2q9e6 → status error (breaker)
+curl http://localhost:25648/api/v1/threads/thr_q2h7z2q9e6{,/timeline,/timeline?includeNestedRows=true,/events}
+doobie --headless &lt; shot-error-state.js
+bb thread tell thr_q2h7z2q9e6 "Reply only with: ok"            → HTTP 409 Thread is not active
+bb thread tell thr_q2h7z2q9e6 "Reply only with: ok" --mode auto → idle, "ok"
+doobie --headless &lt; shot-recovered.js
+bb thread compact thr_7rzwcqg9m8 → manual compact_boundary, success
+pnpm exec vitest run src/delta-translation.autocompact-breaker.test.ts   (plugins/provider-claude-code) → 1 passed
+node scripts/provider-recordings/redact.mjs /tmp/bb-1939-recordings /tmp/bb-reports/issues/1939/repro/recordings-redacted
+pnpm dev:stop; doobie stop; rm -rf data dir and /tmp scratch; lsof -nP -iTCP -sTCP:LISTEN | grep -E ':(17648|25648|33648) '</pre>
+  <h3>9.5 Notes on evidence quality</h3>
+  <ul>
+    <li>The trigger was forced with the CLI's documented-in-code test overrides. The breaker code path, the SDK message shapes, and bb's handling are exactly what a user sees; only the threshold that made the prefix count as "the limit" was artificial. I did not burn three full-window compactions on a real 1M-context session.</li>
+    <li><code>bb provider list</code> (read-only) was the only command run against the user's real bb; everything else targeted the dev instance on ports 17648/25648/33648, which is now stopped and its data dir deleted.</li>
+    <li>The <code>claude.ai</code> MCP server names in the redacted recordings belong to the host user's own Claude configuration, not to bb.</li>
+  </ul>
+</main></body></html>

@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1303 opening a thread fires ~19 API requests, including per-open environment git probes</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.med { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .verdict { font-weight:600; }
+  .v-repro { color:var(--ok); }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:4px; }
+  .shots { display:flex; gap:16px; flex-wrap:wrap; } .shots figure { flex:1 1 260px; margin:0; } .shots img { max-height:560px; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1303 · Opening a thread fires ~19 API requests, including per-open environment git probes</h1>
+  <p class="meta">
+    <span class="pill">Perf</span> <span class="pill med">Medium</span> <span class="pill">Effort: Medium</span>
+    <span class="pill">perf</span>
+    <a href="https://github.com/get-bb/bb/issues/1303">open on GitHub</a>
+    <span>2026-08-18</span>
+    <span>base <code>16ceb3a540f81c1189efaffb27a39b1d9443abf5</code> (main)</span>
+  </p>
+  <p class="meta">
+    <span class="verdict v-repro">Verdict: REPRODUCED</span>
+    <span>· root-cause confidence: <b>high</b></span>
+    <span>· linked open PRs: none (two earlier attempts, #1470 and #1481, were closed unmerged)</span>
+  </p>
+
+  <h2>TL;DR</h2>
+  <p><b>Plain-language framing.</b> The bb web app is a single-page app: when you tap a thread in the sidebar it does not reload the page, it mounts the thread screen (<code>ThreadDetailView</code>) and every React hook on that screen that needs server data fires its own <code>GET /api/v1/…</code> request. Two of those hooks ask the server for the <em>workspace git status</em> and the <em>GitHub pull request</em> of the thread's environment. The server forwards both to the host daemon, which runs <code>git status</code>/<code>git diff</code>/… and <code>gh pr view</code> on the worktree, every single time, with no cache anywhere.</p>
+  <p><b>What I measured on main (16ceb3a54), mobile viewport 390×844, tapping a thread in the sidebar:</b> 12–15 distinct <code>/api/v1/</code> URLs (20–21 requests fired, half of them immediately aborted by React StrictMode in dev), in three dependent tiers: (1) ten thread-scoped reads fired at once, (2) <code>environments/:id/status</code> and <code>environments/:id/pull-request</code> once the thread's <code>environmentId</code> is known, (3) a second <code>status</code> refetch a few hundred ms later. With 300 ms of emulated RTT the first timeline text appears at +876 ms instead of +271 ms and the view settles at +1.7 s. The status probe costs 70–260 ms of git work per open; the pull-request probe costs <b>1.1–1.6 s of GitHub API network</b> per open on any repo with a GitHub remote (60 ms only when there is no remote, because <code>gh</code> fails immediately). The status query is configured with <code>staleTime: 0</code> + <code>refetchOnMount: "always"</code> and the PR query with <code>refetchOnMount: true</code> + <code>refetchOnWindowFocus: "always"</code>, so both re-probe on every open and the PR one additionally on every tab/app foreground.</p>
+  <p>The issue's core claims hold. Its framing that the waterfall "serializes into seconds" is only partly right: the ten thread reads are issued in parallel (they queue behind the browser's 6-connections-per-origin limit on HTTP/1.1, so at 300 ms RTT they complete in two ~300 ms batches), the real serialization is the thread → environment → status/PR dependency plus the uncached git/<code>gh</code> work behind those two endpoints.</p>
+
+  <h2>Claims vs findings</h2>
+  <table>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Opening one thread at mobile width issues ~19 requests (StrictMode duplicates excluded)</td><td class="ok">Verified (order of magnitude)</td><td>Sidebar tap: 12 distinct URLs / 20 fired (<code>count-requests.out</code>, <code>waterfall-0ms.out</code>). Cold page load of a thread URL: 15 distinct thread-scoped URLs plus shell requests (<code>cold-load-requests.out</code>). Exact count depends on which panels/tabs the thread has; the closed PR #1481 measured 14 distinct resources / 20 requests on the seed DB.</td></tr>
+    <tr><td>Requests include thread, timeline, tabs, interactions, queued-messages, prompt-history, default-execution-options, thread-storage listing, fork + parent child-thread lists, environment status, environment pull-request</td><td class="ok">Verified</td><td>All twelve appear verbatim in the request lists below, plus <code>system/execution-options</code> (another host RPC, 230–410 ms) and <code>plugins/contributions</code>.</td></tr>
+    <tr><td>Each response is small and fast locally (mostly &lt;60 ms)</td><td class="ok">Verified</td><td>DB-backed reads: 4–26 ms each. Exceptions: <code>system/execution-options</code> 232–409 ms, <code>environments/:id/status</code> 72–256 ms, <code>environments/:id/pull-request</code> 60 ms (no remote) / 1.1–1.6 s (GitHub remote).</td></tr>
+    <tr><td>On mobile RTTs of 100–300 ms the waterfall serializes into seconds</td><td class="unv">Partially verified</td><td>With 300 ms emulated RTT: first timeline text +876 ms (vs +271 ms), settle +1.74 s. Most thread reads are parallel (bounded by 6 HTTP/1.1 connections); the dependent tiers are thread → env status/PR → status refetch. Seconds are reached mainly through the uncached <code>gh</code> lookup and higher RTTs (the reporter's 529 ms TTFB comment).</td></tr>
+    <tr><td><code>environments/:id/status</code> and <code>environments/:id/pull-request</code> each took ~200 ms on a warm local daemon</td><td class="ok">Verified / understated</td><td>status: 197–256 ms first probe, 48–72 ms warm (<code>time-env-endpoints.out</code>). pull-request: 1.1–1.6 s with a GitHub remote (<code>…-with-remote.out</code>).</td></tr>
+    <tr><td>They run git (and PR lookup) work on every thread open, including idle threads whose worktree hasn't changed</td><td class="ok">Verified</td><td>No cache in the daemon (<code>Workspace.getStatus</code> spawns 4–5 git processes; <code>getPullRequest</code> spawns <code>git</code> + <code>gh pr view</code>), and the app query policies force a refetch on every mount (Root cause).</td></tr>
+    <tr><td>Comment: reproduces on a small (~4k DOM nodes) instance; taps cost 3–15 s over a Cloudflare tunnel with 529 ms TTFB</td><td class="unv">Unverifiable here</td><td>Consistent with the mechanism: 3 dependent tiers × 529 ms + a 1–1.5 s <code>gh</code> round trip ≈ 3 s before the view settles. Not measured on a real device.</td></tr>
+  </table>
+
+  <h2>Environment</h2>
+  <ul>
+    <li>bb <code>16ceb3a54</code> (main, 2026-08-18), worktree <code>/home/USER/projects/bb/.claude/worktrees/wf_242c3e11-a10-23</code>; dev instance app <code>:12873</code>, server <code>:20873</code>, daemon <code>:28873</code>, data dir <code>/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_242c3e11-a10-23-669a8211a96b</code> (dev mode: Vite dev server, React StrictMode on, HTTP/1.1 same-origin proxy to the server).</li>
+    <li>Linux 7.0.0-29-generic, node v24.18.0, codex-cli 0.147.0 (provider <code>codex</code>, one turn "Reply only with ok."), <code>gh</code> authenticated.</li>
+    <li>Project <code>proj_4r7awx3ed2</code> → local path <code>/tmp/1303-qa</code> (1-commit git repo; a <code>github.com/get-bb/bb</code> remote was added for the pull-request timing). Thread <code>thr_thnzrmgehr</code>, environment <code>env_iaxcfu77hf</code>.</li>
+    <li>Browser: Playwright 1.58.2 (bundled with the global <code>dev-browser</code> CLI) driving headless Chromium 1208, viewport 390×844, <code>isMobile</code>, DPR 2. Network emulation via CDP <code>Network.emulateNetworkConditions</code>.</li>
+  </ul>
+
+  <h2>Minimal reproduction</h2>
+  <ol>
+    <li>Build and start a dev instance: <code>pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build &amp;&amp; scripts/bb-dev-app current</code>. Note the App and Server URLs.</li>
+    <li>Create a scratch repo and a project, then spawn one thread so it gets an environment (host id from <code>curl $BB_SERVER_URL/api/v1/hosts</code>):
+<pre>mkdir -p /tmp/1303-qa &amp;&amp; echo hi &gt; /tmp/1303-qa/README.md &amp;&amp; git -C /tmp/1303-qa init -q -b main &amp;&amp; git -C /tmp/1303-qa add . &amp;&amp; git -C /tmp/1303-qa -c user.email=a@b -c user.name=qa commit -qm init
+git -C /tmp/1303-qa remote add origin https://github.com/get-bb/bb.git      # any GitHub remote; makes `gh pr view` do a real API call
+curl -s -X POST $BB_SERVER_URL/api/v1/projects -H 'content-type: application/json' \
+  -d '{"name":"qa","source":{"type":"local_path","path":"/tmp/1303-qa","hostId":"host_pjs6fmc5mh"}}'          # -&gt; proj_4r7awx3ed2
+node packages/scripts/dist/commands/run-cli.js thread spawn --project proj_4r7awx3ed2 --machine host_pjs6fmc5mh \
+  --provider codex --permission-mode accept-edits --title "1303 target" --prompt "Reply only with ok." --json  # -&gt; thr_thnzrmgehr
+curl -s $BB_SERVER_URL/api/v1/threads/thr_thnzrmgehr | jq '{status, environmentId}'                            # idle, env_iaxcfu77hf</pre></li>
+    <li>Time the two environment probes directly (<code>1303/repro/1303-time-env-endpoints.sh</code>):
+<pre>$ BB_SERVER_URL=http://localhost:20873 1303/repro/1303-time-env-endpoints.sh env_iaxcfu77hf 3     # with the GitHub remote
+status        0.049825s http=200
+pull-request  1.180093s http=200
+thread-like   0.001020s http=200 (GET /environments/:id, DB only, for comparison)
+status        0.049921s http=200
+pull-request  1.441495s http=200
+thread-like   0.001025s http=200 (GET /environments/:id, DB only, for comparison)
+status        0.048440s http=200
+pull-request  1.102594s http=200
+thread-like   0.000929s http=200 (GET /environments/:id, DB only, for comparison)
+--- status body:
+{"outcome":"available","workspace":{"workingTree":{"insertions":0,"deletions":0,"lineStatsComplete":true,"files":[],"hasUncommittedChanges":false,"state":"clean"},"checkout":{"kind":"branch","branchName":"main","headSha":"806582ec55704c8eff902c79ce4b0f3b7a6a8ae3"},"branch":{"currentBranch":"main","defaultBranch":"main"},"mergeBase":null}}
+--- pull-request body:
+{"outcome":"absent"}</pre>
+    Same repo before the remote was added (<code>out</code>): <code>pull-request 0.063s</code>, body <code>{"outcome":"unavailable","message":"gh pr view failed: no git remotes found"}</code>. <b>Expected:</b> a read of an idle, unchanged worktree should be cheap and cacheable. <b>Actual:</b> every call spawns git and <code>gh</code>; with a GitHub remote each call is a 1.1–1.4 s GitHub API round trip.</li>
+    <li>Count the requests a sidebar tap fires at mobile width (<code>1303/repro/1303-waterfall.mjs</code>; the sandboxed <code>dev-browser</code> variant <code>1303-count-requests.js</code> / <code>1303-run-count.sh</code> gives the same list without throttling). Output (<code>waterfall-0ms.out</code>):
+<pre>$ APP=http://localhost:12873 PROJECT=proj_4r7awx3ed2 THREAD=thr_thnzrmgehr THREAD_TITLE="1303 target" LATENCY_MS=0 node 1303/repro/1303-waterfall.mjs
+emulation: none; viewport 390x844 mobile
+
+=== thread open: 21 /api/v1/ requests fired (12 distinct URLs; 13 completed, rest aborted by dev StrictMode) ===
+first timeline text visible at +271ms; last response at +1464ms
+start     latency  status
++  149ms      6ms  aborted  GET /api/v1/threads/thr_thnzrmgehr/default-execution-options
++  149ms      6ms  aborted  GET /api/v1/threads/thr_thnzrmgehr/queued-messages
++  149ms      6ms  aborted  GET /api/v1/threads/thr_thnzrmgehr/prompt-history?
++  149ms      6ms  aborted  GET /api/v1/system/execution-options?environmentId=env_iaxcfu77hf&amp;providerId=codex
++  150ms      5ms  aborted  GET /api/v1/threads?projectId=proj_4r7awx3ed2&amp;sourceThreadId=thr_thnzrmgehr&amp;originKind=fork&amp;archived=false
++  150ms      4ms  aborted  GET /api/v1/threads/thr_thnzrmgehr/tabs
++  150ms      4ms      200  GET /api/v1/threads/thr_thnzrmgehr?include=environment%2Chost
++  150ms      4ms      200  GET /api/v1/threads/thr_thnzrmgehr/interactions
++  150ms      4ms  aborted  GET /api/v1/threads/thr_thnzrmgehr/thread-storage/files?limit=1000
++  150ms      5ms  aborted  GET /api/v1/threads/thr_thnzrmgehr/timeline?
++  150ms      7ms      200  GET /api/v1/threads/thr_thnzrmgehr/default-execution-options
++  150ms      7ms      200  GET /api/v1/threads/thr_thnzrmgehr/queued-messages
++  150ms      7ms      200  GET /api/v1/threads/thr_thnzrmgehr/prompt-history?
++  150ms    232ms      200  GET /api/v1/system/execution-options?environmentId=env_iaxcfu77hf&amp;providerId=codex
++  150ms      7ms      200  GET /api/v1/threads?projectId=proj_4r7awx3ed2&amp;sourceThreadId=thr_thnzrmgehr&amp;originKind=fork&amp;archived=false
++  150ms      7ms      200  GET /api/v1/threads/thr_thnzrmgehr/tabs
++  150ms      7ms      200  GET /api/v1/threads/thr_thnzrmgehr/thread-storage/files?limit=1000
++  150ms      7ms      200  GET /api/v1/threads/thr_thnzrmgehr/timeline?
++  228ms    197ms      200  GET /api/v1/environments/env_iaxcfu77hf/status?mergeBaseBranch=main
++  229ms   1235ms      200  GET /api/v1/environments/env_iaxcfu77hf/pull-request
++  695ms     72ms      200  GET /api/v1/environments/env_iaxcfu77hf/status?mergeBaseBranch=main</pre>
+    <b>Expected:</b> a thread open needs a handful of DB reads. <b>Actual:</b> 12 distinct URLs; the environment <code>status</code> probe runs twice per open and the <code>pull-request</code> probe holds the "settled" point at +1.46 s. Cold page load of the thread URL adds <code>threads?parentThreadId=…</code> and <code>timeline?afterSequence=…</code> (15 distinct thread-scoped URLs; <code>cold-load-requests.out</code>).</li>
+    <li>Same tap with 300 ms RTT / 1.6 Mbps emulated (<code>waterfall-300ms.out</code>):
+<pre>$ … LATENCY_MS=300 node 1303/repro/1303-waterfall.mjs
+emulation: latency=300ms down=1.6Mbps up=750kbps; viewport 390x844 mobile
+
+=== thread open: 21 /api/v1/ requests fired (12 distinct URLs; 13 completed, rest aborted by dev StrictMode) ===
+first timeline text visible at +876ms; last response at +1740ms
+start     latency  status
++  156ms    312ms      200  GET /api/v1/threads/thr_thnzrmgehr?include=environment%2Chost
++  156ms    336ms      200  GET /api/v1/threads/thr_thnzrmgehr/interactions
++  156ms    619ms      200  GET /api/v1/threads/thr_thnzrmgehr/default-execution-options      &lt;- 2nd batch: waited for a free connection
++  156ms    627ms      200  GET /api/v1/threads/thr_thnzrmgehr/queued-messages
++  157ms    633ms      200  GET /api/v1/threads/thr_thnzrmgehr/prompt-history?
++  157ms    725ms      200  GET /api/v1/system/execution-options?environmentId=env_iaxcfu77hf&amp;providerId=codex
++  157ms    386ms      200  GET /api/v1/threads?projectId=proj_4r7awx3ed2&amp;sourceThreadId=thr_thnzrmgehr&amp;originKind=fork&amp;archived=false
++  157ms    335ms      200  GET /api/v1/threads/thr_thnzrmgehr/tabs
++  157ms    386ms      200  GET /api/v1/threads/thr_thnzrmgehr/thread-storage/files?limit=1000
++  157ms    335ms      200  GET /api/v1/threads/thr_thnzrmgehr/timeline?
++  482ms    327ms      200  GET /api/v1/environments/env_iaxcfu77hf/status?mergeBaseBranch=main   &lt;- tier 2: needs environmentId
++  483ms   1257ms      200  GET /api/v1/environments/env_iaxcfu77hf/pull-request
++  993ms    304ms      200  GET /api/v1/environments/env_iaxcfu77hf/status?mergeBaseBranch=main   &lt;- tier 3: refetch</pre>
+    (aborted StrictMode duplicates elided.) Time to first timeline text triples (271 → 876 ms) and settle is dominated by the tiered probes.</li>
+  </ol>
+  <div class="shots">
+    <figure><img src="assets/1303-before-sidebar-mobile.png" alt="sidebar drawer open at mobile width before the tap"><figcaption>Before: project page at 390×844 with the sidebar drawer open; the "1303 target" row is what the script taps.</figcaption></figure>
+    <figure><img src="assets/1303-thread-open-mobile.png" alt="thread view after the tap"><figcaption>After the tap (no throttling): the thread view. Nothing on this screen shows git status or a pull request, yet both probes were fired.</figcaption></figure>
+    <figure><img src="assets/1303-thread-open-throttled-300ms.png" alt="thread view after the tap with 300ms RTT emulation"><figcaption>Same tap with 300 ms RTT emulation, captured after settle (+1.74 s); first timeline text appeared at +876 ms.</figcaption></figure>
+  </div>
+
+  <h2>Root cause</h2>
+  <p><b>1. Every data need on the thread screen is its own query, and none of it is deferred.</b> <code>ThreadDetailView</code> mounts, in the same render, hooks for the thread (+environment/host), timeline, interactions, queued messages, prompt history, default execution options, system execution options, tabs, thread-storage listing (<code>limit=1000</code>), fork children (<code>originKind=fork</code>), parent children (<code>parentThreadId</code>), environment work status and environment pull request. The child-thread subset query, for example, is enabled as soon as the thread is loaded regardless of whether the child section is visible (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/views/thread-detail/ThreadDetailView.tsx#L801-L811">ThreadDetailView.tsx#L801-L811</a>); the storage listing feeds a secondary panel that is closed on mobile (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/views/thread-detail/ThreadDetailView.tsx#L645-L682">#L645-L682</a>). Nothing distinguishes "needed for first paint" from "needed when a panel opens".</p>
+  <p><b>2. The two environment probes are configured to refetch on every mount, and the server/daemon do no caching.</b> App side (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/hooks/queries/environment-queries.ts#L103-L140">environment-queries.ts#L103-L140</a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/hooks/queries/environment-queries.ts#L176-L205">#L179-L206</a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/hooks/queries/query-policies.ts#L60-L63">query-policies.ts#L60-L63</a>):</p>
+  <pre>// useEnvironmentWorkStatus
+    ...REALTIME_OWNED_MOUNT_BASELINE_QUERY_POLICY,   // = { refetchOnMount: "always", refetchOnWindowFocus: false }
+    staleTime: 0,
+// useEnvironmentPullRequest
+    refetchOnMount: true,
+    refetchOnWindowFocus: "always",
+    staleTime: (query) =&gt; getEnvironmentPullRequestStaleTime(...)   // 30 s while open/absent, 1 h when merged/closed</pre>
+  <p>Both hooks are called unconditionally by <code>ThreadDetailView</code> as soon as <code>environment.isGitRepo</code> is known (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/views/thread-detail/ThreadDetailView.tsx#L1732-L1753">ThreadDetailView.tsx#L1732-L1753</a>). Server side, <code>GET /environments/:id/status</code> and <code>/pull-request</code> are thin pass-throughs to host RPCs <code>workspace.status</code> and <code>workspace.pull_request</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/routes/environments.ts#L322-L380">routes/environments.ts#L322-L380</a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/environments/workspace-status.ts#L25-L55">workspace-status.ts#L25-L55</a>). Daemon side, <code>Workspace.getStatus</code> spawns <code>git status</code>, a numstat, checkout-ref, default-branch and (optionally) merge-base reads on every call (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/host-workspace/src/workspace.ts#L717-L771">workspace.ts#L717-L771</a>), and <code>getPullRequest</code> runs <code>git</code> + <code>gh pr view --json …</code>, i.e. a GitHub API round trip (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/host-workspace/src/workspace.ts#L680-L696">workspace.ts#L680-L696</a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/host-workspace/src/git-host.ts#L626-L660">git-host.ts#L626-L660</a>). No layer memoizes the result, even though the daemon already runs a fingerprint watcher that knows when a workspace's status or refs changed (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/watch-manager.ts#L365-L415">watch-manager.ts#L365-L415</a> emits <code>work-status-changed</code> / <code>git-refs-changed</code>).</p>
+  <p><b>Why the symptom follows.</b> On each thread open the app fires ~10 parallel reads (tier 1), then, once the thread payload delivers <code>environmentId</code>, the two probes (tier 2, each a server→daemon→child-process chain; the PR one goes to github.com), then a status refetch (tier 3, observed at +695 ms unthrottled and +993 ms throttled — the realtime-subscription baseline / merge-base re-key). Each tier costs at least one RTT and tier 2 costs the git/<code>gh</code> time on top. On a phone with 300–500 ms RTT this is 1.5–3 s before the view settles, on a thread whose worktree has not changed. The <code>refetchOnWindowFocus: "always"</code> on the PR query means backgrounding and foregrounding the phone re-runs the 1–1.5 s <code>gh</code> lookup as well.</p>
+  <p><b>Deeper issue.</b> Two previous fixes (<a href="https://github.com/get-bb/bb/pull/1470">#1470</a>: daemon-side 5 s status cache + defer storage listing; <a href="https://github.com/get-bb/bb/pull/1481">#1481</a>: coalesce mount-time reads, defer tabs/fork/storage) were closed unmerged on 2026-08-13 "to step back and inventory the thread-open request graph". Nothing landed since; <code>git log 16ceb3a54..origin/main</code> touches none of these files. The team explicitly rejected re-creating an aggregate bootstrap (the old <code>composer-bootstrap</code> was removed in #335 because it became a readiness gate), so the issue's first suggestion is contested.</p>
+
+  <h2>Proposed fix (first principles)</h2>
+  <ol>
+    <li><b>Cache workspace status in the daemon, invalidated by the existing watcher.</b> In <code>WatchManager</code>/<code>command-dispatch.ts</code> keep a per-environment <code>{ key(mergeBaseBranch, budgets) → WorkspaceStatus }</code> memo, cleared when the watcher emits <code>work-status-changed</code>/<code>git-refs-changed</code> for that environment and after daemon-owned mutations (commit, checkout, pull, PR actions), plus a short TTL (5 s) as a safety net; coalesce concurrent identical calls. Daemon-internal, no wire change, no <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump. Risk: staleness right after an external <code>git</code> command in a terminal — bounded by the watcher latency + TTL. #1470's branch already had this and can be mined.</li>
+    <li><b>Stop probing GitHub on every open.</b> Change <code>useEnvironmentPullRequest</code> to <code>refetchOnMount: false</code> and drop <code>refetchOnWindowFocus: "always"</code> (the query is realtime-owned via <code>useEnvironmentDetailRealtimeSubscription</code>; the 30 s/1 h staleTime already exists), and have the server refresh PR state on <code>git-refs-changed</code> rather than content-only events. Also add a daemon-side memo of the last <code>gh pr view</code> result per branch (TTL 30–60 s, invalidated on refs change) so a fresh mount from another device is still cheap. App-only + daemon-only changes; no protocol bump. What could go wrong: a PR opened from a terminal outside bb shows up to one refresh cycle late.</li>
+    <li><b>Defer surfaces that are not visible.</b> Gate <code>useEnvironmentWorkStatus</code>/<code>useEnvironmentPullRequest</code>, the storage listing, tabs, and the fork/parent child-thread lists on the surface that renders them being open (secondary panel, thread details drawer, header pill on desktop only). On mobile none of these are visible on first paint (screenshot above). This is what #1481 did for tabs/fork/storage.</li>
+    <li>Optional: make <code>useEnvironmentWorkStatus</code> use <code>refetchOnMount: true</code> + a small staleTime instead of <code>"always"</code>/<code>0</code>, and find why it fires twice per open (the +695 ms refetch); the second probe is pure waste.</li>
+  </ol>
+  <p>Any of 1–3 alone removes most of the per-open git/<code>gh</code> cost; together they cut the open graph from 12–15 to roughly 6 requests (thread, timeline, interactions, queued messages, default execution options, prompt history) with no cross-package contract change. I would not add an aggregate bootstrap endpoint given #335/#1470's history.</p>
+
+  <h2>PR review</h2>
+  <p>No open PRs are linked to this issue. Two closed, unmerged attempts exist for context: <a href="https://github.com/get-bb/bb/pull/1470">#1470</a> "Reduce the thread-open request waterfall" and <a href="https://github.com/get-bb/bb/pull/1481">#1481</a> "Reduce thread-open request fanout" (both closed 2026-08-13 by the author while re-inventorying the request graph). Neither was reviewed here.</p>
+
+  <h2>Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/1302">#1302</a>: sidebar-bootstrap ships 138 KB and refetches wholesale on thread status changes (the "sidebar open takes seconds" half of the comment).</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1301">#1301</a>: thread timeline never unmounts history (22k DOM nodes).</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1304">#1304</a>: composer keystroke cost scales with mounted timeline size.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1616">#1616</a>: iOS Safari performance audit (20 findings).</li>
+    <li><a href="https://github.com/get-bb/bb/pull/1300">#1300</a>: <code>pnpm seed:perf</code> (the fixture the issue was found with).</li>
+    <li><a href="https://github.com/get-bb/bb/pull/1470">#1470</a>, <a href="https://github.com/get-bb/bb/pull/1481">#1481</a>: closed fix attempts.</li>
+  </ul>
+
+  <h2>Appendix</h2>
+  <h3>Commands run</h3>
+  <pre>git checkout 16ceb3a54
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+scripts/bb-dev-app current                                   # app :12873, server :20873, daemon :28873
+mkdir -p /tmp/1303-qa; echo hi &gt; /tmp/1303-qa/README.md; git -C /tmp/1303-qa init -q -b main; git -C /tmp/1303-qa add README.md
+git -C /tmp/1303-qa -c user.email=a@b -c user.name=qa commit -qm init
+curl -s http://localhost:20873/api/v1/hosts                  # host_pjs6fmc5mh
+curl -s -X POST http://localhost:20873/api/v1/projects -H 'content-type: application/json' \
+  -d '{"name":"qa","source":{"type":"local_path","path":"/tmp/1303-qa","hostId":"host_pjs6fmc5mh"}}'   # proj_4r7awx3ed2
+node packages/scripts/dist/commands/run-cli.js thread spawn --project proj_4r7awx3ed2 --machine host_pjs6fmc5mh \
+  --provider codex --permission-mode accept-edits --title "1303 target" --prompt "Reply only with ok." --json  # thr_thnzrmgehr
+BB_SERVER_URL=http://localhost:20873 1303/repro/1303-time-env-endpoints.sh env_iaxcfu77hf 3 &gt; 1303/repro/1303-time-env-endpoints.out
+git -C /tmp/1303-qa remote add origin https://github.com/get-bb/bb.git
+BB_SERVER_URL=http://localhost:20873 1303/repro/1303-time-env-endpoints.sh env_iaxcfu77hf 3 &gt; 1303/repro/1303-time-env-endpoints-with-remote.out
+dev-browser --headless --timeout 60 run 1303/repro/1303-probe.js &gt; 1303/repro/1303-cold-load-requests.out    # cold page load of the thread URL
+APP=http://localhost:12873 PROJECT=proj_4r7awx3ed2 THREAD=thr_thnzrmgehr THREAD_TITLE="1303 target" 1303/repro/1303-run-count.sh &gt; 1303/repro/1303-count-requests.out
+APP=… PROJECT=… THREAD=… THREAD_TITLE="1303 target" LATENCY_MS=0   node 1303/repro/1303-waterfall.mjs &gt; 1303/repro/1303-waterfall-0ms.out
+APP=… PROJECT=… THREAD=… THREAD_TITLE="1303 target" LATENCY_MS=300 SCREENSHOT=assets/1303-thread-open-throttled-300ms.png node 1303/repro/1303-waterfall.mjs &gt; 1303/repro/1303-waterfall-300ms.out
+pnpm dev:stop</pre>
+  <h3>Sidebar-tap run in the sandboxed dev-browser (warm second round)</h3>
+  <p>From <code>count-requests.out</code>: round 2 (react-query caches warm from round 1, 20 s later) still fires 10 distinct URLs including <code>environments/:id/status</code>; only <code>pull-request</code> was skipped because it was inside its 30 s staleTime.</p>
+  <pre>=== round 2: tap thread "1303 target" (thr_thnzrmgehr) in sidebar: 18 /api/v1/ requests (10 distinct URLs; dev StrictMode double-fires); last response at +285ms ===
++  152ms     21ms  200  GET /api/v1/threads/thr_thnzrmgehr/default-execution-options
++  152ms     21ms  200  GET /api/v1/threads/thr_thnzrmgehr/queued-messages
++  152ms     24ms  200  GET /api/v1/threads/thr_thnzrmgehr
++  152ms     25ms  200  GET /api/v1/threads/thr_thnzrmgehr/interactions
++  155ms     22ms  200  GET /api/v1/threads/thr_thnzrmgehr/tabs
++  155ms     24ms  200  GET /api/v1/threads/thr_thnzrmgehr/thread-storage/files?limit=1000
++  155ms     22ms  200  GET /api/v1/threads?projectId=proj_4r7awx3ed2&amp;archived=false
++  155ms     22ms  200  GET /api/v1/threads/thr_thnzrmgehr/timeline?afterSequence=18
++  156ms     21ms  200  GET /api/v1/environments/env_iaxcfu77hf
++  156ms    129ms  200  GET /api/v1/environments/env_iaxcfu77hf/status?mergeBaseBranch=main</pre>
+  <h3>Cold page load of the thread URL: distinct <code>/api/v1/</code> URLs (plugin asset fetches excluded)</h3>
+  <pre>GET /api/v1/system/config, /system/version, /sidebar-bootstrap, /hosts, /plugins, /plugins/contributions, /hosts/:id/provider-clis/status, POST /hosts/:id/paths/exist   # shell
+GET /api/v1/threads/thr_thnzrmgehr?include=environment%2Chost
+GET /api/v1/threads/thr_thnzrmgehr/timeline?
+GET /api/v1/threads/thr_thnzrmgehr/timeline?afterSequence=18
+GET /api/v1/threads/thr_thnzrmgehr/interactions
+GET /api/v1/threads/thr_thnzrmgehr/default-execution-options
+GET /api/v1/threads/thr_thnzrmgehr/queued-messages
+GET /api/v1/threads/thr_thnzrmgehr/prompt-history?
+GET /api/v1/system/execution-options?environmentId=env_iaxcfu77hf&amp;providerId=codex
+GET /api/v1/threads?projectId=proj_4r7awx3ed2&amp;sourceThreadId=thr_thnzrmgehr&amp;originKind=fork&amp;archived=false
+GET /api/v1/threads?projectId=proj_4r7awx3ed2&amp;parentThreadId=thr_thnzrmgehr&amp;archived=false
+GET /api/v1/threads/thr_thnzrmgehr/tabs
+GET /api/v1/threads/thr_thnzrmgehr/thread-storage/files?limit=1000
+GET /api/v1/environments/env_iaxcfu77hf/status?mergeBaseBranch=main      (x3)
+GET /api/v1/environments/env_iaxcfu77hf/pull-request</pre>
+  <h3>Notes on method</h3>
+  <ul>
+    <li>Dev mode double-fires every query (React StrictMode) and immediately aborts the first copy; counts above report distinct URLs and completed requests separately. A production build fires each once.</li>
+    <li>The Vite dev app proxies <code>/api</code> to the server over HTTP/1.1, so the browser's 6-connection limit shapes the parallel batch; behind a Cloudflare tunnel (HTTP/2) the batch is not connection-limited but the tiering and the git/<code>gh</code> cost are identical.</li>
+    <li>The dev-browser sandbox does not support <code>page.route</code>/CDP sessions, hence the plain-node Playwright script for the throttled run.</li>
+  </ul>
+</main></body>
+</html>

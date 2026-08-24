@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1647 deleting a worktree environment leaves its processes running</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-repro { color:var(--high); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  .sev-high { color:var(--high); font-weight:600; } .sev-med { color:var(--warn); font-weight:600; } .sev-low { color:var(--muted); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1647 · Deleting a worktree environment leaves its processes running</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill high">High (proposed)</span> <span class="pill">Effort: Medium (proposed)</span>
+    <span class="pill">workspaces</span>
+    <a href="https://github.com/get-bb/bb/issues/1647">open on GitHub</a>
+    <span>2026-08-18</span>
+    <span>base <code>16ceb3a540f81c1189efaffb27a39b1d9443abf5</code> (main)</span>
+  </p>
+  <p class="meta">
+    <span class="verdict v-repro">Verdict: REPRODUCED</span>
+    <span>· root-cause confidence: <b>high</b></span>
+    <span>· linked open PRs: <a href="https://github.com/get-bb/bb/pull/1696">#1696</a> (verdict: REQUEST CHANGES, minor)</span>
+  </p>
+  <p class="meta"><i>Issue Type in GitHub is <code>Bug</code>; the issue has no Priority/Effort project fields set, so the pills above are my proposal.</i></p>
+
+  <h2>TL;DR</h2>
+  <p>When bb destroys a managed worktree environment (delete the last thread, or archive it and wait out the 5-minute grace window), the host daemon does three things: shuts down the runtime, closes the environment's terminals, and runs <code>git worktree remove --force</code>. The shutdown step signals only the <em>direct</em> children the daemon spawned: the provider bridge process gets <code>SIGTERM</code> (then <code>SIGKILL</code> after 5&nbsp;s) and each terminal pty gets <code>SIGHUP</code>. Nothing bb does reaches anything those children started that detached from them — a <code>nohup … &amp;</code> dev server from an agent's Bash tool, a background job in a bb terminal, an MCP server left over when the bridge is force-killed. Those survive with a working directory that no longer exists (<code>/proc/&lt;pid&gt;/cwd → "… (deleted)"</code>) and nothing ever reaps them.</p>
+  <p>I reproduced this on Linux with the current main in two independent ways: (A) a claude-code thread that ran <code>nohup sleep 3000 &amp;</code> via its Bash tool — after the thread was deleted and the environment reported <code>destroyed</code>, the <code>sleep</code> was still alive with a <code>(deleted)</code> cwd; (C) a bb terminal in the environment running <code>nohup python3 -m http.server 18647 &amp;</code> — after destroy the server still answered HTTP on the port from a deleted directory. A unit test at the exact code path (<code>RuntimeProviderProcessManager.shutdown()</code>) fails on main and passes on PR #1696. Note that in the common happy path the provider CLI itself <em>is</em> cleaned up (bridge handles SIGTERM gracefully and takes claude with it), so the 12h-old <code>claude</code> in the duplicate report requires the force-kill path or a daemon restart, which I could not provoke deterministically.</p>
+  <p>PR #1696 fixes the root cause on the daemon side (spawn provider CLIs and setup scripts as process-group leaders and signal the group; sweep and kill every process whose cwd is inside the managed workspace before removing it) and its tests pass. My live retest on the PR branch shows all three leaked processes reaped. I still recommend REQUEST CHANGES for a few small things: the sweep also kills processes bb never started (I demonstrated a "user shell" rooted in the worktree being SIGTERM/SIGKILLed), the whole-group SIGTERM bypasses the bridge's graceful shutdown ordering, and the PR description is stale about ACP agents.</p>
+
+  <h2>Claims vs findings</h2>
+  <table>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Deleting a worktree environment removes the directory but does not kill processes started inside it</td><td class="ok">Verified</td><td>Repro A and C below; <code>destroyEnvironment</code> only calls <code>runtime.shutdown()</code> (SIGTERM to the bridge pid) and <code>workspace.destroy()</code>; terminals get <code>pty.kill()</code> (SIGHUP to the shell pid). No sweep, no group signal (Root cause).</td></tr>
+    <tr><td>Survivors have a cwd that no longer exists and nothing reaps them</td><td class="ok">Verified</td><td><code>/proc/1490762/cwd → …/env_i9cqm9wn4t/1647-qa (deleted)</code>; still alive minutes later until I killed it. There is no reaper in the daemon (<code>grep -rn cwd apps/host-daemon/src</code> finds no sweep on main).</td></tr>
+    <tr><td>Reproduction: dev server started in the env keeps running after delete</td><td class="ok">Verified</td><td>Repro C: <code>python3 -m http.server 18647</code> from a bb terminal survives destroy and still answers (<code>HTTP 404</code> because its root dir is gone).</td></tr>
+    <tr><td>40 environments / 190 processes / 1.75&nbsp;GB RSS / swap 94% on macOS</td><td class="unv">Unverifiable</td><td>Reporter's machine; mechanism consistent with what I reproduced. macOS uses the same daemon code path (no platform branch in <code>destroyEnvironment</code>).</td></tr>
+    <tr><td>A <code>claude</code> provider process alive 12h46m after destroy (#1769)</td><td class="unv">Plausible, not reproduced</td><td>In my runs (idle and mid-turn) the claude-code bridge handled SIGTERM gracefully and <code>claude</code> exited with it. It would survive when the bridge is <code>SIGKILL</code>ed after the 5&nbsp;s deadline (only the bridge pid is killed; <code>claude</code> is a grandchild), or when the daemon that spawned it restarted before destroy (a re-attached daemon has no handle to the old bridge at all). Both are real code paths on main; I did not provoke them live.</td></tr>
+    <tr><td>Suggested fix: kill the process group on teardown</td><td class="unv">Partially sufficient</td><td>Group signalling covers same-group grandchildren (my unit repro) but not new-session processes (<code>nohup</code>/<code>setsid</code>, claude-code's Bash tool children — those were <em>not</em> in the bridge's group in my PR-branch run and were only caught by the cwd sweep, see PR daemon log).</td></tr>
+  </table>
+
+  <h2>Environment</h2>
+  <ul>
+    <li>bb <code>16ceb3a54</code> (main, 2026-08-18); own dev instance from this worktree: app <code>:11440</code>, server <code>:19440</code>, host daemon <code>:27440</code>, data dir <code>/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183</code></li>
+    <li>Linux 7.0.0-29-generic, node v24.18.0, Claude Code 2.1.234 (provider <code>claude-code</code>), codex-cli 0.147.0 (unused)</li>
+    <li>Project <code>proj_ymakza7kkq</code> (local path <code>/tmp/1647-qa</code>, host <code>host_cfsw4qq4t3</code>)</li>
+    <li>CLI wrapper: <code>1647/repro/1647-bb.sh</code>; process lister: <code>1647/repro/1647-procs.sh</code> (prints pid, ppid, cwd, cmdline for every process whose cwd is at/under a directory, including <code>(deleted)</code>)</li>
+    <li>PR #1696 tested at head <code>b3f6d2e7d</code> (fetched via <code>refs/pull/1696/head</code>).</li>
+  </ul>
+
+  <h2>Minimal reproduction</h2>
+  <p>Precondition: dev instance up (<code>scripts/bb-dev-app current</code>), project created with the curl from the brief. All commands use the wrapper <code>/tmp/1647-bb.sh</code>.</p>
+
+  <h3>A. Agent-started background process survives environment destroy (main)</h3>
+  <pre>$ /tmp/1647-bb.sh thread spawn --project proj_ymakza7kkq --new-environment worktree \
+    --provider claude-code --permission-mode full --title "1647 repro" \
+    --prompt 'Run exactly this shell command with your Bash tool: nohup sleep 3000 >/dev/null 2>&amp;1 &amp; disown ; then reply only with ok.' --json
+# → thr_4z7cwus4xh, environment env_i9cqm9wn4t,
+#   path /home/USER/.bb-dev/…/worktrees/env_i9cqm9wn4t/1647-qa
+# wait until `thread show` reports "status": "idle"
+
+$ /tmp/1647-procs.sh /home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_i9cqm9wn4t/1647-qa
+1489631	ppid=1472667	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_i9cqm9wn4t/1647-qa	/home/USER/.nvm/versions/node/v24.18.0/bin/node --conditions=source --import file:///home/USER/projects/bb
+1489910	ppid=1489631	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_i9cqm9wn4t/1647-qa	/home/USER/.local/bin/claude --output-format stream-json --verbose --input-format stream-json --thinking ada
+1490762	ppid=1	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_i9cqm9wn4t/1647-qa	sleep 3000 
+# ↑ bridge (node, direct child of the daemon 1472667), claude (grandchild), and the
+#   agent's `sleep 3000` already reparented to pid 1 (ppid=1).
+
+$ curl -s -X DELETE http://localhost:19440/api/v1/threads/thr_4z7cwus4xh \
+    -H 'content-type: application/json' -d '{"childThreadsConfirmed":true}'
+{"ok":true}
+$ sleep 8; ls -d …/env_i9cqm9wn4t/1647-qa
+ls: cannot access '…/env_i9cqm9wn4t/1647-qa': No such file or directory
+$ /tmp/1647-bb.sh environment show env_i9cqm9wn4t --json | grep -E '"status"|"path"'
+  "path": null,
+  "status": "destroyed",
+
+$ /tmp/1647-procs.sh /home/USER/.bb-dev/…/worktrees/env_i9cqm9wn4t/1647-qa
+1490762	ppid=1	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_i9cqm9wn4t/1647-qa (deleted)	sleep 3000 </pre>
+  <p><b>Expected</b>: after the environment is <code>destroyed</code>, no process is rooted in its directory. <b>Actual</b>: bridge and claude are gone, but the agent-started <code>sleep 3000</code> is alive with cwd <code>… (deleted)</code>. Raw files: <code>before</code>, <code>after</code>, <code>thread log</code>.</p>
+
+  <h3>C. Terminal-started dev server survives (main)</h3>
+  <pre>$ /tmp/1647-bb.sh thread spawn --project proj_ymakza7kkq --new-environment worktree --provider claude-code \
+    --permission-mode full --title "1647 repro C" --prompt 'Reply only with ok.' --json      # → thr_zrtk56q3s2 / env_cbjteb28gn
+$ /tmp/1647-bb.sh terminal create --environment env_cbjteb28gn --json                        # → term_gsuk92nuzi
+$ /tmp/1647-bb.sh terminal send term_gsuk92nuzi --text 'nohup python3 -m http.server 18647 >/tmp/1647-httpserver.log 2>&amp;1 &amp;' --enter
+$ /tmp/1647-procs.sh …/worktrees/env_cbjteb28gn/1647-qa
+1553763	ppid=1472667	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_cbjteb28gn/1647-qa	/home/USER/.nvm/versions/node/v24.18.0/bin/node --conditions=source --import file:///home/USER/projects/bb
+1554056	ppid=1553763	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_cbjteb28gn/1647-qa	/home/USER/.local/bin/claude --output-format stream-json --verbose --input-format stream-json --thinking ada
+1558312	ppid=1472667	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_cbjteb28gn/1647-qa	/bin/bash 
+1562990	ppid=1558312	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_cbjteb28gn/1647-qa	python3 -m http.server 18647 
+$ curl -s -o /dev/null -w '%{http_code}\n' http://localhost:18647/
+200
+$ curl -s -X DELETE http://localhost:19440/api/v1/threads/thr_zrtk56q3s2 -H 'content-type: application/json' -d '{"childThreadsConfirmed":true}'
+Tue Aug 18 05:22:18 AM UTC 2026
+{&quot;ok&quot;:true}
+--- t+3s env status:   &quot;status&quot;: &quot;destroyed&quot;,
+1562990	ppid=1	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_cbjteb28gn/1647-qa (deleted)	python3 -m http.server 18647 
+--- t+6s env status:   &quot;status&quot;: &quot;destroyed&quot;,
+1562990	ppid=1	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_cbjteb28gn/1647-qa (deleted)	python3 -m http.server 18647 
+--- t+9s env status:   &quot;status&quot;: &quot;destroyed&quot;,
+1562990	ppid=1	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_cbjteb28gn/1647-qa (deleted)	python3 -m http.server 18647 
+--- t+12s env status:   &quot;status&quot;: &quot;destroyed&quot;,
+1562990	ppid=1	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_cbjteb28gn/1647-qa (deleted)	python3 -m http.server 18647 
+--- t+15s env status:   &quot;status&quot;: &quot;destroyed&quot;,
+1562990	ppid=1	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_cbjteb28gn/1647-qa (deleted)	python3 -m http.server 18647 
+http.server still answering on :18647 -&gt; HTTP 404</pre>
+  <p><b>Expected</b>: the dev server dies with its environment. <b>Actual</b>: the bb terminal shell (bash 1558312) died from the pty <code>SIGHUP</code>, but the <code>nohup</code>'d server keeps serving from a deleted directory. Files: <code>before</code>, <code>after</code>.</p>
+
+  <h3>B. Control: mid-turn foreground work is cleaned up (main)</h3>
+  <p>Deleting a thread while claude was running <code>sleep 90</code> in its Bash tool (a foreground child) left nothing behind: the bridge shut down gracefully, claude killed its own tool subprocess. So the leak is specifically about processes that detach from the provider tree (or survive a force-kill of it). Files: <code>before</code>, <code>after</code>.</p>
+
+  <h3>Unit-level repro at the exact code path</h3>
+  <p>File: <code>1647/repro/repro-1647-orphaned-grandchildren.test.ts</code>. Drop it into <code>packages/agent-runtime/src/</code> and run <code>cd packages/agent-runtime &amp;&amp; pnpm exec vitest run src/repro-1647-orphaned-grandchildren.test.ts</code>. It starts a fake provider whose launcher backgrounds a <code>sleep</code> (stand-in for <code>next dev</code>) with cwd = workspace, then calls <code>RuntimeProviderProcessManager.shutdown()</code> — exactly what <code>RuntimeManager.destroyEnvironment</code> does before <code>workspace.destroy()</code>. <b>On main it FAILS</b> at line 140 (<code>expect(isAlive(grandchildPid)).toBe(false)</code>): the provider is dead, the grandchild is alive with cwd <code>(deleted)</code>. <b>On PR #1696 it passes</b> (the provider is a group leader and the group gets the signal).</p>
+  <pre>
+ RUN  v4.1.1 /home/USER/projects/bb/.claude/worktrees/wf_debcf606-e4a-9/packages/agent-runtime
+
+stdout | src/repro-1647-orphaned-grandchildren.test.ts &gt; #1647 provider shutdown leaves grandchildren running &gt; kills the grandchild a provider process started in the workspace
+provider pid 1734117 alive=false; grandchild pid 1734118 alive=true cwd=/tmp/bb-1647-ws-mPfixq (deleted)
+
+ ❯  @bb/agent-runtime  src/repro-1647-orphaned-grandchildren.test.ts (1 test | 1 failed) 39ms
+     × kills the grandchild a provider process started in the workspace 38ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL   @bb/agent-runtime  src/repro-1647-orphaned-grandchildren.test.ts &gt; #1647 provider shutdown leaves grandchildren running &gt; kills the grandchild a provider process started in the workspace
+AssertionError: expected true to be false // Object.is equality
+
+- Expected
++ Received
+
+- false
++ true
+
+ ❯ src/repro-1647-orphaned-grandchildren.test.ts:140:36
+    138|         `grandchild pid ${grandchildPid} alive=${isAlive(grandchildPid…
+    139|     );
+    140|     expect(isAlive(grandchildPid)).toBe(false);
+       |                                    ^
+    141|   });
+    142| });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed (1)
+   Start at  05:33:54
+   Duration  835ms (transform 437ms, setup 0ms, import 709ms, tests 39ms, environment 0ms)</pre>
+  <pre>/**
+ * Repro for get-bb/bb#1647: RuntimeProviderProcessManager.shutdown() only
+ * signals the direct provider child. A grandchild the provider started
+ * (dev server, MCP server, background job) survives with its cwd pointing at
+ * the workspace that destroyEnvironment is about to delete.
+ *
+ * Expected on main: FAILS at `expect(isAlive(grandchildPid)).toBe(false)`.
+ */
+import { readlinkSync, mkdtempSync, rmSync } from &quot;node:fs&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { afterEach, describe, expect, it, vi } from &quot;vitest&quot;;
+import { RuntimeProviderProcessManager } from &quot;./runtime-provider-process.js&quot;;
+import { RuntimeThreadIdentityRegistry } from &quot;./runtime-thread-identity.js&quot;;
+import { buildNodeScriptArgs } from &quot;./test/fake-adapter.js&quot;;
+import { fakeProviderScriptPath } from &quot;./test/index.js&quot;;
+import { createFakeAdapter } from &quot;./test/runtime-test-harness.js&quot;;
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitFor(
+  check: () =&gt; boolean,
+  timeoutMs = 8000,
+): Promise&lt;boolean&gt; {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() &gt; deadline) return false;
+    await new Promise((r) =&gt; setTimeout(r, 25));
+  }
+  return true;
+}
+
+describe(&quot;#1647 provider shutdown leaves grandchildren running&quot;, () =&gt; {
+  const cleanupPids: number[] = [];
+  afterEach(() =&gt; {
+    for (const pid of cleanupPids) {
+      try {
+        process.kill(pid, &quot;SIGKILL&quot;);
+      } catch {
+        // gone
+      }
+    }
+  });
+
+  it(&quot;kills the grandchild a provider process started in the workspace&quot;, { timeout: 30_000 }, async () =&gt; {
+    const workspacePath = mkdtempSync(join(tmpdir(), &quot;bb-1647-ws-&quot;));
+    const stderr: string[] = [];
+    const identityRegistry = new RuntimeThreadIdentityRegistry();
+    let nextRequestId = 1;
+    const base = createFakeAdapter(fakeProviderScriptPath);
+    // Provider = `sh` that backgrounds a `sleep` (stand-in for `next dev`),
+    // reports its pid on stderr, then execs the real fake provider script.
+    const adapter: typeof base = {
+      ...base,
+      process: {
+        command: &quot;sh&quot;,
+        args: [
+          &quot;-c&quot;,
+          &#x27;sleep 300 &amp; echo &quot;grandchild=$!&quot; &gt;&amp;2; exec node &quot;$@&quot;&#x27;,
+          &quot;sh&quot;,
+          ...buildNodeScriptArgs(fakeProviderScriptPath),
+        ],
+      },
+      buildCommandPlan(command) {
+        if (command.type === &quot;initialize&quot;) {
+          return { kind: &quot;noop&quot;, reason: &quot;spawn only&quot; };
+        }
+        return base.buildCommandPlan(command);
+      },
+    };
+    const manager = new RuntimeProviderProcessManager({
+      additionalWorkspaceWriteRoots: [],
+      adapterFactory: () =&gt; adapter,
+      bridgeBundleDir: undefined,
+      captureThreadExitState: (threadId) =&gt; ({
+        activeTurnId: null,
+        pendingTurnStart: false,
+        providerThreadId: null,
+        threadId,
+      }),
+      createProviderIdentityState: (providerId) =&gt;
+        identityRegistry.createProviderState({ providerId }),
+      env: {},
+      getNextRequestId: () =&gt; nextRequestId++,
+      handleStdoutLine: () =&gt; undefined,
+      onProcessExit: vi.fn(),
+      onProviderIdentityWaitersInterrupted: (p) =&gt;
+        identityRegistry.resolvePendingIdentityWaiters(p.identity),
+      onProviderThreadDetached: (threadId) =&gt;
+        identityRegistry.clearThread(threadId),
+      onStderr: (line) =&gt; stderr.push(line),
+      skillRoots: [],
+      workspacePath,
+    });
+
+    await manager.ensureProvider({ processKey: &quot;fake&quot;, providerId: &quot;fake&quot; });
+
+    const providerPid =
+      manager.requireProviderProcess({
+        processKey: &quot;fake&quot;,
+        providerId: &quot;fake&quot;,
+      }).child.pid ?? 0;
+    cleanupPids.push(providerPid);
+
+    expect(
+      await waitFor(() =&gt; stderr.join(&quot;&quot;).includes(&quot;grandchild=&quot;)),
+    ).toBe(true);
+    const grandchildPid = Number(
+      /grandchild=(\d+)/.exec(stderr.join(&quot;&quot;))?.[1] ?? 0,
+    );
+    cleanupPids.push(grandchildPid);
+    expect(isAlive(grandchildPid)).toBe(true);
+    if (process.platform === &quot;linux&quot;) {
+      expect(readlinkSync(`/proc/${grandchildPid}/cwd`)).toBe(workspacePath);
+    }
+
+    // This is exactly what RuntimeManager.destroyEnvironment does before
+    // `workspace.destroy()` removes the directory.
+    await manager.shutdown();
+    expect(await waitFor(() =&gt; !isAlive(providerPid))).toBe(true);
+
+    // The workspace is now removed by destroyEnvironment; the grandchild keeps
+    // running with a cwd of &quot;&lt;workspace&gt; (deleted)&quot;.
+    rmSync(workspacePath, { recursive: true, force: true });
+    const grandchildCwd =
+      process.platform === &quot;linux&quot; &amp;&amp; isAlive(grandchildPid)
+        ? readlinkSync(`/proc/${grandchildPid}/cwd`)
+        : &quot;(process gone)&quot;;
+    console.log(
+      `provider pid ${providerPid} alive=${isAlive(providerPid)}; ` +
+        `grandchild pid ${grandchildPid} alive=${isAlive(grandchildPid)} cwd=${grandchildCwd}`,
+    );
+    expect(isAlive(grandchildPid)).toBe(false);
+  });
+});</pre>
+
+  <h2>Root cause</h2>
+  <p>Environment destroy is a daemon RPC (<code>environment.destroy</code>) dispatched by the server once the last live thread is gone (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/environments/environment-cleanup-internal.ts#L263-L283">environment-cleanup-internal.ts#L263-L283</a>). The daemon handler closes terminals then destroys the runtime entry (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/command-dispatch.ts#L551-L573">command-dispatch.ts#L551-L573</a>):</p>
+  <pre>// apps/host-daemon/src/runtime-manager.ts#L1117-L1131
+async destroyEnvironment(environmentId: string): Promise&lt;void&gt; {
+  …
+  this.entries.delete(environmentId);
+  await this.stopWatchingStatus(entry);
+  await entry.runtime.shutdown();      // ← only signals direct provider child pids
+  await entry.workspace.destroy();     // ← git worktree remove --force
+  await this.cleanupUnusedInjectedSkillStagingDirs([]);
+}</pre>
+  <p><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/runtime-manager.ts#L1117-L1131">runtime-manager.ts#L1117-L1131</a>. <code>runtime.shutdown()</code> ends in <code>RuntimeProviderProcessManager.shutdown()</code>, which does <code>child.kill("SIGTERM")</code> and, after 5&nbsp;s, <code>child.kill("SIGKILL")</code> on the direct child only (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/runtime-provider-process.ts#L432-L466">runtime-provider-process.ts#L432-L466</a>). The provider child is spawned without <code>detached</code>, i.e. in the daemon's own process group (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/runtime-provider-process.ts#L378-L384">#L378-L384</a>), so there is no group to signal even if the code wanted to. Terminals are closed with <code>pty.kill()</code> = <code>SIGHUP</code> to the shell pid (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/terminals/terminal-manager.ts#L209-L213">terminal-manager.ts#L209-L213</a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/terminals/terminal-manager.ts#L766-L830">#L766-L830</a>); an interactive bash forwards SIGHUP to its jobs, but <code>nohup</code>/<code>disown</code>/<code>setsid</code> children ignore or never see it. Finally <code>workspace.destroy()</code> for a managed worktree is <code>removeWorktree({force:true})</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/host-workspace/src/provision.ts#L707-L730">provision.ts#L707-L730</a>) which happily deletes a directory that live processes still have as cwd.</p>
+  <p>Why the symptom follows: anything an agent or terminal user launches "in the background" (dev servers, watchers, <code>nohup</code> jobs; on the claude-code side its Bash tool children even run in their own process group, as my PR-branch run showed) is disconnected from the only pids bb signals. After the bridge and shell exit those processes reparent to pid 1, keep their cwd inode, and consume RAM/CPU indefinitely. Two further paths make even the provider CLI itself leak: (1) if the bridge does not exit within 5&nbsp;s it is <code>SIGKILL</code>ed and cannot tear down its own children (<code>claude</code>, MCP servers) — matches the "claude alive 12h" report; (2) after a daemon restart, re-attached environments (<code>reconnectManaged</code>) have no handle to previously spawned provider processes at all, so a later destroy signals nothing.</p>
+  <p><b>Deeper issue</b>: bb has no notion of process ownership per environment; it relies on the parent/child relationship of the specific pids it spawned. Related open issues #1363 (provider process lease ownership) and #1604 (idle providers never reclaimed for non-Codex providers) are the same gap seen from other angles.</p>
+
+  <h2>Proposed fix (first principles)</h2>
+  <p>Confident. Two layers, both host-daemon side (host-local primitive, correct per AGENTS.md; no wire change, no protocol bump):</p>
+  <ol>
+    <li><b>Own the tree structurally.</b> Spawn provider CLIs, setup scripts and command terminals as process-group leaders (<code>detached: true</code> on POSIX, no-op on Windows) and signal the group (<code>process.kill(-pid, sig)</code>) on shutdown, with the escalation timer keyed on "any group member alive" rather than "leader exited". Preferably SIGTERM the <em>leader</em> first (so the bridge's graceful <code>onSigterm</code> path still drives the CLI down cleanly) and group-signal only at the escalation step.</li>
+    <li><b>Sweep on destroy.</b> Right before <code>workspace.destroy()</code> for a <em>managed</em> workspace, list processes whose cwd is at/under the workspace path (Linux <code>/proc/*/cwd</code>, macOS <code>lsof -d cwd</code>), SIGTERM, wait a short grace, rescan, SIGKILL; log the reaped pids. This catches new-session processes and anything spawned by a previous daemon instance. Consider also running the sweep for <code>(deleted)</code> cwds under the worktrees root on daemon start, so machines that already leaked get cleaned up once.</li>
+  </ol>
+  <p>What could go wrong: the cwd sweep kills processes bb did not start (a user's own shell or editor terminal cd'd into the worktree) — acceptable for a directory that is about to be deleted, but it should be documented and logged; processes that <code>chdir</code> away (proper daemons) still escape and would need per-environment process tracking (cgroups/jobs) to catch. That is exactly the shape of PR #1696.</p>
+
+  <h2>PR review — #1696 "Kill processes left in a destroyed worktree environment"</h2>
+  <p>Head <code>b3f6d2e7d</code> (2 commits; commit 2 addressed the SlopCop review). Files: <code>packages/process-utils/src/index.ts</code> (+ new <code>supportsProcessGroups</code>, <code>killProcessGroup</code>, <code>isProcessGroupAlive</code>, <code>listProcessesWithCwdUnder</code>, <code>killProcessesWithCwdUnder</code>), <code>packages/agent-runtime/src/runtime-provider-process.ts</code> (spawn detached, group signals, keep SIGKILL timer while group alive), <code>packages/host-workspace/src/provisioning.ts</code> (setup script uses shared helper), <code>apps/host-daemon/src/terminals/terminal-manager.ts</code> (pty kill → group), <code>apps/host-daemon/src/runtime-manager.ts</code> (<code>killManagedWorkspaceProcesses</code> before <code>workspace.destroy()</code>), tests in <code>process-utils/test/process-tree.test.ts</code> and <code>runtime-manager.test.ts</code>.</p>
+  <p><b>Does it address the root cause?</b> Yes — it is the two-layer fix above and stays on the daemon side; no server/daemon wire change so no <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump is needed (verified: no contract files touched).</p>
+  <h3>Tests I ran</h3>
+  <ul>
+    <li><code>pnpm exec turbo run test --filter=@bb/process-utils --filter=@bb/agent-runtime --filter=@bb/host-workspace --filter=@bb/host-daemon --force</code>: process-utils 18/18, host-workspace 213/213, host-daemon 563/563, agent-runtime 953/953 passed (<code>log</code>).</li>
+    <li>My unit repro passes on the PR branch (fails on main).</li>
+    <li>Live retest on the PR branch (same repro A + C, plus a process bb did <em>not</em> start rooted in the worktree via <code>1647-user-shell.sh</code>):</li>
+  </ul>
+  <pre>$ /tmp/1647-procs.sh …/worktrees/env_ywfyfbzxqj/1647-qa        # before delete (PR build)
+1632470	ppid=1630562	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_ywfyfbzxqj/1647-qa	/home/USER/.nvm/versions/node/v24.18.0/bin/node --conditions=source --import file:///home/USER/projects/bb
+1632496	ppid=1632470	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_ywfyfbzxqj/1647-qa	/home/USER/.local/bin/claude --output-format stream-json --verbose --input-format stream-json --thinking ada
+1634653	ppid=1	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_ywfyfbzxqj/1647-qa	sleep 3000 
+1636730	ppid=1630562	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_ywfyfbzxqj/1647-qa	/bin/bash 
+1641293	ppid=1	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_ywfyfbzxqj/1647-qa	sleep 4000 
+1644289	ppid=1636730	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_ywfyfbzxqj/1647-qa	python3 -m http.server 18647 
+$ curl -s -X DELETE http://localhost:19440/api/v1/threads/thr_r7jf625hqm … ; sleep 3; /tmp/1647-procs.sh …
+Tue Aug 18 05:27:13 AM UTC 2026
+{&quot;ok&quot;:true}
+--- t+3s env status:   &quot;status&quot;: &quot;destroyed&quot;,
+--- t+6s env status:   &quot;status&quot;: &quot;destroyed&quot;,
+--- t+9s env status:   &quot;status&quot;: &quot;destroyed&quot;,
+--- t+12s env status:   &quot;status&quot;: &quot;destroyed&quot;,
+--- t+15s env status:   &quot;status&quot;: &quot;destroyed&quot;,
+--- t+18s env status:   &quot;status&quot;: &quot;destroyed&quot;,
+--- t+21s env status:   &quot;status&quot;: &quot;destroyed&quot;,
+--- t+24s env status:   &quot;status&quot;: &quot;destroyed&quot;,
+    PID CMD
+# daemon log:
+{&quot;level&quot;:20,&quot;time&quot;:1787029272947,&quot;component&quot;:&quot;host-daemon&quot;,&quot;serverUrl&quot;:&quot;http://127.0.0.1:19440&quot;,&quot;commandType&quot;:&quot;environment.destroy&quot;,&quot;handlerMs&quot;:5017.7,&quot;ok&quot;:true,&quot;msg&quot;:&quot;Online host RPC&quot;}
+{&quot;level&quot;:20,&quot;time&quot;:1787030436801,&quot;component&quot;:&quot;host-daemon&quot;,&quot;serverUrl&quot;:&quot;http://127.0.0.1:19440&quot;,&quot;commandType&quot;:&quot;environment.destroy&quot;,&quot;handlerMs&quot;:4049.4,&quot;ok&quot;:true,&quot;msg&quot;:&quot;Online host RPC&quot;}
+{&quot;level&quot;:40,&quot;time&quot;:1787030833845,&quot;component&quot;:&quot;host-daemon&quot;,&quot;serverUrl&quot;:&quot;http://127.0.0.1:19440&quot;,&quot;environmentId&quot;:&quot;env_ywfyfbzxqj&quot;,&quot;workspacePath&quot;:&quot;/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_ywfyfbzxqj/1647-qa&quot;,&quot;pids&quot;:[1634653,1641293,1644289],&quot;msg&quot;:&quot;Killed processes still running in a destroyed environment&quot;}</pre>
+  <p>All three background processes (agent's <code>sleep 3000</code>, terminal's <code>http.server</code>, and my non-bb <code>sleep 4000</code>) are gone; the environment reads <code>destroyed</code> 3&nbsp;s after delete. I also verified that <code>pnpm dev:stop</code> on the PR branch leaves no orphaned bridge/claude behind even though the bridge is now its own session leader (stdin close still drives the bridge's graceful exit). Files: <code>before</code>, <code>after</code>, <code>daemon log</code>.</p>
+  <h3>Findings</h3>
+  <table>
+    <tr><th>Sev</th><th>Where</th><th>Finding</th></tr>
+    <tr><td class="sev-med">medium</td><td><code>packages/process-utils/src/index.ts</code> <code>listProcessesWithCwdUnder</code> / <code>apps/host-daemon/src/runtime-manager.ts</code> <code>killManagedWorkspaceProcesses</code></td><td>The sweep is ownership-agnostic: it SIGTERM/SIGKILLs <em>any</em> user process whose cwd is inside the workspace, including ones bb never started (demonstrated: pid 1641293 above). A user's own terminal, an editor's integrated shell, or a debugger session sitting in the worktree gets killed when the environment is deleted. Probably acceptable since the directory is being removed, but it is a silent behavior change and should be stated in the PR/docs and the log line should be <code>info</code>-visible in the UI's environment lifecycle, not only daemon <code>warn</code>. Alternative: only SIGTERM (no SIGKILL) processes that are not descendants of pids bb spawned.</td></tr>
+    <tr><td class="sev-med">medium</td><td><code>packages/agent-runtime/src/runtime-provider-process.ts</code> <code>shutdown()</code> / <code>terminateProviderProcess()</code></td><td>The first signal is now <code>SIGTERM</code> to the whole group, so <code>claude</code>/<code>codex app-server</code> receive SIGTERM at the same instant as the bridge, racing the bridge's <code>onSigterm → closeThreadSessionsGracefully</code> path (which expects to drive the CLI down itself). Nothing broke in my runs, but a safer ordering is: SIGTERM the leader, then group-SIGTERM/SIGKILL on the existing 5&nbsp;s escalation. Same helper, one line each.</td></tr>
+    <tr><td class="sev-low">low</td><td><code>runtime-provider-process.ts</code> exit handlers</td><td>When the leader exits while a group member is still alive, the promise now resolves only at the timer (5&nbsp;s / <code>timeoutMs+1000</code>) even if the member dies 50&nbsp;ms later. Poll <code>isProcessGroupAlive</code> at a short interval instead of waiting for the hard timer, otherwise every idle-reap/provider swap that has any straggler costs 5–6&nbsp;s.</td></tr>
+    <tr><td class="sev-low">low</td><td><code>listLsofProcessCwds</code> (macOS)</td><td>Runs <code>lsof</code> over every host process up to 2× per round, up to 5 rounds per destroy, and once more per concurrent destroy. On a loaded Mac <code>lsof</code> can take seconds. Consider one scan restricted with <code>-u $(id -u)</code> and a shorter round limit; also <code>lsof</code> missing/erroring is silently treated as "no processes" — log it.</td></tr>
+    <tr><td class="sev-low">low</td><td><code>terminal-manager.ts</code> pty kill</td><td>Group-signalling the pty group is effectively a no-op for interactive shells (job control puts every job in its own pgrp; bash already re-sends SIGHUP to jobs) and only helps <code>--command</code> terminals. Fine to keep, but the comment overstates it ("background jobs die with the shell") — they die only via the cwd sweep, and only on environment destroy, not on plain terminal close.</td></tr>
+    <tr><td class="sev-low">low</td><td>PR description</td><td>Stale: says "ACP agents (<code>agent-connection.ts</code>) … spawn as process-group leaders" but commit 2 reverted that file (they now stay in the ACP bridge's group, which is the right call). Update the description.</td></tr>
+    <tr><td class="sev-low">low</td><td>Residual gap (not a defect of the PR)</td><td>Processes that <code>chdir</code> out of the workspace (daemonized servers) and processes leaked by environments destroyed while the daemon was offline (<code>destroy.lost</code>) or before this change are not covered. A one-time startup sweep of <code>(deleted)</code> cwds under the daemon's worktrees root would clean up existing machines like the reporter's.</td></tr>
+  </table>
+  <p>Cast/<code>unknown</code> smuggling: none. Security: the sweep root is always a bb-controlled managed path (worktree under the data dir, or a validated personal-workspace path), the symlink guard prevents redirecting the sweep, and the current daemon pid is excluded; PID-reuse window between scan and SIGTERM is tiny and was narrowed by the rescan-before-SIGKILL change.</p>
+  <p><b>Verdict: REQUEST CHANGES (minor)</b> — it fixes the root cause and I could not break it, but I want the leader-first signal ordering and an explicit call-out of the ownership-agnostic sweep before merge; the rest are nits.</p>
+
+  <h2>Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/1769">#1769</a> — duplicate with the macOS numbers (closed).</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1660">#1660</a> — 77&nbsp;GB RSS host; orphaned dev processes in deleted worktrees compound it.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1604">#1604</a> — idle agent processes never reclaimed for non-Codex providers (same "no ownership" gap; the PR's group kill also affects those reaps).</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1363">#1363</a> — provider processes need one host-daemon lease owner.</li>
+  </ul>
+
+  <h2>Appendix</h2>
+  <h3>Helper scripts</h3>
+  <pre>#!/bin/bash
+# List every process whose cwd is at or under $1 (Linux /proc). Prints pid, ppid, cwd, cmdline.
+dir=&quot;$1&quot;
+for p in /proc/[0-9]*; do
+  pid=${p#/proc/}
+  cwd=$(readlink &quot;$p/cwd&quot; 2&gt;/dev/null) || continue
+  case &quot;$cwd&quot; in
+    &quot;$dir&quot;|&quot;$dir/&quot;*|&quot;$dir (deleted)&quot;|&quot;$dir/&quot;*&quot; (deleted)&quot;)
+      ppid=$(awk &#x27;/^PPid:/{print $2}&#x27; &quot;$p/status&quot; 2&gt;/dev/null)
+      cmd=$(tr &#x27;\0&#x27; &#x27; &#x27; &lt; &quot;$p/cmdline&quot; 2&gt;/dev/null | cut -c1-110)
+      printf &#x27;%s\tppid=%s\t%s\t%s\n&#x27; &quot;$pid&quot; &quot;$ppid&quot; &quot;$cwd&quot; &quot;$cmd&quot;;;
+  esac
+done</pre>
+  <pre>#!/bin/bash
+# Simulates a process bb did NOT start (e.g. the user&#x27;s own terminal cd&#x27;d into
+# the worktree, or an editor process) whose cwd is the worktree directory.
+cd &quot;$1&quot; || exit 1
+setsid sleep 4000 &gt;/dev/null 2&gt;&amp;1 &lt; /dev/null &amp;
+echo &quot;user-shell-sleep pid $!&quot;</pre>
+  <h3>Mid-turn control (B)</h3>
+  <pre>ENV=env_xy4dyt63ue
+WS=/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_xy4dyt63ue/1647-qa
+1520263	ppid=1472667	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_xy4dyt63ue/1647-qa	/home/USER/.nvm/versions/node/v24.18.0/bin/node --conditions=source --import file:///home/USER/projects/bb
+1520286	ppid=1520263	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_xy4dyt63ue/1647-qa	/home/USER/.local/bin/claude --output-format stream-json --verbose --input-format stream-json --thinking ada
+1521383	ppid=1520286	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_xy4dyt63ue/1647-qa	/bin/bash -c source /home/USER/.claude/shell-snapshots/snapshot-bash-1787030410931-uknrz8.sh 2&gt;/dev/null || 
+1521415	ppid=1521383	/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-9-3d811fb8a183/worktrees/env_xy4dyt63ue/1647-qa	sleep 90 
+Tue Aug 18 05:20:32 AM UTC 2026
+{&quot;ok&quot;:true}
+--- t+3s env status:   &quot;status&quot;: &quot;destroying&quot;,
+--- t+6s env status:   &quot;status&quot;: &quot;destroyed&quot;,
+--- t+9s env status:   &quot;status&quot;: &quot;destroyed&quot;,
+--- t+12s env status:   &quot;status&quot;: &quot;destroyed&quot;,
+--- t+15s env status:   &quot;status&quot;: &quot;destroyed&quot;,
+--- t+18s env status:   &quot;status&quot;: &quot;destroyed&quot;,
+--- t+21s env status:   &quot;status&quot;: &quot;destroyed&quot;,
+--- t+24s env status:   &quot;status&quot;: &quot;destroyed&quot;,
+--- t+27s env status:   &quot;status&quot;: &quot;destroyed&quot;,
+--- t+30s env status:   &quot;status&quot;: &quot;destroyed&quot;,</pre>
+  <h3>Commands run (chronological)</h3>
+  <pre>pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+scripts/bb-dev-app current                                  # app :11440 server :19440 daemon :27440
+git init /tmp/1647-qa … ; curl -X POST $BB_SERVER_URL/api/v1/projects …   # proj_ymakza7kkq
+/tmp/1647-bb.sh thread spawn --new-environment worktree --provider claude-code … (A, B, C)
+/tmp/1647-procs.sh &lt;worktree path&gt;
+curl -X DELETE http://localhost:19440/api/v1/threads/&lt;id&gt; -d '{"childThreadsConfirmed":true}'
+/tmp/1647-bb.sh environment show &lt;env&gt; --json
+/tmp/1647-bb.sh terminal create --environment &lt;env&gt; ; terminal send … --enter
+cd packages/agent-runtime &amp;&amp; pnpm exec vitest run src/repro-1647-orphaned-grandchildren.test.ts   # FAILS on main
+git fetch origin pull/1696/head ; git checkout b3f6d2e7d ; pnpm install ; turbo build (4 pkgs)
+pnpm exec turbo run test --filter=@bb/process-utils --filter=@bb/agent-runtime --filter=@bb/host-workspace --filter=@bb/host-daemon --force
+scripts/bb-dev-app current   (PR build) ; repeat A + C + user-shell ; delete ; inspect daemon log
+pnpm dev:stop ; git checkout 16ceb3a54 ; pnpm install ; re-run unit repro on main (fails)</pre>
+  <p>Logs: <code>install</code>, <code>build</code>, <code>dev app (main)</code>, <code>dev app (PR)</code>, <code>PR diff</code>, <code>PR tests</code>.</p>
+</main></body></html>

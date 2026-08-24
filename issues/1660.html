@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1660 bb host process grew to 77GB RSS; orphaned dev processes in deleted managed worktrees</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#1a7f37; --warn:#9a6700; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { margin:14px 0; padding:10px 14px; border-left:4px solid var(--warn); background:#fff; font-size:15px; }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; background:#fff; }
+  figcaption { font-size:13px; color:var(--muted); margin-top:6px; }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; line-height:1.4; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .bad { color:var(--high); font-weight:600; } .unk { color:var(--warn); font-weight:600; }
+  ol li, ul li { margin:4px 0; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1660 · bb host process grew to 77GB RSS and froze the machine; orphaned dev processes in deleted managed worktrees compound the leak</h1>
+  <p class="meta">
+    <span class="pill">Type: Bug / feature request (3 asks)</span> <span class="pill high">Priority: High</span> <span class="pill">Effort: Medium–Large</span>
+    <span class="pill">perf</span> <span class="pill">workspaces</span> <span class="pill">host</span>
+    <a href="https://github.com/get-bb/bb/issues/1660">open on GitHub</a>
+    <span>investigated 2026-08-18 (revised same day after independent verification; third verification pass 06:25 UTC re-ran the unit repro and re-checked every code permalink)</span>
+    <span>base commit <code>16ceb3a540f81c1189efaffb27a39b1d9443abf5</code> (main)</span>
+  </p>
+  <div class="verdict">
+    <strong>Verdict: PARTIALLY REPRODUCED.</strong>
+    The orphaned-process claim (request 2) is <span class="ok">reproduced live and with a failing unit test</span>: bb's environment teardown removes the managed worktree directory and kills only its own direct provider child; anything an agent left running from that directory survives with a <code>(deleted)</code> cwd. The lack of resource telemetry (request 3) is <span class="ok">verified</span> from code and CLI. The 77 GB RSS growth of "the bb host process" (request 1) is <span class="unk">not reproduced</span> — it needs a day of macOS multi-thread load I cannot replay — but code review shows no RSS ceiling, no RSS warning on macOS, and at least one deliberately unbounded in-memory queue in the daemon.<br>
+    <strong>Root-cause confidence:</strong> high for the orphan mechanism, low for the specific memory-growth mechanism.
+  </div>
+
+  <h2>TL;DR</h2>
+  <p>
+    A user running many agent threads a day saw one bb process reach ~77 GB RSS and lock the Mac, and during recovery found 88 stray dev servers/watchers whose working directory pointed at worktrees bb had already deleted. Two different things are going on. (1) When bb archives the last thread of a managed worktree, the host daemon shuts down <em>its</em> provider process (the bridge it spawned) and then <code>git worktree remove</code>s + <code>rm -rf</code>s the directory. Nothing enumerates or signals other processes rooted in that directory, so anything the agent started with <code>&amp;</code>/<code>nohup</code>/a tool's background mode (dev servers, watchers, test runners) keeps running from a deleted inode forever. I reproduced this on main in six minutes with a real Claude Code turn. (2) Separately, the daemon and server have no memory ceiling and no memory telemetry: the only resource monitor in the daemon reads RSS but only warns when the Linux inotify count is high, so on macOS a leak is invisible until the machine swaps. I could not reproduce the 77 GB itself; the report gives no heap snapshot or process name, and V8's default heap cap makes a 77 GB JS heap unlikely, so it was more likely native/external memory (Buffers, node-pty, better-sqlite3) or an unbounded queue — the daemon's outbound event queue is explicitly unbounded by design ("These only warn — they never drop, fault, or bound the queue").
+  </p>
+
+  <h2>Claims vs findings</h2>
+  <table>
+    <tr><th>Claim (from issue)</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>"The main bb host process grew to ~77GB RSS over a day of heavy use and froze the machine."</td><td class="unk">Unverified</td><td>No heap profile, PID, or process name in the report ("host process" could be the host daemon, the server, or the bb-app launcher — they are three separate node processes; see <code>startFullStackServerProcess</code>/<code>startFullStackDaemonProcess</code> in <code>packages/bb-app/src/launcher.ts</code>). Not reproducible in the timebox. Code review below lists candidate growth vectors; none proven.</td></tr>
+    <tr><td>"88 orphaned development processes … whose cwd pointed into deleted managed worktrees had accumulated."</td><td class="ok">Verified (mechanism reproduced)</td><td>Live repro: agent-spawned <code>sleep 100000</code> survives <code>environment.destroy</code>, cwd shows <code>… (deleted)</code>. Unit test at <code>packages/host-workspace/test/issue-1660-orphan-process.test.ts</code> fails on main at the assertion "process is dead after destroy". Same class independently reported in <a href="https://github.com/get-bb/bb/issues/1647">#1647</a>/<a href="https://github.com/get-bb/bb/issues/1769">#1769</a> (190 processes / 1.75 GB from 40 destroyed envs).</td></tr>
+    <tr><td>"bb's environment lifecycle reclaimed the worktrees but nothing reaped the processes started from them."</td><td class="ok">Verified</td><td><code>removeWorktree()</code> only runs <code>git worktree remove --force</code> and <code>fs.rm</code>; <code>RuntimeManager.destroyEnvironment()</code> only calls <code>runtime.shutdown()</code> (SIGTERM/SIGKILL to the direct bridge child via <code>child.kill</code>, no process-group or cwd scan). No code path in the repo lists processes by cwd.</td></tr>
+    <tr><td>Bug "recurs; twice previously traced machine-wide memory/CPU exhaustion to this pattern (orphaned dev stacks ~1GB each …)"</td><td class="unk">Unverifiable</td><td>Historical; consistent with #1647/#1769 measurements on other machines.</td></tr>
+    <tr><td>Request 1: "A heap/RSS ceiling with graceful degradation, or periodic compaction"</td><td class="ok">Verified absent</td><td>No <code>--max-old-space-size</code> anywhere in the repo (grep). Health monitor reads <code>process.memoryUsage().rss</code> but never warns on it. See also <a href="https://github.com/get-bb/bb/issues/1748">#1748</a> (server heap sized from host RAM).</td></tr>
+    <tr><td>Request 2: "reap (or at least surface) processes whose cwd resolves into the pruned path … <code>bb doctor --reap-orphans</code>"</td><td class="ok">Verified absent</td><td><code>bb doctor</code> does not exist (CLI prints help). No reaping or surfacing anywhere in the destroy path.</td></tr>
+    <tr><td>Request 3: "Expose host memory telemetry (e.g. <code>bb status --resources</code>)"</td><td class="ok">Verified absent</td><td><code>bb status --help</code> only has <code>--json</code>; the daemon's <code>defaultReadResourceUsage()</code> is never exposed over RPC or CLI.</td></tr>
+  </table>
+
+  <h2>Environment</h2>
+  <ul>
+    <li>bb <code>16ceb3a54</code> (main, 2026-08-18), run from source via <code>scripts/bb-dev-app current</code>.</li>
+    <li>Linux 7.0.0-29-generic x86_64 (the reporter is on macOS/Apple Silicon — the orphan mechanism is platform-independent; only my <code>/proc</code>-based process listing is Linux-specific, use <code>lsof -d cwd</code> on macOS).</li>
+    <li>Node v24.18.0; provider claude-code 2.1.234; codex-cli 0.147.0 also installed.</li>
+    <li>Revision run (this version of the report): dev instance App <code>http://localhost:15803</code>, Server <code>http://localhost:23803</code>, host daemon <code>127.0.0.1:31803</code>, data dir <code>~/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-33-4322b8038a31</code>, host id <code>host_jkzcgxjdxs</code>, host daemon PID 1582592.</li>
+    <li>Third verification pass (no dev instance needed): worktree at <code>c25298f69</code> (= base <code>16ceb3a54</code> + two unrelated commits #1734, #1613 that do not touch the daemon/workspace/runtime code cited here); <code>pnpm install</code> + <code>turbo run build</code> logs in <code>1660/install-verify.log</code>, <code>1660/build-verify.log</code>. Every permalinked line range below was re-read from <code>git show 16ceb3a54:&lt;path&gt;</code> and matches. Also checked <code>origin/main</code> up to <code>511d7db64</code>: no fix for the orphan path has landed.</li>
+    <li>Original run: dev instance App <code>http://localhost:13477</code>, Server <code>http://localhost:21477</code>, host daemon <code>127.0.0.1:29477</code>, data dir <code>~/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-7-ffe168ad615c</code>. Host id <code>host_e9dcahrvyx</code>. Host daemon PID 1178110 (RSS ~285 MB idle after the repro; the server and daemon are separate node processes).</li>
+  </ul>
+
+  <h2>Minimal reproduction</h2>
+  <h3>A. Live, end to end (one real Claude Code turn)</h3>
+  <ol>
+    <li>Start a dev instance and export its env. <strong>Note:</strong> in every step below, <code>bb …</code> means the dev instance's CLI, i.e. <code>pnpm bb:dev …</code> (or <code>node packages/scripts/dist/commands/run-cli.js …</code> after the first <code>pnpm bb:dev</code>), run from the repo root with the exported env — a bare <code>bb</code> would talk to your real <code>~/.bb</code> instance. <pre>scripts/bb-dev-app current
+eval "$(scripts/bb-dev-app env)"     # BB_SERVER_URL=http://localhost:23803 BB_HOST_DAEMON_PORT=31803 …
+pnpm bb:dev machine list             # take the host id from here (mine: host_jkzcgxjdxs)
+# Name  ID               Status     Last seen
+# HOST   host_jkzcgxjdxs  connected  just now</pre></li>
+    <li>Make a scratch repo and a project on it (substitute <em>your</em> host id from step 1): <pre>mkdir -p /tmp/bb1660r-repo &amp;&amp; cd /tmp/bb1660r-repo &amp;&amp; git init -q -b main &amp;&amp; echo "# qa" &gt; README.md \
+  &amp;&amp; git add . &amp;&amp; git -c user.email=qa@example.com -c user.name=qa commit -qm init
+curl -s -X POST $BB_SERVER_URL/api/v1/projects -H 'content-type: application/json' \
+  -d '{"name":"qa1660r","source":{"type":"local_path","path":"/tmp/bb1660r-repo","hostId":"host_jkzcgxjdxs"}}'
+# → {"id":"proj_46fcadffg4", …}</pre></li>
+    <li>Spawn a thread in a <em>new managed worktree</em> whose only job is to leave a background process behind (stands in for <code>pnpm dev &amp;</code>): <pre>pnpm bb:dev thread spawn --project proj_46fcadffg4 --new-environment worktree --provider claude-code \
+  --permission-mode full --title "orphan repro 1660" \
+  --prompt "Run exactly this shell command and nothing else: nohup sleep 100000 &gt;/dev/null 2&gt;&amp;1 &amp; disown ; then reply only with ok." --json
+# → thr_g3xmvwtd84; ~40 s later the thread is idle and environmentId = env_ig2nscwucq
+sqlite3 &lt;data&gt;/bb.db "select id,status,environment_id from threads where id='thr_g3xmvwtd84';"
+# thr_g3xmvwtd84|idle|env_ig2nscwucq
+#   worktree: &lt;data&gt;/worktrees/env_ig2nscwucq/bb1660r-repo   (&lt;data&gt; = the data dir printed by scripts/bb-dev-app current)</pre></li>
+    <li>List processes rooted in the worktree (script: <code>repro/find-worktree-procs.sh</code>): <pre>$ ./find-worktree-procs.sh &lt;data&gt;/worktrees/env_ig2nscwucq
+pid=1591658 ppid=1582592 pgid=1581708 sid=1581708 cwd=…/env_ig2nscwucq/bb1660r-repo cmd=node … (provider bridge, child of host daemon 1582592)
+pid=1591676 ppid=1591658 pgid=1581708 sid=1581708 cwd=…/env_ig2nscwucq/bb1660r-repo cmd=/home/USER/.local/bin/claude --output-format stream-json …
+pid=1593823 ppid=1       pgid=1593823 sid=1593772 cwd=…/env_ig2nscwucq/bb1660r-repo cmd=sleep 100000   &lt;-- agent's background process, ppid 1</pre>
+    Note the <code>pgid</code>/<code>sid</code> columns: the bridge and <code>claude</code> live in the daemon's process group and session (1581708), but the agent's process is the leader of its <em>own</em> group (1593823) in its <em>own</em> session (1593772, whose leader — Claude Code's Bash-tool shell — has already exited). Claude Code spawns its Bash tool with <code>detached: true</code> (Node's <code>setsid()</code>), visible in the CLI bundle: <pre>$ strings -n 8 ~/.local/share/claude/versions/2.1.234 | grep -o '.\{60\}type:"bash",shellPath:e,detached:!0.\{20\}'
+!t?.skipSnapshot)KDp(e).catch(()=&gt;{});let o,i=!1;return{type:"bash",shellPath:e,detached:!0,stdin:"pipe",</pre>
+    This matters for the fix: a process-group kill aimed at the bridge cannot reach this process (see Proposed fix).</li>
+    <li>Archive the thread. The environment enters <code>retiring</code>; after the 5-minute <code>MANAGED_ENVIRONMENT_RETIRE_GRACE_MS</code> the server dispatches <code>environment.destroy</code> to the daemon: <pre>$ pnpm bb:dev thread archive thr_g3xmvwtd84
+Thread thr_g3xmvwtd84 archived
+$ sqlite3 &lt;data&gt;/bb.db "select id,status,retire_requested_at from environments where id='env_ig2nscwucq';"
+env_ig2nscwucq|retiring|1787030673745
+# ~1m40s later, still retiring: the bridge and claude are still alive (archive does not stop them)
+$ ps -o pid,ppid,pgid,sid,stat,etime,cmd -p 1591658,1591676,1593823
+    PID    PPID    PGID     SID STAT     ELAPSED CMD
+1591658 1582592 1581708 1581708 Sl         01:42 node … (provider bridge)
+1591676 1591658 1581708 1581708 Sl         01:42 /home/USER/.local/bin/claude …
+1593823       1 1593823 1593772 S          01:37 sleep 100000
+# … poll `select status from environments where id='env_ig2nscwucq'` until it reads destroyed (~5m12s after archive) …
+$ sqlite3 &lt;data&gt;/bb.db "select id,status,path from environments where id='env_ig2nscwucq';"
+env_ig2nscwucq|destroyed|
+$ ls &lt;data&gt;/worktrees/env_ig2nscwucq
+ls: cannot access …: No such file or directory</pre></li>
+    <li><strong>Expected:</strong> no process is left with a cwd inside the destroyed worktree (or at least bb reports one). <strong>Actual:</strong> <pre>$ ./find-worktree-procs.sh &lt;data&gt;/worktrees/env_ig2nscwucq
+pid=1593823 ppid=1 pgid=1593823 sid=1593772 cwd=/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-33-4322b8038a31/worktrees/env_ig2nscwucq/bb1660r-repo (deleted) cmd=sleep 100000
+$ ps -o pid,ppid,pgid,sid,stat,etime,cmd -p 1591658,1591676,1593823
+    PID    PPID    PGID     SID STAT     ELAPSED CMD
+1593823       1 1593823 1593772 S          05:38 sleep 100000</pre>
+    The bridge (1591658) and <code>claude</code> (1591676) did exit at destroy — <code>RuntimeManager.destroyEnvironment</code> calls <code>runtime.shutdown()</code> before <code>workspace.destroy()</code> (that ordering dates from <code>b04593eb87</code>, 2026-03-24) — but the process the agent started did not, and bb never looked at it. Transcripts: <code>repro/live-repro-transcript-revision.txt</code> (this run, with pgid/sid) and <code>repro/live-repro-transcript.txt</code> (original run: thr_dyb25avqn8 / env_tj4p2dg3ru, same outcome).</li>
+  </ol>
+
+  <h3>B. Unit-level (no provider, ~1 s)</h3>
+  <p>File: <code>repro/issue-1660-orphan-process.test.ts</code> (copy into <code>packages/host-workspace/test/</code>). Run: <code>cd packages/host-workspace &amp;&amp; pnpm exec vitest run test/issue-1660-orphan-process.test.ts</code>. It <strong>fails on main</strong> at the last assertion (<code>expected true to be false</code> — the child is still alive); the preceding assertion that <code>/proc/&lt;pid&gt;/cwd</code> reads <code>&lt;worktree&gt; (deleted)</code> passes. Output: <code>repro/vitest-output.txt</code> (re-run for this revision: <code>repro/vitest-output-revision.txt</code>, same failure at line 101; third pass: <code>repro/vitest-output-verify2.txt</code>, again <code>AssertionError: expected true to be false</code> at line 101).</p>
+  <pre>// Repro for get-bb/bb#1660: destroying a managed worktree does not reap (or
+// even notice) processes whose cwd is inside the worktree. The `sleep` below
+// stands in for a dev server / watcher an agent left running with `&amp;`.
+//
+// This test FAILS on main by design: the final assertion expects the process
+// to be gone after `workspace.destroy()`, but bb only removes the directory.
+import { spawn } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { provisionWorkspace } from "../src/index.js";
+import { runGit } from "../src/git.js";
+
+const tempDirs: string[] = [];
+const children: number[] = [];
+
+async function makeTempDir(prefix: string): Promise&lt;string&gt; {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
+}
+
+async function initRepo(): Promise&lt;string&gt; {
+  const repoPath = await makeTempDir("bb-1660-repo-");
+  await runGit(["init", "-b", "main"], { cwd: repoPath });
+  await runGit(["config", "user.name", "BB Tests"], { cwd: repoPath });
+  await runGit(["config", "user.email", "bb@example.com"], { cwd: repoPath });
+  await fs.writeFile(path.join(repoPath, "README.md"), "hello\n", "utf8");
+  await runGit(["add", "."], { cwd: repoPath });
+  await runGit(["commit", "-m", "Initial commit"], { cwd: repoPath });
+  return repoPath;
+}
+
+function isAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+afterEach(async () =&gt; {
+  for (const pid of children.splice(0)) {
+    try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+  }
+  await Promise.all(tempDirs.splice(0).map((dir) =&gt; fs.rm(dir, { recursive: true, force: true })));
+});
+
+describe("#1660 managed worktree destroy vs processes rooted in it", () =&gt; {
+  it("leaves a background process whose cwd is the worktree running after destroy", async () =&gt; {
+    const repoPath = await initRepo();
+    const parentDir = await makeTempDir("bb-1660-parent-");
+    const targetPath = path.join(parentDir, "env");
+
+    const ws = await provisionWorkspace({
+      workspaceProvisionType: "managed-worktree",
+      sourcePath: repoPath,
+      targetPath,
+      branchName: "bb/issue-1660",
+      baseBranch: "main",
+      timeoutMs: 900000,
+    });
+    expect(ws.managed).toBe(true);
+
+    // Simulate `nohup pnpm dev &amp;` from an agent turn: a detached long-lived
+    // process whose cwd is the managed worktree.
+    const child = spawn("sleep", ["600"], { cwd: ws.path, detached: true, stdio: "ignore" });
+    child.unref();
+    if (child.pid === undefined) throw new Error("spawn failed");
+    children.push(child.pid);
+    expect(isAlive(child.pid)).toBe(true);
+
+    await ws.destroy();
+
+    // The directory is gone...
+    await expect(fs.access(targetPath)).rejects.toThrow();
+
+    // ...but the process rooted in it is still alive. On Linux its cwd now
+    // reads "&lt;path&gt; (deleted)".
+    if (process.platform === "linux") {
+      const cwd = await fs.readlink(`/proc/${child.pid}/cwd`);
+      expect(cwd).toBe(`${targetPath} (deleted)`);
+    }
+
+    // EXPECTED (per issue request #2): bb reaps or at least surfaces processes
+    // rooted in a pruned managed worktree. ACTUAL on main: still running.
+    expect(isAlive(child.pid)).toBe(false);
+  });
+});</pre>
+  <pre>❯ |@bb/host-workspace| test/issue-1660-orphan-process.test.ts (1 test | 1 failed) 61ms
+   × leaves a background process whose cwd is the worktree running after destroy
+
+AssertionError: expected true to be false // Object.is equality
+- Expected  false
++ Received  true
+ ❯ test/issue-1660-orphan-process.test.ts:101:32</pre>
+
+  <h2>Root cause</h2>
+  <h3>1. Environment teardown never considers processes rooted in the worktree (reproduced)</h3>
+  <p>The destroy path is server → daemon <code>environment.destroy</code> → <code>RuntimeManager.destroyEnvironment</code> → <code>workspace.destroy()</code> → <code>removeWorktree()</code>. Each hop only touches what it directly owns:</p>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/command-dispatch.ts#L551-L573"><code>apps/host-daemon/src/command-dispatch.ts#L551-L573</code></a> — closes the environment's bb terminals (<code>pty.kill()</code>, SIGHUP to the shell) then calls <code>destroyEnvironment</code>.</li>
+    <li><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/runtime-manager.ts#L1117-L1131"><code>apps/host-daemon/src/runtime-manager.ts#L1117-L1131</code></a>:
+    <pre>this.entries.delete(environmentId);
+await this.stopWatchingStatus(entry);
+await entry.runtime.shutdown();      // SIGTERM/SIGKILL to the *bridge* child only
+await entry.workspace.destroy();     // rm the directory
+await this.cleanupUnusedInjectedSkillStagingDirs([]);</pre></li>
+    <li><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/runtime-provider-process.ts#L657-L681"><code>packages/agent-runtime/src/runtime-provider-process.ts#L657-L681</code></a> — <code>terminateProviderProcess</code> does <code>child.kill("SIGTERM")</code> then <code>SIGKILL</code> after 5 s. The bridge is spawned non-detached in the daemon's own process group (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/runtime-provider-process.ts#L501-L506">L501-L506</a>), so bb has no process group of its own to signal; it relies on the bridge/CLI to clean up their descendants. Whatever the agent backgrounded (<code>&amp;</code>, <code>nohup</code>, <code>setsid</code>, tool "background" modes) is reparented to PID 1 and untouched. In the reproduced Claude Code path the orphan is not even in the bridge's process group: Claude Code runs its Bash tool <code>detached: true</code> (new session), so the <code>sleep</code> ended up as pgid 1593823 / sid 1593772 while bridge and <code>claude</code> were pgid/sid 1581708. Owning the bridge's process group would therefore not be enough to find it.</li>
+    <li><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/host-workspace/src/provision.ts#L723-L731"><code>packages/host-workspace/src/provision.ts#L723-L731</code></a> — the managed worktree's <code>destroyFn</code> is just <code>removeWorktree({ path, force:true, pruneEmptyParent:true })</code>.</li>
+    <li><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/host-workspace/src/provisioning.ts#L713-L766"><code>packages/host-workspace/src/provisioning.ts#L713-L766</code></a> — <code>removeWorktree</code>: <code>git worktree remove --force</code> then <code>fs.rm(workspacePath, {recursive:true, force:true})</code>. On POSIX, <code>rm</code> of a directory that is some process's cwd succeeds; the process keeps a reference to the unlinked inode, hence the <code>(deleted)</code> suffix. There is no <code>lsof</code>/<code>/proc</code> scan, no warning, no event.</li>
+  </ul>
+  <p>Why the symptom follows: any long-lived process an agent starts in the worktree — dev servers are the common case because agents are asked to "run the app and check" — outlives the thread and the directory. Nothing in bb records that these processes belong to the environment (bb only knows the bridge PID), so no later sweep can find them either. Over a day of many threads created/archived this accumulates exactly the 88 orphans the reporter counted. Note the server-side 5-minute retire grace (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/constants.ts#L15">constants.ts#L15</a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/environments/environment-cleanup-internal.ts#L402-L423">environment-cleanup-internal.ts#L402-L423</a>) only delays the destroy; it does not change what destroy does.</p>
+  <p><em>Deeper issue:</em> bb has no notion of "processes belonging to an environment". The only handle it holds is the bridge PID; the bridge is spawned in the daemon's own process group and session, and provider CLIs (Claude Code at least) deliberately start tool shells in new sessions, so no ancestry-, group- or session-based signal from bb can enumerate what an agent left running. On Linux a cgroup per environment would give true ownership; portably (macOS included) the only thing that finds the reproduced orphan is a scan by cwd. #1769 additionally shows a <code>claude</code> process alive 12h46m after its environment was destroyed on 0.38.0 — that is a different path from the one reproduced here (in both my runs the bridge and <code>claude</code> exited when <code>destroyEnvironment</code> ran) and remains unexplained; a crashed/restarted daemon that lost its <code>RuntimeEntry</code> map is the obvious candidate.</p>
+
+  <h3>2. Host RSS growth (not reproduced; candidates only)</h3>
+  <ul>
+    <li>No heap ceiling and no RSS ceiling anywhere: <code>grep -rn max-old-space-size</code> over apps/packages/scripts returns nothing. V8 sizes its heap from host RAM (see #1748), so a 128 GB Mac Studio permits a very large heap before GC pressure — but even then a 77 GB <em>JS</em> heap is unlikely; the excess is more plausibly external memory (Buffers, node-pty scrollback, better-sqlite3, @parcel/watcher) or many retained sockets/streams.</li>
+    <li>The daemon's only resource monitor, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/host-daemon-health-monitor.ts#L112-L133"><code>host-daemon-health-monitor.ts#L112-L133</code></a>, reads <code>process.memoryUsage().rss</code> every 60 s but <strong>only warns when the inotify instance count is high</strong> — a Linux-only signal (<code>/proc/self/fd</code>). On macOS RSS is read and discarded. So a leak is invisible in bb's own logs until the OS pages.</li>
+    <li>The daemon→server event queue is explicitly unbounded: <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/event-sink.ts#L13-L17"><code>event-sink.ts#L13-L17</code></a> — "These only warn — they never drop, fault, or bound the queue. If they fire in practice, that is the signal to add real backpressure." Under "large tool outputs" with a server that is slow (e.g. the #1131/#1334 SQLite stalls) this queue holds every event payload in memory. Not proven to be the 77 GB, but it is the one place a single daemon process is designed to grow without limit.</li>
+    <li>Things I checked that <em>are</em> bounded: bridge stdout (<code>readBoundedLines</code>) and stderr tail; terminal scrollback (4 MB / 10k chunks per session); interactive-request tombstones (5-min TTL); server timeline and outline caches (LRU 128 / max entries). Provider processes are released on <code>threads.stop</code> (#1584, in 0.38.0) and on environment destroy (<code>runtime.shutdown()</code>), but <em>not</em> on archive: in the live repro the bridge and <code>claude</code> stayed alive for the whole 5-minute retiring window. #1604 tracks the remaining "idle Claude/ACP processes are never reclaimed" case — that is child-process memory, not the daemon's own RSS, but it is what "bb-family total" in the reporter's watchdog would count.</li>
+  </ul>
+  <p>Next experiment that would settle it: run the daemon with <code>--heapsnapshot-signal=SIGUSR2</code> (or <code>--inspect</code>) under a scripted load (N threads × archive loop with a 1 MB tool output each), sample <code>process.memoryUsage()</code> (rss/heapUsed/external/arrayBuffers) every minute, and diff snapshots. If <code>external</code>/<code>arrayBuffers</code> dominates, look at the event-sink queue and provider stdio; if <code>heapUsed</code> dominates, take a snapshot and look at retained <code>RuntimeEntry</code>/<code>ThreadEvent</code> graphs. Ask the reporter which PID (launcher, server, daemon) hit 77 GB and for a <code>vmmap -summary</code>.</p>
+
+  <h2>Proposed fix (first principles)</h2>
+  <p>Ordered by what actually covers the reproduced case. The verifier's and my own <code>pgid</code>/<code>sid</code> readings show that the orphan is in its own session, so a process-group fix alone would <strong>not</strong> have reaped it — the cwd scan is the load-bearing change.</p>
+  <ol>
+    <li><strong>Reap by cwd on destroy (daemon; host-local primitive — correct layer per AGENTS.md). Covers the reproduced case.</strong> In <code>RuntimeManager.destroyEnvironment</code>, before <code>workspace.destroy()</code>, enumerate processes whose cwd is inside <code>entry.workspace.path</code> (Linux: readlink <code>/proc/*/cwd</code>, exactly what <code>find-worktree-procs.sh</code> does; macOS: <code>lsof -d cwd -Fpn +D &lt;path&gt;</code> or <code>proc_pidinfo(PROC_PIDVNODEPATHINFO)</code> via a tiny helper) and SIGTERM→SIGKILL them; log the PIDs/commands. Return the reaped list in the <code>environment.destroy</code> result so the server can record a thread event ("stopped 1 process left running in this workspace: sleep 100000") — that changes the RPC result shape, so bump <code>HOST_DAEMON_PROTOCOL_VERSION</code>. Risk: killing a process the user intentionally started from that directory in another terminal; the directory is about to be <code>rm -rf</code>'d anyway, so that process is doomed to a <code>(deleted)</code> cwd regardless — log loudly rather than skip. Also run the same scan in a periodic daemon sweep against <em>already-deleted</em> managed worktree paths (env rows with status <code>destroyed</code> whose former path is under the managed worktrees root, or simply any process whose cwd is under the worktrees root and ends in <code>(deleted)</code>) so orphans from before the fix and from daemon crashes get reaped — this is what the reporter's 10-minute automation does by hand. This is the change that would make the unit repro pass.</li>
+    <li><strong>Own the process tree (daemon). Defence in depth; does <em>not</em> cover the reproduced case.</strong> Spawn provider bridges and terminal shells with <code>detached: true</code> so each becomes its own process-group/session leader; on <code>runtime.shutdown()</code>/terminal close send <code>process.kill(-pid, "SIGTERM")</code> then <code>SIGKILL</code>, falling back to the direct child if the group is gone (the repo already has this exact pattern for setup scripts: <code>killSetupScriptProcess</code> in <code>packages/host-workspace/src/provisioning.ts#L218-L229</code>). This catches descendants that stayed in the bridge's group — bb terminal shells, providers that do not <code>setsid</code> their tool shells, a hung <code>claude</code> whose bridge died — but <em>not</em> the Claude Code Bash-tool case reproduced above, because that shell already runs in a new session (pgid 1593823 ≠ bridge pgid 1581708). Note also that today the bridge shares the daemon's group (in dev even the launcher's, 1581708), so a naive <code>kill(-pgid)</code> on the bridge's <em>current</em> group would kill the daemon itself; the detach must land together with the group kill. No wire change, so no protocol bump.</li>
+    <li><strong>Telemetry (daemon returns raw data, server/CLI present it).</strong> Add a <code>host.resources</code> RPC returning <code>defaultReadResourceUsage()</code> plus child-process count/RSS and the count of <code>(deleted)</code>-cwd processes under the worktrees root, surface it in <code>bb status --resources</code> and <code>bb machine show</code>, and have the health monitor warn on RSS growth (e.g. &gt; 4 GB or &gt; 2× the 1-hour minimum) on every platform, not only on the Linux inotify signal. Bump the protocol version for the new RPC.</li>
+    <li><strong>Ceiling.</strong> Set an explicit <code>--max-old-space-size</code> for server and daemon from the launcher (see #1748 for the cgroup-aware variant) and put a byte cap on the event-sink queue that switches to spilling to disk or refusing new turns rather than growing forever.</li>
+  </ol>
+
+  <h2>PR review</h2>
+  <p>No open PRs are linked to this issue. However, <a href="https://github.com/get-bb/bb/pull/1696">PR #1696 "Kill processes left in a destroyed worktree environment"</a> (open, <em>Fixes #1647</em>, not cross-referenced to #1660) implements essentially the fix proposed above for request 2: it adds <code>listProcessesWithCwdUnder</code>/<code>killProcessesWithCwdUnder</code> to <code>@bb/process-utils</code> (Linux <code>/proc/*/cwd</code>, macOS <code>lsof -d cwd</code>), makes <code>RuntimeManager.destroyEnvironment</code> sweep and SIGTERM→SIGKILL every process rooted in the workspace before removing the directory, and spawns provider bridges / ACP agents / ptys as process-group leaders that receive group signals. It does not touch requests 1 (RSS ceiling) or 3 (telemetry). It was reviewed hostilely in the <a href="1647.html">#1647 report</a> (verdict there: REQUEST CHANGES, minor — signal ordering and an explicit call-out that the sweep is ownership-agnostic). Note that the sweep lives in the daemon's <code>destroyEnvironment</code>, not in <code>workspace.destroy()</code>, so the unit repro in this report (which calls <code>workspace.destroy()</code> directly) would still fail on that branch; the PR's own <code>runtime-manager.test.ts</code> case covers the daemon path. If #1696 merges, #1660 request 2 should be closed as fixed-by-#1647 and requests 1 and 3 split into their own issues.</p>
+
+  <h2>Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/pull/1696">PR #1696</a> Kill processes left in a destroyed worktree environment — open PR for #1647 that implements the cwd sweep + process-group ownership proposed here; see PR review section.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1647">#1647</a> Deleting a worktree environment leaves its processes running — same mechanism as request 2 of this issue, with macOS measurements (190 processes / 1.75 GB from 40 destroyed envs). This report should be considered its duplicate for the orphan half.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1769">#1769</a> (closed as duplicate of #1647) — evidence that on 0.38.0 even the bridge + <code>claude</code> process survived destroy for 12h46m. Not reproduced here (bridge/<code>claude</code> exited at destroy in both runs on main); the survival path is unexplained — see "Deeper issue".</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1604">#1604</a> Idle agent processes are never reclaimed for non-Codex providers — the automatic counterpart to #1584; explains "bb-family total" memory.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1748">#1748</a> Server heap is sized from host RAM, not the cgroup limit — the "no ceiling" half of request 1.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1334">#1334</a> / <a href="https://github.com/get-bb/bb/issues/1131">#1131</a> — server stalls that would back up the daemon's unbounded event queue.</li>
+    <li><a href="https://github.com/get-bb/bb/pull/1584">#1584</a> Release agent runtimes on thread stop (merged 2026-08-14, in 0.38.0) — makes <code>threads.stop</code> release runtimes. It is <em>not</em> why the bridge/<code>claude</code> exited in my repro: the repro archives (does not stop) the thread and both processes stayed alive through the whole retiring window; they exited because <code>destroyEnvironment</code> calls <code>runtime.shutdown()</code> (code from <code>b04593eb87</code>, 2026-03-24). Listed because it is the closest existing "release provider processes" work.</li>
+  </ul>
+
+  <h2>Appendix</h2>
+  <h3>Commands run</h3>
+  <pre>gh issue view 1660 --repo get-bb/bb --json title,body,state,labels,comments
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+grep -rn "removeWorktree\|destroyEnvironment\|closeEnvironmentTerminals" apps packages --include=*.ts
+grep -rn "max-old-space-size" apps packages scripts
+grep -rn "memoryUsage\|rssBytes" apps/host-daemon/src apps/server/src apps/cli/src
+scripts/bb-dev-app current ; scripts/bb-dev-app env
+bb machine list ; bb provider list ; bb status --help ; bb doctor --help
+curl -s -X POST $BB_SERVER_URL/api/v1/projects … (see repro)
+bb thread spawn … --new-environment worktree --provider claude-code … (see repro)
+./find-worktree-procs.sh &lt;worktree parent&gt;      # before archive
+bb thread archive thr_dyb25avqn8
+sqlite3 &lt;data&gt;/bb.db "select id,status,path,retire_requested_at from environments where id='env_tj4p2dg3ru';"
+./find-worktree-procs.sh &lt;worktree parent&gt;      # after destroy
+cd packages/host-workspace &amp;&amp; NO_COLOR=1 pnpm exec vitest run test/issue-1660-orphan-process.test.ts
+git merge-base --is-ancestor 1c3f3eff0 desktop-v0.38.0   # #1584 is in 0.38.0
+# revision run
+pnpm bb:dev machine list
+curl -s -X POST $BB_SERVER_URL/api/v1/projects … hostId host_jkzcgxjdxs
+pnpm bb:dev thread spawn --project proj_46fcadffg4 --new-environment worktree --provider claude-code … --json
+./find-worktree-procs.sh &lt;data&gt;/worktrees/env_ig2nscwucq ; ps -o pid,ppid,pgid,sid,etime,cmd -p …
+strings -n 8 ~/.local/share/claude/versions/2.1.234 | grep -o '.\{60\}type:"bash",shellPath:e,detached:!0.\{20\}'
+pnpm bb:dev thread archive thr_g3xmvwtd84 ; poll sqlite3 until status=destroyed ; ./find-worktree-procs.sh … ; ps …
+git blame -L 1117,1131 apps/host-daemon/src/runtime-manager.ts ; gh pr view 1584 --json title,mergedAt
+cd packages/host-workspace &amp;&amp; NO_COLOR=1 pnpm exec vitest run test/issue-1660-orphan-process.test.ts   # re-run, still fails at :101
+gh issue list --repo get-bb/bb --state all --search "memory OR orphan OR RSS OR leak OR worktree process"
+pnpm dev:stop</pre>
+  <h3>Artifacts</h3>
+  <ul>
+    <li><code>repro/issue-1660-orphan-process.test.ts</code> — failing-on-main vitest repro</li>
+    <li><code>repro/vitest-output.txt</code> — its output</li>
+    <li><code>repro/find-worktree-procs.sh</code> — /proc cwd scanner used in the live repro</li>
+    <li><code>repro/live-repro-transcript.txt</code> — full live transcript (original run)</li>
+    <li><code>repro/live-repro-transcript-revision.txt</code> — revision run with pgid/sid, retiring-window ps, blame and Claude Code <code>detached</code> evidence</li>
+    <li><code>repro/vitest-output-revision.txt</code> — vitest re-run for the revision</li>
+    <li><code>repro/vitest-output-verify2.txt</code> — vitest re-run for the third verification pass (worktree c25298f69)</li>
+  </ul>
+  <h3>Notes on evidence quality</h3>
+  <ul>
+    <li>No screenshots: nothing about this bug is visual; the evidence is process tables and DB rows.</li>
+    <li>The 77 GB figure and the "88 orphans" count are the reporter's; I reproduced the mechanism (1 orphan from 1 thread), not the scale.</li>
+    <li>The daemon/server logs at default level contained no line for the destroy; the DB row transition <code>retiring → destroyed</code> plus the directory disappearing is the evidence that <code>environment.destroy</code> ran.</li>
+  </ul>
+  <h3>Verification</h3>
+  <p>An independent verifier re-ran both reproductions on <code>16ceb3a54</code> (own dev instance, thread <code>thr_6pqtx3mwdh</code> / env <code>env_ynzhqp6vd5</code>; unit test in <code>packages/host-workspace/test</code>) and got the same results: bridge, <code>claude</code> and <code>sleep 100000</code> rooted in the worktree; after archive → 5-min retire → destroy the directory is gone, bridge/claude exited, <code>sleep</code> alive with <code>(deleted)</code> cwd; vitest fails at line 101. All permalinked code excerpts and related-issue states matched the tree. The verifier raised three findings, all accepted and addressed in this revision:</p>
+  <ul>
+    <li><strong>Major — proposed fix (1) would not reap the reproduced orphan.</strong> Confirmed independently in a fresh live run: <code>ps -o pid,ppid,pgid,sid</code> shows the orphan as pgid 1593823 / sid 1593772 while bridge and <code>claude</code> are pgid/sid 1581708, and the Claude Code binary spawns its Bash tool with <code>detached:!0</code>. The fix section is reordered: the cwd scan is now (1) and marked as the change that covers the reproduced case; the process-group fix is (2) with its scope stated explicitly. Root cause and "Deeper issue" were rewritten to match.</li>
+    <li><strong>Minor — #1584 misattributed.</strong> Confirmed: <code>git blame</code> puts <code>runtime.shutdown()</code> before <code>workspace.destroy()</code> at <code>b04593eb87</code> (2026-03-24); #1584 only affects <code>threads.stop</code>; the bridge stayed alive through the retiring window in my re-run too. Related-issues entry, "Things I checked" bullet and repro step 6 corrected; the #1769 12h46m survival is now marked unexplained.</li>
+    <li><strong>Minor — repro steps assumed the dev CLI/host id.</strong> Step 1 now says <code>bb</code> means <code>pnpm bb:dev</code>, shows <code>pnpm bb:dev machine list</code>, and step 2 says to substitute your own host id. Steps 2–6 were re-recorded from the revision run (<code>proj_46fcadffg4</code> / <code>thr_g3xmvwtd84</code> / <code>env_ig2nscwucq</code>) and <code>find-worktree-procs.sh</code> now prints pgid/sid.</li>
+  </ul>
+</main></body></html>

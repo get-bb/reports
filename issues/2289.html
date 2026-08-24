@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2289 Pi provider: stale model catalog after models.json change; plugin reload never retires superseded bridge workers</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2289 · Pi provider: stale model catalog after models.json change; plugin reload never retires superseded bridge workers</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill high">Priority: High</span> <span class="pill">Effort: n/a (project fields not readable with this token)</span> <span class="pill">perf</span> <span class="pill">providers</span> <span class="pill">provider-pi</span> <span class="pill">host</span>
+    <a href="https://github.com/get-bb/bb/issues/2289">open on GitHub</a>
+    <span>2026-08-24 · base <code>494f66526</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict">REPRODUCED</span> (headline bug; one secondary claim refuted) · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>Add a model to pi's <code>models.json</code> while bb is running and <code>bb provider models pi</code> (and the app's model picker, which reads the same execution-options endpoint) keeps listing the old catalog. <code>bb plugin reload provider-pi</code> says "running" and does not help. The bridge worker process that serves <code>model/list</code> is not what holds the stale data: it holds a long-lived <code>pi --mode rpc --no-session</code> child, and pi answers <code>get_available_models</code> from the snapshot it built at boot (<code>ModelRuntime.getAvailableSnapshot()</code>); pi only re-reads <code>models.json</code> inside <code>refresh()</code>, which bb never triggers and which the pi RPC protocol does not expose. The bb bridge memoizes that child per cwd for 5 minutes of idle time, re-armed on every request, and the daemon keeps the bridge worker itself alive across plugin reloads because its process identity is the artifact digest plus declaration facts, both unchanged by a reload. On top of that the server memoizes every successful <code>provider.list_models</code> answer for 10 minutes (keyed by plugin registration revision, so a reload does bust that layer, but nothing else does). The "repeated reloads leak duplicate workers" part of the issue does not reproduce at the base commit: three reloads left exactly one provider-pi worker under the daemon; the extra workers the reporter saw are most plausibly the per-environment thread runtime's worker (by design, one per runtime) and, on 0.39.0, a maintenance runtime that had no idle shutdown yet.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Adding a model to <code>models.json</code> is invisible to <code>bb provider models pi</code> while standalone <code>pi</code> sees it immediately.</td><td class="ok">Verified</td><td>Step 2 below: bb lists only <code>bb2289/probe-one</code> after <code>probe-two</code> was added; a fresh <code>pi --list-models</code> shows both. Unit test <code>catalog.models-json-staleness.test.ts</code> fails on base with exactly this diff.</td></tr>
+    <tr><td>"The Pi provider's bridge worker loads <code>~/.pi/agent/models.json</code> once at process boot."</td><td class="unv">Partially correct</td><td>The bridge worker never reads <code>models.json</code>. Its memoized <code>pi --mode rpc --no-session</code> catalog child does, once, at pi boot (<code>ModelRuntime.create → ModelConfig.load</code>), and <code>get_available_models</code> returns <code>getAvailableSnapshot()</code> without re-reading. Verified directly against pi 0.84.2 (PATH) and the pinned 0.84.0 with <code>pi-rpc-stale-catalog.sh</code>: two <code>get_available_models</code> calls around an edit both return <code>['probe-one']</code>.</td></tr>
+    <tr><td><code>bb plugin reload provider-pi</code> reports success but the host daemon keeps serving <code>model/list</code> from the old worker.</td><td class="ok">Verified</td><td>Step 3: reload printed <code>provider-pi@0.1.0 running</code>; the same worker pid 10089 (spawned 09:06:20) survived and the list stayed stale. Daemon log shows the same artifact digest <code>1337f13b…</code> before and after every reload, so the process key is unchanged.</td></tr>
+    <tr><td>Repeated reloads leak duplicate <code>bb-provider-bridge-worker … provider-pi</code> processes.</td><td class="no">Refuted at base commit</td><td>Step 5: three consecutive reloads → exactly one provider-pi worker under my daemon (pid 20831) with one pi child. The worker count only grows when a thread starts (its environment runtime gets its own worker, pid 35020, by design: one process per provider per runtime). Other <code>provider-pi</code> workers visible in <code>ps</code> belonged to other dev daemons on this machine (ppid 99045, 5958), not mine.</td></tr>
+    <tr><td>The process-key hash covers "<code>bundled:&lt;id&gt;</code>" for bundled Pi plus the capabilities hash.</td><td class="no">Refuted (immaterial)</td><td>At base the launch source digest is the sha256 of the built host artifact (<code>plugin-runtime.ts</code>, <code>artifact.digest</code>), not a <code>bundled:</code> literal; the key is <code>pi#bridge:&lt;digest16&gt;.&lt;fingerprint(capabilities, providerOptions)&gt;</code>. The conclusion stands either way: the key cannot change when <code>models.json</code> changes.</td></tr>
+    <tr><td><code>retireStaleBridgeProcesses</code> / <code>retireSupersededBridgeProcessIfIdle</code> only retire on a differing key, and plugin reload does not reach bridge lifecycle.</td><td class="ok">Verified</td><td>Code: <code>runtime-provider-process.ts</code> L270-311 compare <code>processKey</code> only; <code>plugin-service.ts reload()</code> L1871 re-runs <code>loadOne</code> and touches only the plugin host worker (<code>plugin-host-manager.ts</code> L426-447 replaces it by generation), never the provider bridge worker. Live: worker pid unchanged across reload.</td></tr>
+    <tr><td>SIGTERM to the tracked worker → next <code>model/list</code> spawns a fresh worker that re-reads <code>models.json</code>.</td><td class="unv">Verified with a caveat</td><td>Killing only the pi child (step 4) did <em>not</em> refresh the CLI listing because the server's 10-minute <code>providerModelList</code> memo answered without calling the daemon (no pi child was even respawned). Kill + <code>bb plugin reload provider-pi</code> (memo key bumped) → <code>probe-two</code> appeared. Step 8 also shows a worker recycled by the daemon's 60 s maintenance-runtime idle shutdown picks up the new file.</td></tr>
+    <tr><td>"Any other surviving superseded worker keeps running idle until manually killed."</td><td class="unv">Not reproduced at base</td><td>At base a maintenance-runtime worker with no threads is shut down after 60 s idle (<code>PROVIDER_MAINTENANCE_IDLE_TIMEOUT_MS</code>, added in d74974183 / #1879 after desktop-v0.39.0). On 0.39.0 there was no such timeout, which is consistent with what the reporter saw on that version. Sibling issue #2308 tracks the general "idle bridge processes never retired" problem.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb <code>494f66526913557ab076e048218236f0a6610927</code> (main, 2026-08-24; package version 0.39.0), run from source via <code>scripts/bb-dev-app current</code>. <code>origin/main</code> had no commits past the base at investigation time.</li>
+    <li>macOS 26.5.2 (Darwin 25.5.0, Apple Silicon), Node v22.23.1, pnpm from PATH.</li>
+    <li>pi on PATH: 0.84.2 (<code>~/.npm-global/bin/pi</code>); pi pinned by <code>plugins/provider-pi</code>: <code>@earendil-works/pi-coding-agent</code> 0.84.0. Both exhibit the same RPC behaviour.</li>
+    <li>Isolated dev instance: App <code>:14908</code>, Server <code>:22908</code>, Host daemon <code>:30908</code>, data dir <code>~/.bb-dev/…wf_846839f8-f8a-6-0c45c8842b56</code> (deleted at cleanup). Host id <code>host_6b6az84tvc</code>, scratch project <code>proj_s47wc3vj2e</code> at <code>/tmp/bb-2289-qa</code>.</li>
+    <li>pi was pointed at an isolated agent dir with <code>PI_CODING_AGENT_DIR=/tmp/bb-2289-pi-agent-live</code> (exported before starting the dev app; the daemon forwards the host env to the pi child) plus <code>PI_OFFLINE=1</code> in the direct probes. The user's <code>~/.pi</code> was never touched. The custom provider carries an inline <code>apiKey</code>, so pi marks it "available" without real credentials and no network call is made.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <p>Repro files: <code>2289/repro/</code> — <code>bbdev.sh</code> (CLI against the isolated instance), <code>add-model.py</code>, <code>pi-rpc-stale-catalog.sh</code> (pi-only probe), <code>reload-n-times.sh</code>, <code>warm-vs-idle.sh</code>, <code>catalog.models-json-staleness.test.ts</code> (+ <code>vitest-out.txt</code>).</p>
+
+  <h3>4a. Fastest: pi alone does not re-read models.json inside one RPC process</h3>
+  <ol>
+    <li>Run <code>pi-rpc-stale-catalog.sh</code>. It writes a <code>models.json</code> with one custom model into an isolated agent dir, starts <code>pi --mode rpc --no-session</code>, asks <code>get_available_models</code>, edits the file to add a second model while the child is alive, asks again.
+<pre>$ AGENT_DIR=/tmp/bb-2289-pi-agent bash pi-rpc-stale-catalog.sh
+pi version: 0.84.2
+edited models.json: added probe-two
+response id=1 bb2289 models=['probe-one']
+response id=2 bb2289 models=['probe-one']        &lt;-- expected ['probe-one', 'probe-two']</pre>
+    Same with the pinned binary: <code>PATH=plugins/provider-pi/node_modules/.bin:$PATH</code> → <code>pi version: 0.84.0</code>, identical output (<code>log</code>).</li>
+  </ol>
+
+  <h3>4b. Unit-level: the bridge's memoized catalog (fails on base)</h3>
+  <p>Save as <code>plugins/provider-pi/src/bridge/catalog.models-json-staleness.test.ts</code>, then <code>cd plugins/provider-pi &amp;&amp; pnpm exec vitest run src/bridge/catalog.models-json-staleness.test.ts</code>. Uses the real pinned pi, an isolated agent dir, no network. (Note: the dev server watches builtin plugin sources, so write this file before starting a dev instance or expect a "1 file changed · rebuilt host" reload.)</p>
+<pre>/**
+ * Repro for get-bb/bb#2289: the memoized `pi --mode rpc --no-session`
+ * catalog child answers `get_available_models` from the snapshot pi built
+ * at boot, so a model added to `&lt;agent dir&gt;/models.json` after the first
+ * `model/list` never shows up until that child is gone.
+ */
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { afterAll, beforeAll, expect, it } from "vitest";
+import { BB_PI_EXTENSION_SOURCE } from "./bb-pi-extension.js";
+import { closeAllPiCatalogs, getPiCatalog } from "./catalog.js";
+import { PI_BRIDGE_COMMAND_ENV } from "./rpc-child.js";
+
+const pinnedPi = fileURLToPath(new URL("../../node_modules/.bin/pi", import.meta.url));
+
+let scratch: string;
+let agentDir: string;
+let extensionPath: string;
+const savedEnv: Record&lt;string, string | undefined&gt; = {};
+
+function modelsJson(ids: string[]): string {
+  return JSON.stringify({ providers: { bb2289: {
+    baseUrl: "http://127.0.0.1:9/v1", api: "openai-completions", apiKey: "not-a-real-key",
+    models: ids.map((id) =&gt; ({ id, name: id })),
+  } } }, null, 2);
+}
+
+beforeAll(() =&gt; {
+  scratch = mkdtempSync(join(tmpdir(), "bb-2289-catalog-"));
+  agentDir = join(scratch, "agent");
+  mkdirSync(agentDir);
+  writeFileSync(join(agentDir, "models.json"), modelsJson(["probe-one"]));
+  extensionPath = join(scratch, "bb-pi-extension.mjs");
+  writeFileSync(extensionPath, BB_PI_EXTENSION_SOURCE, "utf8");
+  for (const key of [PI_BRIDGE_COMMAND_ENV, "PI_CODING_AGENT_DIR", "PI_OFFLINE"]) savedEnv[key] = process.env[key];
+  process.env[PI_BRIDGE_COMMAND_ENV] = pinnedPi;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  process.env.PI_OFFLINE = "1";
+});
+
+afterAll(() =&gt; {
+  closeAllPiCatalogs();
+  for (const [key, value] of Object.entries(savedEnv)) {
+    if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  }
+  rmSync(scratch, { recursive: true, force: true });
+});
+
+it("model/list reflects a model added to models.json after the catalog child booted", async () =&gt; {
+  const catalog = await getPiCatalog(scratch, extensionPath);
+  const before = (await catalog.listModels()).models.map((m) =&gt; m.model);
+  expect(before).toEqual(["bb2289/probe-one"]);
+
+  writeFileSync(join(agentDir, "models.json"), modelsJson(["probe-one", "probe-two"]));
+  expect(JSON.parse(readFileSync(join(agentDir, "models.json"), "utf8")).providers.bb2289.models).toHaveLength(2);
+
+  // Same memoized catalog (same cwd): pi is asked again, answers from its boot snapshot.
+  const after = (await catalog.listModels()).models.map((m) =&gt; m.model);
+  expect(after).toEqual(["bb2289/probe-one", "bb2289/probe-two"]);   // &lt;-- fails on base
+}, 60_000);</pre>
+<pre>FAIL  src/bridge/catalog.models-json-staleness.test.ts &gt; model/list reflects a model added to models.json after the catalog child booted
+AssertionError: expected [ 'bb2289/probe-one' ] to deeply equal [ 'bb2289/probe-one', …(1) ]
+- Expected
++ Received
+  [
+    "bb2289/probe-one",
+-   "bb2289/probe-two",
+  ]
+ ❯ src/bridge/catalog.models-json-staleness.test.ts:81:17
+ Test Files  1 failed (1)   Tests  1 failed (1)   Duration 1.13s</pre>
+
+  <h3>4c. End to end on a running bb (CLI)</h3>
+  <ol>
+    <li>Prepare an isolated pi agent dir and start a dev instance with it:
+<pre>mkdir -p /tmp/bb-2289-pi-agent-live
+cat &gt; /tmp/bb-2289-pi-agent-live/models.json &lt;&lt;'EOF'
+{ "providers": { "bb2289": { "baseUrl": "http://127.0.0.1:9/v1", "api": "openai-completions",
+  "apiKey": "not-a-real-key", "models": [ { "id": "probe-one", "name": "probe-one" } ] } } }
+EOF
+PI_CODING_AGENT_DIR=/tmp/bb-2289-pi-agent-live scripts/bb-dev-app current
+eval "$(scripts/bb-dev-app env)"</pre></li>
+    <li>First listing (spawns the bridge worker and its pi catalog child):
+<pre>$ pnpm bb:dev provider models pi
+Models for pi:
+
+Model             Name       Default
+----------------  ---------  -------
+bb2289/probe-one  probe-one  *</pre>
+    <code>ps</code>: worker <code>bridge-worker-entry.ts …/provider-pi/1337f13b…/host.mjs provider-pi</code> pid 10089 (ppid = host daemon 9024), child <code>pi</code> pid 10238.</li>
+    <li>Add a model, compare standalone pi with bb:
+<pre>$ python3 add-model.py /tmp/bb-2289-pi-agent-live/models.json probe-two
+$ PI_CODING_AGENT_DIR=/tmp/bb-2289-pi-agent-live PI_OFFLINE=1 pi --list-models | grep bb2289
+bb2289    probe-one  128K     16.4K    no        no
+bb2289    probe-two  128K     16.4K    no        no
+$ pnpm bb:dev provider models pi
+Model             Name       Default
+----------------  ---------  -------
+bb2289/probe-one  probe-one  *                      &lt;-- expected probe-two too</pre></li>
+    <li>Reload the plugin, list again:
+<pre>$ pnpm bb:dev plugin reload provider-pi
+provider-pi@0.1.0  running
+  source: builtin:provider-pi
+$ pnpm bb:dev provider models pi
+Model             Name       Default
+----------------  ---------  -------
+bb2289/probe-one  probe-one  *                      &lt;-- still stale; worker pid 10089 unchanged</pre></li>
+    <li>Kill only the pi catalog child, list again (still stale: the server memo answers, the daemon is not called, no pi child is respawned); then reload (bumps the memo key) and list:
+<pre>$ kill -TERM 10238
+$ pnpm bb:dev provider models pi          # stale, served from the 10-minute server memo
+bb2289/probe-one  probe-one  *
+$ pnpm bb:dev plugin reload provider-pi
+$ pnpm bb:dev provider models pi
+bb2289/probe-one  probe-one  *
+bb2289/probe-two  probe-two                          &lt;-- fresh pi child re-read models.json</pre></li>
+    <li>Three reloads in a row, then count workers (<code>log</code>): exactly one provider-pi worker under the dev daemon (pid 20831, ppid 9024) and one pi child. No duplicates.</li>
+    <li>Warm vs idle worker (<code>warm-vs-idle.sh</code>, <code>log</code>). Cycle A ran after the maintenance runtime had idled &gt; 60 s (its worker was already gone); cycle B ran 2 s later against the warm worker:
+<pre>=== 09:16:04 cycle probe-four: add probe-four, bb plugin reload provider-pi, bb provider models pi
+bb2289/probe-one … bb2289/probe-four                  &lt;-- fresh worker 57438 (started 09:16:05) sees it
+=== 09:16:07 cycle probe-five: add probe-five, bb plugin reload provider-pi, bb provider models pi
+bb2289/probe-one … bb2289/probe-four                  &lt;-- probe-five missing; same worker 57438</pre></li>
+  </ol>
+  <p>Not a visual bug; no screenshots. The app's model picker reads <code>GET /api/v1/system/execution-options</code>, the same memoized path the CLI uses (<code>sdk.providers.models</code>), so it shows the same stale list.</p>
+
+  <h2>5. Root cause</h2>
+  <p>Four independent caches sit between <code>models.json</code> and the picker. Only the last one is invalidated by a plugin reload.</p>
+  <h3>5.1 pi: <code>get_available_models</code> is a boot-time snapshot (the actual data staleness)</h3>
+  <p>In pi 0.84.x RPC mode the command returns <code>session.modelRuntime.getAvailableSnapshot()</code> (<code>@earendil-works/pi-coding-agent/dist/modes/rpc/rpc-mode.js</code> L380-383). The snapshot is rebuilt only by <code>ModelRuntime.refresh()</code>, which is where <code>this.config = await ModelConfig.load(this.modelsPath)</code> happens (<code>dist/core/model-runtime.js</code> L499-500); <code>refresh()</code> runs at boot and after credential/provider registration changes (L551, L587, L594). There is no RPC command that triggers it and no file watcher. A fresh <code>pi</code> process (what the reporter calls "standalone pi resolves it immediately") loads the file at boot, so it always looks fresh.</p>
+  <h3>5.2 pi bridge: one memoized catalog child per cwd</h3>
+  <p><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-pi/src/bridge/catalog.ts#L93-L131"><code>plugins/provider-pi/src/bridge/catalog.ts</code> L93-131</a>: <code>catalogsByCwd</code> memoizes a <code>pi --mode rpc --no-session --extension …</code> child; <code>spawnChild()</code> reuses it while <code>!child.exited</code>, and <code>fetchRaw()</code> sends <code>get_available_models</code> to it on every <code>model/list</code>, <code>provider/health</code> and bare-id model resolution (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-pi/src/bridge/bridge.ts#L586-L606">bridge.ts L586-606</a>, L622-624, L678-679). The child is only closed after <code>catalogIdleMs()</code> = 5 minutes without a request (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-pi/src/bridge/catalog.ts#L166-L186">L166-186</a>), and every request re-arms that timer. The header comment even notes "No catalog network-refresh control exists over RPC: pi refreshes at its own startup". Nothing in the bridge looks at <code>models.json</code>.</p>
+<pre>const fetchRaw = async (): Promise&lt;PiRpcModel[]&gt; =&gt; {
+  const data = (await spawnChild().requestOk({
+    type: "get_available_models",
+  })) as { models?: unknown[] } | undefined;
+  // Idle counts from the answer: a slow boot must not evict the child.
+  touch();
+  …</pre>
+  <h3>5.3 host daemon: the bridge worker's identity cannot change on reload</h3>
+  <p><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L410-L418">runtime.ts L410-418</a> keys the process as <code>`${providerId}#bridge:${bridgeLaunchProcessKey(bridgeLaunch)}`</code>, and <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/bridge-launch-process-key.ts#L50-L58">bridge-launch-process-key.ts L50-58</a> builds that from the artifact digest prefix plus a fingerprint of <code>capabilities</code> and <code>providerOptions</code>. <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime-provider-process.ts#L270-L311">runtime-provider-process.ts L270-311</a> retires a thread-less process only when its key differs from the newly ensured one. A builtin plugin reload re-runs <code>loadOne</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/plugins/plugin-service.ts#L1871-L1888">plugin-service.ts L1871-1888</a>) and produces the same artifact digest (daemon log: <code>1337f13b…</code> at 09:06:20, 09:07:11, 09:08:47, 09:10:30, 09:12:34), so <code>listModels</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L2458-L2478">runtime.ts L2458-2478</a>) keeps hitting the same worker and the same catalog child. The reload does restart the plugin's <em>host worker</em> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/plugin-host-manager.ts#L426-L447">plugin-host-manager.ts L426-447</a>, new generation), which is why it looks like "something restarted".</p>
+  <p>What does bound the worker's life at base: <code>model/list</code> runs in the daemon's provider-maintenance runtime (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/app.ts#L768-L773">app.ts L768-773</a>), which is torn down, bridge workers included, after 60 s without a maintenance request (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/runtime-manager.ts#L51">runtime-manager.ts L51</a>, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/runtime-manager.ts#L888-L912">L888-912</a>). Observed: worker 45894 spawned 09:12:34 was gone by 09:14:04. This timeout was added in d74974183 (#1879), after desktop-v0.39.0, so the reporter's 0.39.0 build kept the worker forever; at base the stale window is "as long as something keeps asking within 60 s" (health probes for the settings page and the execution-options provider discovery both go through the same runtime and the same <code>catalog.rawModels()</code>).</p>
+  <h3>5.4 server: 10-minute memo of the model list</h3>
+  <p><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/lifecycle-dedupers.ts#L11-L17">lifecycle-dedupers.ts L11-17</a> (<code>PROVIDER_MODEL_LIST_MEMO_TTL_MS = 10 * 60_000</code>) and <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/system/execution-options.ts#L620-L640">execution-options.ts L620-640</a>: the key is <code>[hostId, daemonSessionId, registrationRevision, command]</code>. This is why killing the pi child alone changed nothing for the CLI (step 4: no <code>provider.list_models</code> RPC reached the daemon) and why the reporter's "picker updated after killing the worker" needs either a reload, a daemon reconnect, or 10 minutes. It also means that even after the fix below, an edit is visible at most 10 minutes later unless the user reloads the plugin.</p>
+  <h3>Why the symptom follows</h3>
+  <p>Edit → pi child still holds the boot snapshot (5.1) → bridge keeps asking that child (5.2) → daemon keeps that bridge worker for the same key across reloads, and for as long as requests arrive within 60 s (5.3) → server re-serves the last answer for 10 minutes unless the registration revision changes (5.4). A plugin reload clears 5.4 only.</p>
+  <h3>Deeper issue</h3>
+  <p>The bridge's <code>resolvePiModel</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-pi/src/bridge/bridge.ts#L652-L692">bridge.ts L652-692</a>) refuses <code>&lt;provider&gt;/&lt;id&gt;</code> when a warm catalog for that cwd knows the provider but not the id. With a stale catalog this can reject a model that pi itself would run. I did not hit it live because a thread's environment runtime uses a separate bridge process whose catalog was cold (the probe-three thread spawned, booted a fresh pi session and failed only with the expected "Connection error" against the fake endpoint), but a <code>model/list</code> with a workspace cwd through the same process would arm it.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>Fix it in the pi bridge (the plugin owns provider translation; the daemon should not learn about pi's config files, and putting <code>models.json</code> into the daemon's process key, as the issue suggests first, would make a host-wide bridge identity depend on a per-user file and still leave the server memo stale).</p>
+  <ol>
+    <li><strong>Invalidate the catalog child when <code>models.json</code> changes.</strong> In <code>catalog.ts</code>, resolve pi's agent dir the way pi does (<code>PI_CODING_AGENT_DIR</code> else <code>~/.pi/agent</code>) and record a content hash (or <code>mtimeMs + size</code>) of <code>models.json</code> when the child is spawned. In <code>fetchRaw()</code>/<code>probe()</code>, compare before sending; on a difference <code>child.kill()</code> and let <code>spawnChild()</code> respawn (it already handles <code>child.exited</code>). The file is tiny, hashing it per request is cheap, and the respawn cost (~1.4 s, what the first probe already costs) is paid once per edit. Missing file ↔ present file counts as a change. This fixes 5.1 and 5.2 together and also keeps <code>resolvePiModel</code> honest.</li>
+    <li><strong>Let the server see it.</strong> The 10-minute memo (5.4) still hides the change. Either shorten the TTL for providers whose catalog is user-editable, or add a cheap "catalog fingerprint" to the memo key; the pragmatic option is to keep the TTL and document that <code>bb plugin reload provider-pi</code> (which already bumps the key) is the refresh path, now that the bridge respawns the child behind it.</li>
+    <li><strong>Regression test</strong>: the vitest above (real pinned pi, isolated agent dir) passes with (1); add a second case that the child pid changed exactly once and that no extra pi process survives (<code>closeAllPiCatalogs</code>).</li>
+  </ol>
+  <p>What could go wrong: editors that write via rename can produce a transient missing file (hash "absent" → respawn → hash present → respawn again; harmless but wasteful, so compare against the last <em>successful</em> spawn's hash). Models added through pi extensions/<code>registerProvider</code> are not in <code>models.json</code> and stay invisible to the fingerprint; that is a pi-side concern (an RPC <code>refresh</code> command upstream would be the cleanest long-term answer and the bridge could call it instead of respawning). Do not include the fingerprint in the daemon process key: that would spawn a second bridge worker per edit while threads pin the old one.</p>
+
+  <h2>7. PR review</h2>
+  <p>No open PRs are linked to this issue.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/2308">#2308</a> Idle provider bridge processes are never retired for non-Codex providers — the general lifecycle half of this report (at base the maintenance runtime does retire after 60 s; environment runtimes are a different story).</li>
+    <li><a href="https://github.com/get-bb/bb/issues/2160">#2160</a> Pi keeps using previous model after model picker change until /compact — another pi-side "state captured at boot" symptom.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/2291">#2291</a> provider.list_models startup probe logs a warning on every daemon start — same <code>provider.list_models</code> path.</li>
+    <li>Commits that shaped the current behaviour: 189be3eb3 (#1885, server memo), d74974183 (#1879, maintenance runtime idle shutdown), e42a4ef48 (#2325, current <code>catalog.ts</code>).</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Daemon log: artifact digest across reloads</h3>
+<pre>09:06:20 Downloading 1337f13bb6e9   (first model/list spawns worker 10089)
+09:07:11 Using cached 1337f13bb6e9   (after reload #1)
+09:08:47 Using cached 1337f13bb6e9   (after reload #2)
+09:10:30 Using cached 1337f13bb6e9   (thread.start, environment runtime worker 35020)
+09:12:34 Using cached 1337f13bb6e9   (model/list after the maintenance runtime idled; new worker 45894)
+[09:06:21] Online host RPC {"commandType":"provider.list_models","handlerMs":1610.7,"ok":true}
+[09:07:02] plugin provider-pi@0.1.0 loaded            (reload #1; list at 09:07:11 hit the same worker, &lt;1 s so not logged)
+[09:08:39] plugin provider-pi@0.1.0 loaded            (reload #2)
+[09:08:49] Online host RPC {"commandType":"provider.list_models","handlerMs":1438.5,"ok":true}   (cold pi child → probe-two visible)
+[09:09:18] [09:09:19] [09:09:20] plugin provider-pi@0.1.0 loaded   (reload ×3; worker count stayed 1)</pre>
+  <h3>Process snapshots</h3>
+<pre># after step 1 (my daemon is pid 9024)
+10089  9024  …/bridge-worker-entry.ts …/plugin-host-artifacts/provider-pi/1337f13b…/host.mjs provider-pi …
+10238 10089  pi                                   (catalog child: pi --mode rpc --no-session --extension …)
+# after 3 reloads (step 5)
+20831  9024  provider-pi worker     20994 20831 pi
+# after thread.start (step 6): a second worker for the thread's environment runtime, by design
+35020  9024  provider-pi worker     35029 35020 pi (the thread's session child)</pre>
+  <h3>Thread started on a model only present in the edited file</h3>
+  <p><code>thread spawn --provider pi --model bb2289/probe-three</code> (thr_9267nerxqu) was accepted, its fresh pi session child read the file, and the turn failed with <code>provider/error: "Connection error."</code> against the fake endpoint — i.e. the per-thread runtime is not affected by the maintenance catalog's staleness unless a catalog is warm in that same bridge process.</p>
+  <h3>Commands run (abridged)</h3>
+<pre>gh issue view 2289 --repo get-bb/bb --json …
+pnpm install --frozen-lockfile --prefer-offline ; pnpm exec turbo run build
+git fetch origin main ; git log 494f66526..origin/main --oneline      # empty
+AGENT_DIR=/tmp/bb-2289-pi-agent bash pi-rpc-stale-catalog.sh            # pi 0.84.2
+PATH=plugins/provider-pi/node_modules/.bin:$PATH AGENT_DIR=/tmp/bb-2289-pi-agent-0840 bash pi-rpc-stale-catalog.sh   # pi 0.84.0
+PI_CODING_AGENT_DIR=/tmp/bb-2289-pi-agent-live scripts/bb-dev-app current
+curl -s -X POST $BB_SERVER_URL/api/v1/projects -d '{"name":"qa","source":{"type":"local_path","path":"/tmp/bb-2289-qa","hostId":"host_6b6az84tvc"}}'
+bbdev.sh provider models pi ; add-model.py … probe-two ; bbdev.sh provider models pi ; bbdev.sh plugin reload provider-pi ; …
+kill -TERM &lt;pi child&gt; ; bbdev.sh provider models pi ; bbdev.sh plugin reload provider-pi ; bbdev.sh provider models pi
+reload-n-times.sh 3 ; warm-vs-idle.sh
+cd plugins/provider-pi &amp;&amp; pnpm exec vitest run src/bridge/catalog.models-json-staleness.test.ts
+pnpm dev:stop ; rm -rf ~/.bb-dev/…-0c45c8842b56 /tmp/bb-2289-* ; lsof -nP -iTCP -sTCP:LISTEN | grep -E ':(14908|22908|30908)'   # free</pre>
+  <p>Raw logs: <code>step1</code>, <code>step2</code>, <code>step3 reload</code>, <code>step3 list</code>, <code>step4 kill</code>, <code>step4 kill+reload</code>, <code>step5</code>, <code>step6</code>, <code>step8</code>, <code>pi-only probe (0.84.2)</code>, <code>pi-only probe (0.84.0)</code>, <code>dev-app start</code>, <code>vitest output</code>.</p>
+</main></body></html>

@@ -1,0 +1,607 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2029 Plugin reload: host rebuilds plugin artifacts into the deployed root, and orphaned services survive with closed handles while reload reports exit 0</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.med { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; white-space:pre-wrap; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2029 · Plugin reload: host rebuilds plugin artifacts into the deployed root, and orphaned services survive with closed handles while reload reports exit 0</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill med">Priority: Medium</span> <span class="pill">Effort: n/a</span> <span class="pill">cli</span> <span class="pill">plugins</span>
+    <a href="https://github.com/get-bb/bb/issues/2029">open on GitHub</a>
+    <span>2026-08-20 · base <code>c7c66423d</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict">REPRODUCED</span> (both defects, live on a dev instance at the base commit) · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>Two separate behaviours, both real and both reproduced at <code>c7c66423d</code>.</p>
+  <p><strong>Defect 1 — the host writes into a path-installed plugin's root.</strong> For <code>path:</code> installs the server treats <code>dist/app.*</code> as a cache of the source tree: it rebuilds the frontend bundle in place on <em>install</em> (always), and on every <em>load</em> (server start, <code>bb plugin reload</code>, <code>bb plugin enable</code>) when either any non-ignored file's mtime is newer than <code>dist/app.js</code> or the committed <code>dist/app.meta.json</code> records a different SDK version than the running host. This is deliberate design ("mutable plugin app artifacts are only a cache of their source tree"), not an accident, and it is covered by an existing unit test. Deploying a git checkout that commits <code>dist/</code> therefore goes dirty the moment the host loads it. The reporter's mtime workaround only disables the first trigger; the SDK-version trigger still rewrites the files (repro step 5). The "output differs from committed bytes" part of the complaint (path comments like <code>// .bb/worktrees/.../src/provider-marks.ts</code>) is specific to 0.39.0, where the esbuild call had no <code>absWorkingDir</code> and no <code>minify</code>, so path comments were relative to the server process cwd; PR #1895 (on main, unreleased) minifies and pins <code>absWorkingDir</code>, so on main the rebuilt <code>app.js</code>/<code>app.css</code> are byte-identical and only <code>dist/app.meta.json</code> (<code>builtWith.bbVersion</code>) can differ.</p>
+  <p><strong>Defect 2 — reload reports success for an unusable plugin.</strong> When a background service ignores its abort signal, the runtime waits 5 s, marks the plugin <code>degraded</code>, refuses to load the new instance (to avoid double-starting), closes the old instance's database handles, and returns normally. <code>POST /api/v1/plugins/reload</code> therefore answers <code>{"ok":true}</code> and <code>bb plugin reload</code> exits 0, while the plugin's CLI command is gone (<code>error: unknown command 'collab'</code>) and the orphaned service keeps ticking against the closed handle (<code>TypeError: The database connection is not open</code>). The "degraded" state itself is the intended design; the missing piece is that the reload result does not carry that outcome, so automation cannot see it.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>The host rebuilds <code>dist/app.js</code>/<code>dist/app.css</code> during plugin load when a source mtime exceeds <code>dist/app.js</code>, writing into the plugin root.</td><td class="ok">Verified</td><td><a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/plugins/plugin-runtime.ts#L976-L1012">isMutableAppBundleStale</a> + <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/plugins/plugin-runtime.ts#L1085-L1124">loadAppBundleCandidate</a>; repro step 4(a): after <code>touch src/provider-marks.ts</code>, <code>bb plugin reload</code> rewrote all three <code>dist/app.*</code> files and logged <code>rebuilding frontend bundle (plugin source is newer than dist/app.js)</code>.</td></tr>
+    <tr><td>The rebuilt output differs from committed bytes because it embeds absolute/cwd-relative paths.</td><td class="ok">Verified for 0.39.0; fixed-by-accident on main</td><td>0.39.0's build had no <code>absWorkingDir</code> and no minify, so esbuild's <code>// path</code> comments were relative to <code>process.cwd()</code> (demo: <code>esbuild-path-comments.log</code>). #1895 (<code>dbbb7640f</code>, not in any release tag) adds <code>absWorkingDir: rootDir</code> and <code>minify: true</code>; on main only <code>app.meta.json</code> differs (repro steps 1, 4, 5: <code>builtWith.bbVersion</code> 0.39.0 → 0.0.0-dev).</td></tr>
+    <tr><td><code>server.js</code> is never rebuilt by this path; only <code>app.*</code>.</td><td class="ok">Verified</td><td>Path installs load the backend from source (<a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/plugins/plugin-runtime.ts#L1027-L1040">resolveServerEntry</a>); only <code>buildPluginApp</code> (and <code>buildPluginHost</code> when <code>bb.host</code> is declared) runs on load. Observed: in steps 1, 4 and 5 the <code>dist/server.js</code> mtime stays at its last <code>bb plugin build</code>/<code>git checkout</code> value while <code>dist/app.*</code> are rewritten next to it (in step 2 it changes only because <code>git checkout</code> wrote it, before the reload).</td></tr>
+    <tr><td>Timing: artifacts written ~13 s after the reload call returned.</td><td class="unv">Unverified</td><td>On main the rebuild is awaited inside <code>loadOne</code> before the route answers (step 4: files rewritten during the call). I could not reproduce a delayed write; possibly a second load (enable, server restart) in their deploy.</td></tr>
+    <tr><td>Workaround: keep <code>dist/</code> mtimes newer than all sources.</td><td class="ok">Verified but incomplete</td><td>Disables the mtime trigger only. Step 5: with every <code>dist/*</code> newer than every source but <code>app.meta.json</code> stamped <code>sdkVersion 0.4.1</code>, server start still rebuilt (<code>built with SDK unknown, running SDK is 0.4.9</code>). Also <code>bb plugin install &lt;path&gt;</code> always builds (step 1; <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/plugins/managed-plugin-artifacts.ts#L330-L352">apps/server/src/services/plugins/managed-plugin-artifacts.ts:330</a>).</td></tr>
+    <tr><td>A reload left the previous service resident, throwing <code>capacity-interval-unreadable:TypeError: The database connection is not open</code> every tick.</td><td class="ok">Verified</td><td>Step 3: after reload, <code>bb plugin logs collab-fixture</code> fills with exactly that TypeError once per second; <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/plugins/plugin-runtime.ts#L1670-L1698">disposePluginInstance</a> closes database handles after the bounded service wait.</td></tr>
+    <tr><td><code>bb plugin reload</code> returned exit 0.</td><td class="ok">Verified</td><td>Step 3: <code>exit=0</code>; <code>--json</code> shows <code>"ok": true</code>. Route always answers ok (<a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/routes/plugins.ts#L451-L455">apps/server/src/routes/plugins.ts:451</a>); CLI only fails on <code>!ok</code> or unknown id (<a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/cli/src/commands/plugin.ts#L1621-L1650">apps/cli/src/commands/plugin.ts:1621</a>). Unit repro <code>issue-2029-reload-reports-success.test.ts</code> fails on main at the last assertion.</td></tr>
+    <tr><td><code>bb plugin list</code> showed <code>degraded (service lane-watcher did not stop)</code>.</td><td class="ok">Verified</td><td>Step 3 output and <a href="assets/2029-plugins-page.png">screenshot</a>.</td></tr>
+    <tr><td>The plugin's CLI command surface was entirely gone (<code>error: unknown command 'collab'</code>).</td><td class="ok">Verified</td><td>Step 3: <code>bb collab</code> → <code>error: unknown command 'collab'</code> exit 1; <code>bb plugin run collab-fixture</code> → <code>plugin "collab-fixture" is not running (status: degraded — …)</code>. Cause: <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/plugins/plugin-runtime.ts#L1575-L1588">apps/server/src/services/plugins/plugin-runtime.ts:1575</a> deletes the plugin from <code>loaded</code> when the old service hung.</td></tr>
+    <tr><td>A second reload cleared the degraded label; <code>disable</code>+<code>enable</code> cleared the orphan.</td><td class="unv">Unverified (plugin-dependent)</td><td>Recovery only happens once the hung <code>start()</code> promise settles (<a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/plugins/plugin-runtime.ts#L1298-L1305">apps/server/src/services/plugins/plugin-runtime.ts:1298</a>, <code>onHungServiceSettled</code>). My fixture's promise never settles, so the second reload, disable and enable all stayed <code>degraded</code> (step 3). The reporter's service must have settled between their calls; the interval behind it is never killed by the host either way.</td></tr>
+    <tr><td><code>bb plugin list</code> reported <code>running</code> for a period while a component was dead.</td><td class="unv">Unverified</td><td>Plausible paths: a failed reload keeps the previous instance and reports <code>running (reload failed: …)</code> (<a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/plugins/plugin-runtime.ts#L1288-L1294">apps/server/src/services/plugins/plugin-runtime.ts:1288</a>); a crashed service in backoff leaves plugin status <code>running</code> with the service state shown separately. Not reproduced.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb monorepo at <code>c7c66423d</code> (branch main, 2026-08-20); origin/main (<code>f4ab03f46</code>) has three newer commits, all mobile UI (#2032, #2033, #2034), none touching <code>apps/server/src/services/plugins</code>, <code>apps/server/src/routes/plugins.ts</code>, <code>apps/cli/src/commands/plugin.ts</code> or <code>packages/plugin-build</code>. App version <code>0.39.0</code> (dev build reports <code>0.0.0-dev</code>), plugin SDK <code>0.4.9</code>. Issue was filed against 0.39.0 / SDK 0.4.1 on macOS.</li>
+    <li>Linux 7.0.0-29-generic, Node v24.18.0, pnpm workspace, esbuild 0.28.1.</li>
+    <li>Own dev instance via <code>scripts/bb-dev-app current</code>: server <code>http://localhost:22378</code>, app <code>http://localhost:14378</code>, host daemon <code>127.0.0.1:30378</code>, data dir <code>~/.bb-dev/projects-bb-.claude-worktrees-wf_926b3193-f6c-17-5f109972db34</code> (deleted at cleanup). The logs below are from this instance (revision run); the first run on a sibling worktree (:19347) produced the same results.</li>
+    <li>Fixture plugin: <code>/tmp/bb2029-plugin</code> (git repo with <code>dist/</code> committed), assembled by <code>step0-fixture-setup.sh</code> from <code>2029/repro/</code> (<code>fixture-package.json</code> → <code>package.json</code>, <code>fixture-server.ts</code> → <code>src/server.ts</code>, <code>fixture-app.tsx</code> → <code>src/app.tsx</code>, <code>fixture-provider-marks.ts</code> → <code>src/provider-marks.ts</code>).</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <p>Fixture: a path plugin with a frontend entry (<code>src/app.tsx</code> importing <code>src/provider-marks.ts</code>), a CLI command <code>bb collab</code>, and a background service <code>lane-watcher</code> that captures <code>bb.storage.database()</code>, ticks every second, and ignores its abort signal (the reporter's lane-watcher behaviour). <code>dist/</code> is built with <code>bb plugin build</code> and committed, so <code>git status</code> is the integrity check.</p>
+  <pre>// Fixture for get-bb/bb#2029. Mirrors the reporter&#x27;s &quot;lane-watcher&quot;:
+// a background service that keeps a reference to the plugin&#x27;s database
+// handle and ticks on an interval. It deliberately ignores its abort signal
+// (a plugin bug, but one the host must survive).
+export default function plugin(bb: any) {
+  const db = bb.storage.database();
+  db.exec(&quot;CREATE TABLE IF NOT EXISTS ticks (at INTEGER)&quot;);
+  bb.cli.register({
+    name: &quot;collab&quot;,
+    summary: &quot;collab fixture command&quot;,
+    run() {
+      return { exitCode: 0, stdout: &quot;collab ok\n&quot; };
+    },
+  });
+  bb.background.service(&quot;lane-watcher&quot;, {
+    start(_signal: AbortSignal) {
+      setInterval(() =&gt; {
+        try {
+          db.prepare(&quot;INSERT INTO ticks (at) VALUES (?)&quot;).run(Date.now());
+        } catch (error) {
+          bb.log.error(&quot;capacity-interval-unreadable:&quot; + String(error));
+        }
+      }, 1000);
+      return new Promise&lt;void&gt;(() =&gt; {});
+    },
+  });
+}
+</pre>
+  <p><strong>How to run the steps.</strong> Start your own dev instance from a bb checkout at <code>c7c66423d</code> (<code>pnpm install --frozen-lockfile && pnpm exec turbo run build && scripts/bb-dev-app current</code>), then in the shell that runs the steps:</p>
+  <pre>export BB_WORKTREE=/path/to/your/bb/checkout          # the checkout whose scripts/bb-dev-app current is running
+eval &quot;$($BB_WORKTREE/scripts/bb-dev-app env)&quot;          # BB_SERVER_URL, BB_HOST_DAEMON_PORT, BB_PROJECT_ID
+# optional overrides: BB_CLI (default: node $BB_WORKTREE/packages/scripts/dist/commands/run-cli.js)
+#                     BB_DEV_LOG (default: the dev.log path printed by `$BB_WORKTREE/scripts/bb-dev-app status`)
+bash 2029/repro/step0-fixture-setup.sh</pre>
+  <p>Steps 3, 4 and 5 each need a server that has no hung service from the previous step: run <code>pnpm dev:stop && scripts/bb-dev-app current</code> in the checkout and wait ~15 s before the step. Every step prints what it does and the CLI exit codes where those are the point.</p>
+  <ol start="0">
+    <li><strong>Assemble, build and commit the fixture</strong> — <code>step0-fixture-setup.sh</code>. Copies the four fixture files into <code>/tmp/bb2029-plugin</code> (<code>src/provider-marks.ts</code> says <code>provider-mark-v1</code>), runs <code>bb plugin build</code>, commits everything including <code>dist/</code>. Expected and actual: <code>git status</code> clean.
+    <pre>== bb plugin build /tmp/bb2029-plugin ==
+dist/server.js
+dist/server.js.map
+dist/server.meta.json
+dist/app.js
+dist/app.css
+dist/app.meta.json
+== dist contents ==
+total 24
+drwxrwxr-x 2 USER USER  160 2026-08-20 14:41:51.988275918 +0000 .
+drwxrwxr-x 5 USER USER  140 2026-08-20 14:41:51.870630173 +0000 ..
+-rw-rw-r-- 1 USER USER 1899 2026-08-20 14:41:51.986627899 +0000 app.css
+-rw-rw-r-- 1 USER USER   87 2026-08-20 14:41:51.892629742 +0000 app.js
+-rw-rw-r-- 1 USER USER  216 2026-08-20 14:41:51.986627899 +0000 app.meta.json
+-rw-rw-r-- 1 USER USER 1041 2026-08-20 14:41:51.884629899 +0000 server.js
+-rw-rw-r-- 1 USER USER 1596 2026-08-20 14:41:51.884629899 +0000 server.js.map
+-rw-rw-r-- 1 USER USER  216 2026-08-20 14:41:51.886629859 +0000 server.meta.json
+== committed (git status --short must be empty) ==
+d9c74f9 v1: fixture with committed dist
+</pre></li>
+    <li><strong>Install from a clean checkout</strong> — <code>step1-install.sh</code>. Expected: the author's directory is untouched. Actual: <code>dist/app.js</code>, <code>dist/app.css</code>, <code>dist/app.meta.json</code> are rewritten (mtimes) and <code>app.meta.json</code> differs in bytes.
+    <pre>== before install: git status --short (empty = clean) ==
+== dist mtimes before ==
+-rw-rw-r-- 1 USER USER 1899 2026-08-20 14:41:51.986627899 +0000 app.css
+-rw-rw-r-- 1 USER USER   87 2026-08-20 14:41:51.892629742 +0000 app.js
+-rw-rw-r-- 1 USER USER  216 2026-08-20 14:41:51.986627899 +0000 app.meta.json
+-rw-rw-r-- 1 USER USER 1041 2026-08-20 14:41:51.884629899 +0000 server.js
+-rw-rw-r-- 1 USER USER 1596 2026-08-20 14:41:51.884629899 +0000 server.js.map
+-rw-rw-r-- 1 USER USER  216 2026-08-20 14:41:51.886629859 +0000 server.meta.json
+== bb plugin install /tmp/bb2029-plugin --yes ==
+Installing bb-plugin-collab-fixture@0.1.0 from /tmp/bb2029-plugin
+Plugins are full-trust code running inside the BB server. They can read all local BB data, including other plugins&#x27; secrets.
+Installed:
+collab-fixture@0.1.0  running
+  source: path:/tmp/bb2029-plugin
+  service lane-watcher: running
+  command: bb collab — collab fixture command
+== after install: git status --short ==
+ M dist/app.meta.json
+== git diff ==
+diff --git a/dist/app.meta.json b/dist/app.meta.json
+index 36591ef..658daf9 100644
+--- a/dist/app.meta.json
++++ b/dist/app.meta.json
+@@ -5,7 +5,7 @@
+   &quot;pluginId&quot;: &quot;collab-fixture&quot;,
+   &quot;pluginVersion&quot;: &quot;0.1.0&quot;,
+   &quot;builtWith&quot;: {
+-    &quot;bbVersion&quot;: &quot;0.39.0&quot;,
++    &quot;bbVersion&quot;: &quot;0.0.0-dev&quot;,
+     &quot;pluginSdkVersion&quot;: &quot;0.4.9&quot;
+   }
+ }
+== dist mtimes after ==
+-rw-rw-r-- 1 USER USER 1899 2026-08-20 14:41:58.421501760 +0000 app.css
+-rw-rw-r-- 1 USER USER   87 2026-08-20 14:41:58.410501976 +0000 app.js
+-rw-rw-r-- 1 USER USER  219 2026-08-20 14:41:58.422501741 +0000 app.meta.json
+-rw-rw-r-- 1 USER USER 1041 2026-08-20 14:41:51.884629899 +0000 server.js
+-rw-rw-r-- 1 USER USER 1596 2026-08-20 14:41:51.884629899 +0000 server.js.map
+-rw-rw-r-- 1 USER USER  216 2026-08-20 14:41:51.886629859 +0000 server.meta.json
+</pre></li>
+    <li><strong>Deploy by <code>git checkout</code> then reload</strong> — <code>step2-deploy-reload.sh</code>. Here git wrote <code>dist/app.js</code> and <code>src/provider-marks.ts</code> with identical mtimes, so the mtime gate was <em>not</em> satisfied and no rebuild happened; the step instead surfaces defect 2 (reload → <code>degraded</code>, <code>exit=0</code>). Whether a checkout trips the gate depends on write ordering and timestamp granularity, which is the "undocumented internal condition" the issue describes.
+    <pre>== author a new version: edit src/provider-marks.ts, bb plugin build, commit (v2) ==
+v1=d9c74f9 v2=f3fe72a
+== deploy: git checkout v1, then git checkout v2 (what a deploy does on the host) ==
+== git status after checkout (clean) ==
+== mtimes after checkout: git writes files in index order, dist/ before src/ ==
+2026-08-20 14:42:02.585420134 +0000 dist/app.js
+2026-08-20 14:41:51.671300923 +0000 src/app.tsx
+2026-08-20 14:42:02.585420134 +0000 src/provider-marks.ts
+2026-08-20 14:41:51.670020634 +0000 src/server.ts
+== sha256 of committed dist before reload ==
+a7ca6f1b4131f93bd0d6f48640465ccd5b5f2cd8d2083142bc844b67f389b579  dist/app.js
+6fb89e29f98d48b2bf3285b51e79c7f21a89f929d8a92f634aff27ff0cecdbdb  dist/app.css
+f7a63a24cb59b7d1a5c5cee5d415664c111d8cec2adc6f3c85fe8f9fbc461aef  dist/app.meta.json
+== bb plugin reload collab-fixture ==
+collab-fixture@0.1.0  degraded  (service lane-watcher did not stop)
+  source: path:/tmp/bb2029-plugin
+exit=0
+== git status after reload ==
+== git diff after reload ==
+== mtimes after reload ==
+2026-08-20 14:42:02.585420134 +0000 dist/app.js
+2026-08-20 14:42:01.554440345 +0000 dist/app.css
+2026-08-20 14:42:01.554440345 +0000 dist/app.meta.json
+2026-08-20 14:42:01.465442089 +0000 dist/server.js
+== sha256 after reload ==
+a7ca6f1b4131f93bd0d6f48640465ccd5b5f2cd8d2083142bc844b67f389b579  dist/app.js
+6fb89e29f98d48b2bf3285b51e79c7f21a89f929d8a92f634aff27ff0cecdbdb  dist/app.css
+f7a63a24cb59b7d1a5c5cee5d415664c111d8cec2adc6f3c85fe8f9fbc461aef  dist/app.meta.json
+</pre></li>
+    <li><strong>Orphaned service, exit 0, command surface gone</strong> — <code>step3-orphan.sh</code> (run against a freshly started server). Expected: a reload that leaves the plugin unusable fails its exit code. Actual: <code>exit=0</code>, <code>"ok": true</code>, <code>bb collab</code> → <code>unknown command</code>, plugin log fills with <code>TypeError: The database connection is not open</code>, and the count keeps growing after <code>disable</code>/<code>enable</code>.
+    <pre>== before: bb plugin list (collab-fixture) ==
+collab-fixture@0.1.0  running
+  source: path:/tmp/bb2029-plugin
+  service lane-watcher: running
+  command: bb collab — collab fixture command
+== before: bb collab ==
+collab ok
+exit=0
+== bb plugin reload collab-fixture ==
+collab-fixture@0.1.0  degraded  (service lane-watcher did not stop)
+  source: path:/tmp/bb2029-plugin
+  handlers: 1 calls / 0ms total / 0ms max
+exit=0
+== bb plugin reload --json collab-fixture (ok flag) ==
+{
+  &quot;ok&quot;: true,
+  &quot;plugins&quot;: [
+    {
+      &quot;id&quot;: &quot;ask-user-question&quot;,
+      &quot;source&quot;: &quot;builtin:ask-user-question&quot;,
+      &quot;rootDir&quot;: &quot;/home/USER/projects/bb/.claude/worktrees/wf_926b3193-f6c-17/plugins/ask-user-question&quot;,
+      &quot;version&quot;: &quot;0.1.0&quot;,
+      &quot;provenance&quot;: &quot;builtin&quot;,
+      &quot;isOrphanedBuiltin&quot;: false,
+      &quot;publisherLabel&quot;: &quot;BB Official&quot;,
+      &quot;sourceDisplay&quot;: &quot;builtin · ask-user-que
+exit=0
+== after: bb plugin list (collab-fixture) ==
+collab-fixture@0.1.0  degraded  (service lane-watcher did not stop)
+  source: path:/tmp/bb2029-plugin
+  handlers: 1 calls / 0ms total / 0ms max
+connect@0.1.0  running
+== after: bb collab ==
+error: unknown command &#x27;collab&#x27;
+exit=1
+== after: bb plugin run collab-fixture ==
+plugin &quot;collab-fixture&quot; is not running (status: degraded — service lane-watcher did not stop)
+exit=1
+== plugin log (bb plugin logs collab-fixture, last 3) ==
+{&quot;ts&quot;:1787236980145,&quot;level&quot;:&quot;error&quot;,&quot;message&quot;:&quot;capacity-interval-unreadable:TypeError: The database connection is not open&quot;}
+{&quot;ts&quot;:1787236981145,&quot;level&quot;:&quot;error&quot;,&quot;message&quot;:&quot;capacity-interval-unreadable:TypeError: The database connection is not open&quot;}
+{&quot;ts&quot;:1787236982147,&quot;level&quot;:&quot;error&quot;,&quot;message&quot;:&quot;capacity-interval-unreadable:TypeError: The database connection is not open&quot;}
+== count of &#x27;database connection is not open&#x27; lines ==
+13
+== server log lines for collab-fixture ==
+@bb/server:dev: [14:42:32] INFO: [server] plugin collab-fixture@0.1.0 loaded
+@bb/server:dev: [14:42:56] WARN: [server] [plugin:collab-fixture] service lane-watcher did not stop within 5000ms — plugin degraded until it does
+@bb/server:dev: [14:42:56] WARN: [server] plugin collab-fixture not loaded (degraded): service lane-watcher did not stop
+== disable + enable ==
+collab-fixture@0.1.0  disabled  (service lane-watcher did not stop)
+  source: path:/tmp/bb2029-plugin
+  handlers: 1 calls / 0ms total / 0ms max
+exit=0
+collab-fixture@0.1.0  degraded  (service lane-watcher did not stop)
+  source: path:/tmp/bb2029-plugin
+  handlers: 1 calls / 0ms total / 0ms max
+exit=0
+== after enable: count of &#x27;database connection is not open&#x27; lines (still growing?) ==
+17
+20
+</pre>
+    <figure><img src="assets/2029-plugins-page.png" alt="Installed plugins page showing Collab fixture as Degraded: service lane-watcher did not stop"><figcaption>App → Extensions → Installed plugins after step 3: "Collab fixture — Degraded — service lane-watcher did not stop". The CLI that produced it exited 0.</figcaption></figure></li>
+    <li><strong>Reload rebuilds into the root when a source is newer</strong> — <code>step4-reload-rebuild.sh</code> (fresh server). Part (a) reproduces: <code>touch src/provider-marks.ts</code> + reload rewrote <code>dist/app.*</code> (and left <code>dist/server.js</code> untouched), log line <code>rebuilding frontend bundle (plugin source is newer than dist/app.js)</code>. Part (b) did not fire in this run only because the same reload had already left the plugin hung (hung check precedes the rebuild); it is re-run cleanly as step 5.
+    <pre>== (a) source newer than dist/app.js: touch src/provider-marks.ts, then reload ==
+(git clean above)
+2026-08-20 14:42:02.585420134 +0000 dist/app.js
+2026-08-20 14:42:01.465442089 +0000 dist/server.js
+2026-08-20 14:43:46.163389660 +0000 src/provider-marks.ts
+collab-fixture@0.1.0  degraded  (service lane-watcher did not stop)
+-- dist mtimes after reload --
+2026-08-20 14:43:46.387385269 +0000 dist/app.js
+2026-08-20 14:43:46.478383485 +0000 dist/app.css
+2026-08-20 14:43:46.479383466 +0000 dist/app.meta.json
+2026-08-20 14:42:01.465442089 +0000 dist/server.js
+-- git status / diff after reload --
+ M dist/app.meta.json
+diff --git a/dist/app.meta.json b/dist/app.meta.json
+index 36591ef..658daf9 100644
+--- a/dist/app.meta.json
++++ b/dist/app.meta.json
+@@ -5,7 +5,7 @@
+   &quot;pluginId&quot;: &quot;collab-fixture&quot;,
+   &quot;pluginVersion&quot;: &quot;0.1.0&quot;,
+   &quot;builtWith&quot;: {
+-    &quot;bbVersion&quot;: &quot;0.39.0&quot;,
++    &quot;bbVersion&quot;: &quot;0.0.0-dev&quot;,
+     &quot;pluginSdkVersion&quot;: &quot;0.4.9&quot;
+   }
+ }
+@bb/server:dev: [14:43:46] INFO: [server] plugin collab-fixture: rebuilding frontend bundle (plugin source is newer than dist/app.js)
+
+== (b) committed meta says another SDK version; dist mtimes are NEWER than every source ==
+-- newest source vs dist/app.js --
+2026-08-20 14:41:51.670020634 +0000 src/server.ts
+2026-08-20 14:41:51.671300923 +0000 src/app.tsx
+2026-08-20 14:42:01.465442089 +0000 dist/server.js
+2026-08-20 14:43:46.163389660 +0000 src/provider-marks.ts
+2026-08-20 14:43:51.531284428 +0000 dist/app.js
+(git clean above)
+collab-fixture@0.1.0  degraded  (service lane-watcher did not stop)
+-- git status / diff after reload --
+@bb/server:dev: [14:43:46] INFO: [server] plugin collab-fixture: rebuilding frontend bundle (plugin source is newer than dist/app.js)
+</pre></li>
+    <li><strong>SDK-version trigger defeats the mtime workaround</strong> — <code>step5-sdk-mismatch.sh</code>. Committed <code>app.meta.json</code> stamped <code>sdkVersion 0.4.1</code> (the reporter's SDK), every <code>dist/*</code> touched newer than every source, server restarted. Actual: rebuilt on load anyway (<code>dist/app.*</code> rewritten, <code>dist/server.js</code> untouched); checkout dirty. The log says <code>built with SDK unknown</code> rather than <code>0.4.1</code> because the simulated meta only changed the top-level <code>sdkVersion</code>, and <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/plugins/app-bundle.ts#L244-L249">parsePluginArtifactMeta</a> rejects a meta whose <code>builtWith.pluginSdkVersion</code> (still 0.4.9) differs from <code>sdkVersion</code>, so <code>readPluginAppBundleMeta</code> returns <code>null</code>; a genuine 0.4.1-built artifact would parse and log <code>built with SDK 0.4.1</code>. Either way <code>meta?.sdkVersion !== PLUGIN_SDK_VERSION</code> is true and the rebuild fires.
+    <pre>== committed meta ==
+  &quot;sdkVersion&quot;: &quot;0.4.1&quot;,
+    &quot;bbVersion&quot;: &quot;0.39.0&quot;,
+== mtimes: every dist file newer than every source ==
+2026-08-20 14:41:51.670020634 +0000 src/server.ts
+2026-08-20 14:41:51.671300923 +0000 src/app.tsx
+2026-08-20 14:42:01.465442089 +0000 dist/server.js
+2026-08-20 14:43:46.163389660 +0000 src/provider-marks.ts
+2026-08-20 14:44:16.934786434 +0000 dist/app.js
+2026-08-20 14:44:17.018784788 +0000 dist/app.css
+2026-08-20 14:44:17.018784788 +0000 dist/app.meta.json
+== bb plugin list ==
+collab-fixture@0.1.0  running
+  source: path:/tmp/bb2029-plugin
+== git status / diff after the server loaded the plugin ==
+ M dist/app.meta.json
+diff --git a/dist/app.meta.json b/dist/app.meta.json
+index 0cee571..658daf9 100644
+--- a/dist/app.meta.json
++++ b/dist/app.meta.json
+@@ -1,11 +1,11 @@
+ {
+   &quot;sdkMajor&quot;: 0,
+-  &quot;sdkVersion&quot;: &quot;0.4.1&quot;,
++  &quot;sdkVersion&quot;: &quot;0.4.9&quot;,
+   &quot;artifactFormatVersion&quot;: 1,
+   &quot;pluginId&quot;: &quot;collab-fixture&quot;,
+   &quot;pluginVersion&quot;: &quot;0.1.0&quot;,
+   &quot;builtWith&quot;: {
+-    &quot;bbVersion&quot;: &quot;0.39.0&quot;,
++    &quot;bbVersion&quot;: &quot;0.0.0-dev&quot;,
+     &quot;pluginSdkVersion&quot;: &quot;0.4.9&quot;
+   }
+ }
+== dist mtimes after load (server.js untouched) ==
+2026-08-20 14:44:16.934786434 +0000 dist/app.js
+2026-08-20 14:44:17.018784788 +0000 dist/app.css
+2026-08-20 14:44:17.018784788 +0000 dist/app.meta.json
+2026-08-20 14:42:01.465442089 +0000 dist/server.js
+== server log ==
+@bb/server:dev: [14:44:16] INFO: [server] plugin collab-fixture: rebuilding frontend bundle (built with SDK unknown, running SDK is 0.4.9)
+</pre></li>
+    <li><strong>Unit-level repro of defect 2</strong> — <code>apps/server/test/services/plugins/issue-2029-reload-reports-success.test.ts</code>, run with <code>pnpm exec vitest run test/services/plugins/issue-2029-reload-reports-success.test.ts</code> from <code>apps/server</code>. Every observation assertion passes (degraded, API gone, closed-handle errors &gt; 0); the final assertion, "reload() must not resolve as success", fails on main:
+    <pre>     × leaves the plugin unloaded with its CLI gone, yet reload() resolves (reports success) 469ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL   @bb/server  test/services/plugins/issue-2029-reload-reports-success.test.ts &gt; issue 2029: reload of a plugin whose service ignores abort &gt; leaves the plugin unloaded with its CLI gone, yet reload() resolves (reports success)
+AssertionError: reload() resolved although the plugin is degraded and unloaded: expected null not to be null
+ ❯ test/services/plugins/issue-2029-reload-reports-success.test.ts:115:95
+    113|     // Expected by the reporter (and by any automated deploy): a reloa…
+    114|     // leaves the plugin unusable must not report success.
+    115|     expect(reloadError, &quot;reload() resolved although the plugin is degr…
+       |                                                                                               ^
+    116|   });
+    117| });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+</pre>
+    <pre>// Repro for get-bb/bb#2029 (defect 2): `pluginService.reload(id)` resolves
+// normally when the plugin&#x27;s previous service did not stop, even though the
+// outcome is &quot;plugin unloaded, degraded, CLI command gone&quot;. The HTTP route
+// (POST /plugins/reload) and `bb plugin reload` therefore report ok:true /
+// exit 0. The last assertion FAILS on main (c7c66423d) because reload resolves.
+import { mkdtemp, mkdir, rm, writeFile } from &quot;node:fs/promises&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { afterEach, beforeEach, describe, expect, it } from &quot;vitest&quot;;
+import { createConnection, migrate, type DbConnection } from &quot;@bb/db&quot;;
+import type { Logger } from &quot;@bb/logger&quot;;
+import {
+  createPluginService,
+  type PluginService,
+} from &quot;../../../src/services/plugins/plugin-service.js&quot;;
+import { testLogger } from &quot;../../helpers/test-app.js&quot;;
+import { createNoopTelemetryService } from &quot;../../../src/services/system/telemetry.js&quot;;
+
+const logger = testLogger as unknown as Logger;
+
+describe(&quot;issue 2029: reload of a plugin whose service ignores abort&quot;, () =&gt; {
+  let db: DbConnection;
+  let workDir: string;
+  let service: PluginService;
+
+  beforeEach(async () =&gt; {
+    db = createConnection(&quot;:memory:&quot;);
+    migrate(db);
+    workDir = await mkdtemp(join(tmpdir(), &quot;bb-2029-&quot;));
+    service = createPluginService({
+      telemetry: createNoopTelemetryService(),
+      db,
+      hub: {
+        getDaemonSessionIdForHost: () =&gt; null,
+        notifyPluginSignal: () =&gt; 0,
+        notifySystem: () =&gt; {},
+      },
+      logger,
+      dataDir: join(workDir, &quot;data&quot;),
+      appVersion: &quot;0.9.0&quot;,
+      loadTimeoutMs: 2000,
+      serviceStopTimeoutMs: 100,
+      serviceRestartBaseMs: 5,
+    });
+  });
+
+  afterEach(async () =&gt; {
+    await service.stop();
+    await rm(workDir, { recursive: true, force: true });
+  });
+
+  it(&quot;leaves the plugin unloaded with its CLI gone, yet reload() resolves (reports success)&quot;, async () =&gt; {
+    const rootDir = join(workDir, &quot;bb-plugin-collab&quot;);
+    await mkdir(rootDir, { recursive: true });
+    await writeFile(
+      join(rootDir, &quot;package.json&quot;),
+      JSON.stringify({
+        name: &quot;bb-plugin-collab&quot;,
+        version: &quot;0.1.0&quot;,
+        bb: {
+          name: &quot;collab&quot;,
+          description: &quot;fixture&quot;,
+          branding: { icon: &quot;Zap&quot; },
+          server: &quot;./server.ts&quot;,
+        },
+      }),
+    );
+    await writeFile(
+      join(rootDir, &quot;server.ts&quot;),
+      `
+      export default function plugin(bb: any) {
+        const db = bb.storage.database();
+        db.exec(&quot;CREATE TABLE IF NOT EXISTS ticks (at INTEGER)&quot;);
+        bb.cli.register({ name: &quot;collab&quot;, summary: &quot;collab&quot;, run() { return { exitCode: 0, stdout: &quot;ok&quot; }; } });
+        bb.background.service(&quot;lane-watcher&quot;, {
+          start() {
+            const g = globalThis as any;
+            g.__2029ticks = 0; g.__2029closedErrors = 0;
+            const timer = setInterval(() =&gt; {
+              try { db.prepare(&quot;INSERT INTO ticks (at) VALUES (?)&quot;).run(Date.now()); g.__2029ticks += 1; }
+              catch (e) { g.__2029closedErrors += 1; }
+            }, 20);
+            (timer as any).unref?.();
+            return new Promise&lt;void&gt;(() =&gt; {}); // ignores abort forever
+          },
+        });
+      }
+      `,
+    );
+    const installed = await service.installPath(rootDir);
+    expect(installed.status).toBe(&quot;running&quot;);
+    expect(service.getApi(&quot;collab&quot;)).toBeDefined();
+
+    // What `bb plugin reload collab` does. It resolves; the route then answers
+    // { ok: true } and the CLI exits 0.
+    let reloadError: unknown = null;
+    try {
+      await service.reload(&quot;collab&quot;);
+    } catch (error) {
+      reloadError = error;
+    }
+
+    const entry = service.list().find((p) =&gt; p.id === &quot;collab&quot;);
+    expect(entry?.status).toBe(&quot;degraded&quot;);
+    expect(entry?.statusDetail).toContain(&quot;service lane-watcher did not stop&quot;);
+    // The plugin is unloaded: no API handle -&gt; `bb collab` is &quot;unknown command&quot;.
+    expect(service.getApi(&quot;collab&quot;)).toBeUndefined();
+    // The orphaned service keeps ticking on the closed database handle.
+    await new Promise((resolve) =&gt; setTimeout(resolve, 200));
+    const g = globalThis as Record&lt;string, unknown&gt;;
+    expect(g.__2029closedErrors as number).toBeGreaterThan(0);
+
+    // Expected by the reporter (and by any automated deploy): a reload that
+    // leaves the plugin unusable must not report success.
+    expect(reloadError, &quot;reload() resolved although the plugin is degraded and unloaded&quot;).not.toBeNull();
+  });
+});
+</pre></li>
+  </ol>
+  <p>Repro files: <code>2029/repro/</code></p>
+
+  <h2>5. Root cause</h2>
+  <h3>Defect 1: path-install artifacts are a host-owned cache living in the author's directory</h3>
+  <p>Three code paths write <code>dist/app.*</code> into a path plugin's root:</p>
+  <ul>
+    <li><strong>Install</strong>: <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/plugins/managed-plugin-artifacts.ts#L330-L352">managed-plugin-artifacts.ts:330-352</a> — for every non-npm, non-packaged-builtin plugin with <code>bb.app</code>, <code>validateInstallDir</code> calls <code>buildPluginApp(args.rootDir, …)</code> unconditionally. The comment above it says "path: the author owns that directory … only the frontend is built", i.e. the write is intentional.</li>
+    <li><strong>Load</strong> (server start, reload, enable): <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/plugins/plugin-runtime.ts#L1085-L1124">plugin-runtime.ts:1085-1124</a> — <code>loadAppBundleCandidate</code> rebuilds when <code>meta?.sdkVersion !== PLUGIN_SDK_VERSION</code> (<em>any</em> difference, including a meta it cannot parse — <code>readPluginAppBundleMeta</code> returns <code>null</code> for a missing or malformed <code>app.meta.json</code> or one whose <code>builtWith.pluginSdkVersion</code> disagrees with <code>sdkVersion</code>, which is why step 5 logs <code>built with SDK unknown</code>) or when <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/plugins/plugin-runtime.ts#L976-L1012">isMutableAppBundleStale</a> finds any file or directory (excluding <code>dist</code>, <code>node_modules</code>, <code>.git</code>) with <code>mtimeMs &gt; dist/app.js mtimeMs</code>. The docstring states the policy: "Mutable plugin app artifacts are only a cache of their source tree."</li>
+    <li><strong>Load, host bundle</strong>: <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/plugins/plugin-runtime.ts#L1126-L1145">loadHostArtifactCandidate</a> — when <code>bb.host</code> is declared, <code>buildPluginHost</code> runs on <em>every</em> load with no staleness check at all (not exercised by the reporter's plugin, but the same class of write).</li>
+  </ul>
+  <p>The build itself (<a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/packages/plugin-build/src/build-plugin-app.ts#L621-L735">buildPluginApp</a>) stages under <code>dist/.stage-*</code> and renames into <code>dist/app.js</code>, <code>dist/app.css</code>, <code>dist/app.meta.json</code>. <code>app.meta.json</code> always embeds <code>builtWith.bbVersion</code> from the running host, so even a bit-identical JS/CSS rebuild changes that file whenever the host's version differs from the one that produced the commit (<code>0.39.0 → 0.0.0-dev</code> in every step above). In 0.39.0 the esbuild call (<a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/packages/plugin-build/src/build-plugin-app.ts#L494-L520">desktop-v0.39.0 build-plugin-app.ts:494</a> at tag <code>desktop-v0.39.0</code>) had no <code>absWorkingDir</code> and no <code>minify</code>, so esbuild's <code>// &lt;path&gt;</code> comments were computed relative to the server process's cwd — for a macOS app launched from <code>~</code>, <code>// .bb/worktrees/env_…/bb-collab/src/provider-marks.ts</code>, exactly the diff in the issue. #1895 (<code>dbbb7640f</code>, on main, no release tag yet) sets <code>absWorkingDir: rootDir</code> and <code>minify: true</code>; the comments disappear and JS/CSS become location-independent. The write-into-root behaviour is unchanged by #1895.</p>
+  <p>Why the reporter saw drift "on the next deploy": <code>git checkout</code> writes changed paths in index order (<code>dist/…</code> before <code>src/…</code>), so a commit that touches both can leave sources newer than <code>dist/app.js</code>; whether it does depends on filesystem timestamp granularity (identical ns timestamps in step 2 here, but APFS/macOS and larger trees differ). And independent of mtimes, an artifact built by a different SDK version is rebuilt on first load after any host upgrade — so their 0.4.1-built bundle will be rewritten the moment the host ships a newer SDK, regardless of the mtime workaround.</p>
+
+  <h3>Defect 2: the hung-service outcome never reaches the reload result</h3>
+  <ol>
+    <li><code>reload(id)</code> (<a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/plugins/plugin-service.ts#L1778-L1786">apps/server/src/services/plugins/plugin-service.ts:1778</a>) calls <code>loadOne(row)</code> and returns <code>void</code>; the route (<a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/routes/plugins.ts#L451-L455">apps/server/src/routes/plugins.ts:451</a>) returns <code>{ ok: true, plugins: list() }</code> unconditionally; the CLI (<a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/cli/src/commands/plugin.ts#L1621-L1650">apps/cli/src/commands/plugin.ts:1621</a>) exits non-zero only when <code>ok</code> is false or the id is unknown. Plugin status is printed but never inspected.</li>
+    <li>Inside <code>loadOne</code>, when a previous instance exists, <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/plugins/plugin-runtime.ts#L1575-L1588">apps/server/src/services/plugins/plugin-runtime.ts:1575</a> runs <code>disposePluginInstance</code>, which calls <code>stopServices</code> (<a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/plugins/plugin-runtime.ts#L639-L668">apps/server/src/services/plugins/plugin-runtime.ts:639</a>): abort every service, wait <code>serviceStopTimeoutMs</code> (5000 ms, <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/plugins/plugin-runtime.ts#L321">apps/server/src/services/plugins/plugin-runtime.ts:321</a>), and on timeout record the service in <code>hungServices</code>, set status <code>degraded</code>, and move on. <code>disposePluginInstance</code> then closes the old instance's database handles (<a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/plugins/plugin-runtime.ts#L1684-L1694">apps/server/src/services/plugins/plugin-runtime.ts:1684</a>) and invalidates the API handle — so the still-running orphan's next <code>db.prepare(...)</code> throws <code>TypeError: The database connection is not open</code>; this is the documented contract ("The host closes handles on dispose/reload; a closed handle throws on use", <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/packages/plugin-sdk/src/backend-contract.ts#L117-L125">packages/plugin-sdk/src/backend-contract.ts:117</a>).</li>
+    <li>Back in <code>loadOne</code>, because <code>hungServices</code> is non-empty the new instance is discarded (<code>loaded.delete</code>, its handles closed, <code>return</code>) so the plugin is now <em>unloaded</em>: no CLI registration (→ <code>unknown command 'collab'</code>), no routes, no API. Every later <code>loadOne</code> (reload, enable, and even server-lifetime) short-circuits at <a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/plugins/plugin-runtime.ts#L1298-L1305">apps/server/src/services/plugins/plugin-runtime.ts:1298</a> until the hung promise settles.</li>
+    <li>None of that is propagated: no throw, no field on the route payload, no non-zero exit. The only signals are the log line <code>service lane-watcher did not stop within 5000ms</code> and the <code>degraded</code> status, which the CLI prints and then exits 0.</li>
+  </ol>
+  <p><strong>Underlying/related:</strong> the host has no way to stop an orphaned timer or socket owned by plugin code that ignored abort; it can only refuse to double-start. While checking this I also observed (with an earlier fixture revision whose catch block referenced a non-existent <code>bb.logger</code>) that an exception thrown inside the orphan's <code>setInterval</code> callback after reload killed the entire bb server process (<code>server-crash-from-orphan-timer.log</code>). There is no process-level <code>uncaughtException</code> guard in <code>apps/server/src</code>; this is the subject of #1746.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <h3>Defect 2 (small, contained)</h3>
+  <ul>
+    <li>Make <code>PluginService.reload(id)</code> return the per-plugin outcome instead of <code>void</code> — e.g. the reloaded <code>PluginListEntry</code> list — and have <code>POST /plugins/reload</code> answer <code>ok: false</code> (still HTTP 200 or 409) with <code>error: 'plugin "x" degraded: service lane-watcher did not stop'</code> whenever any targeted plugin ended in <code>degraded</code>/<code>error</code>/<code>incompatible</code>/<code>missing</code>, or when a reload kept the previous instance (<code>reload failed: …</code> detail). The CLI then exits 1 through the existing <code>!result.ok</code> path (<a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/cli/src/commands/plugin.ts#L1640-L1642">apps/cli/src/commands/plugin.ts:1640</a>) with the detail printed; the existing unit repro turns green by asserting a rejected/failed outcome. Keep the runtime's degraded policy as is. Risk: <code>bb plugin dev</code> and the builtin watcher loop use the same route and currently tolerate a degraded outcome silently — they should log it, not loop. No wire change to the host daemon, so no protocol bump.</li>
+    <li>Optionally, after the bounded wait, keep surfacing progress: log each <code>onHungServiceSettled</code> (already done) and, in <code>bb plugin list</code>, append "reload again to recover" — cosmetic.</li>
+  </ul>
+  <h3>Defect 1 (design decision, larger)</h3>
+  <ul>
+    <li>Build path-install frontend/host artifacts into a host-owned cache keyed by root path (e.g. <code>&lt;dataDir&gt;/plugin-app-cache/&lt;hash(rootDir)&gt;/</code>), the same way managed <code>git:</code>/<code>npm:</code> artifacts already live under the data dir (<a href="https://github.com/get-bb/bb/blob/c7c66423d55c320bab9103218f0ffef1a8191331/apps/server/src/services/plugins/install-sources.ts#L412-L440">install-sources.ts npmArtifactCacheDir/gitArtifactCacheDir</a>). <code>loadPluginAppBundle</code>/<code>getAppAsset</code> would read from that cache; <code>buildPluginApp</code> already accepts a root and writes to <code>&lt;root&gt;/dist</code>, so it needs an explicit <code>outDir</code> parameter (the Tailwind scanner's <code>dist/**</code> exclusion must then also exclude the cache dir, which is trivially outside the root). The staleness rule can stay but compare against the cache file. This removes every write into the author's directory on install and load; <code>bb plugin build</code> and <code>bb plugin dev</code> keep writing <code>dist/</code> explicitly because the author asked for it.</li>
+    <li>If that is too large: (a) stop calling <code>buildPluginApp</code> in <code>validateInstallDir</code> for <code>path</code> installs when a compatible <code>dist/app.meta.json</code> is already present; (b) in <code>loadAppBundleCandidate</code> treat a present, SDK-compatible, non-stale committed artifact as authoritative and make the rebuild opt-in via a manifest flag (#1863 asks for the inverse: a plugin-supplied build command); (c) document the two triggers (mtime &gt; <code>dist/app.js</code>, <code>sdkVersion</code> mismatch) in the plugin docs so deployers can reason about them.</li>
+    <li>Not worth doing: making the rebuild reproduce committed bytes. #1895 already made JS/CSS location-independent; <code>app.meta.json</code> intentionally records the host that built it.</li>
+  </ul>
+
+  <h2>7. PR review</h2>
+  <p>No open PR is linked to this issue.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/1863">#1863</a> — same reporter, same defect 1 on 0.38.0 ("bb plugin reload rebuilds a path plugin with the host build, with no way for the plugin to supply its own"). #2029's defect 1 is effectively a duplicate with the added byte-diff/mtime observations.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1746">#1746</a> — "Plugin background services can kill the server: supervisor only sees the promise chain"; the orphan-timer crash observed here is that failure mode.</li>
+    <li>PR <a href="https://github.com/get-bb/bb/pull/1895">#1895</a> — minifies plugin app bundles and pins <code>absWorkingDir</code>; removes the cwd-relative path comments from rebuilt output (not yet in a release).</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Commands run</h3>
+  <pre>cd &lt;worktree&gt; &amp;&amp; pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build
+scripts/bb-dev-app current            # server :22378, app :14378, host daemon :30378
+export BB_WORKTREE=$PWD &amp;&amp; eval &quot;$(scripts/bb-dev-app env)&quot;
+bash 2029/repro/step0-fixture-setup.sh    # assemble fixture at /tmp/bb2029-plugin, bb plugin build, commit dist
+bash 2029/repro/step1-install.sh          # install rewrites dist/app.*
+bash 2029/repro/step2-deploy-reload.sh    # checkout + reload
+pnpm dev:stop &amp;&amp; scripts/bb-dev-app current   # fresh server (clears hung service)
+bash 2029/repro/step3-orphan.sh           # reload -&gt; degraded, exit 0, command gone, closed-handle errors
+pnpm dev:stop &amp;&amp; scripts/bb-dev-app current
+bash 2029/repro/step4-reload-rebuild.sh   # touch src -&gt; reload rebuilds
+pnpm dev:stop &amp;&amp; scripts/bb-dev-app current   # step4(b) already committed sdkVersion 0.4.1 and touched dist/*
+bash 2029/repro/step5-sdk-mismatch.sh     # rebuild despite dist newest
+cd apps/server &amp;&amp; pnpm exec vitest run test/services/plugins/issue-2029-reload-reports-success.test.ts
+doobie --headless &lt; 2029/repro/shot.js    # screenshot</pre>
+  <h3>esbuild path-comment demonstration (0.39.0 vs main build options)</h3>
+  <pre>--- 0.39.0-style build (no absWorkingDir, no minify), process.cwd()=/home/USER
+// ../../tmp/bb2029-plugin/src/provider-marks.ts
+var MARK = &quot;provider-mark-v2&quot;;
+
+// ../../tmp/bb2029-plugin/src/app.tsx
+function setup(_app) {
+  globalThis.__collabMark = MARK;
+}
+export {
+  setup as default
+};
+
+--- same, absWorkingDir=/tmp/bb2029-plugin (what bb plugin build does when cwd differs)
+// src/provider-marks.ts
+var MARK = &quot;provider-mark-v2&quot;;
+
+// src/app.tsx
+function setup(_app) {
+  globalThis.__collabMark = MARK;
+}
+export {
+  setup as default
+};
+
+</pre>
+  <h3>Server crash from the orphaned timer (side finding)</h3>
+  <pre># Excerpt of the dev instance&#x27;s dev.log captured at 14:16:47 (copied from the terminal
+# session; the launcher truncates dev.log on restart). At this point the fixture&#x27;s
+# orphaned setInterval callback referenced `bb.logger` (undefined -- the real API is
+# `bb.log`), threw inside the timer, and took the whole bb server process down.
+# Side finding: the host installs no process-level uncaughtException guard, so an
+# orphaned plugin timer that throws after reload is fatal for the server.
+
+@bb/server:dev: [14:16:47] WARN: [server] [plugin:collab-fixture] service lane-watcher did not stop within 5000ms — plugin degraded until it does
+@bb/server:dev: [14:16:47] DEBUG: [server] Slow API request {&quot;durationMs&quot;:5012.1,&quot;method&quot;:&quot;POST&quot;,&quot;path&quot;:&quot;/api/v1/plugins/reload&quot;,&quot;status&quot;:200}
+@bb/server:dev: /tmp/bb2029-plugin/src/server.ts:21
+@bb/server:dev:           bb.logger.error(&quot;capacity-interval-unreadable:&quot; + String(error));
+@bb/server:dev:                     ^
+@bb/server:dev:
+@bb/server:dev: TypeError: Cannot read properties of undefined (reading &#x27;error&#x27;)
+@bb/server:dev:     at Timeout._onTimeout (/tmp/bb2029-plugin/src/server.ts:21:21)
+@bb/server:dev:     at listOnTimeout (node:internal/timers:605:17)
+@bb/server:dev:     at process.processTimers (node:internal/timers:541:7)
+@bb/server:dev:
+@bb/server:dev: Node.js v24.18.0
+@bb/server:dev: [dev-supervisor:server] Child exited unexpectedly with exit code 1. Restarting in 1s.
+@bb/host-daemon:dev: [14:16:47] INFO: [host-daemon] Disconnected from server {&quot;serverUrl&quot;:&quot;http://127.0.0.1:19347&quot;,&quot;code&quot;:1006,&quot;reason&quot;:&quot;&quot;}
+</pre>
+  <h3>Release check</h3>
+  <pre>$ git tag --contains dbbb7640f        # PR #1895 &quot;Minify plugin app bundles ...&quot;
+(no tags)                               # desktop-v0.39.0 predates it
+$ git show desktop-v0.39.0:packages/plugin-build/src/build-plugin-app.ts | grep -c absWorkingDir
+0
+$ git log c7c66423d..origin/main --oneline
+f4ab03f46 Port the web sound-wave recording bar to the mobile composer (#2034)
+c4a3dc5fb Match mobile unread divider to web styling (#2033)
+5f4172be3 Remove the working status from the mobile thread header (#2032)
+$ git log c7c66423d..origin/main --oneline -- apps/server/src/services/plugins apps/server/src/routes/plugins.ts apps/cli/src/commands/plugin.ts packages/plugin-build/src
+(empty)</pre>
+  <h3>Verification</h3>
+  <p>An independent verifier followed the five step scripts and the vitest repro on their own worktree at <code>c7c66423d</code> and dev instance (server :20803) and got the same outcomes: install rewrote <code>dist/app.*</code> and left <code>M dist/app.meta.json</code>; checkout + reload produced identical mtimes, no rebuild, <code>degraded</code> with exit 0; the orphan step gave <code>{"ok": true}</code>, exit 0, <code>unknown command 'collab'</code> and a growing count of <code>The database connection is not open</code> (20 → 24 → 27 across disable/enable); <code>touch src</code> + reload logged <code>plugin source is newer than dist/app.js</code>; the SDK-mismatch restart logged <code>built with SDK unknown, running SDK is 0.4.9</code>; the vitest file failed at the asserted line. They also checked every code permalink and the release check (<code>dbbb7640f</code> not in <code>desktop-v0.39.0</code>). The verifier's findings and what changed in this revision:</p>
+  <ul>
+    <li><strong>Major — repro not copy-pasteable</strong> (fixture assembly only hinted at; step scripts defaulted to the author's worktree path and launcher log; saved <code>fixture-provider-marks.ts</code> said <code>v2</code> so step 2's <code>sed</code> was a no-op). Fixed: added <code>step0-fixture-setup.sh</code> which copies the fixture files into place (provider mark reset to <code>v1</code>), builds and commits; every step script now derives the CLI and dev log from <code>BB_WORKTREE</code> (with <code>BB_CLI</code>/<code>BB_DEV_LOG</code> overrides) and the "How to run the steps" paragraph above documents that. All six steps and the vitest repro were re-run from scratch on a fresh worktree/instance (:22378) with the revised scripts; the logs embedded above are from that run and match the first run.</li>
+    <li><strong>Minor — "server.js mtime unchanged across all steps" was loosely evidenced.</strong> Fixed: steps 4 and 5 now print <code>dist/server.js</code> alongside <code>dist/app.*</code> (untouched while <code>app.*</code> are rewritten), and the claims-table wording points at the code path plus those observations, noting that step 2's <code>server.js</code> mtime change came from <code>git checkout</code>.</li>
+    <li><strong>Minor — "built with SDK unknown" vs committed <code>sdkVersion 0.4.1</code> unexplained.</strong> Fixed: step 5 and the root-cause section now explain that <code>parsePluginArtifactMeta</code> rejects the hand-edited meta (<code>builtWith.pluginSdkVersion</code> 0.4.9 ≠ <code>sdkVersion</code> 0.4.1), so <code>meta</code> is <code>null</code>; a real 0.4.1 artifact would log <code>0.4.1</code>, and the rebuild fires either way.</li>
+    <li>Also refreshed: environment ports/data dir, and the origin/main check (now three newer mobile-UI commits, none touching the plugin paths).</li>
+  </ul>
+</main></body></html>

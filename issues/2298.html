@@ -1,0 +1,822 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2298 Archiving a thread leaves its native browser views alive</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:4px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; } .row figure { flex:1 1 280px; margin:0; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2298 · Archiving a thread leaves its native browser views alive</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill high">Priority: High</span> <span class="pill">Effort: unset</span> <span class="pill">perf</span> <span class="pill">desktop</span>
+    <a href="https://github.com/get-bb/bb/issues/2298">open on GitHub</a>
+    <span>2026-08-24 · base <code>494f66526</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>In the bb desktop app, every in-app browser tab is a native Electron <code>WebContentsView</code> with its own renderer process. Since commit <a href="https://github.com/get-bb/bb/commit/ce006c6ea66a5690fd266a97b6577c0d16024605"><code>ce006c6ea</code></a> ("Keep browser views alive across thread switches") those views are deliberately <em>retained</em> when you leave a thread, and are destroyed only when you close the tab, delete the thread, or delete the environment. Archiving was never added to that list: the UI archive action (<code>archiveThreadAndChildrenAction</code>) closes the panes and navigates away but never calls <code>destroyPersistedBrowserViewsForThread</code>, and the <code>archived-changed</code> server broadcast (CLI/SDK/automation archive) is not handled at all, while the equivalent delete paths both call it. Result: the archived thread disappears from the sidebar but its preview renderer (≈90–110 MB RSS in this repro) stays alive in the main process, and the main process never reclaims views on its own (only on window close), so they accumulate until bb restarts.</p>
+  <p>I reproduced this live in the Electron shell (CDP page targets and renderer PIDs before/after), and with a vitest that fails on <code>494f66526</code>. One claim in the issue is wrong in a useful way: with this Electron (41.7.0), a retained view is <em>hidden</em> (<code>document.visibilityState === "hidden"</code>), so requestAnimationFrame stops entirely and timers are throttled to ~1 Hz — the retained view is not "drawing at full rate". The cost is the retained renderer process and its memory, not continuous compositing. A two-line fix (mirror delete's teardown in both archive paths) passes the repro test, the surrounding 385 tests, typecheck, and was verified live: after archive the target and renderer are gone, and unarchive + reopen recreates the page lazily from the persisted tab record.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Archiving closes the thread's panes but never destroys the native <code>WebContentsView</code>s its browser tabs created.</td><td class="ok">Verified</td><td><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/app/src/components/thread/ThreadActionsProvider.tsx#L333-L350"><code>apps/app/src/components/thread/ThreadActionsProvider.tsx 333–350</code></a> closes panes and navigates, no teardown. Live: after archive the preview's CDP target <code>EE9EB179</code> and renderer pid 74883 survive (section 4, steps 6–7).</td></tr>
+    <tr><td>Deleting a thread does destroy them.</td><td class="ok">Verified</td><td><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/app/src/components/thread/ThreadActionsProvider.tsx#L265-L280"><code>apps/app/src/components/thread/ThreadActionsProvider.tsx 265–280</code></a> and <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/app/src/hooks/cache-owners/resource-route-owner.ts#L69-L82"><code>apps/app/src/hooks/cache-owners/resource-route-owner.ts 69–82</code></a> both call <code>destroyPersistedBrowserViewsForThread</code>. Live: <code>bb thread delete</code> removed the target and killed pid 74883 (step 11).</td></tr>
+    <tr><td>The surviving views keep a renderer process and IOSurface memory.</td><td class="ok">Verified (renderer + RSS)</td><td>Renderer pid 74883 alive after archive with RSS 101–111 MB (<code>renderers-2-after-archive.txt</code>, <code>renderers-3-archived-steady.txt</code>). IOSurface/GPU-helper accounting was not measured (no <code>footprint</code> run); the retained process is sufficient to explain growth.</td></tr>
+    <tr><td>"A hidden view keeps running its page — they keep compositing… it keeps drawing at full rate."</td><td class="no">Refuted</td><td>Hidden retained view reports <code>visibilityState: "hidden"</code>, <strong>0 rAF ticks / 2 s</strong> (vs 120 visible) and 3–4 timer ticks / 2 s (vs ~160). Same result in a standalone Electron 41.7.0 probe (<code>hidden-view-probe.out.jsonl</code>). So a retained view does not animate or composite; it holds a process and memory.</td></tr>
+    <tr><td>WindowServer 43–50 % CPU / GPU helper 20–37 % / IOSurface 483→736 MB are caused by this.</td><td class="unv">Unverified</td><td>Not reproducible from one thread; plausible as aggregate cost of many retained renderers (each keeps its compositor frame sink and last surface), but the reporter's numbers include 4 live threads and any hidden-but-live previews. Hidden views do not produce new frames (above).</td></tr>
+    <tr><td>Once archived, the tabs are no longer reachable in the UI, so <kbd>Cmd+W</kbd> cannot release them; restart is the only remedy.</td><td class="no">Mostly refuted</td><td>Opening the archived thread (the "Archived <i>title</i>" toast link, Archived list, search, or its URL) mounts the panel with the browser tab and a hover-revealed "Close <i>tab</i>" button (proved by the accessibility snapshot <code>snapshot-archived-thread-open.txt</code>, line <code>button "Close bb#2298 animating preview"</code>; the tab itself is visible in <code>assets/2298-05-app-archived-thread-open.png</code>). Closing it there destroys the view. It is non-obvious, not impossible. Also views are reclaimed when the <em>window</em> is closed, not only on restart (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/desktop/src/main.ts#L1788-L1794"><code>apps/desktop/src/main.ts 1788–1794</code></a>).</td></tr>
+    <tr><td>The tab record is still present in <code>thread_tabs</code> after archive.</td><td class="ok">Verified (and correct)</td><td><code>bb thread tabs show</code> after archive returns the browser tab (<code>tabs-2-after-archive.json</code>); direct <code>sqlite3</code> query in <code>thread_tabs-query.txt</code>. This is desired: it is what lets unarchive recreate the page lazily.</td></tr>
+    <tr><td>Views are not retained unconditionally; counts fell on their own.</td><td class="unv">Unverified, consistent with code</td><td>No timer/pressure policy exists in bb. Views go away only via tab close, thread/environment delete, window close, or renderer crash recovery. The observed decline was most likely tabs closed by the user or a window close/restart.</td></tr>
+    <tr><td>Suggested fix: call <code>destroyPersistedBrowserViewsForThread</code> in <code>archiveThreadAndChildrenAction</code> for each archived id; keep tab metadata.</td><td class="ok">Verified as sufficient for the UI path</td><td>Applied in this worktree (section 6): repro test passes, live archive now removes the target. It is <em>not</em> sufficient alone: archive via CLI/SDK/automation reaches the client only as an <code>archived-changed</code> broadcast, which must be handled too (section 5).</td></tr>
+    <tr><td>Cannot be worked around by a plugin.</td><td class="ok">Verified</td><td><code>BbDesktopBrowserApi</code> is only reachable from the desktop preload inside the app renderer (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/app/src/lib/bb-desktop.ts#L111-L113"><code>apps/app/src/lib/bb-desktop.ts 111–113</code></a>); no plugin SDK surface detaches a view.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb <code>494f66526</code> (main as of 2026-08-24; <code>origin/main</code> is the same commit, so nothing later fixes this), package version 0.39.0 (issue also reports 0.39.0).</li>
+    <li>macOS 26.5.2 (25F84), arm64; Node v22.23.1; Electron 41.7.0 (Chromium 146.0.7680.216) from <code>apps/desktop</code>; codex-cli 0.149.1 (provider used for the one-word prompt).</li>
+    <li>Isolated dev instance started from this worktree (<code>wf_846839f8-f8a-17</code>) with <code>scripts/bb-dev-app current</code>: App <code>http://localhost:14158</code> (Vite), Server <code>http://localhost:22158</code>, Host daemon <code>http://127.0.0.1:30158</code>, data dir <code>~/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-17-bd99a5562d1d</code>; local host id <code>host_n9nrg2f8dp</code>, project <code>proj_5srau8qsn9</code>. Every id, port and pid quoted below is from this run; yours will differ (the steps say where each comes from). The original run of this report used a different worktree/instance; the verifier's run used a third — all three gave the same results.</li>
+    <li>Electron shell launched with <code>--remote-debugging-port=49222</code> (<code>repro/launch-desktop.sh</code>, which derives the checkout from its cwd) so page targets could be listed via <code>/json/list</code> and driven with <code>doobie --connect 49222</code>. Preview page served by <code>python3 -m http.server 49333</code> from <code>repro/page/</code>.</li>
+    <li>Caveat: <code>screencapture</code> is not permitted in this session, so screenshots are CDP captures of (a) the app window DOM — which cannot show the native overlay — and (b) the preview page's own target. The "is the page alive / visible" facts come from CDP target lists, renderer PIDs and in-page counters, not from pixels.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <h3>4a. Unit-level (fails on 494f66526)</h3>
+  <ol>
+    <li>Save the test below as <code>apps/app/src/components/thread/ThreadActionsProvider.archive-browser-views.test.tsx</code> (copy in <code>2298/repro/</code>). It registers three persisted browser views (parent, child, unrelated thread) exactly as <code>BrowserTabContent</code> does on mount, then (1) clicks the archive action, (2) dispatches <code>thread-deleted</code> and <code>archived-changed</code> broadcasts through <code>useDeletedResourceRouteOwner</code>.</li>
+    <li>Run: <pre>cd apps/app &amp;&amp; pnpm exec vitest run src/components/thread/ThreadActionsProvider.archive-browser-views.test.tsx</pre></li>
+    <li>Expected: both tests pass (archive detaches the archived threads' tabs). Actual on base: <strong>both tests fail</strong>. Test 1 — nothing is detached after the UI archive action (<code>expected [] to deeply equal ['tab_child_preview', 'tab_parent_preview']</code>). Test 2 — the <code>thread-deleted</code> control assertion passes, then the <code>archived-changed</code> assertion fails (<code>expected [] to deeply equal ['tab_parent_preview']</code>):
+<pre> RUN  v4.1.1 /Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-17/apps/app
+ ❯  @bb/app:isolated  src/components/thread/ThreadActionsProvider.archive-browser-views.test.tsx (2 tests | 2 failed) 116ms
+     × UI archive action detaches the views of every archived thread 114ms
+     × server `archived-changed` broadcast (CLI/agent archive) detaches the thread's views like `thread-deleted` does 2ms
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+ FAIL   @bb/app:isolated  src/components/thread/ThreadActionsProvider.archive-browser-views.test.tsx &gt; #2298 archiving a thread must destroy its persisted browser views &gt; UI archive action detaches the views of every archived thread
+AssertionError: expected [] to deeply equal [ 'tab_child_preview', …(1) ]
+- Expected
++ Received
+- [
+-   "tab_child_preview",
+-   "tab_parent_preview",
+- ]
++ []
+ ❯ src/components/thread/ThreadActionsProvider.archive-browser-views.test.tsx:224:38
+    222|     });
+    223|
+    224|     expect(mocks.detachments.sort()).toEqual([
+       |                                      ^
+    225|       "tab_child_preview",
+    226|       "tab_parent_preview",
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+ FAIL   @bb/app:isolated  src/components/thread/ThreadActionsProvider.archive-browser-views.test.tsx &gt; #2298 archiving a thread must destroy its persisted browser views &gt; server `archived-changed` broadcast (CLI/agent archive) detaches the thread's views like `thread-deleted` does
+AssertionError: expected [] to deeply equal [ 'tab_parent_preview' ]
+- Expected
++ Received
+- [
+-   "tab_parent_preview",
+- ]
++ []
+ ❯ src/components/thread/ThreadActionsProvider.archive-browser-views.test.tsx:256:31
+    254|       changes: ["archived-changed"],
+    255|     });
+    256|     expect(mocks.detachments).toEqual(["tab_parent_preview"]);
+       |                               ^
+    257|   });
+    258| });
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+ Test Files  1 failed (1)
+      Tests  2 failed (2)
+   Start at  09:38:58
+   Duration  1.52s (transform 498ms, setup 67ms, import 753ms, tests 116ms, environment 515ms)</pre></li>
+  </ol>
+  <pre>// @vitest-environment jsdom
+//
+// Repro for get-bb/bb#2298: archiving a thread leaves its native browser views
+// alive. Delete tears the persisted `WebContentsView`s down (both from the UI
+// action and from the `thread-deleted` broadcast); archive does neither.
+
+import type { ReactNode } from "react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { BbDesktopBrowserApi } from "@bb/desktop-contract";
+import type { Thread } from "@bb/domain";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  registerBrowserView,
+  resetBrowserViewPersistence,
+} from "@/components/secondary-panel/browserViewVisibilityCoordinator";
+import { useDeletedResourceRouteOwner } from "@/hooks/cache-owners/resource-route-owner";
+import { sdk } from "@/lib/sdk";
+import { createNoopDesktopBrowserApi } from "@/test/bb-desktop-test-utils";
+import {
+  ThreadActionsProvider,
+  useThreadActions,
+} from "./ThreadActionsProvider";
+
+const mocks = vi.hoisted(() =&gt; ({
+  closePanesForThreads: vi.fn(),
+  detachments: [] as string[],
+  dialogOnClose: vi.fn(),
+  dialogOnOpen: vi.fn(),
+  dialogOnOpenChange: vi.fn(),
+  mutation: vi.fn(),
+  navigate: vi.fn(),
+}));
+
+vi.mock("react-router-dom", async (importOriginal) =&gt; {
+  const actual = await importOriginal&lt;typeof import("react-router-dom")&gt;();
+  return { ...actual, useNavigate: () =&gt; mocks.navigate };
+});
+
+vi.mock("jotai", async (importOriginal) =&gt; {
+  const actual = await importOriginal&lt;typeof import("jotai")&gt;();
+  return { ...actual, useSetAtom: () =&gt; mocks.closePanesForThreads };
+});
+
+vi.mock("@/components/dialogs/ThreadDeleteDialog", () =&gt; ({
+  ThreadDeleteDialog: () =&gt; null,
+}));
+vi.mock("@/components/dialogs/ThreadRenameDialog", () =&gt; ({
+  ThreadRenameDialog: () =&gt; null,
+}));
+vi.mock("@/components/ui/app-toast", () =&gt; ({
+  appToast: {
+    dismiss: vi.fn(),
+    error: vi.fn(),
+    loading: vi.fn(),
+    message: vi.fn(),
+    success: vi.fn(),
+    warning: vi.fn(),
+  },
+}));
+vi.mock("@/hooks/mutations/thread-state-mutations", async (importOriginal) =&gt; {
+  const actual =
+    await importOriginal&lt;
+      typeof import("@/hooks/mutations/thread-state-mutations")
+    &gt;();
+  return {
+    ...actual,
+    useDeleteThread: () =&gt; ({ isPending: false, mutate: mocks.mutation }),
+    useMarkThreadRead: () =&gt; ({ mutate: mocks.mutation }),
+    useMarkThreadUnread: () =&gt; ({ mutate: mocks.mutation }),
+    usePinThread: () =&gt; ({ mutate: mocks.mutation }),
+    useUnpinThread: () =&gt; ({ mutate: mocks.mutation }),
+    useUpdateThread: () =&gt; ({ isPending: false, mutate: mocks.mutation }),
+  };
+});
+vi.mock("@/lib/sdk", () =&gt; ({
+  sdk: {
+    threads: {
+      archiveAll: vi.fn(),
+      childSummary: vi.fn(),
+      unarchive: vi.fn(),
+    },
+  },
+}));
+vi.mock("@/hooks/useDialogState", () =&gt; ({
+  useDialogState: () =&gt; ({
+    onClose: mocks.dialogOnClose,
+    onOpen: mocks.dialogOnOpen,
+    onOpenChange: mocks.dialogOnOpenChange,
+    target: null,
+  }),
+}));
+vi.mock("@/hooks/useRouteState", () =&gt; ({
+  useRouteState: () =&gt; ({ projectId: null, threadId: null }),
+}));
+
+// Stand in for the Electron preload: record which tab ids get `detach`ed,
+// which is what destroys the native WebContentsView (desktop-browser-view.ts
+// `destroyEntry` -&gt; `webContents.close()`).
+const recordingDesktopBrowser: BbDesktopBrowserApi = {
+  ...createNoopDesktopBrowserApi(),
+  detach(tabId) {
+    mocks.detachments.push(tabId);
+  },
+};
+vi.mock("@/lib/bb-desktop", async (importOriginal) =&gt; {
+  const actual = await importOriginal&lt;typeof import("@/lib/bb-desktop")&gt;();
+  return { ...actual, getDesktopBrowserApi: () =&gt; recordingDesktopBrowser };
+});
+
+function makeThread(overrides: Partial&lt;Thread&gt; = {}): Thread {
+  return {
+    archivedAt: null,
+    createdAt: 1,
+    deletedAt: null,
+    environmentId: "env_test",
+    id: "thr_parent",
+    lastReadAt: null,
+    latestAttentionAt: 1,
+    originKind: null,
+    originPluginId: null,
+    parentThreadId: null,
+    pinnedAt: null,
+    projectId: "proj_test",
+    providerId: "codex",
+    sectionId: null,
+    sourceThreadId: null,
+    status: "idle",
+    title: "Thread with a browser preview",
+    titleFallback: null,
+    updatedAt: 1,
+    visibility: "visible",
+    ...overrides,
+  };
+}
+
+function ArchiveButton({ thread }: { thread: Thread }) {
+  const { archiveThreadAndChildren } = useThreadActions();
+  return (
+    &lt;button type="button" onClick={() =&gt; archiveThreadAndChildren(thread)}&gt;
+      Archive
+    &lt;/button&gt;
+  );
+}
+
+function RouteOwnerProbe({
+  onHandler,
+}: {
+  onHandler: (handler: ReturnType&lt;typeof useDeletedResourceRouteOwner&gt;) =&gt; void;
+}) {
+  onHandler(useDeletedResourceRouteOwner());
+  return null;
+}
+
+function renderProvider(children: ReactNode) {
+  return render(
+    &lt;QueryClientProvider client={queryClient}&gt;
+      &lt;ThreadActionsProvider&gt;{children}&lt;/ThreadActionsProvider&gt;
+    &lt;/QueryClientProvider&gt;,
+  );
+}
+
+let queryClient: QueryClient;
+
+beforeEach(() =&gt; {
+  queryClient = new QueryClient({
+    defaultOptions: {
+      mutations: { retry: false },
+      queries: { retry: false },
+    },
+  });
+  vi.mocked(sdk.threads.archiveAll).mockResolvedValue({
+    archivedThreadIds: ["thr_parent", "thr_child"],
+    ok: true,
+  });
+  mocks.closePanesForThreads.mockReturnValue({
+    focusedRoute: null,
+    removedAny: false,
+  });
+  // Simulate what BrowserTabContent does on mount: each open browser tab's
+  // native view is registered against its thread so teardown can find it.
+  registerBrowserView({
+    environmentId: "env_test",
+    tabId: "tab_parent_preview",
+    threadId: "thr_parent",
+  });
+  registerBrowserView({
+    environmentId: "env_test",
+    tabId: "tab_child_preview",
+    threadId: "thr_child",
+  });
+  registerBrowserView({
+    environmentId: "env_other",
+    tabId: "tab_unrelated",
+    threadId: "thr_unrelated",
+  });
+});
+
+afterEach(() =&gt; {
+  cleanup();
+  resetBrowserViewPersistence();
+  mocks.detachments.length = 0;
+  vi.clearAllMocks();
+});
+
+describe("#2298 archiving a thread must destroy its persisted browser views", () =&gt; {
+  it("UI archive action detaches the views of every archived thread", async () =&gt; {
+    renderProvider(&lt;ArchiveButton thread={makeThread()} /&gt;);
+
+    fireEvent.click(screen.getByRole("button", { name: "Archive" }));
+
+    await vi.waitFor(() =&gt; {
+      expect(sdk.threads.archiveAll).toHaveBeenCalledTimes(1);
+    });
+    await vi.waitFor(() =&gt; {
+      // The archive succeeded and the panes closed, but the native views are
+      // still alive: nothing called detach for the archived threads' tabs.
+      expect(mocks.closePanesForThreads).toHaveBeenCalledWith([
+        "thr_parent",
+        "thr_child",
+      ]);
+    });
+
+    expect(mocks.detachments.sort()).toEqual([
+      "tab_child_preview",
+      "tab_parent_preview",
+    ]);
+  });
+
+  it("server `archived-changed` broadcast (CLI/agent archive) detaches the thread's views like `thread-deleted` does", () =&gt; {
+    let handler: ReturnType&lt;typeof useDeletedResourceRouteOwner&gt; | null = null;
+    render(&lt;RouteOwnerProbe onHandler={(value) =&gt; (handler = value)} /&gt;);
+    if (handler === null) {
+      throw new Error("route owner handler not captured");
+    }
+    const dispatch: ReturnType&lt;typeof useDeletedResourceRouteOwner&gt; = handler;
+
+    // Control: deleting a thread over the wire tears its views down.
+    dispatch({
+      type: "changed",
+      entity: "thread",
+      id: "thr_unrelated",
+      changes: ["thread-deleted"],
+    });
+    expect(mocks.detachments).toEqual(["tab_unrelated"]);
+    mocks.detachments.length = 0;
+
+    // Archiving a thread over the wire (bb thread archive / SDK / automation)
+    // should do the same for its views.
+    dispatch({
+      type: "changed",
+      entity: "thread",
+      id: "thr_parent",
+      changes: ["archived-changed"],
+    });
+    expect(mocks.detachments).toEqual(["tab_parent_preview"]);
+  });
+});</pre>
+
+  <h3>4b. Live desktop (what the user sees)</h3>
+  <ol>
+    <li>From the root of your bb checkout (built at <code>494f66526</code>), start an isolated instance and the Electron shell with a CDP port. <code>launch-desktop.sh</code> takes the checkout from its cwd (<code>git rev-parse --show-toplevel</code>), from <code>$WORKTREE</code>, or as its first argument, and refuses to start if the CDP port is busy; it must be run <em>after</em> <code>bb-dev-app current</code> because the shell attaches to the instance of the checkout it is started from. Set <code>R=/path/to/2298/repro</code> for the commands below.
+<pre>scripts/bb-dev-app current                      # prints App/Server/daemon URLs + data dir (App was :14158 here)
+eval "$(scripts/bb-dev-app env)"                # BB_SERVER_URL etc. for the curl below
+CDP_PORT=49222 bash $R/launch-desktop.sh         # = apps/desktop run-electron-dev.mjs with --remote-debugging-port
+python3 -m http.server 49333 --bind 127.0.0.1 --directory $R/page   # an animating page</pre>
+Output of the launcher in this run (<code>repro/desktop.log</code>):
+<pre>launch-desktop.sh: checkout=/Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-17 cdp=http://127.0.0.1:49222
+@bb/desktop: instance bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-17-bd99a5562d1d
+@bb/desktop: data /Users/USER/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-17-bd99a5562d1d
+@bb/desktop: server http://127.0.0.1:22158
+@bb/desktop: daemon http://127.0.0.1:30158
+@bb/desktop: app http://localhost:14158 (Vite dev server — live reload)
+@bb/desktop: user-data /Users/USER/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-17-bd99a5562d1d/desktop
+DevTools listening on ws://127.0.0.1:49222/devtools/browser/8a8a0984-0320-44ac-902e-4178bba4b38a
+[desktop] connect server sync skipped (not-paired)</pre></li>
+    <li>Create a scratch repo, a project and a thread (one-word prompt so the thread exists and goes idle). <code>&lt;host-id&gt;</code> is the <code>id</code> from <code>bash $R/bbdev.sh machine list --json</code> (<code>repro/bbdev.sh</code> runs <code>pnpm bb:dev</code> with your instance's env so nothing touches a real bb); <code>&lt;project-id&gt;</code> is the <code>id</code> in the curl response; <code>&lt;thread-id&gt;</code> is the <code>id</code> in the spawn output.
+<pre>bash $R/make-scratch-repo.sh /tmp/bb-2298-qa-repo
+bash $R/bbdev.sh machine list --json                                   # -> "id": "&lt;host-id&gt;"   (host_n9nrg2f8dp here)
+curl -s -X POST $BB_SERVER_URL/api/v1/projects -H 'content-type: application/json' \
+  -d '{"name":"qa","source":{"type":"local_path","path":"/tmp/bb-2298-qa-repo","hostId":"&lt;host-id&gt;"}}'
+                                                                       # -> "id": "&lt;project-id&gt;" (proj_5srau8qsn9 here)
+bash $R/bbdev.sh thread spawn --project &lt;project-id&gt; --environment /tmp/bb-2298-qa-repo \
+  --machine &lt;host-id&gt; --provider codex --title "2298 archive repro" \
+  --prompt "Reply only with ok." --json                                # -> "id": "&lt;thread-id&gt;"  (thr_yid5rprxku here)</pre></li>
+    <li>In the desktop window open the thread, open the right panel (⌘J) → "Open new tab" (⌘T) → "Open browser" → type <code>http://127.0.0.1:49333/</code> → Enter. Scripted here with <code>repro/open-preview-in-thread.js</code>, which finds the app window among the CDP pages by origin and needs only the two URLs substituted:
+<pre>sed -e "s#__THREAD_URL__#http://localhost:&lt;app-port&gt;/projects/&lt;project-id&gt;/threads/&lt;thread-id&gt;#" \
+    -e "s#__PREVIEW_URL__#http://127.0.0.1:49333/#" $R/open-preview-in-thread.js &gt; /tmp/open-preview.js
+doobie --connect 49222 -t 90 run /tmp/open-preview.js</pre>
+<pre>[
+  "app target A351D19385A952E2ED087873C2E00216 (http://localhost:14158/)",
+  "opened http://localhost:14158/projects/proj_5srau8qsn9/threads/thr_yid5rprxku",
+  "clicked button \"Show right panel\" (e102)",
+  "clicked button \"Open new tab\" (e228)",
+  "clicked button \"Open browser\" (e321)",
+  "clicked textbox \"Address and search bar\" (e374)",
+  "browser tab mounted: true"
+]</pre></li>
+    <li>Observe a second CDP page target and a second renderer process:
+<pre>$ curl -s http://127.0.0.1:49222/json/list   # after opening the tab
+page  EE9EB179  http://127.0.0.1:49333/
+page  A351D193  http://localhost:14158/projects/proj_5srau8qsn9/threads/thr_yid5rprxku
+
+$ ps -axo pid,ppid,rss,command | grep 'Electron Helper (Renderer)'
+66587 66548 453520 /Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-17/node_modules/.pnpm/electron@41.7.0/node_modules/electron/dist/Electron.app/Contents/Frameworks/Electron Helper (Renderer).app/Contents/MacOS/Electron Helper (Renderer) --type=renderer --user-data-dir=/Users/USER/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-17-bd99a5562d1d/desktop --app-path=/Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-17/apps/desktop --enable-sandbox --remote-debugging-port=49222 --lang=en-US --num-raster-threads=4 --enable-zero-copy --enable-gpu-memory-buffer-compositor-resources --enable-main-frame-before-activation --renderer-client-id=5 --time-ticks-at-unix-epoch=-1785397255777419 --launch-time-ticks=2192286856045 --shared-files --field-trial-handle=1718379636,r,1076711170803668596,4174251857620709702,262144 --enable-features=PdfUseShowSaveFilePicker,ScreenCaptureKitPickerScreen,ScreenCaptureKitStreamPickerSonoma --disable-features=DropInputEventsWhilePaintHolding,LocalNetworkAccessChecks,ScreenAIOCREnabled,SpareRendererForSitePerProcess,TimeoutHangingVideoCaptureStarts,TraceSiteInstanceGetProcessCreation --variations-seed-version --pseudonymization-salt-handle=1935764596,r,3157891776355157638,13858753825582910177,4 --trace-process-track-uuid=3190708990997080739 --seatbelt-client=59
+74883 66548 101952 /Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-17/node_modules/.pnpm/electron@41.7.0/node_modules/electron/dist/Electron.app/Contents/Frameworks/Electron Helper (Renderer).app/Contents/MacOS/Electron Helper (Renderer) --type=renderer --user-data-dir=/Users/USER/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-17-bd99a5562d1d/desktop --app-path=/Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-17/apps/desktop --enable-sandbox --remote-debugging-port=49222 --lang=en-US --num-raster-threads=4 --enable-zero-copy --enable-gpu-memory-buffer-compositor-resources --enable-main-frame-before-activation --renderer-client-id=6 --time-ticks-at-unix-epoch=-1785397255777419 --launch-time-ticks=2192393307580 --shared-files --field-trial-handle=1718379636,r,1076711170803668596,4174251857620709702,262144 --enable-features=PdfUseShowSaveFilePicker,ScreenCaptureKitPickerScreen,ScreenCaptureKitStreamPickerSonoma --disable-features=DropInputEventsWhilePaintHolding,LocalNetworkAccessChecks,ScreenAIOCREnabled,SpareRendererForSitePerProcess,TimeoutHangingVideoCaptureStarts,TraceSiteInstanceGetProcessCreation --variations-seed-version --pseudonymization-salt-handle=1935764596,r,3157891776355157638,13858753825582910177,4 --trace-process-track-uuid=3190708991934122588 --seatbelt-client=70</pre>
+    <div class="row">
+      <figure><img src="assets/2298-01-app-before-archive.png" alt="bb desktop app DOM before archive"><figcaption>Before archive: thread "2298 archive repro" in the sidebar, right panel showing the "bb#2298 animating preview" browser tab. The content area is empty in this DOM capture because the page lives in a native overlay.</figcaption></figure>
+      <figure><img src="assets/2298-02-preview-before-archive.png" alt="preview page target before archive"><figcaption>The native view's own page (captured through its CDP target): HUD shows it is <em>visible</em> and counting rAF frames.</figcaption></figure>
+    </div></li>
+    <li>Sample the preview target: visible, 120 rAF ticks in 2 s (<code>preview-sample-1-before.json</code>).</li>
+    <li>Click the sidebar row's <strong>"Archive thread"</strong> button (this is <code>archiveThreadAndChildrenAction</code>; scripted with <code>repro/archive-via-sidebar.js</code> after <code>sed "s#__APP_URL__#http://localhost:&lt;app-port&gt;#"</code>). The thread leaves the sidebar, the app navigates to the root composer, and the "Archived … Undo" toast appears:
+<pre>$ doobie --connect 49222 -t 60 run /tmp/archive.js
+{
+  "clicked": "button \"Archive thread\" (e53)",
+  "url": "http://localhost:14158/",
+  "archivedToast": true,
+  "sidebarShowsNoThreads": false,
+  "browserTabMounted": false
+}</pre>
+    <figure><img src="assets/2298-03-app-after-archive.png" alt="app after archive"><figcaption>After archive: sidebar shows "No threads" under both the project and the Threads section, root composer. (The "Archived … Undo" toast had already auto-dismissed when this capture was taken; the script above saw it.)</figcaption></figure></li>
+    <li><strong>Bug:</strong> the preview target and its renderer are still there, now hidden:
+<pre>$ curl -s http://127.0.0.1:49222/json/list   # after UI archive
+page  EE9EB179  http://127.0.0.1:49333/
+page  A351D193  http://localhost:14158/
+
+$ ps ... | grep 'Electron Helper (Renderer)'   # pid 74883 = the preview renderer, still alive
+66587 66548 391520 /Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-17/node_modules/.pnpm/electron@41.7.0/node_modules/electron/dist/Electron.app/Contents/Frameworks/Electron Helper (Renderer).app/Contents/MacOS/Electron Helper (Renderer) --type=renderer --user-data-dir=/Users/USER/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-17-bd99a5562d1d/desktop --app-path=/Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-17/apps/desktop --enable-sandbox --remote-debugging-port=49222 --lang=en-US --num-raster-threads=4 --enable-zero-copy --enable-gpu-memory-buffer-compositor-resources --enable-main-frame-before-activation --renderer-client-id=5 --time-ticks-at-unix-epoch=-1785397255777419 --launch-time-ticks=2192286856045 --shared-files --field-trial-handle=1718379636,r,1076711170803668596,4174251857620709702,262144 --enable-features=PdfUseShowSaveFilePicker,ScreenCaptureKitPickerScreen,ScreenCaptureKitStreamPickerSonoma --disable-features=DropInputEventsWhilePaintHolding,LocalNetworkAccessChecks,ScreenAIOCREnabled,SpareRendererForSitePerProcess,TimeoutHangingVideoCaptureStarts,TraceSiteInstanceGetProcessCreation --variations-seed-version --pseudonymization-salt-handle=1935764596,r,3157891776355157638,13858753825582910177,4 --trace-process-track-uuid=3190708990997080739 --seatbelt-client=59
+74883 66548 110848 /Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-17/node_modules/.pnpm/electron@41.7.0/node_modules/electron/dist/Electron.app/Contents/Frameworks/Electron Helper (Renderer).app/Contents/MacOS/Electron Helper (Renderer) --type=renderer --user-data-dir=/Users/USER/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-17-bd99a5562d1d/desktop --app-path=/Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-17/apps/desktop --enable-sandbox --remote-debugging-port=49222 --lang=en-US --num-raster-threads=4 --enable-zero-copy --enable-gpu-memory-buffer-compositor-resources --enable-main-frame-before-activation --renderer-client-id=6 --time-ticks-at-unix-epoch=-1785397255777419 --launch-time-ticks=2192393307580 --shared-files --field-trial-handle=1718379636,r,1076711170803668596,4174251857620709702,262144 --enable-features=PdfUseShowSaveFilePicker,ScreenCaptureKitPickerScreen,ScreenCaptureKitStreamPickerSonoma --disable-features=DropInputEventsWhilePaintHolding,LocalNetworkAccessChecks,ScreenAIOCREnabled,SpareRendererForSitePerProcess,TimeoutHangingVideoCaptureStarts,TraceSiteInstanceGetProcessCreation --variations-seed-version --pseudonymization-salt-handle=1935764596,r,3157891776355157638,13858753825582910177,4 --trace-process-track-uuid=3190708991934122588 --seatbelt-client=70
+
+$ bash 2298/repro/sample-preview.sh ...   # preview-sample-2-after-archive.json
+{
+  "phase": "after archive (thread gone from sidebar)",
+  "targetPresent": true,
+  "targetId": "EE9EB17993C3C8029EC94C9E43C70075",
+  "windowMs": 2000,
+  "rafTicks": 0,
+  "timerTicks": 3,
+  "visibilityState": "hidden",
+  "url": "http://127.0.0.1:49333/"
+}</pre>
+    <figure><img src="assets/2298-04-preview-after-archive.png" alt="preview page target after archive, hidden"><figcaption>The same page, captured after archive: still loaded (rAF counter frozen at 5744), <code>visibility: hidden</code>. Nothing in the UI references it any more.</figcaption></figure></li>
+    <li>Expected: the view is destroyed (target gone, renderer exits), as happens on delete. The persisted tab record is (correctly) kept:
+<pre>$ bash $R/bbdev.sh thread tabs show thr_yid5rprxku --json
+{
+  "revision": 5,
+  "tabs": [
+    {
+      "id": "thread-info:thread-info:none",
+      "kind": "thread-info"
+    },
+    {
+      "id": "git-diff:git-diff:none",
+      "kind": "git-diff"
+    },
+    {
+      "environmentId": "env_b257zvewfp",
+      "id": "browser:kPqeY6kb8TvheykEiZeXs:env_b257zvewfp",
+      "kind": "browser",
+      "title": "bb#2298 animating preview",
+      "url": "http://127.0.0.1:49333/"
+    }
+  ]
+}</pre></li>
+    <li>Same leak via the wire path (how agents/CLI archive): unarchive, view the thread, run <code>bash $R/bbdev.sh thread archive &lt;thread-id&gt;</code>. The client only receives <code>archived-changed</code>: the app stays on the thread with a "Thread is archived" banner and the browser tab still mounted (<code>assets/2298-07-app-after-cli-archive.png</code>); navigating away in-app hides the view and, again, nothing destroys it (<code>preview-sample-6-before-delete.json</code>: present, hidden). Steps 9–11 are scripted in <code>repro/wire-path.sh</code>; its output from this run is <code>repro/wire-path-run.txt</code>.</li>
+    <li>Control — delete: <code>bash $R/bbdev.sh thread delete &lt;thread-id&gt; --yes</code> sends <code>thread-deleted</code>, which the client handles:
+<pre>$ curl -s http://127.0.0.1:49222/json/list   # after CLI delete
+page  A351D193  http://localhost:14158/
+
+$ ps -p 74883 -o pid,rss   # preview renderer
+  PID    RSS            (no row: exited)
+
+{"phase":"after CLI delete","targetPresent":false}</pre></li>
+  </ol>
+
+  <h3>Preview-target samples (2 s windows, from <code>sample-preview.sh</code>)</h3>
+  <table><tr><th>Phase</th><th>CDP target</th><th>visibilityState</th><th>rAF ticks</th><th>10 ms timer ticks</th></tr>
+    <tr><td>before archive (preview tab visible)</td><td class="ok">present</td><td>visible</td><td>120</td><td>147</td></tr><tr><td>after archive (thread gone from sidebar)</td><td class="ok">present</td><td>hidden</td><td>0</td><td>3</td></tr><tr><td>archived thread opened from its URL</td><td class="ok">present</td><td>visible</td><td>120</td><td>145</td></tr><tr><td>after CLI archive while the thread was being viewed</td><td class="ok">present</td><td>visible</td><td>120</td><td>148</td></tr><tr><td>archived, app window reloaded at the root (side finding)</td><td class="ok">present</td><td>visible</td><td>120</td><td>149</td></tr><tr><td>archived, left via in-app navigation (just before delete)</td><td class="ok">present</td><td>hidden</td><td>0</td><td>2</td></tr><tr><td>after CLI delete</td><td class="no">absent</td><td>–</td><td>–</td><td>–</td></tr>
+  </table>
+  <p>Row 5 (app window reloaded at the root via a full <code>page.goto</code>) is a side finding, see section 5: the reload wipes the renderer-side registry and the view stays <em>visible</em> with nothing owning it.</p>
+  <p>Repro files: <code>2298/repro/</code></p>
+
+  <h2>5. Root cause</h2>
+  <p><strong>Ownership model.</strong> Commit <a href="https://github.com/get-bb/bb/commit/ce006c6ea66a5690fd266a97b6577c0d16024605"><code>ce006c6ea</code></a> changed browser views from "destroyed when the deck unmounts" to "retained in a renderer-side registry, destroyed only on explicit teardown". The registry is a module-level map in the app renderer (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/app/src/components/secondary-panel/browserViewVisibilityCoordinator.ts#L65-L133"><code>apps/app/src/components/secondary-panel/browserViewVisibilityCoordinator.ts 65–133</code></a>); <code>BrowserTabContent</code> registers on mount and explicitly does <em>not</em> detach on unmount:</p>
+  <pre>// BrowserTabContent.tsx L579-L590, L661-L665
+// Create (or re-attach to) the native view on mount and stream navigation
+// state back. Unmount is not ownership teardown: switching threads unmounts
+// the deck, but the native view is intentionally retained ...
+    registerBrowserView({ environmentId, tabId, threadId });
+...
+      // The native view survives this unmount. Only explicit tab close/thread
+      // deletion owns detach; unmount just disconnects this component's state
+      // listener and forgets any stale visibility ownership.
+      visibilityCoordinator?.release(tabId);</pre>
+  <p>The explicit teardown sites are: tab removed from the open-tab list (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/app/src/components/secondary-panel/BrowserTabDeck.tsx#L63-L85"><code>apps/app/src/components/secondary-panel/BrowserTabDeck.tsx 63–85</code></a>), thread delete from the UI (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/app/src/components/thread/ThreadActionsProvider.tsx#L265-L280"><code>apps/app/src/components/thread/ThreadActionsProvider.tsx 265–280</code></a>), and <code>thread-deleted</code> / <code>environment-deleted</code> broadcasts (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/app/src/hooks/cache-owners/resource-route-owner.ts#L69-L82"><code>apps/app/src/hooks/cache-owners/resource-route-owner.ts 69–82</code></a>). <strong>Archive is in none of them.</strong></p>
+  <pre>// ThreadActionsProvider.tsx L265-L280 (delete)            // L333-L350 (archive)
+onSuccess: () => {                                          archiveThreadAndChildrenMutateAsync({ id: thread.id }).then(
+  destroyPersistedBrowserViewsForThread({                    (response) => {
+    desktopBrowser: getDesktopBrowserApi(),                     ...
+    threadId: thread.id,                                        syncNavigationAfterClose(
+  });                                                            closePanesForThreads(response.archivedThreadIds),
+  closeDialog();                                                  navigateAwayIfArchived,
+  syncNavigationAfterClose(closePanesForThreads([thread.id]),   );
+    () => navigateAwayIfViewing(thread));                       const toastId = ...      // &lt;- no teardown anywhere
+},</pre>
+  <p>On the wire side, the server's archive service stops runtime work and closes the thread's <em>terminals</em> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/threads/thread-archive.ts#L84-L112"><code>apps/server/src/services/threads/thread-archive.ts 84–112</code></a>) but browser views are a desktop-renderer concern, and the client's handler for <code>archived-changed</code> only invalidates queries (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/app/src/hooks/cache-owners/realtime-cache-registry.ts#L452-L459"><code>apps/app/src/hooks/cache-owners/realtime-cache-registry.ts 452–459</code></a>). So both ways of archiving — the button and <code>bb thread archive</code>/SDK/automations — leave the registry entry and the native view untouched.</p>
+  <p><strong>Why the symptom follows.</strong> When the pane closes, <code>BrowserTabContent</code>'s layout-effect cleanup calls <code>coordinator.hide(tabId)</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/app/src/components/secondary-panel/BrowserTabContent.tsx#L740-L751"><code>apps/app/src/components/secondary-panel/BrowserTabContent.tsx 740–751</code></a>), which is <code>entry.view.setVisible(false)</code> in the main process (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/desktop/src/desktop-browser-view.ts#L332-L343"><code>apps/desktop/src/desktop-browser-view.ts 332–343</code></a>). The <code>WebContentsView</code>, its <code>webContents</code> and renderer process remain (<code>destroyEntry</code> → <code>webContents.close()</code> runs only from <code>detach</code>, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/desktop/src/desktop-browser-view.ts#L715-L731"><code>apps/desktop/src/desktop-browser-view.ts 715–731</code></a> / <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/desktop/src/desktop-browser-view.ts#L821-L823"><code>apps/desktop/src/desktop-browser-view.ts 821–823</code></a>). The main process has no age/pressure policy and only drops views in <code>releaseWindow</code> on window close (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/desktop/src/main.ts#L1788-L1794"><code>apps/desktop/src/main.ts 1788–1794</code></a>) and <code>destroyAll</code> on quit. Each archived thread that had an open preview therefore leaves one renderer process behind for the life of the window.</p>
+  <p><strong>What the retained view costs (and does not).</strong> Electron 41's <code>setVisible(false)</code> marks the page hidden: in a standalone probe (<code>repro/hidden-view-probe.cjs</code>) and in the real app, a hidden retained view produced 0 rAF frames and ~1 timer tick per second, and <code>webContents.close()</code> ends the renderer process:</p>
+  <pre>{"phase":"visible (setVisible(true))","windowMs":1000,"rafTicks":60,"timerTicks":79,"visibilityState":"visible","rendererPid":3192}
+{"phase":"hidden via view.setVisible(false)","windowMs":1000,"rafTicks":0,"timerTicks":1,"visibilityState":"hidden","rendererPid":3192}
+{"phase":"removed via contentView.removeChildView(view)","windowMs":1000,"rafTicks":0,"timerTicks":1,"visibilityState":"hidden","rendererPid":3192}
+{"phase":"after webContents.close() (bb detach)","rendererPid":3192,"rendererProcessAlive":false,"webContentsDestroyed":true}</pre>
+  <p>So the accumulation is process count, heap, and each renderer's retained compositor resources — not live animation. That matches "memory pressure looks unremarkable" better than the issue's compositing theory; the WindowServer/GPU CPU the reporter saw is more plausibly from the 4 live threads' visible or recently hidden previews.</p>
+  <p><strong>Deeper issue (side finding, row 5 of the samples table).</strong> Because the only registry of views lives in renderer JS memory, a full reload of the app window (<code>page.goto</code> here; in the product, anything that reloads the renderer — dev HMR full reload, a renderer crash, ⌘R if enabled) wipes the registry while the main process keeps every view. Worse, React cleanups do not run on a hard navigation, so a view that was visible stays <em>visible</em> (row 5: <code>visible</code>, 120 rAF/2 s) at its last bounds with nothing owning it; after the reload neither archive nor delete can find it (<code>destroyPersistedBrowserViewsForThread</code> iterates the now-empty map). The durable fix for that is for the main process to own thread/environment ownership (attach already receives <code>tabId</code>; add <code>threadId</code>/<code>environmentId</code>) and to drop all views of a host window on <code>did-start-navigation</code> of the host <code>webContents</code>. It is out of scope for #2298 but the same mechanism.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>Make archive symmetric with delete at both entry points. Applied in this worktree; diff in <code>2298/repro/proposed-fix.diff</code>:</p>
+  <pre>diff --git a/apps/app/src/components/thread/ThreadActionsProvider.tsx b/apps/app/src/components/thread/ThreadActionsProvider.tsx
+index b5dfdf289..036ac0105 100644
+--- a/apps/app/src/components/thread/ThreadActionsProvider.tsx
++++ b/apps/app/src/components/thread/ThreadActionsProvider.tsx
+@@ -347,6 +347,17 @@ export function ThreadActionsProvider({
+             closePanesForThreads(response.archivedThreadIds),
+             navigateAwayIfArchived,
+           );
++          // Archive is the ordinary way to finish with a thread: release the
++          // native browser views its tabs created, exactly as delete does.
++          // The tab metadata stays persisted, so unarchiving recreates the
++          // page lazily the same way reopening a thread already does.
++          const desktopBrowser = getDesktopBrowserApi();
++          for (const archivedThreadId of response.archivedThreadIds) {
++            destroyPersistedBrowserViewsForThread({
++              desktopBrowser,
++              threadId: archivedThreadId,
++            });
++          }
+           const toastId = `thread-archived-${thread.id}`;
+           appToast.success(
+             &lt;ArchivedThreadToastTitle
+diff --git a/apps/app/src/hooks/cache-owners/resource-route-owner.ts b/apps/app/src/hooks/cache-owners/resource-route-owner.ts
+index 70451ce16..6119f511c 100644
+--- a/apps/app/src/hooks/cache-owners/resource-route-owner.ts
++++ b/apps/app/src/hooks/cache-owners/resource-route-owner.ts
+@@ -38,6 +38,16 @@ function isDeletedThreadMessage(
+   );
+ }
+ 
++function isArchivedThreadMessage(
++  message: ChangedMessage,
++): message is ThreadChangedMessage &amp; { id: string } {
++  return (
++    message.entity === "thread" &amp;&amp;
++    message.id !== undefined &amp;&amp;
++    message.changes.includes("archived-changed")
++  );
++}
++
+ function isDeletedEnvironmentMessage(
+   message: ChangedMessage,
+ ): message is EnvironmentChangedMessage &amp; { id: string } {
+@@ -67,6 +77,17 @@ export function useDeletedResourceRouteOwner(): DeletedResourceRouteChangeHandle
+       }
+ 
+       if (!isDeletedThreadMessage(message)) {
++        // An archive that did not come from this window's own action (CLI,
++        // SDK, automation, another client) must still release the thread's
++        // native browser views; `archived-changed` is also emitted when a
++        // thread is unarchived, where there are no registered views to drop.
++        if (isArchivedThreadMessage(message)) {
++          destroyPersistedBrowserViewsForThread({
++            desktopBrowser: getDesktopBrowserApi(),
++            threadId: message.id,
++          });
++          return;
++        }
+         if (isDeletedEnvironmentMessage(message)) {
+           destroyPersistedBrowserViewsForEnvironment({
+             desktopBrowser: getDesktopBrowserApi(),</pre>
+  <ul>
+    <li><strong>UI action</strong> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/app/src/components/thread/ThreadActionsProvider.tsx#L333-L350"><code>apps/app/src/components/thread/ThreadActionsProvider.tsx 333–350</code></a>): after <code>closePanesForThreads(response.archivedThreadIds)</code>, call <code>destroyPersistedBrowserViewsForThread</code> for every archived id (children included — the server returns them). Tab metadata is untouched, so Undo/unarchive + reopen recreates the page lazily, which the deck already does (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/app/src/components/secondary-panel/BrowserTabDeck.tsx#L108-L118"><code>apps/app/src/components/secondary-panel/BrowserTabDeck.tsx 108–118</code></a>). Verified live: after archive the target and renderer are gone; after <code>bb thread unarchive</code> + reopening, a fresh target appears and the page reloads (<code>fix-preview-sample-3-reopened.json</code>).</li>
+    <li><strong>Broadcast</strong> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/app/src/hooks/cache-owners/resource-route-owner.ts#L69-L82"><code>apps/app/src/hooks/cache-owners/resource-route-owner.ts 69–82</code></a>): treat <code>archived-changed</code> like <code>thread-deleted</code> for view ownership. This covers CLI/SDK/automation archives and other windows. <code>archived-changed</code> also fires on unarchive; at that moment the thread has no registered views, so the call is a no-op. Destroying twice (action + broadcast) is harmless: the second call finds no records; <code>detach</code> on a gone tab is ignored by <code>withEntry</code>/<code>destroyEntry</code>.</li>
+    <li><strong>Edge to decide:</strong> a wire archive while the thread is being viewed in some pane. With the patch as written the view is destroyed under a mounted <code>BrowserTabContent</code>: the tab strip and address bar stay, the page area goes blank until the tab is re-selected or the thread reopened. Options: (a) accept (matches "archive stops the thread's work", like terminals being closed server-side), (b) skip teardown when the thread is open in a pane and instead destroy on deck unmount when <code>thread.archivedAt !== null</code>, or (c) have <code>BrowserTabContent</code> re-attach when its tab is shown and its view is gone. (b) is the smallest faithful version; it needs the pane state, which <code>useDeletedResourceRouteOwner</code> does not have today (it only knows <code>routeThreadId</code>).</li>
+    <li>What could go wrong: nothing on the server/daemon boundary (pure client change, no protocol version bump). The only behavioural change is that reopening an archived thread reloads its preview instead of showing the retained page — the intended trade.</li>
+    <li>Verification done: repro test 2/2 pass with the fix (<pre> RUN  v4.1.1 /Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-17/apps/app
+ Test Files  1 passed (1)
+      Tests  2 passed (2)
+   Start at  09:44:21
+   Duration  1.72s (transform 554ms, setup 72ms, import 878ms, tests 111ms, environment 584ms)</pre>); <code>vitest run src/components/thread/ src/components/secondary-panel/browserViewVisibilityCoordinator.test.ts src/components/secondary-panel/BrowserTabDeck src/hooks/cache-owners/</code> → 57 files / 385 tests pass (<code>related-tests-with-fix.log</code>); <code>turbo run typecheck --filter=@bb/app --force</code> passes (<code>typecheck-with-fix.log</code>). Live fix validation on a second thread (<code>thr_kyzt8d4ieh</code>), scripted in <code>repro/fix-validation.sh</code> (output <code>fix-validation-run.txt</code>):
+    <table><tr><th>Phase</th><th>CDP target</th><th>visibilityState</th><th>rAF ticks</th><th>timer ticks</th></tr><tr><td>fix: before archive (preview tab visible)</td><td class="ok">present</td><td>visible</td><td>120</td><td>161</td></tr><tr><td>fix: after archive</td><td class="no">absent</td><td>–</td><td>–</td><td>–</td></tr><tr><td>fix: after unarchive + reopen (page recreated)</td><td class="ok">present</td><td>visible</td><td>120</td><td>138</td></tr></table>
+    Renderer pid 1801 (the preview) present before the archive, gone after (<code>fix-renderers-1-before.txt</code> / <code>fix-renderers-2-after.txt</code>).</li>
+    <li>Follow-up worth filing separately: the reload-orphan problem above, and the issue's own suggestion of an age-based policy for views hidden via ⌘J, which the retain-on-hide design currently leaves unbounded too.</li>
+  </ul>
+
+  <h2>7. PR review</h2>
+  <p>No open pull request is linked to #2298 (checked <code>gh pr list --search 2298</code> and the issue timeline).</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/commit/ce006c6ea66a5690fd266a97b6577c0d16024605">ce006c6ea</a> "Keep browser views alive across thread switches" — introduced the retain-on-unmount model and the delete-only teardown this issue is about.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1843">#1843</a> Plugins and agents cannot run bounded scripts in BB Browser tabs — same "browser views are desktop-core only" constraint the issue's Note section describes.</li>
+    <li>No existing issue covers hidden-view retention (⌘J) or the reload-orphan case; both are follow-ups from section 5/6.</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>CDP target lists</h3>
+  <pre># baseline (app window only)
+page  A351D193  http://localhost:14158/
+
+# after opening the browser tab
+page  EE9EB179  http://127.0.0.1:49333/
+page  A351D193  http://localhost:14158/projects/proj_5srau8qsn9/threads/thr_yid5rprxku
+
+# after UI archive
+page  EE9EB179  http://127.0.0.1:49333/
+page  A351D193  http://localhost:14158/
+
+# after CLI archive
+page  EE9EB179  http://127.0.0.1:49333/
+page  A351D193  http://localhost:14158/projects/proj_5srau8qsn9/threads/thr_yid5rprxku
+
+# after CLI delete
+page  A351D193  http://localhost:14158/</pre>
+  <h3>Renderer processes</h3>
+  <pre># after opening the browser tab (pid ppid rss-KB cmd)
+66587 66548 453520 /Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-17/node_modules/.pnpm/electron@41.7.0/node_modules/electron/dist/Electron.app/Contents/Frameworks/Electron Helper (Renderer).app/Contents/MacOS/Electron Helper (Renderer) --type=renderer --user-data-dir=/Users/USER/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-17-bd99a5562d1d/desktop --app-path=/Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-17/apps/desktop --enable-sandbox --remote-debugging-port=49222 --lang=en-US --num-raster-threads=4 --enable-zero-copy --enable-gpu-memory-buffer-compositor-resources --enable-main-frame-before-activation --renderer-client-id=5 --time-ticks-at-unix-epoch=-1785397255777419 --launch-time-ticks=2192286856045 --shared-files --field-trial-handle=1718379636,r,1076711170803668596,4174251857620709702,262144 --enable-features=PdfUseShowSaveFilePicker,ScreenCaptureKitPickerScreen,ScreenCaptureKitStreamPickerSonoma --disable-features=DropInputEventsWhilePaintHolding,LocalNetworkAccessChecks,ScreenAIOCREnabled,SpareRendererForSitePerProcess,TimeoutHangingVideoCaptureStarts,TraceSiteInstanceGetProcessCreation --variations-seed-version --pseudonymization-salt-handle=1935764596,r,3157891776355157638,13858753825582910177,4 --trace-process-track-uuid=3190708990997080739 --seatbelt-client=59
+74883 66548 101952 /Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-17/node_modules/.pnpm/electron@41.7.0/node_modules/electron/dist/Electron.app/Contents/Frameworks/Electron Helper (Renderer).app/Contents/MacOS/Electron Helper (Renderer) --type=renderer --user-data-dir=/Users/USER/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-17-bd99a5562d1d/desktop --app-path=/Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-17/apps/desktop --enable-sandbox --remote-debugging-port=49222 --lang=en-US --num-raster-threads=4 --enable-zero-copy --enable-gpu-memory-buffer-compositor-resources --enable-main-frame-before-activation --renderer-client-id=6 --time-ticks-at-unix-epoch=-1785397255777419 --launch-time-ticks=2192393307580 --shared-files --field-trial-handle=1718379636,r,1076711170803668596,4174251857620709702,262144 --enable-features=PdfUseShowSaveFilePicker,ScreenCaptureKitPickerScreen,ScreenCaptureKitStreamPickerSonoma --disable-features=DropInputEventsWhilePaintHolding,LocalNetworkAccessChecks,ScreenAIOCREnabled,SpareRendererForSitePerProcess,TimeoutHangingVideoCaptureStarts,TraceSiteInstanceGetProcessCreation --variations-seed-version --pseudonymization-salt-handle=1935764596,r,3157891776355157638,13858753825582910177,4 --trace-process-track-uuid=3190708991934122588 --seatbelt-client=70
+# after UI archive
+66587 66548 391520 /Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-17/node_modules/.pnpm/electron@41.7.0/node_modules/electron/dist/Electron.app/Contents/Frameworks/Electron Helper (Renderer).app/Contents/MacOS/Electron Helper (Renderer) --type=renderer --user-data-dir=/Users/USER/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-17-bd99a5562d1d/desktop --app-path=/Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-17/apps/desktop --enable-sandbox --remote-debugging-port=49222 --lang=en-US --num-raster-threads=4 --enable-zero-copy --enable-gpu-memory-buffer-compositor-resources --enable-main-frame-before-activation --renderer-client-id=5 --time-ticks-at-unix-epoch=-1785397255777419 --launch-time-ticks=2192286856045 --shared-files --field-trial-handle=1718379636,r,1076711170803668596,4174251857620709702,262144 --enable-features=PdfUseShowSaveFilePicker,ScreenCaptureKitPickerScreen,ScreenCaptureKitStreamPickerSonoma --disable-features=DropInputEventsWhilePaintHolding,LocalNetworkAccessChecks,ScreenAIOCREnabled,SpareRendererForSitePerProcess,TimeoutHangingVideoCaptureStarts,TraceSiteInstanceGetProcessCreation --variations-seed-version --pseudonymization-salt-handle=1935764596,r,3157891776355157638,13858753825582910177,4 --trace-process-track-uuid=3190708990997080739 --seatbelt-client=59
+74883 66548 110848 /Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-17/node_modules/.pnpm/electron@41.7.0/node_modules/electron/dist/Electron.app/Contents/Frameworks/Electron Helper (Renderer).app/Contents/MacOS/Electron Helper (Renderer) --type=renderer --user-data-dir=/Users/USER/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-17-bd99a5562d1d/desktop --app-path=/Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-17/apps/desktop --enable-sandbox --remote-debugging-port=49222 --lang=en-US --num-raster-threads=4 --enable-zero-copy --enable-gpu-memory-buffer-compositor-resources --enable-main-frame-before-activation --renderer-client-id=6 --time-ticks-at-unix-epoch=-1785397255777419 --launch-time-ticks=2192393307580 --shared-files --field-trial-handle=1718379636,r,1076711170803668596,4174251857620709702,262144 --enable-features=PdfUseShowSaveFilePicker,ScreenCaptureKitPickerScreen,ScreenCaptureKitStreamPickerSonoma --disable-features=DropInputEventsWhilePaintHolding,LocalNetworkAccessChecks,ScreenAIOCREnabled,SpareRendererForSitePerProcess,TimeoutHangingVideoCaptureStarts,TraceSiteInstanceGetProcessCreation --variations-seed-version --pseudonymization-salt-handle=1935764596,r,3157891776355157638,13858753825582910177,4 --trace-process-track-uuid=3190708991934122588 --seatbelt-client=70
+# after CLI delete
+66587 66548 523936 /Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-17/node_modules/.pnpm/electron@41.7.0/node_modules/electron/dist/Electron.app/Contents/Frameworks/Electron Helper (Renderer).app/Contents/MacOS/Electron Helper (Renderer) --type=renderer --user-data-dir=/Users/USER/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-17-bd99a5562d1d/desktop --app-path=/Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-17/apps/desktop --enable-sandbox --remote-debugging-port=49222 --lang=en-US --num-raster-threads=4 --enable-zero-copy --enable-gpu-memory-buffer-compositor-resources --enable-main-frame-before-activation --renderer-client-id=5 --time-ticks-at-unix-epoch=-1785397255777419 --launch-time-ticks=2192286856045 --shared-files --field-trial-handle=1718379636,r,1076711170803668596,4174251857620709702,262144 --enable-features=PdfUseShowSaveFilePicker,ScreenCaptureKitPickerScreen,ScreenCaptureKitStreamPickerSonoma --disable-features=DropInputEventsWhilePaintHolding,LocalNetworkAccessChecks,ScreenAIOCREnabled,SpareRendererForSitePerProcess,TimeoutHangingVideoCaptureStarts,TraceSiteInstanceGetProcessCreation --variations-seed-version --pseudonymization-salt-handle=1935764596,r,3157891776355157638,13858753825582910177,4 --trace-process-track-uuid=3190708990997080739 --seatbelt-client=59</pre>
+  <h3>thread_tabs after the run (sqlite3 on the instance DB)</h3>
+  <pre>thread_id|revision|archived_at|deleted_at|tabs_json
+thr_kyzt8d4ieh|5|1787589937156||[{"id":"thread-info:thread-info:none","kind":"thread-info"},{"id":"git-diff:git-diff:none","kind":"git-diff"},{"environmentId":"env_b257zvewfp","id":"browser:tbiewCIKguIz0WEA3JgCq:env_b257zvewfp","kind":"browser","title":"bb#2298 animating preview","url":"http://127.0.0.1:49333/"}]</pre>
+  <h3>Archived thread reopened by URL (tab reachable)</h3>
+  <div class="row">
+    <figure><img src="assets/2298-05-app-archived-thread-open.png" alt="archived thread opened by URL"><figcaption>Archived thread opened by its URL: "Thread is archived / Unarchive" banner and the "bb#2298 animating preview" browser tab mounted. Its Close button is hover-revealed and not visible in the pixels; the accessibility snapshot proves it exists (<code>snapshot-archived-thread-open.txt</code>: <code>button "Close bb#2298 animating preview"</code>).</figcaption></figure>
+    <figure><img src="assets/2298-07-app-after-cli-archive.png" alt="after CLI archive while viewing"><figcaption>After <code>bb thread archive</code> while viewing: the app stays on the thread with the tab mounted; the wire path never closes panes or views.</figcaption></figure>
+  </div>
+  <h3>Commands run (abridged, in order; R = 2298/repro)</h3>
+  <pre>pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build
+gh api repos/get-bb/bb/issues/2298 ; git fetch origin main ; git rev-parse origin/main   # == base
+# code reading: rg destroyPersistedBrowserViewsForThread / archiveThreadAndChildrenAction ; git log -S ... ; git show ce006c6ea
+Electron.app/Contents/MacOS/Electron $R/hidden-view-probe.cjs &gt; $R/hidden-view-probe.out.jsonl
+cp $R/ThreadActionsProvider.archive-browser-views.test.tsx apps/app/src/components/thread/
+cd apps/app &amp;&amp; pnpm exec vitest run src/components/thread/ThreadActionsProvider.archive-browser-views.test.tsx   # fails on base
+scripts/bb-dev-app current ; eval "$(scripts/bb-dev-app env)"
+CDP_PORT=49222 bash $R/launch-desktop.sh &amp; ; python3 -m http.server 49333 --bind 127.0.0.1 --directory $R/page &amp;
+bash $R/make-scratch-repo.sh ; bash $R/bbdev.sh machine list --json ; curl -X POST $BB_SERVER_URL/api/v1/projects ...
+bash $R/bbdev.sh thread spawn ... --prompt "Reply only with ok." --json
+sed ... $R/open-preview-in-thread.js &gt; /tmp/open-preview.js ; doobie --connect 49222 -t 90 run /tmp/open-preview.js
+bash $R/capture-state.sh 49222 ... ; bash $R/sample-preview.sh ... ; doobie ... screenshot/snapshot of the app page
+sed ... $R/archive-via-sidebar.js &gt; /tmp/archive.js ; doobie --connect 49222 -t 60 run /tmp/archive.js   # UI archive -&gt; target + renderer survive
+bash $R/wire-path.sh &lt;thread-id&gt; &lt;project-id&gt; http://localhost:14158 49222 f8a-17   # unarchive / CLI archive / reload / delete
+git apply $R/proposed-fix.diff ; vitest (repro + neighbours) ; turbo run typecheck --filter=@bb/app --force
+bash $R/bbdev.sh thread spawn ... ; bash $R/fix-validation.sh &lt;thread-id&gt; &lt;project-id&gt; http://localhost:14158 49222 f8a-17 &lt;bb.db&gt;
+pnpm dev:stop ; kill Electron/page-server ; rm -rf dev data dir ; lsof -nP -iTCP -sTCP:LISTEN   # cleanup</pre>
+  <h3>Output of <code>wire-path.sh</code> (steps 9–11) in this run</h3>
+  <pre>## 9a. unarchive via CLI (the thread is currently open in the app)
+{
+  "ok": true,
+  "threadId": "thr_yid5rprxku"
+}
+banner=0 tab=1
+## 9b. archive via CLI while the thread is being viewed
+{
+  "ok": true,
+  "threadId": "thr_yid5rprxku",
+  "archivedThreadIds": [
+    "thr_yid5rprxku"
+  ]
+}
+URL http://localhost:14158/projects/proj_5srau8qsn9/threads/thr_yid5rprxku
+53:      - status "Thread is archived" [ref=e269]:
+55:        - generic [ref=e274]: Thread is archived
+63:        - button "Close bb#2298 animating preview" [ref=e199]
+page  EE9EB179  http://127.0.0.1:49333/
+page  A351D193  http://localhost:14158/projects/proj_5srau8qsn9/threads/thr_yid5rprxku
+# pid ppid rss-KB (Electron Helper (Renderer) of f8a-17)
+66587 66548 279280
+74883 66548 102752
+{
+  "phase": "after CLI archive while the thread was being viewed",
+  "targetPresent": true,
+  "targetId": "EE9EB17993C3C8029EC94C9E43C70075",
+  "windowMs": 2000,
+  "rafTicks": 120,
+  "timerTicks": 148,
+  "visibilityState": "visible",
+  "url": "http://127.0.0.1:49333/"
+}
+## 9c. side finding: full reload of the app window (page.goto to the root) orphans the view
+URL http://localhost:14158/
+{
+  "phase": "archived, app window reloaded at the root (side finding)",
+  "targetPresent": true,
+  "targetId": "EE9EB17993C3C8029EC94C9E43C70075",
+  "windowMs": 2000,
+  "rafTicks": 120,
+  "timerTicks": 149,
+  "visibilityState": "visible",
+  "url": "http://127.0.0.1:49333/"
+}
+## 9d. reopen the archived thread (re-registers the view), then leave it with an in-app navigation
+{
+  "afterOpen": {
+    "url": "thread",
+    "hasBrowserTab": true
+  },
+  "afterClientSideNav": {
+    "url": "http://localhost:14158/",
+    "hasBrowserTab": false,
+    "hasSidebarThread": false
+  }
+}
+{
+  "phase": "archived, left via in-app navigation (just before delete)",
+  "targetPresent": true,
+  "targetId": "EE9EB17993C3C8029EC94C9E43C70075",
+  "windowMs": 2000,
+  "rafTicks": 0,
+  "timerTicks": 2,
+  "visibilityState": "hidden",
+  "url": "http://127.0.0.1:49333/"
+}
+## 11. control: delete via CLI
+{
+  "ok": true,
+  "threadId": "thr_yid5rprxku"
+}
+page  A351D193  http://localhost:14158/
+# pid ppid rss-KB (Electron Helper (Renderer) of f8a-17)
+66587 66548 523936
+{"phase":"after CLI delete","targetPresent":false}</pre>
+  <h3>Output of <code>fix-validation.sh</code> (section 6) in this run</h3>
+  <pre>## open the preview tab in thr_kyzt8d4ieh
+[
+  "app target A351D19385A952E2ED087873C2E00216 (http://localhost:14158/)",
+  "opened http://localhost:14158/projects/proj_5srau8qsn9/threads/thr_kyzt8d4ieh",
+  "clicked button \"Show right panel\" (e109)",
+  "clicked button \"Open new tab\" (e238)",
+  "clicked button \"Open browser\" (e324)",
+  "clicked textbox \"Address and search bar\" (e377)",
+  "browser tab mounted: true"
+]
+page  6B7557C9  http://127.0.0.1:49333/
+page  A351D193  http://localhost:14158/projects/proj_5srau8qsn9/threads/thr_kyzt8d4ieh
+# pid ppid rss-KB (Electron Helper (Renderer) of f8a-17)
+1801 66548 98272
+66587 66548 552304
+{
+  "phase": "fix: before archive (preview tab visible)",
+  "targetPresent": true,
+  "targetId": "6B7557C915472289A17A987499D38433",
+  "windowMs": 2000,
+  "rafTicks": 120,
+  "timerTicks": 161,
+  "visibilityState": "visible",
+  "url": "http://127.0.0.1:49333/"
+}
+## archive from the sidebar (archiveThreadAndChildrenAction)
+{
+  "clicked": "button \"Archive thread\" (e53)",
+  "url": "http://localhost:14158/",
+  "archivedToast": true,
+  "sidebarShowsNoThreads": false,
+  "browserTabMounted": false
+}
+page  A351D193  http://localhost:14158/
+# pid ppid rss-KB (Electron Helper (Renderer) of f8a-17)
+66587 66548 546528
+{"phase":"fix: after archive","targetPresent":false}
+## persisted tab record survives the archive
+thread_id|revision|archived_at|deleted_at|tabs_json
+thr_kyzt8d4ieh|5|1787589937156||[{"id":"thread-info:thread-info:none","kind":"thread-info"},{"id":"git-diff:git-diff:none","kind":"git-diff"},{"environmentId":"env_b257zvewfp","id":"browser:tbiewCIKguIz0WEA3JgCq:env_b257zvewfp","kind":"browser","title":"bb#2298 animating preview","url":"http://127.0.0.1:49333/"}]
+## unarchive via CLI, reopen by URL: the page is recreated
+{
+  "ok": true,
+  "threadId": "thr_kyzt8d4ieh"
+}
+URL http://localhost:14158/projects/proj_5srau8qsn9/threads/thr_kyzt8d4ieh
+85:        - button "Close bb#2298 animating preview" [ref=e214]
+page  30EA1588  http://127.0.0.1:49333/
+page  A351D193  http://localhost:14158/projects/proj_5srau8qsn9/threads/thr_kyzt8d4ieh
+# pid ppid rss-KB (Electron Helper (Renderer) of f8a-17)
+5156 66548 98720
+66587 66548 582432
+{
+  "phase": "fix: after unarchive + reopen (page recreated)",
+  "targetPresent": true,
+  "targetId": "30EA1588676F5C3163D3C4CACC57A7C8",
+  "windowMs": 2000,
+  "rafTicks": 120,
+  "timerTicks": 138,
+  "visibilityState": "visible",
+  "url": "http://127.0.0.1:49333/"
+}</pre>
+  <p>Note on isolation: a bare <code>pnpm bb:dev</code> without the <code>scripts/bb-dev-app env</code> variables resolves to the user's real server. In the first run of this investigation two such unprefixed calls happened (read-only or failed before doing anything); in the revised run every CLI call went through <code>repro/bbdev.sh</code>, which evaluates <code>scripts/bb-dev-app env</code> for the checkout it is run from before calling <code>pnpm bb:dev</code>.</p>
+  <p>Full artifacts: <code>2298/repro/</code> — probe script and outputs, repro test, fix diff, test/typecheck logs, CDP target and renderer snapshots, preview samples, UI snapshots, doobie driver scripts (<code>open-preview-in-thread.js</code>, <code>archive-via-sidebar.js</code>), helper scripts (<code>launch-desktop.sh</code>, <code>bbdev.sh</code>, <code>make-scratch-repo.sh</code>, <code>capture-state.sh</code>, <code>snapshot-app.sh</code>, <code>sample-preview.sh</code>, <code>wire-path.sh</code>, <code>fix-validation.sh</code>) and their outputs (<code>*-run.txt</code>).</p>
+
+  <h2>10. Verification</h2>
+  <p>An independent verifier re-ran this report from scratch in its own worktree (<code>wf_846839f8-f8a-13</code> at <code>494f66526</code>) and its own dev instance (app :16770 / server :24770 / daemon :32770). The unit repro failed 2/2 on base with the assertions shown in 4a, and passed 36/36 (repro + <code>src/hooks/cache-owners/</code> + <code>ThreadActionsProvider</code> tests) with <code>proposed-fix.diff</code> applied; <code>turbo typecheck @bb/app</code> passed. Live: opening the preview produced a second CDP page target and renderer (~102 MB RSS); the sidebar "Archive thread" click left the target and renderer alive (hidden, 0 rAF / 2 s, ~109 MB RSS); opening the archived thread by URL showed the "Thread is archived" banner and the <code>Close bb#2298 animating preview</code> button in the accessibility snapshot; in-app navigation away left the view present and hidden; <code>bb thread delete</code> removed the target and ended the renderer. The verifier also checked every code claim against <code>494f66526</code> (line ranges, the two delete teardown sites, the missing archive ones, <code>releaseWindow</code>/<code>destroyAll</code> as the only main-process reclaim paths, <code>archived-changed</code> emitted on both archive and unarchive), confirmed <code>origin/main == 494f66526</code> and that no PR is linked, and checked that all six referenced screenshots exist and match their captions. Verifier artifacts: <code>2298/verify/</code>.</p>
+  <p>The verifier's findings and what changed in this revision:</p>
+  <ul>
+    <li><strong>Major — <code>launch-desktop.sh</code> hard-coded the author's worktree path</strong>, so the literal step 1 could not work for anyone else. Fixed: the script now takes the checkout from its cwd (<code>git rev-parse --show-toplevel</code>) or its first argument, validates it, and refuses a busy CDP port. The whole live repro (sections 4b and 6) was then re-run from a fresh worktree (<code>wf_846839f8-f8a-17</code>, new dev instance on :14158/:22158/:30158) using the scripts exactly as written in the report; every artifact, number, screenshot and id in sections 3, 4b and 6 comes from that re-run (<code>desktop.log</code> shows the launcher deriving the checkout; <code>wire-path-run.txt</code> and <code>fix-validation-run.txt</code> are the raw outputs). Results were identical to the first run and to the verifier's.</li>
+    <li><strong>Minor — session-specific literals in steps 2–3 and a hard-coded app target id in the doobie script.</strong> Fixed: the commands use <code>&lt;host-id&gt;</code>/<code>&lt;project-id&gt;</code>/<code>&lt;thread-id&gt;</code>/<code>&lt;app-port&gt;</code> placeholders and say where each value comes from; <code>open-preview-in-thread.js</code> and <code>archive-via-sidebar.js</code> discover the app window via <code>browser.listPages()</code> by origin; <code>bbdev.sh</code> replaces the <code>BB_SERVER_URL=…</code> prefixes and derives the instance from the checkout.</li>
+    <li><strong>Minor — 4a wording</strong> implied only one test fails. Reworded: both fail, with the exact assertion for each.</li>
+    <li><strong>Minor — figure 2298-05 caption</strong> said the Close control is visible in the image. Corrected: the button is hover-revealed; the accessibility snapshot is the evidence.</li>
+  </ul>
+</main></body></html>

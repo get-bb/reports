@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1363 provider processes need one host-daemon lease owner tied to active turns</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1363 · Provider processes need one host-daemon lease owner tied to active turns</h1>
+  <p class="meta">
+    <span class="pill">Type: not set (author's characterization: architecture / bug)</span> <span class="pill high">host</span> <span class="pill">Priority: not set</span> <span class="pill">Effort: not set (large)</span>
+    <a href="https://github.com/get-bb/bb/issues/1363">open on GitHub</a>
+    <span>2026-08-18</span>
+    <span>base <code>16ceb3a540f81c1189efaffb27a39b1d9443abf5</code> (main)</span>
+  </p>
+  <p class="meta">
+    <span class="verdict v-partial">Verdict: PARTIALLY REPRODUCED</span>
+    <span>· root-cause confidence: <b>high</b> (for the mechanisms below) / <b>low</b> (for the reporter's exact 17-process count on 0.36.1)</span>
+    <span>· linked open PRs: none</span>
+  </p>
+
+  <h2>TL;DR</h2>
+  <p>The reporter saw, on bb-app 0.36.1, 17 resident <code>codex app-server</code> processes (1.26 GiB) plus 7 code-mode hosts for only 4 active threads, and asks for one host-daemon owner that leases every provider process to an active turn or a bounded idle TTL and kills the process group when the lease ends. I could not reproduce that exact ratio on main (the Codex plumbing was rewritten between 0.36.1 and main: per-thread <em>bridge</em> + per-thread app-server, #1640), but I verified the structural claim: <b>there is no single lease owner</b>. Provider lifetime is decided by three independent mechanisms with gaps between them:</p>
+  <ol>
+    <li><b>The idle reaper</b> (<code>apps/host-daemon/src/app.ts</code>, every 5 min, 30 min idle) is the only automatic release, and by default it only applies to Codex. With the shipped default (<code>providerSessionReaping</code> experiment off) every idle Claude Code / ACP / Pi session stays resident until the thread is manually stopped or the daemon restarts. Verified live: 3 idle claude threads = 3 resident <code>claude</code> processes (~1.05 GB RSS) for &gt;33 min while codex peers were reaped at 31 min. Unit repro test fails on main.</li>
+    <li><b>The reaper only sees "idle" state the daemon itself tracks.</b> A thread whose provider hangs mid-turn (I froze an app-server with <code>SIGSTOP</code>) is never a reap candidate: server shows <code>stopping</code> forever after <code>bb thread stop</code> times out, the daemon keeps the active turn, and the app-server + code-mode host stay resident indefinitely. There is no maximum turn duration anywhere; the server's own comment says settlement "rests on" the turn ending by itself.</li>
+    <li><b>Archive releases Codex but not Claude Code</b>: archiving an idle claude-code thread leaves its 350 MB <code>claude</code> process resident (archive only forwards to providers with <code>threadArchive: true</code>; the "stop active work" call skips idle threads).</li>
+    <li>Two smaller items: <code>RuntimeManager.evictIdleEnvironments()</code> has had no caller since May 2026, so per-environment shared bridge processes never unload; and the codex bridge's SIGTERM/stdin-close path calls <code>process.exit(0)</code> right after sending SIGTERM to children, so its 4 s SIGKILL escalation never fires — a child that cannot act on SIGTERM survives daemon death as an orphan (observed: <code>codex app-server</code> + <code>codex-code-mode-host</code> reparented to PID 1 after <code>kill -9</code> of the daemon).</li>
+  </ol>
+  <p>What <em>does</em> work on main: Codex idle reap (verified at 31 min), archive of an idle Codex thread (bridge, app-server and code-mode host all exit), <code>bb thread stop</code> on an idle thread releases any provider (manual release verb from #1584), bridge/app-server crashes cascade cleanly (no orphans), and daemon restart cleans up everything that is not wedged.</p>
+
+  <h2>Claims vs findings</h2>
+  <table>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>17 Codex app-servers / 7 code-mode hosts for 4 active threads on 0.36.1</td><td class="unv">Unverifiable</td><td>Reporter's production numbers; the pre-#1640 code path (<code>packages/agent-runtime/src/codex/adapter.ts</code> in 0.36.0) is gone on main. Consistent with the mechanisms below (idle &lt;30 min, hung/pending turns, threads with in-flight ops are all non-reapable), but I could not measure his host.</td></tr>
+    <tr><td>Restart clears the processes (cleanup on restart works)</td><td class="ok">Verified</td><td>Daemon restart via <code>bb-dev-app</code> and via <code>kill -9</code> removed every bridge / app-server / claude process except one wedged app-server (exp. G; the "wedged" child was an app-server I had frozen with <code>SIGSTOP</code> as an artificial stand-in for a hang, so this exception does not occur for a healthy child).</td></tr>
+    <tr><td>Steady-state provider ownership is not bounded by an invariant</td><td class="ok">Verified</td><td>Exp. C (claude never reaped), exp. E (hung turn never reaped), exp. F (archive leaves claude resident); code walk in Root cause.</td></tr>
+    <tr><td>Reactive idle reaping exists</td><td class="ok">Verified</td><td>Codex sessions reaped 31 min after idle in exp. B (<code>Reaped idle provider sessions</code> log lines).</td></tr>
+    <tr><td>Operator cannot map PID → session → thread/turn</td><td class="ok">Verified</td><td>No local-API/CLI diagnostic exists (<code>bb machine show</code> prints host row only). Codex app-servers carry no <code>BB_THREAD_ID</code> env (only claude CLIs do); daemon-side <code>listActiveThreads()</code> is only sent at session open.</td></tr>
+    <tr><td>124 host-daemon sessions (100 <code>replaced</code>, 21 <code>daemon-disconnect</code>)</td><td class="unv">Unverifiable</td><td>Reporter's DB. Note: a same-instance reconnect (<code>replaced</code>) does <em>not</em> touch provider processes (<code>closeDaemonSessionSocket</code>, not <code>closeDaemonSession</code>) — so churn there neither leaks nor frees processes.</td></tr>
+    <tr><td>OOM kill of <code>bb.service</code> at 4 GiB</td><td class="unv">Unverifiable</td><td>Not reproduced; my instance held 2.6 GB RSS in provider processes with 4 codex + 2 claude threads (dev-mode tsx bridges are heavier than production bundles).</td></tr>
+  </table>
+
+  <h2>Environment</h2>
+  <ul>
+    <li>bb <code>16ceb3a54</code> (main, 2026-08-18), worktree <code>/home/USER/projects/bb/.claude/worktrees/wf_debcf606-e4a-16</code>; own dev instance: app <code>:12352</code>, server <code>:20352</code>, host daemon <code>:28352</code>, data dir <code>/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_debcf606-e4a-16-a46f9a08b8b1</code></li>
+    <li>Revision-pass re-run (portable scripts): worktree <code>/home/USER/projects/bb/.claude/worktrees/wf_debcf606-e4a-50</code> at the same commit, app <code>:15519</code>, server <code>:23519</code>, host daemon <code>:31519</code>, host <code>host_hvuqh8u6ut</code>, project <code>proj_fixrjmwu3c</code>, environment <code>env_irxtwkf8y3</code></li>
+    <li>Linux 7.0.0-29-generic, 16 cores, 57 GB RAM, node v24.18.0, codex-cli 0.147.0 (feature <code>code_mode_host</code> stable/on), Claude Code 2.1.234</li>
+    <li>Host <code>host_vp62yvdkp4</code> ("HOST"), project <code>proj_9tmcdwmi7t</code> (local path <code>/tmp/bb-1363-qa</code>), environment <code>env_thjnh8daw7</code></li>
+    <li>Experiments: <code>{"providerSessionReaping":false, ...}</code> (defaults). Reaper constants: idle 30 min, sweep every 5 min.</li>
+    <li>Helpers (portable — they derive server URL, data dir, host id and project from <em>your</em> worktree's dev instance; run them with the shell's cwd inside the bb worktree, or set <code>BB_WT=/path/to/bb</code>): <code>env.sh</code> (sourced by the others: reads <code>scripts/bb-dev-app status</code>, defines a <code>bb</code> CLI function and <code>bb_host_id</code> from <code>bb machine list --json</code>), <code>spawn.sh</code> (creates the <code>qa</code> project on first use, spawns N threads with "Reply only with ok." on <code>--machine $(bb_host_id)</code> and waits until all threads are idle), <code>procs.sh</code> (finds this worktree's daemon by cwd and walks its descendants: pid/ppid/rss/etime), <code>rss-sum.sh</code> (RSS grouped by process kind).</li>
+  </ul>
+  <h3>Glossary (process shapes you will see in <code>procs.sh</code> output)</h3>
+  <ul>
+    <li><b>host daemon</b> — the per-machine bb process that owns provider processes and executes host RPC commands from the server (<code>thread.start</code>, <code>thread.stop</code>, <code>thread.archive</code>, …). In dev it is <code>tsx apps/host-daemon/src/index.ts</code>.</li>
+    <li><b>bridge</b> — a Node helper process the daemon spawns per provider plugin (<code>bridge-worker-entry … provider-codex</code> / <code>provider-claude-code</code>) that translates bb's runtime protocol into the provider's own protocol. Codex uses one bridge <em>per thread</em>; Claude Code uses one bridge <em>per environment</em> (worktree) shared by all its threads. Each provider also keeps one extra <b>maintenance runtime bridge</b> for non-thread work (model listing, title generation) with cwd <code>provider-maintenance-workspace</code>.</li>
+    <li><b>app-server</b> — the <code>codex app-server</code> CLI process (the actual Codex agent) that a codex bridge spawns for its thread. <b>code-mode host</b> (<code>codex-code-mode-host</code>) is Codex's shell/tool helper, spawned by the app-server when a turn runs a command.</li>
+    <li><b><code>claude</code> CLI</b> — the Claude Code process (<code>claude --output-format stream-json …</code>) that a claude-code bridge spawns per thread; it carries <code>BB_THREAD_ID</code> in its environment.</li>
+    <li><b>processKey</b> — the daemon's internal key for a provider process (e.g. <code>codex-thread:&lt;threadId&gt;#bridge:…</code>); the reaper and release paths address processes by this key. <b>reconcileDaemonReportedThreads</b> is the server routine that, when a daemon (re)connects and reports which threads it still has loaded, settles server thread status to match.</li>
+  </ul>
+
+  <h2>Minimal reproduction</h2>
+  <p>Precondition: from a bb worktree at the base commit run <code>pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build &amp;&amp; scripts/bb-dev-app current</code>. Then, <b>with your shell's cwd inside that worktree</b> (or <code>BB_WT=/path/to/bb</code> exported), copy <code>1363/repro/*.sh</code> anywhere and run them by absolute path; nothing in them is machine-specific. <code>spawn.sh</code> creates the <code>qa</code> project (local path <code>/tmp/bb-1363-qa</code>) on first use and passes <code>--machine $(bb_host_id)</code> because <code>bb thread spawn</code> without <code>--machine</code> can resolve a different host on a box with several bb instances (<code>HTTP 404: Host not found</code>). Its first output line prints <code>server=… host=… project=…</code>; the ad-hoc <code>bb thread spawn</code> commands below use those values as <code>$HOST</code> / <code>$PROJECT</code>. The <code>bb</code> function defined by <code>env.sh</code> is <code>node $WT/packages/scripts/dist/commands/run-cli.js</code>. Where the transcripts below show only <code>$ bash 1363/repro/spawn.sh …</code>, read it as <code>bash /tmp/bb-reports/issues/1363/repro/spawn.sh …</code> from inside the worktree.</p>
+
+  <h3>A. Footprint per thread on main</h3>
+  <pre>$ bash 1363/repro/spawn.sh codex 3 c        # 3 codex threads, "Reply only with ok."
+$ bash 1363/repro/procs.sh
+daemon pid: 1493947  (05:22:17)
+PID      PPID     RSS_KB    ETIME        ARGS
+1558053  1493947  210388    00:20        [bridge] provider-codex        &lt;- provider-maintenance runtime bridge (cwd provider-maintenance-workspace)
+1558551  1493947  208524    00:19        [bridge] provider-codex        &lt;- c-1
+1558611  1558551  171796    00:19        codex app-server
+1562935  1493947  207104    00:11        [bridge] provider-codex        &lt;- c-2
+1563195  1562935  176508    00:10        codex app-server
+1563570  1493947  209292    00:10        [bridge] provider-codex        &lt;- c-3
+1563675  1563570  184264    00:10        codex app-server
+--- counts:
+bridges:      4
+codex app-server: 3</pre>
+  <p>Per Codex thread on main: one node bridge process (<code>codex-thread:&lt;threadId&gt;#bridge:…</code> process key) + one <code>codex app-server</code>; a turn that runs a shell command adds a <code>codex-code-mode-host</code> child (~20 MB). Per Claude Code thread: one <code>claude</code> CLI process (~350 MB) under a single per-environment bridge. Plus one permanent bridge per provider for the maintenance runtime. RSS at 05:37 with 4 codex + 2 claude sessions resident (<code>procs-05-40.txt</code>): <code>codex-bridge n=6 780 MB · codex-app-server n=4 713 MB · claude-cli n=2 684 MB · claude-bridge n=2 382 MB · TOTAL 2649 MB</code> (dev-mode <code>tsx</code> bridges; production bundles are ~50 MB each).</p>
+
+  <h3>B. Codex idle reap works (31 min)</h3>
+  <p>c-1..c-3 went idle at 05:22:17. Sweep ticks every 5 min from daemon start (05:18:18). The daemon log (<code>dev-log-excerpt.txt</code>):</p>
+  <pre>[05:53:18] INFO: [host-daemon] Reaped idle provider sessions {"count":3,"sessions":[
+  {"environmentId":"env_thjnh8daw7","idleForMs":1876254,"providerId":"codex","threadId":"thr_jxeat766jj"},
+  {"environmentId":"env_thjnh8daw7","idleForMs":1868549,"providerId":"codex","threadId":"thr_sswktt9hb6"},
+  {"environmentId":"env_thjnh8daw7","idleForMs":1862713,"providerId":"codex","threadId":"thr_jcj8w4e3b4"}]}
+[05:58:18] INFO: [host-daemon] Reaped idle provider sessions {"count":1,"sessions":[
+  {"environmentId":"env_thjnh8daw7","idleForMs":1966503,"providerId":"codex","threadId":"thr_dufwvzmwci"}]}</pre>
+  <p>After the sweep the three bridges and app-servers were gone (<code>procs-05-54-after-reap.txt</code>). <b>Expected</b> per the issue: yes. <b>Actual</b>: yes, for Codex only.</p>
+
+  <h3>C. Claude Code sessions are never reaped (default policy) — the monotonic-growth case</h3>
+  <pre>$ bash 1363/repro/spawn.sh claude-code 3 cl     # cl-1..cl-3, "Reply only with ok.", all idle by 05:30:15
+$ bash 1363/repro/procs.sh | tail -6
+1637115  1493947  194360    03:56        [bridge] provider-claude-code   &lt;- maintenance runtime
+1637298  1493947  196928    03:54        [bridge] provider-claude-code   &lt;- env_thjnh8daw7 (shared by all claude threads)
+1638262  1637298  336192    03:54        /home/USER/.local/bin/claude --output-format stream-json ... (BB_THREAD_ID=thr_arj57gdfup)
+1693532  1637298  356000    00:12        /home/USER/.local/bin/claude --output-format stream-json ...
+1693897  1637298  357172    00:11        /home/USER/.local/bin/claude --output-format stream-json ...
+claude:       3</pre>
+  <p>Same snapshot at 05:59:29, i.e. after the codex reap ticks at 05:53 and 05:58 (<code>procs-before-daemon-kill.txt</code>): the two remaining claude CLIs (cl-1 idle 33 min, cl-3 idle 29 min) are still resident; only cl-2, which I released manually with <code>bb thread stop</code> in exp. D, is gone. <b>Expected</b> (issue's acceptance evidence "zero unmatched provider processes after the lease TTL"): the claude sessions released at ~30 min like codex. <b>Actual</b>: never released; the reaper returns nothing for non-Codex providers unless the <code>providerSessionReaping</code> experiment is on (<code>docs/configuration.md</code> L622). N idle claude threads ⇒ N × ~350 MB resident until daemon restart.</p>
+  <p><b>Unit-level repro</b> (fails on main): <code>1363/repro/issue-1363-provider-lease.test.ts</code>, also at <code>packages/agent-runtime/src/issue-1363-provider-lease.test.ts</code> in my worktree. Run: <code>cd packages/agent-runtime &amp;&amp; pnpm exec vitest run src/issue-1363-provider-lease.test.ts</code>. Output (<code>vitest-issue-1363.out</code>):</p>
+  <pre>FAIL  src/issue-1363-provider-lease.test.ts &gt; issue #1363: idle provider sessions are bounded by a lease
+  &gt; releases every idle non-Codex session after the idle TTL under the shipped default policy
+AssertionError: expected [] to deeply equal [ 't1', 't2', 't3' ]</pre>
+  <pre>import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createAgentRuntimeWithAdapters } from "./runtime.js";
+import { createFakeAdapter, fullRuntimeOptions } from "./test/runtime-test-harness.js";
+
+// Issue #1363: "Provider processes need one host-daemon lease owner tied to
+// active turns". The issue's proposed invariant is that every resident
+// provider session maps to an active turn or a bounded lease, and that after
+// the lease TTL there are zero unmatched sessions.
+//
+// This test encodes that invariant against the runtime's only lease-like
+// mechanism, `reapIdleProviderSessions`, using the policy the host daemon
+// ships by default (`providerSessionReapingEnabled: false`, i.e. the
+// "Idle provider session release" experiment OFF) and a 60-minute idle
+// window (twice IDLE_PROVIDER_SESSION_REAP_AFTER_MS).
+//
+// It FAILS on main: for every provider except Codex, the sweep returns []
+// no matter how long the session has been idle, so N idle threads keep N
+// resident provider sessions (for claude-code: N `claude` CLI processes)
+// until the thread is archived/stopped or the daemon restarts.
+
+const RESTORABLE_PROVIDER_SCRIPT = `const fs = require("fs");
+const readline = require("readline");
+const rl = readline.createInterface({ input: process.stdin });
+const threads = new Map();
+let nextTurn = 1;
+function send(m) { process.stdout.write(JSON.stringify(m) + "\\n"); }
+process.on("SIGTERM", () =&gt; process.exit(0));
+rl.on("line", (line) =&gt; {
+  const msg = JSON.parse(line);
+  const p = msg.params || {};
+  if (msg.method === "initialize" || msg.method === "skills/configure") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
+    return;
+  }
+  if (msg.method === "thread/start") {
+    const providerThreadId = "prov-" + p.threadId;
+    threads.set(p.threadId, providerThreadId);
+    // A graduated bridge (claude-code, acp, pi) reports sessionRestorable.
+    send({ jsonrpc: "2.0", id: msg.id, result: { providerThreadId, sessionRestorable: true } });
+    send({ jsonrpc: "2.0", method: "thread/identity", params: { threadId: p.threadId, providerThreadId } });
+    return;
+  }
+  if (msg.method === "turn/start") {
+    const providerThreadId = threads.get(p.threadId);
+    const turnId = "turn-" + nextTurn++;
+    send({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
+    send({ jsonrpc: "2.0", method: "turn/started", params: { threadId: p.threadId, providerThreadId, turnId } });
+    send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: p.threadId, providerThreadId, turnId, status: "completed" } });
+    return;
+  }
+  if (msg.method === "thread/stop") {
+    threads.delete(p.threadId);
+    send({ jsonrpc: "2.0", id: msg.id, result: {} });
+    return;
+  }
+  if (msg.id !== undefined) {
+    send({ jsonrpc: "2.0", id: msg.id, result: {} });
+  }
+});
+`;
+
+describe("issue #1363: idle provider sessions are bounded by a lease", () =&gt; {
+  let tmpDir: string;
+
+  beforeEach(() =&gt; {
+    tmpDir = mkdtempSync(join(tmpdir(), "bb-issue-1363-"));
+  });
+
+  afterEach(() =&gt; {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("releases every idle non-Codex session after the idle TTL under the shipped default policy", async () =&gt; {
+    const scriptPath = join(tmpDir, "restorable-provider.cjs");
+    writeFileSync(scriptPath, RESTORABLE_PROVIDER_SCRIPT);
+    const runtime = createAgentRuntimeWithAdapters({
+      workspacePath: tmpDir,
+      onEvent: () =&gt; {},
+      onToolCall: async () =&gt; ({
+        contentItems: [{ type: "inputText", text: "ok" }],
+        success: true,
+      }),
+      adapterFactory: () =&gt; ({
+        ...createFakeAdapter(scriptPath),
+        displayName: "Claude Code",
+        id: "claude-code",
+      }),
+    });
+
+    try {
+      const threadIds = ["t1", "t2", "t3"];
+      for (const threadId of threadIds) {
+        await runtime.startThread({
+          environmentId: "env-1",
+          threadId,
+          projectId: "p1",
+          providerId: "claude-code",
+          options: fullRuntimeOptions,
+        });
+      }
+      for (const threadId of threadIds) {
+        expect(runtime.hasThread(threadId)).toBe(true);
+        expect(runtime.getActiveTurnId(threadId)).toBeNull();
+      }
+
+      // Same arguments the host daemon's reaper passes
+      // (apps/host-daemon/src/app.ts startIdleProviderSessionReaper), with the
+      // experiment OFF (default) and the sessions idle for 60 minutes.
+      const result = await runtime.reapIdleProviderSessions({
+        idleForMs: 30 * 60 * 1000,
+        nowMs: Date.now() + 60 * 60 * 1000,
+        providerSessionReapingEnabled: false,
+      });
+
+      // Issue #1363 acceptance evidence: "Zero unmatched provider processes
+      // after the lease TTL." On main this is [] and all three sessions stay
+      // resident.
+      expect(result.reapedSessions.map((s) =&gt; s.threadId).sort()).toEqual(
+        threadIds,
+      );
+      for (const threadId of threadIds) {
+        expect(runtime.hasThread(threadId)).toBe(false);
+      }
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+});</pre>
+
+  <h3>D. Manual release works for any provider (#1584 verb)</h3>
+  <pre>$ bb thread stop thr_ze4x9aemtz        # cl-2, idle
+Thread thr_ze4x9aemtz stopped
+$ bash 1363/repro/procs.sh | tail -3    # 5 s later
+1638262  1637298  337996    07:00        /home/USER/.local/bin/claude ...
+1693897  1637298  355584    03:17        /home/USER/.local/bin/claude ...
+claude:       2                          # was 3</pre>
+
+  <h3>E. A hung provider turn pins its process group forever (no turn lease)</h3>
+  <pre>$ source 1363/repro/env.sh; HOST=$(bb_host_id); PROJECT=&lt;id printed by spawn.sh&gt;
+$ bb thread spawn --project $PROJECT --provider codex --permission-mode accept-edits --machine $HOST --title c-7 --prompt "Run the shell command 'sleep 60' then reply only with ok." --json
+  "id": "thr_3tjcy6jkye"
+$ bash 1363/repro/procs.sh | grep -A6 1734125     # while the command runs
+1734125  1493947  210732    00:25        [bridge] provider-codex
+1734149  1734125  208940    00:25        codex app-server
+1735139  1734149  21348     00:19        .../codex-code-mode-host
+1735197  1734149  17288     00:19        .../codex-linux-sandbox --sandbox-policy-cwd ...
+1735205  1735204  7520      00:19        sleep 60
+$ kill -STOP 1734149                               # simulate a wedged app-server, 05:34:27
+$ bb thread show thr_3tjcy6jkye --json | grep status   # 90 s later
+    "status": "active",
+$ bb thread stop thr_3tjcy6jkye                    # 05:36:04
+Thread thr_3tjcy6jkye stopped                      # returned 05:36:35 (server log: WARN Awaited thread stop command failed {"intent":"interrupt"})
+$ bb thread show thr_3tjcy6jkye --json | grep status
+    "status": "stopping",                          # still "stopping" at 05:59; both reap ticks (05:53, 05:58) skipped it
+$ bash 1363/repro/procs.sh | grep -A3 1734125      # 05:59:29
+1734125  1493947  135132    25:35        [bridge] provider-codex
+1734149  1734125  208916    25:34        codex app-server        (STAT Tl)
+1735139  1734149  21344     25:28        .../codex-code-mode-host</pre>
+  <p><b>Expected</b> (issue): a turn that "disconnects, errors, or exceeds the reuse TTL" ends the lease and the daemon terminates the process group. <b>Actual</b>: the daemon has no notion of a maximum turn age. The reaper's first check rejects any thread with <code>getActiveTurnId(threadId) !== null</code>, the server's stop is "dispatched once — no inline retry, no durable timer" and relies on the turn ending by itself, so bridge + app-server + code-mode host stay resident until the daemon restarts (which is what finally settled c-7 to <code>idle</code> at 05:59:39 through <code>reconcileDaemonReportedThreads</code>). SIGSTOP is a stand-in for any real hang (deadlock, stuck network read); the observable state is identical.</p>
+
+  <h3>F. Archiving an idle Claude Code thread does not release its process</h3>
+  <pre>$ bb thread spawn --project $PROJECT --provider claude-code --permission-mode accept-edits --machine $HOST --title cl-4 --prompt "Reply only with ok." --json   # (or: bash 1363/repro/spawn.sh claude-code 1 cl)  -&gt; thr_pnndii523q, idle 06:00:46
+$ bb thread archive thr_pnndii523q
+Thread thr_pnndii523q archived
+$ ps -o pid,ppid,etime,rss,args -p 1858952          # 53 s later
+1858952 1858924    00:53 350788 /home/USER/.local/bin/claude --output-format stream-json ...
+$ ps -o pid,ppid,etime,rss,args -p 1858952          # 5.5 min later, still resident
+1858952 1858924    05:36 353008 /home/USER/.local/bin/claude --output-format stream-json ...</pre>
+  <p><b>Server-level repro test</b> (fails on main): <code>1363/repro/issue-1363-archive-idle-runtime-release.test.ts</code> (also at <code>apps/server/test/threads/</code> in my worktree; run <code>cd apps/server &amp;&amp; pnpm exec vitest run test/threads/issue-1363-archive-idle-runtime-release.test.ts</code>). It archives an idle thread through <code>POST /api/v1/threads/:id/archive</code> with a real in-memory DB and lists the host commands the server enqueued: for <code>codex</code> a <code>thread.archive</code> is queued (passes); for <code>claude-code</code> neither <code>thread.archive</code> nor <code>thread.stop</code> is queued — <code>AssertionError: expected 0 to be greater than 0</code> (<code>vitest-issue-1363-archive.out</code>).</p>
+  <p><b>Re-run with the portable helper scripts on a second dev instance</b> (revision pass, worktree <code>wf_debcf606-e4a-50</code>, server <code>:23519</code>, host <code>host_hvuqh8u6ut</code>; raw: <code>rerun-06-18-spawn.txt</code>, <code>rerun-06-18-procs-after-spawn.txt</code>, <code>rerun-06-19-procs-after-archive.txt</code>). Same shape: the codex thread's bridge + app-server are gone within 20 s of archive; the claude CLI stays.</p>
+  <pre>$ bash /tmp/bb-reports/issues/1363/repro/spawn.sh codex 1 c
+server=http://localhost:23519 host=host_hvuqh8u6ut project=proj_fixrjmwu3c
+== spawn c-1 (codex) 06:18:21
+Thread spawned: thr_ep5aj224vw
+...
+all idle at 06:18:33
+$ bash /tmp/bb-reports/issues/1363/repro/spawn.sh claude-code 1 cl
+== spawn cl-1 (claude-code) 06:18:37
+Thread spawned: thr_gb3snsw5up
+all idle at 06:18:45
+$ bash /tmp/bb-reports/issues/1363/repro/procs.sh | grep -E "bridge|app-server|claude "
+1879976  1878453  261932    00:23        [bridge] provider-codex          &lt;- maintenance runtime
+1880248  1878453  214060    00:22        [bridge] provider-codex          &lt;- c-1
+1880259  1880248  164680    00:21        codex app-server
+1881326  1878453  605444    00:07        [bridge] provider-claude-code    &lt;- maintenance runtime
+1881408  1878453  287376    00:05        [bridge] provider-claude-code    &lt;- env_irxtwkf8y3
+1881431  1881408  364428    00:05        /home/USER/.local/bin/claude --output-format stream-json ...   (BB_THREAD_ID=thr_gb3snsw5up)
+$ bb thread archive thr_ep5aj224vw ; bb thread archive thr_gb3snsw5up      # 06:18:58
+$ bash /tmp/bb-reports/issues/1363/repro/procs.sh | grep -E "bridge|app-server|claude "   # 06:19:19
+1879976  1878453  261936    00:57        [bridge] provider-codex          &lt;- maintenance runtime only
+1881326  1878453  605456    00:41        [bridge] provider-claude-code
+1881408  1878453  287376    00:39        [bridge] provider-claude-code
+1881431  1881408  364472    00:39        /home/USER/.local/bin/claude --output-format stream-json ...   &lt;- still resident
+$ ps -o pid,ppid,etime,rss,args -p 1881431      # 06:21:02
+1881431 1881408       02:22 363236 /home/USER/.local/bin/claude --output-format stream-json ...</pre>
+  <p>Contrast with Codex: archiving idle c-4 (<code>thr_k2tifuq2s7</code>, which had spawned a code-mode host) removed bridge, app-server and code-mode host within 8 s. Reason: <code>archiveThreadWithLifecycleEffects</code> only calls <code>requestActiveRuntimeThreadStopIfNeeded</code> (no-op for idle) and <code>dispatchSettledArchivedThreadProviderArchiveCommand</code>, which returns early unless <code>providerSupportsThreadArchiveForwarding</code> — true for the codex bridge (<code>threadArchive: true</code>), false for claude-code.</p>
+
+  <h3>G. Crash cascades and the one orphan path</h3>
+  <ul>
+    <li><code>kill -9</code> the c-5 <em>bridge</em>: its app-server and code-mode host exited within 6 s (stdin EOF); thread shows <code>idle</code>. No orphan.</li>
+    <li><code>kill -9</code> the c-6 <em>app-server</em>: code-mode host exited; the thread-scoped bridge (134 MB) survived thread-less until the reaper released it 30 min later (05:58:18 line above). Bounded, not leaked.</li>
+    <li><code>kill -9</code> the <em>daemon</em> (05:59:30, simulating an OOM kill): every bridge and claude CLI exited; the SIGSTOPped app-server from exp. E and its code-mode host survived, reparented to PID 1:
+      <pre>$ ps -o pid,ppid,stat,etime,rss,args -p 1734149,1735139
+1734149       1 Tl         25:46 208916 codex app-server
+1735139 1734149 Sl         25:40 21344 .../codex-code-mode-host
+$ grep -E "SigCgt|ShdPnd" /proc/1734149/status
+ShdPnd: 0000000000004000    # SIGTERM pending, never delivered while stopped
+SigCgt: 0000000000000440    # codex does not catch SIGTERM</pre>
+      The bridge's <code>onClose</code>/<code>onSigterm</code> call <code>killAllChildren()</code> (SIGTERM + 4 s SIGKILL timer inside each connection) and then <code>process.exit(0)</code> immediately, so the escalation timer dies with the bridge. A child that cannot act on SIGTERM (stopped, or in uninterruptible I/O) is orphaned. Codex itself does not trap SIGTERM, so a plain deadlocked app-server would still die; this is an edge, not the main leak.</li>
+  </ul>
+
+  <h2>Root cause</h2>
+  <p><b>There is no lease; there are three uncoordinated release triggers, each with a hole.</b></p>
+  <p><b>1. The idle reaper is provider- and state-gated, and off by default for everything but Codex.</b> <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/app.ts#L66-L67">app.ts#L66-L67</a> sweeps every 5 min for 30-min-idle sessions and reads the experiment flag from the server before each pass (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/app.ts#L714-L718">app.ts#L714-L718</a>). In the runtime, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/runtime.ts#L801-L850">findReapableIdleProviderSession</a> rejects a thread when any of these hold:</p>
+  <pre>threadHasInFlightOperation(threadId) || pendingTurnStartThreadIds.has(threadId) || turnState.getActiveTurnId(threadId) !== null   // → never idle
+!runtimeConfig || (providerSessionReapingEnabled ? !runtimeConfig.sessionRestorable : runtimeConfig.providerId !== CODEX_PROVIDER_ID)
+!providerThreadId || idleSinceMs === undefined || nowMs - idleSinceMs &lt; idleForMs</pre>
+  <p>and <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/runtime.ts#L2377-L2445">reapIdleProviderSessions</a> additionally skips a candidate that has open background work (experiment on) or is not a thread-scoped Codex process (experiment off). So with the shipped default the sweep is literally <code>providerId === "codex"</code>. Every other provider's session lives until <code>thread.stop</code>, <code>thread.archive</code> (Codex only, see 3), or daemon shutdown. Exp. C and the failing unit test show this. #1604 reported the same gap; the experiment in <code>3bc9ce54b</code> made it opt-in rather than closing it.</p>
+  <p><b>2. The reaper's inputs are the daemon's own turn state, and nothing bounds a turn.</b> Idle time is only recorded on <code>turn/completed</code> / non-retry <code>provider/error</code> (<code>observeProviderSessionIdleState</code>) or after <code>startThread</code>/<code>resumeThread</code>/a failed <code>turn/start</code> send. A provider that stops emitting events keeps <code>turnState</code> active forever, so the process is un-reapable forever. The only watchdog is the 120 s <em>turn-start</em> watchdog (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/runtime.ts#L381-L400">runtime.ts#L381-L400</a>), which only emits a <code>system/error</code>. On the server side, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/thread-lifecycle.ts#L1302-L1314">thread-lifecycle.ts#L1302-L1314</a> states the assumption explicitly: "turns are bounded, so the daemon's turn-completed/failed/interrupted event drives stopping → idle/error regardless of the stop RPC". Exp. E shows what happens when that assumption is false: <code>stopping</code> on the server, active turn in the daemon, resident process group, and no timer anywhere that ends it. This is the reporter's "one observable invariant" gap: thread status (server), turn state (daemon), and process (bridge child) can disagree indefinitely.</p>
+  <p><b>3. Archive releases only providers that forward archive.</b> <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/thread-archive.ts#L55-L64">thread-archive.ts#L55-L64</a> calls <code>requestActiveRuntimeThreadStopIfNeeded</code> (returns unless <code>status === "active"</code>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/thread-lifecycle.ts#L1607-L1620">L1607</a>) and <code>dispatchSettledArchivedThreadProviderArchiveCommand</code>, which returns <code>false</code> unless <code>providerSupportsThreadArchiveForwarding</code> (<code>thread-commands.ts</code> L589-L596). Codex forwards (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/provider-codex/src/bridge/bridge.ts#L1302">bridge.ts#L1302</a>) and the runtime then runs <code>forgetThreadRuntimeState</code> + <code>releaseIdleProviderProcess</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/agent-runtime/src/runtime.ts#L1014-L1019">runtime.ts#L1014-L1019</a>); Claude Code does not, so an archived idle claude thread keeps its 350 MB CLI (exp. F).</p>
+  <p><b>4. Environment runtimes never unload.</b> <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/host-daemon/src/runtime-manager.ts#L1155-L1190">RuntimeManager.evictIdleEnvironments()</a> exists and is tested, but <code>git log -S evictIdleEnvironments</code> shows its last production caller was removed in <code>68565f7e4</code> ("Clean up sandbox host handling", May 2026). Per-environment shared bridges (claude-code, ACP, pi: one node process per environment per provider) therefore persist after their last thread is released. Bounded by environment count, but with many worktrees it is the same shape as the reporter's "processes outnumber threads". (Consistent with the read-only census of the user's real daemon on this machine: 12 <code>bb-claude-code-bridge.mjs</code> processes, 2 with a live <code>claude</code> child.)</p>
+  <p><b>5. Kill is not process-group kill.</b> Bridges spawn <code>codex app-server</code> with a plain <code>spawn()</code> (no <code>detached</code>/setsid) and <code>kill()</code> signals the child pid only (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/provider-codex/src/bridge/app-server-connection.ts#L332-L344">app-server-connection.ts#L332-L344</a>); code-mode hosts and sandboxed commands die only because they watch their own parent/pipes. And <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/plugins/provider-codex/src/bridge/bridge.ts#L1914-L1930">bridge.ts#L1914-L1930</a> exits before the SIGKILL escalation can run (exp. G).</p>
+  <p><b>Why the reporter saw 17 for 4.</b> On 0.36.1 (pre-#1640) each Codex thread was one directly-spawned app-server with the same reap rules (<code>runtime.ts</code> at <code>desktop-v0.36.0</code> L1628-L1668). Anything idle &lt;30 min, anything with a pending/hung turn, anything with an in-flight RPC, and every non-Codex session was resident. Without a PID→thread diagnostic (none exists; Codex children carry no <code>BB_THREAD_ID</code>) the operator cannot tell which bucket each of the 13 extra processes was in — which is exactly the issue's point.</p>
+
+  <h2>Proposed fix (first principles)</h2>
+  <ol>
+    <li><b>Make the runtime the lease owner and make the lease provider-agnostic.</b> In <code>createAgentRuntimeInternal</code> keep one record per provider session: <code>{threadId, providerThreadId, processKey, leaseKind: "turn"|"idle", leaseUntilMs}</code>. Refresh on every provider event for the thread. Replace the <code>providerSessionReapingEnabled ? !sessionRestorable : providerId !== codex</code> gate with: restorable ⇒ release at idle TTL (default on; keep the experiment only as an opt-out or delete it and update <code>docs/configuration.md</code>); non-restorable ⇒ still release at a longer TTL and mark the thread so the next turn starts a fresh session with a visible notice (the ACP fallback already does this). Risk: providers whose resume loses in-agent context — that is why the flag exists; ship it default-on for claude-code/codex (both restorable) first.</li>
+    <li><b>Bound turns.</b> Add a per-thread "no provider event for N minutes" watchdog (N configurable, e.g. 30 min, on top of the existing 120 s turn-start watchdog): emit <code>turn/completed {status:"failed", error: provider_stalled}</code>, then <code>stopThread</code> with release so the server's <code>stopping</code> settles and the process group is torn down. This is the missing "turn finishes, disconnects, errors, or exceeds the TTL" arm of the invariant. Risk: legitimately silent long tool calls; make the threshold long and reset it on any event including background-work notifications.</li>
+    <li><b>Kill process groups.</b> Spawn app-server / CLI children with <code>detached: true</code> (own pgid) and kill with <code>process.kill(-pid, sig)</code>; in the codex bridge, await the escalation (or send SIGKILL directly) before <code>process.exit(0)</code> in <code>onClose</code>/<code>onSigterm</code>. Same for the runtime's <code>terminateProviderProcess</code>.</li>
+    <li><b>Release on archive for every provider.</b> In <code>archiveThreadWithLifecycleEffects</code>, when the thread is idle and its runtime is loaded, dispatch <code>thread.stop {intent:"release"}</code> (the existing <code>releaseIdleThreadRuntime</code>) when archive forwarding is unsupported. Server-side, no wire change.</li>
+    <li><b>Call <code>evictIdleEnvironments()</code></b> from the same 5-minute maintenance pass after the reap (an entry with no live threads, no terminals and no background work). Existing tests cover the method.</li>
+    <li><b>Diagnostics.</b> Add a daemon local-API endpoint (and <code>bb machine show &lt;id&gt; --processes</code>) listing <code>pid → providerId → processKey → threadIds → lease</code>, sourced from <code>RuntimeProviderProcessManager</code>; set <code>BB_THREAD_ID</code> on codex app-server children as claude does. This makes the invariant observable and turns the reporter's next audit into a query.</li>
+  </ol>
+  <p>Items 1, 4 and 5 are daemon/server policy changes with no protocol change; item 2 adds a new failure code but no new wire fields; none of them require a <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump unless a diagnostic RPC (item 6) is added to the host command set, in which case it must be bumped.</p>
+
+  <h2>PR review</h2>
+  <p>No open PRs are linked to this issue.</p>
+
+  <h2>Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/1604">#1604</a>: Idle agent processes are never reclaimed for non-Codex providers — the same gap as exp. C, with a macOS census; partly addressed by the opt-in <code>providerSessionReaping</code> experiment (<code>3bc9ce54b</code>, <code>7c33c816d</code>).</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1573">#1573</a> / <a href="https://github.com/get-bb/bb/pull/1584">#1584</a>: manual release verb (<code>bb thread stop</code> on an idle thread) — verified working in exp. D.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1647">#1647</a> / <a href="https://github.com/get-bb/bb/issues/1769">#1769</a>: deleting a worktree environment leaves its processes running (process-group teardown, same fix shape as item 3).</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1660">#1660</a>: bb host process grew to 77 GB RSS; orphaned dev processes.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1334">#1334</a>: co-located execution workload starves the server (the reporter's sibling issue).</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1393">#1393</a>: host lacks global admission control across work sources.</li>
+  </ul>
+
+  <h2>Appendix</h2>
+  <h3>Timeline of the live session (UTC)</h3>
+  <pre>05:18:18  daemon started (pid 1493947); reaper ticks every 5 min from here
+05:21:23  c-1..c-3 (codex) spawned; idle 05:22:17               -> 3 bridges + 3 app-servers (+1 maintenance bridge)
+05:23:03  c-4 spawned with 'echo hi' -> code-mode host appears; archived 05:23:57 -> all 3 processes gone by 05:24:05
+05:24:13  c-5 spawned; kill -9 its bridge 05:25:0x -> app-server + code-mode host gone; thread idle
+05:25:2x  c-6 spawned; kill -9 its app-server -> code-mode host gone, bridge stays; reaped 05:58:18
+05:26:2x  cl-1 (claude) spawned; 05:30:07 cl-2, cl-3 -> 3 claude CLIs (~350 MB each)
+05:31:5x  bb thread stop cl-2 -> its claude CLI released
+05:34:0x  c-7 spawned with 'sleep 60'; 05:34:27 SIGSTOP app-server; 05:36:04 bb thread stop -> WARN Awaited thread stop command failed; status stopping
+05:53:18  reaper: c-1, c-2, c-3 released (idleForMs ~1.87e6)
+05:58:18  reaper: c-6 released
+05:59:29  snapshot: cl-1, cl-3 claude CLIs still resident (33 / 29 min idle); c-7 group resident
+05:59:30  kill -9 daemon -> all bridges/claude exit; c-7 app-server + code-mode host orphaned to PID 1; supervisor restarts daemon 05:59:39; c-7 settles idle
+06:00:46  cl-4 spawned; archived; claude CLI still resident 53 s later</pre>
+  <h3>Commands run</h3>
+  <pre>pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+scripts/bb-dev-app current                                  # app :12352, server :20352, daemon :28352
+BB=node\ packages/scripts/dist/commands/run-cli.js  BB_SERVER_URL=http://localhost:20352
+$BB thread spawn --project proj_9tmcdwmi7t --provider codex --permission-mode accept-edits --machine host_vp62yvdkp4 --title c-1 --prompt "Reply only with ok." --json
+# from inside the bb worktree (scripts derive URLs/host/project from `scripts/bb-dev-app status` + `bb machine list --json`):
+bash /tmp/bb-reports/issues/1363/repro/spawn.sh codex 3 c ; bash /tmp/bb-reports/issues/1363/repro/spawn.sh claude-code 3 cl
+bash /tmp/bb-reports/issues/1363/repro/procs.sh ; bash /tmp/bb-reports/issues/1363/repro/rss-sum.sh
+$BB thread archive thr_k2tifuq2s7 ; $BB thread stop thr_ze4x9aemtz ; $BB thread stop thr_3tjcy6jkye
+kill -9 &lt;bridge pid&gt; ; kill -9 &lt;app-server pid&gt; ; kill -STOP &lt;app-server pid&gt; ; kill -9 &lt;daemon pid&gt; ; kill -CONT &lt;orphan&gt;
+grep "Reaped idle provider sessions" ~/.bb-dev/launchers/projects-bb-.claude-worktrees-wf_debcf606-e4a-16/dev.log
+cd packages/agent-runtime &amp;&amp; pnpm exec vitest run src/issue-1363-provider-lease.test.ts
+git log -S evictIdleEnvironments ; git show desktop-v0.36.0:packages/agent-runtime/src/runtime.ts
+pnpm dev:stop</pre>
+  <h3>Raw artifacts</h3>
+  <ul>
+    <li><code>procs-05-40.txt</code> — full tree with 4 codex + 2 claude sessions resident</li>
+    <li><code>threads-05-40.txt</code> — thread list at the same moment</li>
+    <li><code>procs-05-54-after-reap.txt</code> — after the 05:53 reap</li>
+    <li><code>procs-before-daemon-kill.txt</code> — 05:59:29, just before <code>kill -9</code> of the daemon</li>
+    <li><code>dev-log-excerpt.txt</code> — server/daemon log lines (reaper, failed stop, sessions)</li>
+    <li><code>vitest-issue-1363.out</code> — failing runtime repro test output</li>
+    <li><code>vitest-issue-1363-archive.out</code> — failing server-level archive repro test output</li>
+    <li><code>rerun-06-18-spawn.txt</code>, <code>rerun-06-18-procs-after-spawn.txt</code>, <code>rerun-06-19-procs-after-archive.txt</code> — revision-pass re-run of exp. A/F with the portable scripts on a second instance</li>
+  </ul>
+  <h3>Notes on the pre-#1640 code path (0.36.1)</h3>
+  <p><code>git show desktop-v0.36.0:packages/agent-runtime/src/runtime.ts</code> has the same reaper shape (<code>findReapableIdleProviderSession</code> with <code>runtimeConfig?.providerId !== CODEX_PROVIDER_ID</code>, <code>reapIdleProviderSessions</code> gated by <code>isThreadScopedCodexProcess</code>) with the app-server spawned directly by the daemon rather than through a per-thread bridge. The provider-session release experiment (<code>3bc9ce54b</code>) is in 0.38.0 but not 0.37.0.</p>
+  <h2>Verification</h2>
+  <p>An independent verifier set up their own worktree at <code>16ceb3a54</code> and dev instance (server <code>:21825</code>, host <code>host_zm5j79zai4</code>) and followed this report. Both unit repros reproduced exactly (<code>expected [] to deeply equal [ 't1', 't2', 't3' ]</code>; archive test codex passes / claude-code fails with <code>expected 0 to be greater than 0</code>). Live: one claude-code + one codex thread produced the process census described in exp. A; after archiving both, the codex bridge and app-server were gone within 19 s while the claude CLI (~360 MB) stayed resident (exp. F confirmed). The verifier did not wait for the 30-min reap ticks or repeat the SIGSTOP / <code>kill -9</code> experiments (B, E, G), which therefore rest on the author's log excerpts (<code>dev-log-excerpt.txt</code>) and are consistent with the code walk. Verifier findings and what changed in this revision:</p>
+  <ul>
+    <li><b>Major — helper scripts hardcoded the author's ports/worktree/host id/project.</b> Fixed: <code>env.sh</code> now derives <code>WT</code> from the shell's git toplevel (or <code>BB_WT</code>), and server/app/daemon URLs, data dir and dev log from <code>scripts/bb-dev-app status</code>; <code>spawn.sh</code> takes the host id from <code>bb machine list --json</code> and creates the <code>qa</code> project itself; <code>procs.sh</code> finds the daemon by matching its cwd to <code>$WT</code>; <code>rss-sum.sh</code> calls <code>procs.sh</code> relative to itself. I re-ran the rewritten scripts unmodified against a third, fresh dev instance (worktree <code>wf_debcf606-e4a-50</code>, server <code>:23519</code>, host <code>host_hvuqh8u6ut</code>) and pasted the real output into exp. F above; the codex/claude archive asymmetry reproduced again (claude CLI pid 1881431 still resident 2 min after archive; codex app-server 1880259 gone within 20 s). Both unit repro tests were also re-run there with the same failures.</li>
+    <li><b>Minor — elided spawn commands in exp. E/F.</b> Fixed: the full <code>bb thread spawn --project … --provider … --permission-mode accept-edits --machine … --title … --prompt … --json</code> form is now inline, with <code>$HOST</code>/<code>$PROJECT</code> defined in the Precondition.</li>
+    <li><b>Minor — unglossed internal terms.</b> Fixed: added a Glossary under Environment (host daemon, bridge, maintenance runtime bridge, app-server, code-mode host, claude CLI, processKey, reconcileDaemonReportedThreads).</li>
+    <li><b>Minor — header "Type" pill / exp. G caveat in the claims table.</b> Fixed: the pill now says the issue has no Type set and that "architecture / bug" is the author's characterization (the issue carries only the <code>host</code> label); the "Restart clears the processes" cell now states that the one surviving app-server was a <code>SIGSTOP</code> stand-in.</li>
+  </ul>
+</main></body></html>

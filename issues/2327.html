@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2327 turn/completed can precede command completion and wedge later turns between active-writer and no-session errors</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:6px; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2327 · turn/completed can precede command completion and wedge later turns between active-writer and no-session errors</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill high">Priority: High</span> <span class="pill">Effort: unset</span> <span class="pill">providers · threads · provider-codex</span>
+    <a href="https://github.com/get-bb/bb/issues/2327">open on GitHub</a>
+    <span>2026-08-24 · base <code>494f66526</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict">REPRODUCED</span> (the wedge; not the "turn/completed before item/completed" ordering claim, which is a Codex-side observation bb records faithfully) · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>Codex CLI 0.146+ takes a per-thread <em>writer lock</em> (an <code>flock</code> on <code>$CODEX_HOME/thread-writer-locks/&lt;codex-thread-id&gt;.lock</code>) whenever a <code>codex app-server</code> process loads a thread, and refuses any other process's <code>thread/resume</code> of that thread with <code>thread &lt;id&gt; already has an active writer</code>. bb's Codex bridge runs one <code>codex app-server</code> per bb thread and reopens the rollout with <code>thread/resume</code> after every release, settings-change rebuild, auth/rate-limit rebuild, bridge restart, or environment move. Whenever another app-server still has the thread loaded at that moment — a foreign client (Codex desktop app, <code>codex resume</code>, a second bb daemon sharing <code>~/.codex</code>) or bb's own previous child that has not finished exiting — the resume is refused. bb treats that refusal as an untyped bridge error (<code>recovery: null</code>): the turn is rejected with <code>client/turn/rejected</code> + <code>system/error</code>, the thread goes to <code>error</code>, and "stop and retry" does not help because the next attempt resumes the same locked rollout again. In the bridge the reporter ran (before #2325, merged six minutes before the issue was filed), a failed rebuild additionally made the bridge forget the thread while the runtime still believed it had a live session, so the very next turn answered <code>No active codex session for thread</code> — the contradictory pair in the report. At the base commit the bridge still answers <code>No active codex session for thread</code> to a <code>turn/start</code> that follows a refused <code>thread/resume</code> (shown at the bridge level in 4c), but the base-commit runtime no longer issues that <code>turn/start</code>: it forgets the thread after the failed resume (<code>abandonFailedSessionConstruction</code>), so end to end every retry now reports "already has an active writer" only. The "active writer" half and the non-recovery are fully present at the base commit; the exact pair from the issue is reachable end to end only with the pre-#2325 bridge.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Later new-turn requests fail with <code>thread &lt;provider-thread&gt; already has an active writer</code></td><td class="ok">Verified</td><td>Reproduced end to end on a dev instance (section 4, step 6) and at the bridge level (scenarios A and B). The text is Codex's own <code>ThreadStoreError::Conflict</code> from <code>codex-rs/thread-store/src/local/writer_lock.rs</code>; it does not exist anywhere in bb's source.</td></tr>
+    <tr><td>… and also with <code>No active codex session for thread &lt;bb-thread&gt;</code></td><td class="ok">Verified at bridge level; end to end only pre-#2325 (code trace)</td><td>Bridge-level scenario A (4c): after a refused <code>thread/resume</code> the bridge holds nothing for the thread, so a <code>turn/start</code> answers exactly this. The base-commit runtime does not send that <code>turn/start</code> — a rejected resume runs <code>abandonFailedSessionConstruction</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L2107-L2116">runtime.ts#L2107-L2116</a>) and the next command resumes again, so the end-to-end run (4b, events 19–30) only ever shows "already has an active writer". Before #2325 the bridge itself reached this state from a plain settings-change rebuild (section 5.3), which matches the reporter's timing.</td></tr>
+    <tr><td>The two states are contradictory / the thread is wedged</td><td class="ok">Verified</td><td>They are two views of one fact: the rollout is loaded by a process bb does not own. Which message appears depends on whether the bridge still has an entry for the thread when the next request arrives; the pre-#2325 bridge dropped the entry after any failed rebuild, so a user there saw both texts in succession.</td></tr>
+    <tr><td>Stopping the runtime and retrying the exact input does not recover</td><td class="ok">Verified</td><td>Section 4, step 8: <code>bb thread stop</code> then <code>bb thread tell --mode auto</code> is rejected identically. Recovery only happened after the foreign app-server exited (step 9).</td></tr>
+    <tr><td>Provider retry refused because the input had not been accepted</td><td class="ok">Verified (code)</td><td><code>plugins/provider-retry/src/recovery.ts</code> <code>inspectFailedTurn</code> returns <code>input-not-accepted</code> when the latest <code>client/turn/requested</code> has no <code>turn/input/accepted</code>; a rejected <code>turn/start</code> never produces one.</td></tr>
+    <tr><td>edit-message could not apply because the request was agent-origin</td><td class="ok">Verified (code)</td><td><code>apps/server/src/services/threads/thread-edit-message.ts:209</code> rejects <code>request.initiator !== "user"</code>.</td></tr>
+    <tr><td><code>turn/completed</code> was emitted while a <code>commandExecution</code> item was still running; the item completed minutes later</td><td class="unv">Unverified</td><td>This is Codex app-server ordering. bb's translator maps <code>turn/completed</code> to a keyed <code>turn.boundary</code> and a later <code>item/completed</code> to a keyed <code>item.close</code> on the same vouched turn id (<code>plugins/provider-codex/src/delta-translation.ts:978-1095</code>, assembler <code>delta-assembler.ts:1532</code>), so bb records whatever order Codex emits. I could not make Codex produce this order on demand and it is not needed for the wedge: the writer lock is held for the life of the app-server process regardless of turn state (shown in <code>codex-writer-lock.log</code>: an idle thread, a thread mid-command, both refuse a second writer).</td></tr>
+    <tr><td>"Do not emit turn/completed until every item is terminal" (bb should delay the terminal event)</td><td class="no">Refuted as the fix</td><td>Holding back <code>turn/completed</code> would not change the lock: a process holds the thread's writer lock from <code>thread/start|resume</code> until it exits, not only while a turn is running. The defect is in how bb (re)opens rollouts and how it classifies this refusal.</td></tr>
+    <tr><td>No bb version / Codex version given</td><td class="unv">Unverifiable</td><td>The issue carries no versions. It was filed 2026-08-24T04:40Z, six minutes after #2325 (<code>e42a4ef48</code>, 2026-08-23T21:34-0700) merged, so the reporter's bridge almost certainly predates #2325. Codex must be ≥ 0.146.0 (the writer lock landed in <code>openai/codex@5c94796d</code>, first shipped in rust-v0.146.0 on 2026-07-29).</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb <code>494f66526913557ab076e048218236f0a6610927</code> (main, 2026-08-24); <code>origin/main</code> has no later commit touching <code>plugins/provider-codex</code>, <code>packages/agent-runtime</code> or <code>apps/host-daemon</code> (checked up to <code>47643f5e2</code>).</li>
+    <li>macOS 26.5.2 (Darwin 25.5, Apple Silicon), Node v22.23.1, pnpm.</li>
+    <li>Codex CLI 0.149.1 (<code>@openai/codex</code> npm wrapper + <code>codex-darwin-arm64</code> native binary). Writer-lock source read from <code>openai/codex</code> main (<code>codex-rs/thread-store/src/local/writer_lock.rs</code>, <code>codex-rs/app-server/src/lib.rs</code>).</li>
+    <li>Dev instance from this worktree (revise pass): app <code>http://localhost:17285</code>, server <code>http://localhost:25285</code>, host daemon <code>127.0.0.1:33285</code>, data dir <code>~/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-36-f06effcd4c76</code> (deleted after the run), host <code>host_4mecev643h</code>. Project <code>proj_bubq6jkc6w</code> on <code>/tmp/bb-2327-e2e-repo</code>, thread <code>thr_dyn6jcqggc</code> → codex thread <code>01a034dc-fdc9-73f0-a00d-a960e9b7cb4d</code>. (The first pass used ports 13910/21910/29910, thread <code>thr_n42gyd75j5</code>; the independent verifier used ports 16350/24350/32350, thread <code>thr_w95pxvdpna</code>. All three runs produced the same event sequence 19–43.)</li>
+    <li>4a and 4c use a scratch <code>CODEX_HOME=/tmp/bb-2327-codex-home</code> with <code>~/.codex/auth.json</code> copied in (deleted afterwards) and the scratch working directory <code>/tmp/bb-2327-repo</code>. The dev-instance repro (4b) uses the machine's default <code>~/.codex</code>, as bb does in production.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <h3>4a. Codex alone: the writer lock (no bb involved, ~15 s, two tiny turns)</h3>
+  <p>Prerequisites: <code>codex</code> ≥ 0.146 on PATH (0.149.1 here) and a <em>logged-in scratch</em> <code>CODEX_HOME</code>. Phase A (the lock refusal) works without credentials; Phase B asks the model to run <code>sleep 75</code>, so it needs <code>auth.json</code>. The script creates <code>CODEX_HOME</code> and its working directory (<code>REPRO_CWD</code>, default <code>/tmp/bb-2327-repo</code>) itself.</p>
+  <ol>
+    <li>Two <code>codex app-server</code> processes sharing one <code>CODEX_HOME</code>. P1 starts a thread and runs one turn; P2 tries <code>thread/resume</code> on it.
+<pre>$ mkdir -p /tmp/bb-2327-codex-home &amp;&amp; cp ~/.codex/auth.json /tmp/bb-2327-codex-home/
+$ CODEX_HOME=/tmp/bb-2327-codex-home node /tmp/bb-reports/issues/2327/repro/codex-writer-lock.mjs --sleep 75
+[+    39ms] codex version: codex-cli 0.149.1
+[+   524ms] P1 thread/start -&gt; thread 01a034da-b5af-7531-b20a-7e14edb14a7b
+[+  4093ms] P1 &lt;- turn/completed {"turn":"01a034da-b5ce-…","status":"completed"}
+[+  4806ms] lock held by P1 (native binary pid): {"exists":true,"pids":[48689]}
+[+  4857ms] P2 stderr: ERROR codex_core::session::session: failed to initialize thread persistence: thread-store conflict: thread 01a034da-b5af-7531-b20a-7e14edb14a7b already has an active writer
+[+  4857ms] P2 thread/resume while P1 is alive -&gt; error: thread 01a034da-b5af-7531-b20a-7e14edb14a7b already has an active writer
+[+  4864ms] P1 exited 7ms after SIGTERM (code=0 signal=null)
+[+  5220ms] P2 thread/resume after P1 died -&gt; ok
+[+  5391ms] P2 (idle) exited 8ms after stdin EOF (code=0 signal=null)
+…
+[+ 11977ms] P3 commandExecution started: "/bin/zsh -lc 'sleep 75'" (item exec-d713e1b5-…)
+[+ 12192ms] P4 thread/resume while P3 runs a command -&gt; error: thread 01a034da-b5af-7531-b20a-7e14edb14a7b already has an active writer
+[+ 15287ms] P3 alive=false lockPids=[] P4 thread/resume=ok        ← P3 exited 37 ms after its stdin closed
+exit=0</pre>
+    Without <code>auth.json</code> the same command still shows the Phase A refusal but Phase B ends with <code>401 Unauthorized</code> and "model did not start a command in 120s" (exit 2; see the verifier's <code>4a-literal-attempt2-noauth.log</code>). The lock is an <code>flock</code> held by the native <code>codex</code> binary (<code>lsof</code> shows the pid) for as long as the process has the thread loaded, idle or mid-command. SIGTERM and stdin-EOF both release it within tens of milliseconds on 0.149.1 (also with an MCP server configured: <code>codex-sigterm-with-mcp.log</code>, 8–13 ms).</li>
+  </ol>
+
+  <h3>4b. bb end to end (dev instance, CLI + browser)</h3>
+  <p>All commands run from the bb worktree at <code>494f66526</code> after <code>pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build</code>. Codex must be logged in under the machine's default <code>~/.codex</code> (bb uses it in production). <code>DATA_DIR</code> is not exported by <code>scripts/bb-dev-app env</code>; derive it from <code>status</code> as shown. The <code>unset BB_THREAD_ID …</code> line matters: with a stale <code>BB_THREAD_ID</code> in the environment <code>thread tell</code> fails with <code>HTTP 400: Sender thread is invalid</code>.</p>
+  <ol>
+    <li>Create a scratch git repo, start a dev instance, and create a project on that repo (the host id comes from <code>machine list</code>).
+<pre>$ mkdir -p /tmp/bb-2327-e2e-repo &amp;&amp; git -C /tmp/bb-2327-e2e-repo init -q &amp;&amp; git -C /tmp/bb-2327-e2e-repo commit -q --allow-empty -m init
+$ scripts/bb-dev-app current            # prints App/Server/Host daemon URLs and the data dir; wait until it says "Dev session: running"
+$ eval "$(scripts/bb-dev-app env)"; unset BB_THREAD_ID BB_ENVIRONMENT_ID BB_THREAD_STORAGE
+$ DATA_DIR=$(scripts/bb-dev-app status | sed -n 's/^Data dir: //p')
+$ HOST_ID=$(pnpm bb:dev machine list 2&gt;/dev/null | grep -o 'host_[a-z0-9]*' | head -1); echo $HOST_ID
+host_4mecev643h
+$ curl -s -X POST $BB_SERVER_URL/api/v1/projects -H 'content-type: application/json' \
+    -d "{\"name\":\"qa-2327\",\"source\":{\"type\":\"local_path\",\"path\":\"/tmp/bb-2327-e2e-repo\",\"hostId\":\"$HOST_ID\"}}"
+{"id":"proj_bubq6jkc6w","kind":"standard","name":"qa-2327", …}</pre></li>
+    <li>Spawn a Codex thread and let its first turn finish.
+<pre>$ pnpm bb:dev thread spawn --project proj_bubq6jkc6w --provider codex --permission-mode accept-edits --title "2327 writer lock" --prompt "Reply only with ok." --json
+{ "id": "thr_dyn6jcqggc", … }
+$ pnpm bb:dev thread wait thr_dyn6jcqggc --timeout 120
+Thread thr_dyn6jcqggc reached status idle.</pre>
+    <figure><img src="assets/2327-before.png" alt="Healthy thread: user prompt and the assistant reply ok"><figcaption>Before: the thread is idle after one successful turn.</figcaption></figure></li>
+    <li>Find the Codex thread id and confirm bb's app-server child holds its writer lock.
+<pre>$ sqlite3 "$DATA_DIR/bb.db" "select data from events where thread_id='thr_dyn6jcqggc' and type='thread/identity' limit 1;"
+{"providerThreadId":"01a034dc-fdc9-73f0-a00d-a960e9b7cb4d"}
+$ ls ~/.codex/thread-writer-locks/ | grep 01a034dc-fdc9
+01a034dc-fdc9-73f0-a00d-a960e9b7cb4d.lock
+$ lsof -t -nP ~/.codex/thread-writer-locks/01a034dc-fdc9-73f0-a00d-a960e9b7cb4d.lock   # bb's codex child
+56625</pre></li>
+    <li>Release bb's session (what the 30-minute idle reaper in <code>apps/host-daemon/src/app.ts:65</code> does on its own, or an explicit stop) — the lock is now free.
+<pre>$ pnpm bb:dev thread stop thr_dyn6jcqggc
+Thread thr_dyn6jcqggc stopped
+$ lsof -t -nP ~/.codex/thread-writer-locks/01a034dc-fdc9-73f0-a00d-a960e9b7cb4d.lock   # (no output: free)</pre></li>
+    <li>Open the same rollout from a process bb does not own (this models the Codex desktop app, <code>codex resume &lt;id&gt;</code>, or another bb daemon sharing <code>~/.codex</code>).
+<pre>$ node /tmp/bb-reports/issues/2327/repro/foreign-holder.mjs 01a034dc-fdc9-73f0-a00d-a960e9b7cb4d /tmp/bb-2327-e2e-repo &amp;
+holding codex thread 01a034dc-fdc9-73f0-a00d-a960e9b7cb4d (app-server wrapper pid 58077); kill me to release
+$ lsof -t -nP ~/.codex/thread-writer-locks/01a034dc-fdc9-73f0-a00d-a960e9b7cb4d.lock
+58078</pre></li>
+    <li>Send a follow-up. <strong>Expected:</strong> bb resumes the rollout and runs the turn (or tells the user who holds the thread and waits/retries). <strong>Actual:</strong> the turn is rejected, the thread flips to <code>error</code>.
+<pre>$ pnpm bb:dev thread tell thr_dyn6jcqggc "Reply only with ok again."
+Thread thr_dyn6jcqggc steered
+$ pnpm bb:dev thread show thr_dyn6jcqggc --json | grep -m1 '"status"'
+    "status": "error",
+$ sqlite3 "$DATA_DIR/bb.db" "select sequence,type,substr(data,1,300) from events where thread_id='thr_dyn6jcqggc' order by sequence desc limit 4;"
+22|system/error|{"code":"thread_command_failed","message":"Command turn.submit failed","detail":"thread 01a034dc-fdc9-73f0-a00d-a960e9b7cb4d already has an active writer"}
+21|client/turn/rejected|{"requestId":"creq_dvty6hcrfi","reason":"command_failed","message":"thread 01a034dc-fdc9-73f0-a00d-a960e9b7cb4d already has an active writer"}
+20|thread/identity|{"providerThreadId":"01a034dc-fdc9-73f0-a00d-a960e9b7cb4d"}
+19|client/turn/requested|{"direction":"outbound","source":"tell","initiator":"user","request":{"method":"turn/start","params":{}},"requestId":"creq_dvty6hcrfi", …}</pre>
+    The host daemon logs the bridge rejection with <code>"recovery": null</code> — no typed hint, so the runtime has nothing to act on (<code>dev log excerpt</code>).
+    <figure><img src="assets/2327-error.png" alt="Thread page showing Command turn.submit failed with the active writer error"><figcaption>The moment the bug shows: "Command turn.submit failed — thread … already has an active writer". The thread is now in the error state (red icon in the sidebar).</figcaption></figure></li>
+    <li>Retry. The default (steer) mode is refused by the server because the thread is in <code>error</code>; <code>--mode auto</code> goes through and is rejected identically (events 23–26).
+<pre>$ pnpm bb:dev thread tell thr_dyn6jcqggc "Reply only with ok (retry)."
+Error: HTTP 409: Thread is not active
+$ pnpm bb:dev thread tell thr_dyn6jcqggc "Reply only with ok (retry)." --mode auto
+Thread thr_dyn6jcqggc updated
+25|client/turn/rejected|{"requestId":"creq_pvj42gm6w8","reason":"command_failed","message":"thread 01a034dc-fdc9-73f0-a00d-a960e9b7cb4d already has an active writer"}
+26|system/error|{"code":"thread_command_failed","message":"Command turn.submit failed","detail":"thread 01a034dc-fdc9-73f0-a00d-a960e9b7cb4d already has an active writer"}</pre></li>
+    <li>Stop the runtime and retry — the issue's recovery attempt — still rejected (events 27–30): the stop released nothing bb owned, and the retry resumes the same locked rollout.
+<pre>$ pnpm bb:dev thread stop thr_dyn6jcqggc &amp;&amp; pnpm bb:dev thread tell thr_dyn6jcqggc "Reply only with ok (after stop)." --mode auto
+Thread thr_dyn6jcqggc stopped
+Thread thr_dyn6jcqggc updated
+29|client/turn/rejected|{"requestId":"creq_pcp3b4fvdm","reason":"command_failed","message":"thread 01a034dc-fdc9-73f0-a00d-a960e9b7cb4d already has an active writer"}
+30|system/error|{"code":"thread_command_failed","message":"Command turn.submit failed","detail":"thread 01a034dc-fdc9-73f0-a00d-a960e9b7cb4d already has an active writer"}</pre></li>
+    <li>Only the foreign process going away unwedges the thread.
+<pre>$ pkill -f "foreign-holder.mjs 01a034dc-fdc9"
+$ pnpm bb:dev thread tell thr_dyn6jcqggc "Reply only with ok (foreign gone)." --mode auto &amp;&amp; pnpm bb:dev thread wait thr_dyn6jcqggc --timeout 120
+Thread thr_dyn6jcqggc updated
+Thread thr_dyn6jcqggc reached status idle.
+35|turn/started|{"providerThreadId":"01a034dc-fdc9-73f0-a00d-a960e9b7cb4d"}
+43|turn/completed|{"providerThreadId":"01a034dc-fdc9-73f0-a00d-a960e9b7cb4d","status":"completed", …}</pre>
+    <figure><img src="assets/2327-recovered.png" alt="Thread page with three failed follow-ups and a final successful ok"><figcaption>After the foreign app-server exits the same thread works again; the three failed sends stay in the timeline as "Command turn.submit failed" errors and the fourth gets its "ok". (This shot is from the revise-pass run, thread <code>thr_dyn6jcqggc</code>; the two shots above are from the first run and show the identical states.)</figcaption></figure></li>
+  </ol>
+  <p>Full event dump (events 19–43 of the revise-pass run): <code>e2e-events-after-tell.txt</code>. Cleanup afterwards: <code>pnpm dev:stop</code>, delete <code>$DATA_DIR</code>, <code>rm -rf /tmp/bb-2327-*</code>.</p>
+
+  <h3>4c. bb bridge alone (vitest, real Codex, both halves of the contradiction)</h3>
+  <p><code>repro/bridge.writer-lock-2327.test.ts</code> drives <code>handleLine</code> of the real bridge with the repo's JSON-RPC test harness against the real <code>codex app-server</code>. It is not part of the repo: copy it into <code>plugins/provider-codex/src/bridge/</code> of a built worktree first. It is gated on <code>BB_2327_REPRO=1</code> because it spends two tiny real turns, needs the logged-in scratch <code>CODEX_HOME</code> from 4a, and takes the path of the slow-exit wrapper (scenario B) from <code>BB_2327_SLOW_WRAPPER</code> (default <code>/tmp/bb-reports/issues/2327/repro/slow-exit-codex-wrapper.mjs</code>; set it if you saved the repro files elsewhere). <code>BB_2327_WORKSPACE</code> (default <code>/tmp/bb-2327-repo</code>, created if missing) and <code>BB_2327_TRANSCRIPT</code> are optional.</p>
+<pre>$ cp /tmp/bb-reports/issues/2327/repro/bridge.writer-lock-2327.test.ts plugins/provider-codex/src/bridge/
+$ cd plugins/provider-codex
+$ BB_2327_REPRO=1 CODEX_HOME=/tmp/bb-2327-codex-home \
+    BB_2327_SLOW_WRAPPER=/tmp/bb-reports/issues/2327/repro/slow-exit-codex-wrapper.mjs \
+    BB_2327_TRANSCRIPT=/tmp/bridge-transcript.log \
+    pnpm exec vitest run src/bridge/bridge.writer-lock-2327.test.ts
+ Test Files  1 passed (1)
+      Tests  2 passed (2)        # "passed" = the bug is present as asserted
+   Duration  20.97s</pre>
+  <p>Scenario A (foreign holder) — the bridge transcript shows the exact pair from the issue:</p>
+<pre>[+  3271ms] bb's child holds the writer lock: [49651]
+[+  3404ms] runtime -&gt; bridge #3 thread/stop {"intent":"release", …}
+[+  3405ms] bridge -&gt; runtime #3 result {"ok":true}
+[+  4284ms] foreign codex app-server pid=49876 resumed 01a034db-629c-…; lock holders [49877]
+[+  4423ms] runtime -&gt; bridge #4 thread/resume {"threadId":"thr_2327_foreign","providerThreadId":"01a034db-629c-…", …}
+[+  6044ms] bridge -&gt; runtime #4 ERROR {"code":-32000,"message":"thread 01a034db-629c-7b50-9769-1689461668e7 already has an active writer"}
+[+  6044ms] runtime -&gt; bridge #5 turn/start {"threadId":"thr_2327_foreign", …}        ← the harness sends this; the base-commit runtime would not (it forgot the thread after #4)
+[+  6046ms] bridge -&gt; runtime #5 ERROR {"code":-32000,"message":"No active codex session for thread \"thr_2327_foreign\""}
+[+  6046ms] runtime -&gt; bridge #6 thread/resume …
+[+  7645ms] bridge -&gt; runtime #6 ERROR {"code":-32000,"message":"thread 01a034db-629c-7b50-9769-1689461668e7 already has an active writer"}
+[+  7645ms] foreign codex app-server killed
+[+  9568ms] bridge -&gt; runtime #7 result {"providerThreadId":"01a034db-629c-…","sessionRestorable":true}</pre>
+  <p>Scenario B (bb racing its own previous child) — a reasoning-level change is construction-scoped for Codex, so <code>turn/start</code> rebuilds the session. The wrapper delays the old child's SIGTERM by 1.5 s to model a teardown slower than the replacement's spawn + <code>initialize</code> + <code>thread/resume</code> (≈ 650 ms here):</p>
+<pre>[+ 10395ms] runtime -&gt; bridge #10 turn/start {… "reasoningLevel":"low"}        → ok, turn settles
+[+ 13225ms] runtime -&gt; bridge #11 turn/start {… "reasoningLevel":"high"}       → rebuild: SIGTERM old child, spawn new, thread/resume
+[+ 14271ms] bridge -&gt; runtime #11 ERROR {"code":-32000,"message":"thread 01a034db-87e7-7461-bf02-57191f9fe74d already has an active writer"}
+[+ 16773ms] runtime -&gt; bridge #12 turn/start {… "reasoningLevel":"high"}       → 2.5 s later, old child gone
+[+ 17795ms] bridge -&gt; runtime #12 result {"threadId":"thr_2327_rebuild"}
+            bridge notification session/replaced {"reason":"codex app-server exited; the session was restored from its rollout.", …}</pre>
+  <p>At the base commit the retry succeeds because #2325 added <code>registerResumableSession</code>. The pre-#2325 <code>rebuildThreadSession</code> had no catch block (<code>git show e42a4ef48^:plugins/provider-codex/src/bridge/bridge.ts</code> lines 1094–1123): the failed construction deleted the thread's only entry, so every later <code>turn/start</code> answered <code>No active codex session for thread</code> until the runtime forgot the thread and resumed it again. (Running the old <code>bridge.ts</code> file against the current SDK is not possible — its schema imports moved in #2325 — so this half is traced in code, not executed.) Full transcript: <code>bridge-transcript-base.log</code>.</p>
+  <p>Repro files: <code>2327/repro/</code> — <code>codex-writer-lock.mjs</code> (4a), <code>codex-sigterm-with-mcp.mjs</code> + <code>slow-mcp-server.mjs</code> (teardown timing), <code>foreign-holder.mjs</code> (4b step 5), <code>slow-exit-codex-wrapper.mjs</code> (4c scenario B), <code>bridge.writer-lock-2327.test.ts</code>, logs.</p>
+
+  <h2>5. Root cause</h2>
+  <h3>5.1 Codex: one writer per thread, per process lifetime</h3>
+  <p>Since <a href="https://github.com/openai/codex/commit/5c94796d">openai/codex@5c94796d</a> ("Enforce single-writer ownership for paginated threads", shipped in rust-v0.146.0, 2026-07-29) the thread store acquires <code>$CODEX_HOME/thread-writer-locks/&lt;thread&gt;.lock</code> with <code>File::try_lock()</code> when a session is created for a thread and answers a second writer with <code>ThreadStoreError::Conflict { "thread {id} already has an active writer" }</code>; the guard is dropped only when the session is torn down (process exit). In stdio mode (<code>single_client_mode</code>, the mode bb uses) the app-server installs no SIGTERM drain and exits on stdin EOF after <code>shutdown_threads()</code>, which measured 5–45 ms on 0.149.1. Nothing in this is turn-scoped: an idle loaded thread is locked exactly like one mid-command.</p>
+
+  <h3>5.2 bb reopens rollouts by spawning a new app-server, and never checks who holds the thread</h3>
+  <p>The Codex bridge keeps one app-server child per bb thread and reconstructs the session through <code>constructThreadSession</code> for every start/resume/fork and every rebuild (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-codex/src/bridge/bridge.ts#L1052-L1055">bridge.ts#L1052-L1055</a>):</p>
+<pre>const existing = sessionsByBbThreadId.get(args.threadId);
+if (existing) {
+  releaseSession(existing);          // SIGTERM the old child (SIGKILL only after 4 s), returns immediately
+}
+…
+const connection = spawnChildConnection({ … });   // new app-server, right away
+…
+const result = await connection.request({ method /* thread/resume */, params, … });</pre>
+  <p><code>releaseSession</code> → <code>connection.kill()</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-codex/src/bridge/app-server-connection.ts#L341-L352">app-server-connection.ts#L341-L352</a>) only sends the signal; nothing awaits the old child's <code>exit</code>/<code>close</code> before the replacement's <code>thread/resume</code> goes out. Every rebuild site goes through this: a construction-scoped settings change or a dead child (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-codex/src/bridge/bridge.ts#L1564-L1599">requireLiveSessionForTurn</a>), a terminal auth/rate-limit error (<code>rebuildBeforeNextTurnReason</code>), a runtime-driven <code>thread/resume</code> while the bridge still has the session, and <code>thread/stop {release}</code> immediately followed by a resume (environment move via <code>releaseThreadFromOtherEnvironments</code>, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/runtime-manager.ts#L449-L491">runtime-manager.ts#L449-L491</a>; the 30-minute idle reaper, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/app.ts#L65-L66">app.ts#L65-L66</a>, followed by a new turn; a <code>restartRecommended</code> bridge restart, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L1136-L1199">runtime.ts#L1136-L1199</a>). With 0.149.1's ~10 ms teardown the self-race window is small on an idle machine, but it is a race by construction, and it does not matter who the other writer is: any process that has the rollout loaded produces the same refusal.</p>
+
+  <h3>5.3 bb classifies the refusal as a generic failure and leaves the thread inconsistent</h3>
+  <ul>
+    <li>The bridge only recognises Codex's "is archived" text (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-codex/src/bridge/bridge.ts#L327-L328">CODEX_ARCHIVED_SESSION_ERROR_PATTERN</a>) and turns it into a typed <code>sessionArchived</code> hint the runtime acts on. "already has an active writer" gets <code>BRIDGE_ERROR</code> with no hint (<code>sendConstructionError</code>, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-codex/src/bridge/bridge.ts#L1499-L1521">bridge.ts#L1499-L1521</a>), so <code>sendRequestWithRecovery</code> in the runtime rethrows it (<code>recovery: null</code> in the daemon log), the daemon answers <code>command_failed</code>, and the server appends <code>client/turn/rejected</code> + <code>system/error</code> and moves the thread to <code>error</code>.</li>
+    <li>Bridge and runtime disagree about who still holds the thread. After a rejected <code>turn/start</code> the runtime keeps the thread registered (<code>runTurn</code> catch only calls <code>markHostedProviderSessionIdle</code>, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L2185-L2193">runtime.ts#L2185-L2193</a>), whereas a rejected <code>thread/resume</code> forgets it (<code>abandonFailedSessionConstruction</code>, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L2107-L2116">runtime.ts#L2107-L2116</a>) so the next command resumes again. At the base commit this means an end-to-end user only ever sees "already has an active writer" (4b). The bridge, however, still answers "No active codex session" to any <code>turn/start</code> that reaches it after a refused resume (4c, #5), and before #2325 the bridge itself dropped the thread after any failed rebuild (no catch in <code>rebuildThreadSession</code>, <code>git show e42a4ef48^:plugins/provider-codex/src/bridge/bridge.ts</code> lines 1094–1123) while the runtime kept it registered — so a single settings-change rebuild produced "active writer" once and then "No active codex session" on every subsequent turn, the pair the reporter saw. #2325's <code>registerResumableSession</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-codex/src/bridge/bridge.ts#L1242-L1266">bridge.ts#L1242-L1266</a>) closes that rebuild path; the bridge/runtime bookkeeping mismatch itself remains.</li>
+    <li>Nothing retries or waits. A transient holder (bb's own exiting child, a bridge that just restarted) would be gone within a second; a persistent holder (Codex desktop app, <code>codex resume</code>, a second daemon on the same <code>~/.codex</code>) is never reported as such, so the user gets "Command turn.submit failed" with no actionable cause, and the provider-retry plugin refuses because no input was accepted.</li>
+  </ul>
+  <p><strong>Deeper issue:</strong> bb assumes a Codex rollout is re-openable at any time by any process. Since Codex 0.146 a rollout has exactly one writer, and bb neither serialises its own handoffs (old child → new child) on that invariant nor treats a foreign writer as a first-class state of the thread. The ordering observation in the issue (a command item completing after <code>turn/completed</code>) is orthogonal; it would not cause or prevent this failure.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <ol>
+    <li><strong>Bridge: never resume while bb's own previous writer can still be alive.</strong> In <code>constructThreadSession</code>, when an <code>existing</code> session has a live connection, await the old connection's finalized exit (it already escalates SIGTERM → SIGKILL at 4 s) before spawning the replacement; do the same in <code>handleThreadStop {release}</code> before answering, so a runtime that chains release → resume (environment move, bridge restart) cannot race. Cost: up to the kill-escalation timeout once, on an already-dying child. Risk: a child that never closes its pipes — the connection's <code>CLOSE_AFTER_EXIT_GRACE_MS</code> already bounds that.</li>
+    <li><strong>Bridge: classify the conflict.</strong> Add <code>/\bthread\s+\S+\s+already has an active writer\b/i</code> next to the archived pattern and map it to a typed recovery hint (e.g. <code>sessionBusy</code>, <code>retryable: true</code>, with the Codex thread id). The runtime's <code>actOnRejection</code> can then retry the construction a bounded number of times with backoff (covers bb's own transient holders and a desktop app that is just closing), and otherwise surface a typed <code>AgentRuntimeRecoveryError</code> so the server records a specific <code>system/error</code> ("this Codex thread is open in another program") instead of <code>thread_command_failed</code>, and the thread can stay <code>idle</code> with the input queued rather than flipping to <code>error</code>. This is a wire change: bump <code>HOST_DAEMON_PROTOCOL_VERSION</code> and document the hint in <code>docs/provider-bridge-protocol.md</code>.</li>
+    <li><strong>Runtime: make the two paths agree.</strong> After a rejected <code>turn/start</code> whose rejection carries a construction-failure hint, forget the thread the same way a rejected <code>thread/resume</code> does, so the next send always goes through resume (one error text, one recovery) and "No active codex session" cannot appear for this cause. Optionally, have the bridge report the lock holder's pid from <code>lsof</code>-free means (Codex does not expose it; the lock file is empty), so keep the message generic.</li>
+    <li><strong>Tests.</strong> Extend <code>fake-codex-app-server.mjs</code> with a scripted "active writer" refusal (first N resumes fail) and add bridge tests for: (a) rebuild waits for the old child, (b) the typed hint and bounded retry, (c) release → resume on the same thread. Keep the real-Codex test in this report as an opt-in integration check.</li>
+  </ol>
+  <p>Not recommended: delaying <code>turn/completed</code> until items settle (the issue's first expectation). It changes nothing about the lock and would hold bb turns open for Codex background processes.</p>
+
+  <h2>7. PR review</h2>
+  <p>No open pull request is linked to this issue.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li>#2325 — "Provider plugins: one API for Codex, Claude Code, pi, and ACP agents" (<code>e42a4ef48</code>): added <code>registerResumableSession</code>, which removes the pre-existing "forget the thread after a failed rebuild" half of this report. Merged six minutes before the issue was filed.</li>
+    <li>#2242 — "Prevent competing turns and false Codex session rebuilds": fewer spurious rebuilds means fewer chances to hit the self-race, but the remaining rebuild sites are unchanged.</li>
+    <li>#1584 (release must not fabricate an interruption), #1402 (stale child output), #130 (rebuild after auth failure) — the rebuild/release machinery this report exercises.</li>
+    <li>openai/codex #34986 — the Codex change that introduced the writer lock.</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Commands run (in order)</h3>
+<pre>gh issue view 2327 --repo get-bb/bb --json …
+pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build
+strings …/codex-darwin-arm64/…/bin/codex | grep -n "active writer"              # message is Codex's, not bb's
+gh api repos/openai/codex/contents/codex-rs/thread-store/src/local/writer_lock.rs -H "Accept: application/vnd.github.raw"
+gh api "repos/openai/codex/commits?path=codex-rs/thread-store/src/local/writer_lock.rs"   # 5c94796d 2026-07-23
+gh api repos/openai/codex/compare/5c94796d...rust-v0.146.0 --jq .status              # ahead → contained in 0.146.0
+gh api repos/openai/codex/contents/codex-rs/app-server/src/lib.rs …                  # single_client_mode, stdio close path
+lsof -nP ~/.codex/thread-writer-locks/*.lock                                         # flock held by the codex binary
+mkdir -p /tmp/bb-2327-codex-home &amp;&amp; cp ~/.codex/auth.json /tmp/bb-2327-codex-home/
+CODEX_HOME=/tmp/bb-2327-codex-home node repro/codex-writer-lock.mjs --sleep 75
+CODEX_HOME=/tmp/bb-2327-codex-home-mcp node repro/codex-sigterm-with-mcp.mjs
+cp repro/bridge.writer-lock-2327.test.ts plugins/provider-codex/src/bridge/ &amp;&amp; cd plugins/provider-codex
+BB_2327_REPRO=1 CODEX_HOME=/tmp/bb-2327-codex-home BB_2327_SLOW_WRAPPER=repro/slow-exit-codex-wrapper.mjs pnpm exec vitest run src/bridge/bridge.writer-lock-2327.test.ts
+git show e42a4ef48^:plugins/provider-codex/src/bridge/bridge.ts | sed -n 1085,1135p  # pre-#2325 rebuild has no catch
+git fetch origin main; git log 494f66526..origin/main --oneline -- plugins/provider-codex packages/agent-runtime apps/host-daemon   # empty
+git -C /tmp/bb-2327-e2e-repo init; scripts/bb-dev-app current; DATA_DIR=$(scripts/bb-dev-app status | sed -n 's/^Data dir: //p'); pnpm bb:dev machine list
+curl … /api/v1/projects; pnpm bb:dev thread spawn/wait/stop/tell …; sqlite3 "$DATA_DIR/bb.db" …
+node repro/foreign-holder.mjs 01a034dc-fdc9-73f0-a00d-a960e9b7cb4d /tmp/bb-2327-e2e-repo
+sed -e 's#__URL__#http://localhost:17285/projects/proj_bubq6jkc6w/threads/thr_dyn6jcqggc#' -e 's#__SHOT__#…png#' repro/shot.js | doobie --headless   # screenshots
+pnpm dev:stop; rm -rf "$DATA_DIR" /tmp/bb-2327-*</pre>
+  <h3>Codex writer lock (excerpt of <code>writer_lock.rs</code> on openai/codex main)</h3>
+<pre>match file.try_lock() {
+    Ok(()) =&gt; {}
+    Err(std::fs::TryLockError::WouldBlock) =&gt; {
+        return Err(ThreadStoreError::Conflict {
+            message: format!("thread {thread_id} already has an active writer"),
+        });
+    }
+    …
+}
+impl Drop for WriterLockGuard { fn drop(&amp;mut self) { … drop(self.file.take()); fs::remove_file(&amp;self.path) … } }</pre>
+  <h3>Codex app-server shutdown in stdio mode (<code>lib.rs</code>)</h3>
+<pre>let single_client_mode = matches!(&amp;transport, AppServerTransport::Stdio);
+let graceful_signal_restart_enabled = runtime_options.install_shutdown_signal_handler &amp;&amp; !single_client_mode;
+…
+if single_client_mode &amp;&amp; stdio_closed { break "stdio_connection_closed"; }
+…
+processor.drain_background_tasks().await;
+processor.shutdown_threads().await;</pre>
+  <h3>Daemon log at the rejection (dev instance)</h3>
+<pre>@bb/host-daemon:dev: [10:42:09] WARN: [host-daemon] online host RPC failed {"serverUrl":"http://127.0.0.1:25285","type":"turn.submit"}
+@bb/host-daemon:dev:     err: {
+@bb/host-daemon:dev:       "type": "JsonRpcResponseError",
+@bb/host-daemon:dev:       "message": "thread 01a034dc-fdc9-73f0-a00d-a960e9b7cb4d already has an active writer",
+@bb/host-daemon:dev:       …at handleStdoutLine (packages/agent-runtime/src/runtime.ts:1463:7)
+@bb/host-daemon:dev:       "code": -32000,
+@bb/host-daemon:dev:       "recovery": null,
+@bb/host-daemon:dev:     }
+@bb/host-daemon:dev: [10:42:09] DEBUG: [host-daemon] Online host RPC {"commandType":"turn.submit","errorCode":"command_failed","handlerMs":675.8,"ok":false}
+@bb/server:dev: [10:42:09] WARN: [server] Live ready turn command failed {"threadId":"thr_dyn6jcqggc"}</pre>
+  <h3>Measured Codex teardown times (0.149.1, this machine)</h3>
+  <table><tr><th>Situation</th><th>Signal</th><th>Process exit</th><th>Writer lock released</th></tr>
+    <tr><td>idle thread, no MCP</td><td>SIGTERM</td><td>4–7 ms (exit code 0)</td><td>&lt; 250 ms poll</td></tr>
+    <tr><td>idle thread, no MCP</td><td>stdin EOF</td><td>8–45 ms</td><td>with exit</td></tr>
+    <tr><td>thread mid <code>sleep 75</code> command</td><td>stdin EOF</td><td>22–37 ms (command killed: <code>exec_command failed … UnknownProcessId</code>)</td><td>with exit</td></tr>
+    <tr><td>thread with a SIGTERM-ignoring MCP server</td><td>SIGTERM / stdin EOF</td><td>8 ms / 13 ms</td><td>157 ms / 25 ms (lsof poll granularity)</td></tr>
+  </table>
+  <p>bb's replacement child needs ≈ 70 ms to spawn + <code>initialize</code> and ≈ 650 ms for <code>thread/resume</code> on a fresh rollout, so on this Codex build bb only races itself under load; older Codex builds and foreign clients are the realistic triggers. Raw logs: <code>codex-writer-lock.log</code>, <code>codex-sigterm-with-mcp.log</code>, <code>phase-a.log</code> (first attempt; shows <code>thread/resume</code> needs a persisted rollout: "no rollout found for thread id").</p>
+  <h3>Things ruled out</h3>
+  <ul>
+    <li>A Codex child inheriting the lock fd into its sandboxed command (would make the lock outlive the app-server): Rust opens files <code>O_CLOEXEC</code>; <code>lsof</code> on a live app-server's child (<code>node_repl</code>) shows no lock fd.</li>
+    <li>Codex lingering after its bridge dies (orphan holder): stdin EOF exits within 45 ms even mid-command on 0.149.1.</li>
+    <li>A later commit on <code>origin/main</code> fixing this: none touch the relevant packages after <code>494f66526</code> (re-checked in the revise pass up to <code>21cb6b68b</code>; the only later commits in <code>plugins/provider-codex</code>, <code>packages/agent-runtime</code>, <code>apps/host-daemon</code>, <code>apps/server</code> are test-only stabilizations).</li>
+  </ul>
+
+  <h3>Verification</h3>
+  <p>An independent verifier re-ran every step on its own worktree (<code>b735da19e</code>, identical to <code>494f66526</code> for the packages involved) and dev instance (ports 16350/24350/32350): 4a reproduced once the scratch cwd and a logged-in <code>CODEX_HOME</code> existed; 4b reproduced end to end (thread <code>thr_w95pxvdpna</code>, events 19–30 all "already has an active writer", recovery after killing the foreign holder); 4c passed 2/2 with the same transcript. All code permalinks were checked against <code>494f66526</code> and found accurate. Its artifacts are under <code>2327/verify/</code>.</p>
+  <p>Findings and what changed in this revision:</p>
+  <ul>
+    <li><strong>Major — 4a did not work as written</strong> (the script's default cwd and the scratch <code>CODEX_HOME</code> did not exist; Phase B needs auth). <code>codex-writer-lock.mjs</code> now creates both directories, refuses <code>~/.codex</code> as <code>CODEX_HOME</code>, and warns when <code>auth.json</code> is missing; the step lists the <code>mkdir</code> + <code>cp auth.json</code> prerequisite. Re-run from scratch at <code>494f66526</code>: output above and <code>codex-writer-lock.log</code> (overwritten in place).</li>
+    <li><strong>Minor — 4b placeholders</strong>: the step now creates the scratch git repo, derives <code>DATA_DIR</code> from <code>scripts/bb-dev-app status</code>, and reads the host id from <code>pnpm bb:dev machine list</code> instead of a hard-coded id. Re-run on a fresh dev instance from this worktree; all ids, outputs, the event dump, the daemon log excerpt and the "recovered" screenshot were replaced with that run (the event sequence numbers 19–43 came out identical to the first run).</li>
+    <li><strong>Minor — "No active codex session" overstated at the base commit</strong>: the TL;DR, the claims table and section 5.3 now say that the bridge answers it to a <code>turn/start</code> after a refused resume (4c), that the base-commit runtime no longer sends that request because <code>abandonFailedSessionConstruction</code> forgets the thread, and that the end-to-end pair is only reachable with the pre-#2325 bridge (code trace).</li>
+    <li><strong>Minor — 4c prerequisites</strong>: the step now includes the <code>cp</code> of the test into <code>plugins/provider-codex/src/bridge/</code>, the <code>BB_2327_SLOW_WRAPPER</code>/<code>BB_2327_WORKSPACE</code> overrides and the auth requirement; the test file's header says the same. Re-run: <code>vitest-writer-lock-base.log</code> (2 passed) and <code>bridge-transcript-base.log</code>, both overwritten in place.</li>
+  </ul>
+</main></body></html>

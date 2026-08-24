@@ -1,0 +1,617 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report &middot; #2130 Open file views do not refresh when a file changes on disk</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:960px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.med { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; max-height:520px; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:18px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:6px; }
+  details summary { cursor:pointer; color:var(--accent); }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  @media (max-width:700px) { .grid2 { grid-template-columns:1fr; } }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">&larr; reports</a></p>
+  <h1>#2130 &middot; Open file views do not refresh when a file changes on disk</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill med">Priority: Medium</span> <span class="pill">Effort: unset</span> <span class="pill">docs</span> <span class="pill">ui</span>
+    <a href="https://github.com/get-bb/bb/issues/2130">open on GitHub</a>
+    <span>2026-08-21 &middot; base <code>fcada5a3b</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict v-partial">PARTIALLY REPRODUCED</span> &middot; <strong>Root-cause confidence:</strong> high</p>
+  <p>Partially, because the issue bundles five "surfaces" and two of them are wrong: workspace files and thread-storage files opened in a thread <em>do</em> refresh live (host-daemon file watcher &rarr; realtime invalidation, measured &le;5&nbsp;s, no focus change needed). The real gaps are: (a) the <strong>Docs plugin markdown editor</strong>, which becomes the default opener for every <code>.md</code> the moment the Docs plugin is installed and never re-reads the file; (b) <strong>absolute host paths outside the workspace</strong> opened in a thread, which only refresh on a browser <code>visibilitychange</code>; (c) the <strong>project file preview on the "New thread" view</strong>, which never refreshes at all (not listed in the issue); and (d) the <strong>host-scoped preview used by plugin pages</strong>, which has no invalidation and a 30&nbsp;s stale window (code-verified, unit-tested, not reachable from any built-in UI without a plugin that opens host targets).</p>
+
+  <h2>1. TL;DR</h2>
+  <p>bb shows files in a right-hand panel. Whether that panel tracks the file on disk depends entirely on <em>which React Query hook the tab happens to use</em>, and that is decided by where the file lives and which view you opened it from. Files inside the thread's workspace and inside thread storage are wired to the host daemon's filesystem watcher: an outside write arrives as a <code>work-status-changed</code> / <code>thread-storage-changed</code> realtime event and the preview refetches within a few seconds (verified live). Three other previews have no such owner: the <code>threadHostFilePreview</code> query (absolute paths outside the workspace) refetches only when the browser tab is hidden and shown again; the <code>projectFilePreview</code> query (the "New thread" page) and the <code>hostFilePreview</code> query (plugin pages) are never invalidated and do not refetch on focus, so they stay stale until the tab is closed or the Refresh button is clicked. Separately, the Docs plugin registers itself as the file opener for <code>md</code>/<code>mdx</code>/<code>markdown</code>; its <code>DocsFileOpener</code> reads the file once in a <code>useEffect</code>, keeps it in component state, and has no poll, watcher, subscription, focus handler or Refresh button, so installing the Docs plugin silently turns every live markdown preview into a frozen one. Its unmount autosave also swallows a conflict result because the only handler is <code>setConflict</code> on an already-unmounted component.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>"A file opened in BB keeps showing its old contents after something else writes it ... The view stays stale for as long as it is open."</td><td class="unv">Partially verified</td><td>True for the Docs editor, for absolute host paths in a thread (until a visibility change), for the New-thread project preview, and for plugin-page host previews. False for workspace files and thread-storage files opened in a thread: both refreshed within 3&ndash;5&nbsp;s in the live repro (&sect;4 steps 3 and 6).</td></tr>
+    <tr><td>Surface 1: <code>useHostFilePreview</code> &mdash; nothing invalidates <code>hostFilePreviewQueryKey</code>; 30&nbsp;s <code>staleTime</code> makes close/reopen replay the cache.</td><td class="ok">Verified</td><td><a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/app/src/hooks/queries/host-file-preview-query.ts#L140-L143"><code>apps/app/src/hooks/queries/host-file-preview-query.ts:140-143</code></a> sets <code>staleTime: 30_000</code>; <code>grep -rn hostFilePreviewQueryKey apps/app/src</code> finds only the hook and the key factory &mdash; no <code>invalidateQueries</code>. Unit test <code>useHostFilePreview</code> in &sect;4 fails on main. Only consumer is <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/app/src/components/secondary-panel/ThreadSecondaryPanelTabContent.tsx#L481-L494"><code>HostScopedFilePreviewTabContent:481-494</code></a>, rendered from <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/app/src/components/plugin/PluginPanelRightPanelHost.tsx#L721-L728"><code>PluginPanelRightPanelHost:721-728</code></a> (plugin full-page routes). No built-in plugin opens a <code>{kind:"host"}</code> target today, so this was not reproduced live.</td></tr>
+    <tr><td>Surface 2: "Built-in preview, workspace paths &mdash; <code>RESUME_REFETCH_QUERY_POLICY</code>. Refetches on focus ... never updates while you sit and watch it."</td><td class="no">Refuted (mislabeled)</td><td>Workspace paths in a thread use <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/app/src/hooks/queries/environment-queries.ts#L250-L300"><code>useEnvironmentFilePreview:250-300</code></a> (<code>EXPENSIVE_MANUAL_QUERY_POLICY</code>), whose key is invalidated by <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/app/src/hooks/cache-owners/realtime-cache-registry.ts#L1101-L1116"><code>dirtyEnvironmentLiveWorkspaceStateQueries:1101-1116</code></a> on every <code>work-status-changed</code> event, which the daemon emits from its parcel watcher on any content change (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/host-daemon/src/watch-manager.ts#L324-L333"><code>apps/host-daemon/src/watch-manager.ts:324-333</code></a>). Live: <code>status.txt</code> updated in &le;3&nbsp;s with the window untouched (figures 1&ndash;2). The hook that actually has <code>RESUME_REFETCH_QUERY_POLICY</code> is <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/app/src/hooks/queries/thread-queries.ts#L877-L900"><code>useThreadHostFilePreview:877-900</code></a> &mdash; absolute paths <em>outside</em> the workspace &mdash; and for that one the described behaviour (stale until a visibility change) is verified (figures 3&ndash;4, &sect;4 step 4).</td></tr>
+    <tr><td>Surface 3: thread-storage paths &mdash; "no realtime event invalidates a file preview key. Reopening the tab works; focus does not."</td><td class="no">Refuted</td><td><a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/app/src/hooks/cache-owners/realtime-cache-registry.ts#L995-L1013"><code>dirtyThreadStorageQueriesForThread:995-1013</code></a> and <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/app/src/hooks/cache-owners/realtime-cache-registry.ts#L1174-L1184"><code>dirtyThreadStorageQueriesForEnvironment:1174-1184</code></a> both return <code>threadStorageFilePreviewQueryKeyPrefix</code>; they run on <code>environment-changed</code> and <code>thread-storage-changed</code>, the latter produced by the daemon's thread-storage watcher (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/packages/host-watcher/src/parcel-host-watcher.ts#L77-L100"><code>packages/host-watcher/src/parcel-host-watcher.ts:77-100</code></a>). Live: <code>queue.txt</code> in thread storage updated in &le;5&nbsp;s (&sect;4 step 6).</td></tr>
+    <tr><td>Surface 4: Docs plugin opener loads once via <code>openFile</code> in a <code>useEffect</code>; only reload path is the <code>reloadNonce</code> behind the conflict banner, which only appears when a save fails its sha256 check.</td><td class="ok">Verified</td><td><a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/docs/app.tsx#L1112-L1136"><code>plugins/docs/app.tsx:1112-1136</code></a> (single fetch keyed on <code>reloadNonce</code>), <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/docs/app.tsx#L1139-L1171"><code>plugins/docs/app.tsx:1139-1171</code></a> (<code>setConflict(true)</code> only on <code>saveOpenedFile</code> conflict), <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/docs/app.tsx#L1218-L1232"><code>plugins/docs/app.tsx:1218-1232</code></a> (banner + Reload). Live: <code>NOTES.md</code> stale after 30&nbsp;s and after a visibility cycle (figures 5&ndash;6). Unit test fails on main. Docs registers <code>extensions: ["md","mdx","markdown"]</code> at <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/docs/app.tsx#L2205-L2210"><code>plugins/docs/app.tsx:2205-2210</code></a> and became the default opener immediately after <code>bb plugin install builtin:docs</code>.</td></tr>
+    <tr><td>"<code>refetchOnWindowFocus</code> is not window focus": <code>focusManager</code> is rewired to <code>visibilitychange</code>/<code>pageshow</code>; app-switching on macOS leaves the document visible, so no refetch.</td><td class="ok">Verified (by code)</td><td><a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/app/src/lib/query-client.ts#L34-L47"><code>apps/app/src/lib/query-client.ts:34-47</code></a>. The <code>window.focus</code> listener at <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/app/src/lib/query-client.ts#L76-L91"><code>apps/app/src/lib/query-client.ts:76-91</code></a> only resumes suspended fetches; it does not call <code>focusManager</code>. Not exercised on real macOS app switching (headless run); the live repro used a genuine tab hide/show, which is the only trigger that works.</td></tr>
+    <tr><td>Related: unmount cleanup calls non-forced <code>save()</code>; a conflict calls <code>setConflict</code> on an unmounted component, so edits inside the 700&nbsp;ms debounce are neither written nor reported.</td><td class="ok">Verified</td><td><a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/docs/app.tsx#L1178-L1183"><code>plugins/docs/app.tsx:1178-1183</code></a>. Unit test 2 in &sect;4: after typing and unmounting at +150&nbsp;ms the rpc log is exactly <code>["openFile","saveOpenedFile"]</code> with <code>expectedSha256: "sha-1"</code>; the mocked conflict produces no further call and no UI.</td></tr>
+    <tr><td>Workarounds: close/reopen; built-in Refresh button; "Open with" per tab; Settings &rarr; File openers; local <code>refetchInterval</code> patch.</td><td class="ok">Verified</td><td>Refresh icon visible in every built-in preview screenshot; Docs editor toolbar has only "Open file externally" (figure 5). <code>FileOpenersSettingsSection.tsx</code> and <code>ExperimentalFileLinkMenu.tsx</code> ("Open with") exist. The patch was not evaluated.</td></tr>
+    <tr><td>Not in the issue: the "New thread" (root compose) project file preview.</td><td class="no">New finding</td><td><a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/app/src/hooks/queries/project-queries.ts#L197-L256"><code>useProjectFilePreview:197-256</code></a> uses <code>EXPENSIVE_MANUAL_QUERY_POLICY</code> (<code>refetchOnWindowFocus: false</code>) and <code>projectFilePreviewQueryKey</code> is referenced nowhere in the realtime registry. Live: stale after 30&nbsp;s and after a visibility cycle (figures 7&ndash;8); unit test fails on main.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb <code>fcada5a3b88302acb9944aa74b11db4ecaa215a0</code> (main, 2026-08-21); <code>git log fcada5a3b..origin/main</code> touches none of the files above (only #2147, #2150), so the findings hold on origin/main.</li>
+    <li>macOS 26.5.2 (Darwin 25.5.0), Node v22.23.1, pnpm 9.15.0, codex-cli 0.149.0 (one "Reply only with ok." turn to provision the thread).</li>
+    <li>Own dev instance via <code>scripts/bb-dev-app current</code>: app <code>http://localhost:15170</code>, server <code>:23170</code>, host daemon <code>:31170</code>, data dir <code>~/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_21e66a79-f02-5-4b69f8ca9065</code> (deleted at cleanup).</li>
+    <li>Browser: headless Chrome driven by <code>doobie</code> in a dedicated profile (<code>-b bb2130</code>) so no other page could change <code>document.visibilityState</code>. (A first attempt in the shared profile produced spurious refreshes because other agents' pages toggled visibility; those runs were discarded.)</li>
+    <li>Project <code>proj_sy4khgnq6z</code> ("qa") &rarr; <code>/tmp/bb-2130-repo</code> (git, files <code>status.txt</code>, <code>NOTES.md</code>); thread <code>thr_qdnvnfqkvh</code>, environment <code>env_idq63bcwvv</code> (unmanaged, branch main).</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <p>All timed checks below read the rendered text straight out of the DOM (<code>read-preview-text.js</code>) so that nothing touches focus; screenshots were taken afterwards.</p>
+  <ol>
+    <li>Start a dev instance and create a scratch repo + project:
+<pre>scripts/bb-dev-app current                      # prints App/Server/Host daemon URLs
+mkdir /tmp/bb-2130-repo &amp;&amp; cd /tmp/bb-2130-repo &amp;&amp; git init -q
+printf '# Notes\n\nversion 1\n' &gt; NOTES.md; printf 'version 1\n' &gt; status.txt
+git add -A &amp;&amp; git commit -qm init
+curl -s -X POST $BB_SERVER_URL/api/v1/projects -H 'content-type: application/json' \
+  -d '{"name":"qa","source":{"type":"local_path","path":"/tmp/bb-2130-repo","hostId":"&lt;host id from bb machine list&gt;"}}'
+pnpm bb:dev thread spawn --project &lt;proj id&gt; --environment /tmp/bb-2130-repo --provider codex \
+  --permission-mode accept-edits --title "2130 repro" --prompt "Reply only with ok." --json</pre></li>
+    <li>Open the thread in the browser (<code>/projects/&lt;proj&gt;/threads/&lt;thr&gt;</code>) and open a <strong>workspace file</strong> in the panel:
+<pre>pnpm bb:dev thread open &lt;thr&gt; status.txt --json
+# -&gt; persisted tab kind "workspace-file-preview" (pnpm bb:dev thread tabs show &lt;thr&gt;)</pre></li>
+    <li><strong>Workspace file: refreshes live (claim refuted).</strong> With the window untouched:
+<pre>$ echo "version 3 written at $(date +%T)" &gt; /tmp/bb-2130-repo/status.txt   # 08:16:25
+$ sleep 3; doobie --headless -b bb2130 run read-preview-text.js
+  "visibility": "visible",
+  "codeView": ["1version 3 written at 08:16:25..."]        # time 08:16:31
+expected: view shows the new contents           actual: same (PASS, ~3 s)</pre>
+      <div class="grid2">
+      <figure><img src="assets/2130-workspace-before.png" alt="workspace preview before"><figcaption>Fig 1 &mdash; <code>status.txt</code> (workspace-file-preview) showing "version 1".</figcaption></figure>
+      <figure><img src="assets/2130-workspace-after.png" alt="workspace preview after"><figcaption>Fig 2 &mdash; six seconds after <code>echo ... &gt; status.txt</code>, no focus change: the view already shows "version 2 written at 08:12:32" and the composer's Uncommitted pill appeared &mdash; the watcher &rarr; <code>work-status-changed</code> path works.</figcaption></figure>
+      </div></li>
+    <li><strong>Absolute host path outside the workspace: stale until a visibility change.</strong> <code>bb thread open</code> refuses paths outside the workspace, so the tab was persisted directly (this is the tab a timeline link to <code>/tmp/...</code> creates):
+<pre>pnpm bb:dev thread tabs set &lt;thr&gt; --expected-revision &lt;n&gt; --tabs-json '[..., {"environmentId":"env_idq63bcwvv","hostId":null,
+  "id":"host-file-preview:/tmp/bb-2130-outside/outside.txt:env_idq63bcwvv","kind":"host-file-preview","lineRange":null,
+  "path":"/tmp/bb-2130-outside/outside.txt","threadId":"thr_qdnvnfqkvh"}]'
+# activate the tab, then:
+$ echo "outside version 4 written at $(date +%T)" &gt; /tmp/bb-2130-outside/outside.txt   # 08:16:56
+$ sleep 10; read-preview-text.js  -&gt; "1outside version 3 written at 08:14:20"   (08:17:10)
+$ sleep 20; read-preview-text.js  -&gt; "1outside version 3 written at 08:14:20"   (08:17:30)  &lt;- stale after 34 s
+$ hide-then-show.js               -&gt; {{ whileAway: "hidden", now: "visible" }}
+$ read-preview-text.js            -&gt; "1outside version 4 written at 08:16:56"   (08:17:56)  &lt;- only a visibilitychange refreshes it
+expected: updates while visible   actual: frozen until the tab is hidden and shown again</pre>
+      <div class="grid2">
+      <figure><img src="assets/2130-thread-host-before.png" alt="host path preview before"><figcaption>Fig 3 &mdash; the same tab right after it was opened (earlier run, shared profile): "outside version 1".</figcaption></figure>
+      <figure><img src="assets/2130-thread-host-after.png" alt="host path preview stale"><figcaption>Fig 4 &mdash; <code>/tmp/bb-2130-outside/outside.txt</code> (host-file-preview, <code>useThreadHostFilePreview</code>) still shows "outside version 3 written at 08:14:20" while the file on disk already says version 4 (08:16:56).</figcaption></figure>
+      </div></li>
+    <li>Confirm which query each tab uses (dumped from the live React Query cache with <code>list-preview-queries.js</code>; <code>refetchOnWindowFocus: false</code> on the workspace entry is fine because the realtime registry owns it):
+<pre>["threadHostFilePreview","thr_qdnvnfqkvh","env_idq63bcwvv","/tmp/bb-2130-outside/outside.txt"]  observers 0
+["threadStorageFilePreview","thr_qdnvnfqkvh","queue.txt"]                                      observers 0
+["environmentFilePreview","env_idq63bcwvv","status.txt",{"kind":"working-tree"}]                observers 1  staleTime 2000  refetchOnWindowFocus false</pre></li>
+    <li><strong>Thread-storage file: refreshes live (claim refuted).</strong>
+<pre>$ echo "storage version 1 ..." &gt; &lt;data dir&gt;/thread-storage/thr_qdnvnfqkvh/queue.txt
+# persist a {"kind":"thread-storage-file-preview","path":"queue.txt",...} tab as in step 4, activate it
+$ echo "storage version 2 written at $(date +%T)" &gt; .../queue.txt     # 08:18:42
+$ sleep 5; read-preview-text.js -&gt; "1storage version 2 written at 08:18:42"   (08:18:50)  PASS</pre></li>
+    <li><strong>Docs plugin editor: never refreshes.</strong>
+<pre>pnpm bb:dev plugin install builtin:docs --yes     # reload the page, then
+pnpm bb:dev thread open &lt;thr&gt; NOTES.md --json       # -&gt; tab kind "plugin-panel", pluginId "simple-notes" (Docs is now the default .md opener)
+$ echo "version 2 written at $(date +%T)" &gt;&gt; /tmp/bb-2130-repo/NOTES.md   # 08:20:05
+$ sleep 10; read-preview-text.js -&gt; docsEditor: "Notes version 1", changedOnDiskBanner: false  (08:20:19)
+$ sleep 20; read-preview-text.js -&gt; docsEditor: "Notes version 1", changedOnDiskBanner: false  (08:20:39)
+$ hide-then-show.js; read-preview-text.js -&gt; "Notes version 1", banner false                   (08:20:49)
+expected: editor shows the appended heading, or a "Changed on disk." banner
+actual:   still "version 1"; no banner; no Refresh control (the git pill in the composer did update to "2 files")</pre>
+      <div class="grid2">
+      <figure><img src="assets/2130-docs-before.png" alt="docs editor before"><figcaption>Fig 5 &mdash; <code>NOTES.md</code> opened by the Docs plugin (book icon on the active tab). Toolbar has only the path and "Open file externally"; no Refresh.</figcaption></figure>
+      <figure><img src="assets/2130-docs-after.png" alt="docs editor after"><figcaption>Fig 6 &mdash; 45&nbsp;s after appending "## Agent update / version 2 ..." on disk and one hide/show cycle: editor still says "version 1". Note the composer's "Uncommitted &middot; 2 files" pill did update &mdash; the realtime event arrived, the Docs editor just ignores it.</figcaption></figure>
+      </div></li>
+    <li><strong>"New thread" view project preview: never refreshes (not in the issue).</strong> Go to <code>/</code>, pick project "qa", open the right panel, <code>&#8984;P</code> search "status" and open <code>status.txt</code>. Cache entry: <code>["projectFilePreview","proj_sy4khgnq6z",null,"host_fqcic7dtdr","status.txt"] staleTime 2000 refetchOnWindowFocus false</code>.
+<pre>$ echo "version 5 written at $(date +%T)" &gt; /tmp/bb-2130-repo/status.txt   # 08:30:53
+$ sleep 20; hide-then-show.js; read-preview-text.js -&gt; "1version 4 written at 08:23:19"  (08:31:23)
+expected: version 5   actual: version 4, even after a visibility cycle</pre>
+      <div class="grid2">
+      <figure><img src="assets/2130-root-project-before.png" alt="root compose preview before"><figcaption>Fig 7 &mdash; New-thread view, project "qa", <code>status.txt</code> showing version 4.</figcaption></figure>
+      <figure><img src="assets/2130-root-project-after.png" alt="root compose preview after"><figcaption>Fig 8 &mdash; 30&nbsp;s after writing version 5 plus a hide/show cycle: still version 4.</figcaption></figure>
+      </div></li>
+  </ol>
+
+  <h3>Unit-level repros</h3>
+  <p>Two vitest files; four assertions fail on <code>fcada5a3b</code> (one control passes, proving the focus simulation works). Saved under <code>2130/repro/</code> with a <code>README</code>.</p>
+  <p><code>apps/app/src/hooks/queries/issue-2130-stale-file-preview.repro.test.tsx</code> &mdash; run with <code>cd apps/app &amp;&amp; pnpm exec vitest run src/hooks/queries/issue-2130-stale-file-preview.repro.test.tsx</code>:</p>
+  <pre>// @vitest-environment jsdom
+//
+// Repro for get-bb/bb#2130: built-in file previews that have no refresh owner.
+//
+// Each test mounts one of the preview hooks against a mocked SDK, lets it load
+// "version 1", then changes what the SDK would return ("version 2") to stand in
+// for an outside write to the file. It then exercises every refresh trigger the
+// app wires for that hook and asserts the hook refetched. On main the
+// assertions marked FAILS ON MAIN fail, which is the bug.
+
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import { focusManager } from "@tanstack/react-query";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createQueryClientTestHarness } from "@/test/queryClientTestHarness";
+import { useHostFilePreview } from "./host-file-preview-query";
+import { useProjectFilePreview } from "./project-queries";
+
+const filesSdk = vi.hoisted(() =&gt; ({
+  createPreview: vi.fn(),
+  read: vi.fn(),
+}));
+const projectsSdk = vi.hoisted(() =&gt; ({
+  fileContent: vi.fn(),
+}));
+
+vi.mock("@/lib/sdk", () =&gt; ({
+  sdk: { files: filesSdk, projects: projectsSdk },
+}));
+vi.mock("@/hooks/useRealtimeSubscription", () =&gt; ({
+  useProjectDetailRealtimeSubscription: () =&gt; undefined,
+  useThreadDetailRealtimeSubscription: () =&gt; undefined,
+}));
+vi.mock("@/lib/api", () =&gt; ({
+  getThreadHostFilePreview: vi.fn(),
+}));
+
+function textRead(content: string) {
+  return {
+    path: "/tmp/queue.txt",
+    content,
+    contentEncoding: "utf8" as const,
+    mimeType: "text/plain",
+    modifiedAtMs: 1,
+    sha256: content,
+    sizeBytes: content.length,
+  };
+}
+
+/** Simulate the browser tab being hidden and shown again (the only "focus"
+ *  signal the app feeds React Query; see apps/app/src/lib/query-client.ts). */
+function hideAndShowWindow() {
+  act(() =&gt; {
+    focusManager.setFocused(false);
+    focusManager.setFocused(true);
+  });
+  act(() =&gt; {
+    focusManager.setFocused(undefined);
+  });
+}
+
+afterEach(() =&gt; {
+  cleanup();
+  vi.clearAllMocks();
+  vi.useRealTimers();
+});
+
+describe("issue #2130 · host-scoped preview (useHostFilePreview)", () =&gt; {
+  it("refetches after the file changes on disk and the window regains focus within 30s", async () =&gt; {
+    filesSdk.createPreview.mockResolvedValue(null);
+    filesSdk.read.mockResolvedValue(textRead("version 1\n"));
+    const { wrapper } = createQueryClientTestHarness();
+    const { result } = renderHook(
+      () =&gt; useHostFilePreview("host-1", "/tmp/queue.txt"),
+      { wrapper },
+    );
+    await waitFor(() =&gt; expect(result.current.isSuccess).toBe(true));
+    expect(filesSdk.read).toHaveBeenCalledTimes(1);
+
+    // Outside write.
+    filesSdk.read.mockResolvedValue(textRead("version 2\n"));
+
+    // Trigger 1: nothing in the app invalidates hostFilePreviewQueryKey, so
+    // there is no realtime path to exercise. Trigger 2: focus. The hook sets
+    // staleTime: 30_000, so a focus within 30s is ignored.
+    hideAndShowWindow();
+    await act(() =&gt; new Promise((resolve) =&gt; setTimeout(resolve, 50)));
+
+    // FAILS ON MAIN: still one read, view still shows version 1.
+    expect(filesSdk.read).toHaveBeenCalledTimes(2);
+    await waitFor(() =&gt;
+      expect(
+        result.current.data?.kind === "text" ? result.current.data.content : "",
+      ).toBe("version 2\n"),
+    );
+  });
+});
+
+describe("issue #2130 · project preview on the new-thread view (useProjectFilePreview)", () =&gt; {
+  it("refetches after the file changes on disk and the window regains focus", async () =&gt; {
+    projectsSdk.fileContent.mockResolvedValue({
+      content: "version 1\n",
+      contentEncoding: "utf8",
+      mimeType: "text/plain",
+    });
+    const { wrapper } = createQueryClientTestHarness();
+    const { result } = renderHook(
+      () =&gt;
+        useProjectFilePreview("proj_1", "status.txt", {
+          environmentId: null,
+          hostId: "host-1",
+        }),
+      { wrapper },
+    );
+    await waitFor(() =&gt; expect(result.current.isSuccess).toBe(true));
+    expect(projectsSdk.fileContent).toHaveBeenCalledTimes(1);
+
+    projectsSdk.fileContent.mockResolvedValue({
+      content: "version 2\n",
+      contentEncoding: "utf8",
+      mimeType: "text/plain",
+    });
+
+    // Wait past the 2s default staleTime, then a focus cycle. The hook uses
+    // EXPENSIVE_MANUAL_QUERY_POLICY (refetchOnWindowFocus: false) and no
+    // realtime dirty function names projectFilePreviewQueryKey.
+    await act(() =&gt; new Promise((resolve) =&gt; setTimeout(resolve, 2_100)));
+    hideAndShowWindow();
+    await act(() =&gt; new Promise((resolve) =&gt; setTimeout(resolve, 50)));
+
+    // FAILS ON MAIN: still one fetch; the panel keeps version 1 forever.
+    expect(projectsSdk.fileContent).toHaveBeenCalledTimes(2);
+  }, 10_000);
+});
+
+// Control: the thread-scoped host preview (RESUME_REFETCH_QUERY_POLICY) does
+// refetch on a focus cycle once its 2s staleTime has elapsed. This passes on
+// main and proves the focus simulation above is real; it also documents that
+// this surface only recovers on focus, never while the user watches it.
+describe("issue #2130 · control: thread host preview refetches on focus only", () =&gt; {
+  it("refetches on a focus cycle after staleTime, but never without one", async () =&gt; {
+    const api = await import("@/lib/api");
+    const { useThreadHostFilePreview } = await import("./thread-queries");
+    const read = vi.mocked(api.getThreadHostFilePreview);
+    const preview = (content: string) =&gt; ({
+      kind: "text" as const,
+      content,
+      mimeType: "text/plain",
+      name: "outside.txt",
+      path: "/tmp/outside.txt",
+      url: "/tmp/outside.txt",
+    });
+    read.mockResolvedValue(preview("version 1\n"));
+    const { wrapper } = createQueryClientTestHarness();
+    const { result } = renderHook(
+      () =&gt; useThreadHostFilePreview("thr_1", "env_1", "/tmp/outside.txt"),
+      { wrapper },
+    );
+    await waitFor(() =&gt; expect(result.current.isSuccess).toBe(true));
+    expect(read).toHaveBeenCalledTimes(1);
+
+    read.mockResolvedValue(preview("version 2\n"));
+    await act(() =&gt; new Promise((resolve) =&gt; setTimeout(resolve, 2_100)));
+    // No trigger yet: the view keeps version 1 no matter how long we wait.
+    expect(read).toHaveBeenCalledTimes(1);
+
+    hideAndShowWindow();
+    await waitFor(() =&gt; expect(read).toHaveBeenCalledTimes(2));
+  }, 10_000);
+});
+</pre>
+  <details><summary>vitest output (app)</summary><pre>RUN  v4.1.1 /Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_21e66a79-f02-5/apps/app
+
+ ❯ src/hooks/queries/issue-2130-stale-file-preview.repro.test.tsx (3 tests | 2 failed) 4865ms
+     × refetches after the file changes on disk and the window regains focus within 30s 122ms
+     × refetches after the file changes on disk and the window regains focus 2216ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/hooks/queries/issue-2130-stale-file-preview.repro.test.tsx &gt; issue #2130 · host-scoped preview (useHostFilePreview) &gt; refetches after the file changes on disk and the window regains focus within 30s
+AssertionError: expected "vi.fn()" to be called 2 times, but got 1 times
+ ❯ src/hooks/queries/issue-2130-stale-file-preview.repro.test.tsx:89:27
+     87|
+     88|     // FAILS ON MAIN: still one read, view still shows version 1.
+     89|     expect(filesSdk.read).toHaveBeenCalledTimes(2);
+       |                           ^
+     90|     await waitFor(() =&gt;
+     91|       expect(
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  src/hooks/queries/issue-2130-stale-file-preview.repro.test.tsx &gt; issue #2130 · project preview on the new-thread view (useProjectFilePreview) &gt; refetches after the file changes on disk and the window regains focus
+AssertionError: expected "vi.fn()" to be called 2 times, but got 1 times
+ ❯ src/hooks/queries/issue-2130-stale-file-preview.repro.test.tsx:131:37
+    129|
+    130|     // FAILS ON MAIN: still one fetch; the panel keeps version 1 forev…
+    131|     expect(projectsSdk.fileContent).toHaveBeenCalledTimes(2);
+       |                                     ^
+    132|   }, 10_000);
+    133| });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  2 failed | 1 passed (3)
+   Start at  08:27:18
+   Duration  9.54s (transform 1.15s, setup 1.31s, import 1.32s, tests 4.86s, environment 1.88s)</pre></details>
+  <p><code>plugins/docs/issue-2130-file-opener-stale.repro.test.tsx</code> &mdash; run with <code>cd plugins/docs &amp;&amp; pnpm exec vitest run issue-2130-file-opener-stale.repro.test.tsx</code>:</p>
+  <pre>// @vitest-environment jsdom
+//
+// Repro for get-bb/bb#2130, surface 4: the Docs plugin's markdown file opener
+// loads a file once and never re-reads it. Also covers the "Related" note in
+// the issue: a conflicting save on unmount is silently dropped.
+
+import { act, cleanup, fireEvent, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
+
+const app = await loadPluginApp(() =&gt; import("./app"));
+
+beforeEach(() =&gt; {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    value: vi.fn((query: string) =&gt; ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })),
+  });
+});
+
+afterEach(() =&gt; {
+  cleanup();
+  vi.unstubAllGlobals();
+});
+
+const preview = {
+  baseUrl: "/api/v1/file-previews/lease",
+  expiresAtMs: Date.now() + 60_000,
+};
+
+const source = {
+  kind: "workspace" as const,
+  threadId: "thr_1",
+  environmentId: "env_1",
+  projectId: "project_1",
+};
+
+describe("issue #2130 · Docs file opener", () =&gt; {
+  it("re-reads or flags a file that changed on disk while the reader never typed", async () =&gt; {
+    // What the file on disk currently holds. The test mutates it to stand in
+    // for an agent/terminal writing the file while the tab is open.
+    let disk = { content: "# Plan\n\nversion 1", sha256: "sha-1" };
+    const slot = renderSlot(
+      app.fileOpeners[0]!,
+      {
+        path: "PLAN.md",
+        source,
+        experimental_Original: () =&gt; null,
+      },
+      {
+        rpc: {
+          openFile: () =&gt; ({ file: disk, preview, previewPath: "PLAN.md" }),
+          saveOpenedFile: () =&gt; ({ outcome: "written", sha256: "unused" }),
+        },
+      },
+    );
+    await slot.findByText("version 1");
+    expect(
+      slot.rpcCalls.filter((call) =&gt; call.method === "openFile"),
+    ).toHaveLength(1);
+
+    // Outside write.
+    disk = { content: "# Plan\n\nversion 2", sha256: "sha-2" };
+
+    // Give the component every chance: time passes, the window is hidden and
+    // shown again. There is no poll, watcher, subscription, or focus handler
+    // in DocsFileOpener, so nothing happens.
+    await act(() =&gt; new Promise((resolve) =&gt; setTimeout(resolve, 1_500)));
+    await act(async () =&gt; {
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        value: "hidden",
+      });
+      document.dispatchEvent(new Event("visibilitychange"));
+      window.dispatchEvent(new Event("blur"));
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        value: "visible",
+      });
+      document.dispatchEvent(new Event("visibilitychange"));
+      window.dispatchEvent(new Event("focus"));
+    });
+    await act(() =&gt; new Promise((resolve) =&gt; setTimeout(resolve, 200)));
+
+    // FAILS ON MAIN: one openFile call, no banner, editor still says version 1.
+    const reRead =
+      slot.rpcCalls.filter((call) =&gt; call.method === "openFile").length &gt; 1;
+    const banner = slot.queryByText("Changed on disk.") !== null;
+    expect(
+      reRead || banner,
+      `expected a re-read or a "Changed on disk." banner; got rpcCalls=${JSON.stringify(
+        slot.rpcCalls.map((call) =&gt; call.method),
+      )}, banner=${banner}, editor="${slot.container.textContent}"`,
+    ).toBe(true);
+  });
+
+  it("does not silently drop an edit whose unmount save conflicts with a newer file on disk", async () =&gt; {
+    const slot = renderSlot(
+      app.fileOpeners[0]!,
+      {
+        path: "PLAN.md",
+        source,
+        experimental_Original: () =&gt; null,
+      },
+      {
+        rpc: {
+          openFile: () =&gt; ({
+            file: { content: "# Plan", sha256: "sha-1" },
+            preview,
+            previewPath: "PLAN.md",
+          }),
+          // The file changed on disk after it was opened, so the optimistic
+          // save (expectedSha256: sha-1) is rejected.
+          saveOpenedFile: () =&gt; ({ outcome: "conflict", sha256: "sha-2" }),
+        },
+      },
+    );
+    const body = await slot.findByText("Plan");
+    body.textContent = "Plan with an edit";
+    fireEvent.input(body);
+    // Let ProseMirror's DOM observer deliver the edit to the editor (well
+    // inside the 700ms autosave debounce), then close the tab.
+    await act(() =&gt; new Promise((resolve) =&gt; setTimeout(resolve, 150)));
+    expect(slot.rpcCalls.map((call) =&gt; call.method)).toEqual(["openFile"]);
+    slot.unmount();
+    await waitFor(() =&gt;
+      expect(slot.rpcCalls.map((call) =&gt; call.method)).toEqual([
+        "openFile",
+        "saveOpenedFile",
+      ]),
+    );
+    const save = slot.rpcCalls.find((call) =&gt; call.method === "saveOpenedFile")!;
+    expect(save.input).toMatchObject({
+      content: "# Plan with an edit",
+      expectedSha256: "sha-1",
+    });
+
+    // FAILS ON MAIN: the conflict resolves into setConflict() on an unmounted
+    // component. Nothing retries, nothing is persisted, nothing is reported:
+    // there is no follow-up rpc call and no observable signal of any kind.
+    await act(() =&gt; new Promise((resolve) =&gt; setTimeout(resolve, 100)));
+    expect(
+      slot.rpcCalls.length,
+      `expected a retry/forced save or some report after the conflict; rpc log=${JSON.stringify(
+        slot.rpcCalls.map((call) =&gt; call.method),
+      )}`,
+    ).toBeGreaterThan(2);
+  });
+});
+</pre>
+  <details><summary>vitest output (docs)</summary><pre>RUN  v4.1.1 /Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_21e66a79-f02-5/plugins/docs
+
+ ❯  bb-plugin-simple-notes  issue-2130-file-opener-stale.repro.test.tsx (2 tests | 2 failed) 2045ms
+     × re-reads or flags a file that changed on disk while the reader never typed 1775ms
+     × does not silently drop an edit whose unmount save conflicts with a newer file on disk 269ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL   bb-plugin-simple-notes  issue-2130-file-opener-stale.repro.test.tsx &gt; issue #2130 · Docs file opener &gt; re-reads or flags a file that changed on disk while the reader never typed
+AssertionError: expected a re-read or a "Changed on disk." banner; got rpcCalls=["openFile"], banner=false, editor="PLAN.mdPlanversion 1": expected false to be true // Object.is equality
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ issue-2130-file-opener-stale.repro.test.tsx:102:7
+    100|         slot.rpcCalls.map((call) =&gt; call.method),
+    101|       )}, banner=${banner}, editor="${slot.container.textContent}"`,
+    102|     ).toBe(true);
+       |       ^
+    103|   });
+    104|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL   bb-plugin-simple-notes  issue-2130-file-opener-stale.repro.test.tsx &gt; issue #2130 · Docs file opener &gt; does not silently drop an edit whose unmount save conflicts with a newer file on disk
+AssertionError: expected a retry/forced save or some report after the conflict; rpc log=["openFile","saveOpenedFile"]: expected 2 to be greater than 2
+ ❯ issue-2130-file-opener-stale.repro.test.tsx:155:7
+    153|         slot.rpcCalls.map((call) =&gt; call.method),
+    154|       )}`,
+    155|     ).toBeGreaterThan(2);
+       |       ^
+    156|   });
+    157| });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  2 failed (2)
+   Start at  08:28:37
+   Duration  3.65s (transform 108ms, setup 0ms, import 1.02s, tests 2.04s, environment 514ms)</pre></details>
+
+  <h2>5. Root cause</h2>
+  <p><strong>There is no single "file view"; there are five React Query hooks plus one plugin component, and only two of them have a refresh owner.</strong> The tab kind is chosen by where the path lives and which view opened it (thread view: <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/app/src/views/thread-detail/ThreadDetailView.tsx#L2652-L2735"><code>apps/app/src/views/thread-detail/ThreadDetailView.tsx:2652-2735</code></a>; New-thread view: <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/app/src/views/RootComposePanelTabContent.tsx#L420-L500"><code>apps/app/src/views/RootComposePanelTabContent.tsx:420-500</code></a>; plugin pages: <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/app/src/components/plugin/PluginPanelRightPanelHost.tsx#L710-L737"><code>apps/app/src/components/plugin/PluginPanelRightPanelHost.tsx:710-737</code></a>).</p>
+  <table>
+    <tr><th>Tab / hook</th><th>Query key</th><th>Policy</th><th>Realtime invalidation</th><th>Observed</th></tr>
+    <tr><td>thread &rarr; workspace path<br><code>useEnvironmentFilePreview</code></td><td><code>environmentFilePreview</code></td><td>EXPENSIVE_MANUAL (no focus)</td><td><code>work-status-changed</code> &rarr; <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/app/src/hooks/cache-owners/realtime-cache-registry.ts#L1112-L1114"><code>invalidate:1112-1114</code></a>; event emitted by the daemon watcher on any content change</td><td class="ok">live (&le;3 s)</td></tr>
+    <tr><td>thread &rarr; thread-storage path<br><code>useThreadStorageFilePreview</code></td><td><code>threadStorageFilePreview</code></td><td>REALTIME_OWNED_MOUNT_BASELINE</td><td><code>thread-storage-changed</code> / <code>environment-changed</code></td><td class="ok">live (&le;5 s)</td></tr>
+    <tr><td>thread &rarr; absolute path outside workspace<br><code>useThreadHostFilePreview</code></td><td><code>threadHostFilePreview</code></td><td>RESUME_REFETCH (focus + reconnect, 2 s stale)</td><td>none &mdash; the daemon watches only the workspace root and the thread-storage root</td><td class="no">stale until <code>visibilitychange</code></td></tr>
+    <tr><td>New-thread view &rarr; project file<br><code>useProjectFilePreview</code></td><td><code>projectFilePreview</code></td><td>EXPENSIVE_MANUAL (no focus)</td><td>none (key not referenced by any dirty function)</td><td class="no">stale forever</td></tr>
+    <tr><td>plugin page &rarr; host target<br><code>useHostFilePreview</code></td><td><code>hostFilePreview</code></td><td>default focus + <code>staleTime 30_000</code></td><td>none</td><td class="no">stale; focus only after 30 s (unit test)</td></tr>
+    <tr><td>any view &rarr; <code>.md/.mdx/.markdown</code> with Docs installed<br><code>DocsFileOpener</code></td><td>n/a (component state)</td><td>one <code>openFile</code> RPC per <code>[filePath, openerSource, reloadNonce]</code></td><td>none; plugin RPC is request/response</td><td class="no">stale forever, no banner, no Refresh</td></tr>
+  </table>
+  <p><strong>Why the live path works:</strong> the daemon's <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/host-daemon/src/watch-manager.ts#L316-L333"><code>WatchManager.queueWorkspaceWatchChange:316-333</code></a> forwards every <code>workspace-content-changed</code> event as <code>work-status-changed</code> ("The filesystem event itself is sufficient evidence that live content is stale"), the server relays it via <code>hub.notifyEnvironment</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/internal/environment-changes.ts#L36-L50"><code>apps/server/src/internal/environment-changes.ts:36-50</code></a>), and the app's registry invalidates <code>environmentFilePreviewQueryKeyPrefix(environmentId)</code>. That was built deliberately in #620 (<code>71de847f6</code>, "Fix file preview refresh") and hardened in #1299 (<code>53ff24930</code>). The issue's surfaces 2 and 3 describe policies that are real but irrelevant, because a realtime-owned query does not need focus refetch.</p>
+  <p><strong>Why the others do not:</strong> the watcher is scoped to the environment's workspace root and the thread-storage root; there is no watch for arbitrary host paths, so <code>threadHostFilePreview</code>/<code>hostFilePreview</code> can only rely on focus, and the app deliberately maps "focus" to <code>visibilitychange</code>/<code>pageshow</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/app/src/lib/query-client.ts#L34-L47"><code>apps/app/src/lib/query-client.ts:34-47</code></a>). <code>projectFilePreview</code> is the odd one out: its backing data <em>is</em> a workspace (the project's default source path, often the same directory as a thread's environment), but the key carries a <code>projectId</code>, not an <code>environmentId</code>, so the environment-scoped invalidation cannot reach it, and it opted out of focus refetch as well.</p>
+  <p><strong>Docs opener:</strong> <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/docs/app.tsx#L1112-L1136"><code>plugins/docs/app.tsx:1112-1136</code></a> fetches in an effect keyed on <code>[filePath, openerSource, reloadNonce, rpc]</code> and stores the result in <code>useState</code>. The only writer of <code>reloadNonce</code> is the Reload button inside <code>{conflict ? ... : null}</code>, and the only writer of <code>conflict</code> is a <code>saveOpenedFile</code> response of <code>outcome: "conflict"</code>. A reader who never edits never saves, so never learns the file moved. Because <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/docs/app.tsx#L2205-L2210"><code>app.slots.fileOpener:2205-2210</code></a> claims the three markdown extensions, installing the (official, on-demand) Docs plugin downgrades every markdown file view from the live native preview to this component. The unmount cleanup (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/docs/app.tsx#L1178-L1183"><code>plugins/docs/app.tsx:1178-1183</code></a>) runs a non-forced <code>save()</code>; a conflict there reaches <code>setConflict(true)</code> on an unmounted component and is dropped.</p>
+  <p><strong>Deeper issue:</strong> the plugin SDK's file-opener contract has no way for the host to tell an opener "your file changed" (no push channel, no <code>experimental_useLiveFile</code> hook), and the built-in previews have no shared "refresh owner" abstraction &mdash; each hook picks a policy by hand, which is how two sibling hooks for the same on-disk directory ended up with opposite behaviour.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <ol>
+    <li><strong>Make <code>projectFilePreview</code> realtime-owned.</strong> In <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/app/src/hooks/queries/project-queries.ts#L197-L256"><code>apps/app/src/hooks/queries/project-queries.ts:197-256</code></a> resolve the project's default environment(s) and either key the preview by environment when one exists or add a dirty function in the realtime registry that maps <code>work-status-changed</code> for an environment to <code>projectFilePreviewQueryKeyPrefix(projectId)</code> (the registry already has <code>getCachedThreadIdsForEnvironment</code>-style helpers). At minimum switch it to <code>RESUME_REFETCH_QUERY_POLICY</code>. Risk: none beyond extra refetches of a heavy payload; it already has <code>HEAVY_PAYLOAD_QUERY_POLICY</code>.</li>
+    <li><strong>Give host-path previews a watcher.</strong> The daemon already exposes policy-free <code>watchPathRoot</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/packages/host-watcher/src/host-watcher-types.ts#L99-L118"><code>packages/host-watcher/src/host-watcher-types.ts:99-118</code></a>). Add a host RPC "watch these absolute paths for this thread/session" whose change event the server relays as a new environment/thread change kind (e.g. <code>host-file-changed</code> with <code>hostId</code>+<code>path</code>), and a dirty function that invalidates <code>threadHostFilePreviewQueryKey</code>/<code>hostFilePreviewQueryKey</code> for that path. This changes wire shapes, so bump <code>HOST_DAEMON_PROTOCOL_VERSION</code>. Until then, the cheap mitigation is <code>staleTime</code> 0&ndash;2 s and <code>refetchOnWindowFocus: true</code> on <code>useHostFilePreview</code> (one-line change at <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/app/src/hooks/queries/host-file-preview-query.ts#L141-L142"><code>apps/app/src/hooks/queries/host-file-preview-query.ts:141-142</code></a>), and listening to <code>window.focus</code> in addition to <code>visibilitychange</code> in <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/app/src/lib/query-client.ts#L34-L47"><code>apps/app/src/lib/query-client.ts:34-47</code></a> so a macOS app switch counts (the comment block there explains why resume catch-up was trimmed; a focus-triggered refetch of <em>stale</em> queries only is much cheaper than the removed invalidation wave, but verify on iOS Safari).</li>
+    <li><strong>Plugin file openers need a change signal.</strong> Two options that do not require plugin host entrypoints: (a) the app host already receives <code>work-status-changed</code> for the opener's environment &mdash; expose it as <code>experimental_useFileChangeSignal(source, path)</code> (or pass a <code>changeToken</code> prop through <code>PluginFileOpenerProps</code>) that bumps when the owning environment/thread-storage query would be invalidated; (b) let the opener pull: add <code>modifiedAtMs</code>/<code>sha256</code> to the <code>openFile</code> result (already returns <code>sha256</code>) and have <code>DocsFileOpener</code> re-check on the signal, showing the existing "Changed on disk." banner when the editor is dirty and reloading silently when it is not. Either way the Docs opener should also render a Refresh control like the native preview. Risk: reloading replaces <code>TiptapEditor</code> (keyed on <code>initialValue</code>), which drops cursor position; only reload when <code>markdownRef.current === savedRef.current</code>.</li>
+    <li><strong>Unmount save:</strong> on conflict during the cleanup save, either force-write to a sidecar / keep the content in a module-level "unsaved edits" map keyed by path and re-offer it on next open, or at least surface a toast via the SDK. Do not force-overwrite silently.</li>
+  </ol>
+
+  <h2>7. PR review</h2>
+  <p>No open pull requests are linked to this issue.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/615">#615</a> "Add refresh file functionality" (closed) &mdash; same symptom for the native markdown preview; fixed by #620 (<code>71de847f6</code>), which is why workspace previews are live today.</li>
+    <li><a href="https://github.com/get-bb/bb/pull/1299">#1299</a> "Fix stale file previews during slow workspace scans" &mdash; made the watcher emit <code>work-status-changed</code> before Git fingerprinting.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/2102">#2102</a> "A fileOpener cannot open another file or retitle its tab" &mdash; another gap in the file-opener plugin contract.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1773">#1773</a> "Docs file opener fails tab sync because fileOpenerOwner is rejected" (closed) &mdash; history of the Docs opener tab plumbing.</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Commands run</h3>
+  <pre>pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build
+scripts/bb-dev-app current                                  # App :15170, Server :23170, Host daemon :31170
+pnpm bb:dev machine list                                    # host_fqcic7dtdr
+curl -s -X POST http://localhost:23170/api/v1/projects ...  # proj_sy4khgnq6z
+pnpm bb:dev thread spawn --project proj_sy4khgnq6z --environment /tmp/bb-2130-repo --provider codex \
+   --permission-mode accept-edits --title "2130 repro" --prompt "Reply only with ok." --json   # thr_qdnvnfqkvh
+pnpm bb:dev thread wait thr_qdnvnfqkvh
+pnpm bb:dev thread open thr_qdnvnfqkvh status.txt --json
+pnpm bb:dev thread open thr_qdnvnfqkvh /tmp/bb-2130-outside/outside.txt   # Error: Absolute path must be inside the target thread workspace.
+pnpm bb:dev thread tabs show/set thr_qdnvnfqkvh ...        # added host-file-preview and thread-storage-file-preview tabs
+pnpm bb:dev plugin install builtin:docs --yes              # simple-notes@0.2.2 running
+pnpm bb:dev thread open thr_qdnvnfqkvh NOTES.md --json     # -&gt; plugin-panel tab owned by simple-notes
+doobie --headless -b bb2130 run 2130/repro/browser/&lt;script&gt;.js   # see README
+cd apps/app &amp;&amp; pnpm exec vitest run src/hooks/queries/issue-2130-stale-file-preview.repro.test.tsx
+cd plugins/docs &amp;&amp; pnpm exec vitest run issue-2130-file-opener-stale.repro.test.tsx
+git fetch origin main &amp;&amp; git log --oneline fcada5a3b..origin/main   # 15f21ade7 (#2147), 2ad4bfaae (#2150) only</pre>
+  <h3>Evidence files</h3>
+  <ul>
+    <li><code>logs/thread-preview-queries.json</code> &mdash; React Query cache dump from the thread view.</li>
+    <li><code>logs/vitest-app-previews.txt</code>, <code>logs/vitest-docs-opener.txt</code> &mdash; raw test output.</li>
+    <li><code>logs/project-create.json</code>, <code>logs/thread-spawn.json</code>.</li>
+    <li><code>repro/browser/</code> &mdash; doobie scripts.</li>
+  </ul>
+  <h3>Things ruled out</h3>
+  <ul>
+    <li>The watcher missing gitignored directories: a directory added to <code>.gitignore</code> after the watcher started still refreshed (ignore list is computed once at watch start via <code>git status --ignored=matching</code>; a directory ignored <em>before</em> start would be skipped &mdash; not tested, noted as a caveat).</li>
+    <li>Headless artefacts: the first run in the shared doobie profile showed the host-path preview "refreshing" &mdash; traced to another page being brought to front (<code>document.visibilityState</code> flipped to hidden/visible). All results above come from the isolated <code>-b bb2130</code> profile.</li>
+  </ul>
+</main></body></html>

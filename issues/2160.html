@@ -1,0 +1,803 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2160 Pi keeps using previous model after model picker change until /compact</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:6px; }
+  details summary { cursor:pointer; color:var(--accent); }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2160 · Pi keeps using previous model after model picker change until /compact</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill high">Priority: High</span> <span class="pill">Effort: unset</span> <span class="pill">providers</span> <span class="pill">provider-pi</span>
+    <a href="https://github.com/get-bb/bb/issues/2160">open on GitHub</a>
+    <span>2026-08-21 · base <code>fcada5a3b</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict no">REPRODUCED</span> (live against the real Pi SDK, twice, plus a unit test that fails on base; independently verified) · <strong>Root-cause confidence:</strong> high</p>
+  <p>One sub-claim is refuted: <code>/compact</code> is <em>not</em> what resynchronises the model. Only a provider-session rebuild (<code>thread/resume</code>: after <code>bb thread stop</code>, a daemon restart, bridge recovery, or the idle-session reaper) does.</p>
+
+  <h2>1. TL;DR</h2>
+  <p>In a Pi thread, picking a different model in bb's composer changes what bb <em>records</em> (every <code>client/turn/requested</code> event carries the new model) but not what Pi <em>uses</em>: every later turn, and any manual compaction, is still sent to the model the Pi session was constructed with. The user sees "Grok 4.6" in the picker while Pi keeps billing gpt-5-mini (or, in the reporter's case, keeps billing Grok after they picked GPT).</p>
+  <p>The cause is a missing piece in the Pi provider bridge. Since the provider-bridge-protocol migration (<code>c5b53caab</code>, #1640, 2026-08-17) the runtime no longer diffs execution options: it sends them on every <code>turn/start</code> and expects each bridge to reconcile them itself (the Codex and Claude bridges do). The Pi bridge reads <code>options.model</code> and <code>options.reasoningLevel</code> only when it constructs a session (<code>thread/start</code>/<code>resume</code>/<code>fork</code>); its <code>handleTurnStart</code> ignores <code>params.options</code> entirely, so <code>AgentSession.setModel</code> is never called and the session is never rebuilt. Before #1640 the legacy Pi adapter classified a model change as a "session" change, which made the runtime send <code>thread/resume</code> and rebuild the Pi session with the new model; that path was deleted and nothing replaced it.</p>
+  <p>The reporter's observation that <code>/compact</code> fixed it is a coincidence: compaction is just another <code>turn/start</code> through the same handler, and I reproduced a real compaction followed by another stale-model turn. What does fix it is anything that rebuilds the Pi session; I demonstrated this with <code>bb thread stop</code> followed by a new turn.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Changing the model in bb's picker does not change the model Pi uses for new turns.</td><td class="ok">Verified</td><td>Live, three independent runs (author x2, verifier x1): thread started on <code>github-copilot/gpt-5-mini</code>, every later turn requested with <code>github-copilot/grok-4.6</code> (five in the revised run); Pi's session file records <code>github-copilot/gpt-5-mini</code> on every assistant message until the session is rebuilt (section 4a). Unit test fails on base (section 4b).</td></tr>
+    <tr><td>bb's <code>client/turn/requested</code> events record the newly selected model.</td><td class="ok">Verified</td><td><code>bb-turn-models.txt</code> (revised run, <code>thr_ahgjgq8fc9</code>): seq 16, 25, 34, 41, 50 all carry <code>model=github-copilot/grok-4.6</code>; only seq 1 (the spawn) carries <code>gpt-5-mini</code>. Original run (<code>thread-events-final.json</code>): seq 12, 21, 28, 37, 44.</td></tr>
+    <tr><td>The Pi session has only the initial <code>model_change</code> entry.</td><td class="ok">Verified</td><td>Session file has exactly one <code>model_change</code> (the construction one). Note: even a successful resume with a new model does not append a <code>model_change</code> (the SDK appends it only for brand-new sessions), so the per-message <code>provider</code>/<code>model</code> fields are the reliable evidence, not <code>model_change</code> entries.</td></tr>
+    <tr><td>Manual compaction is the synchronisation boundary; after <code>/compact</code> Pi used the selected model.</td><td class="no">Refuted</td><td>Performed a real compaction (<code>tokensBefore=30011</code> in the original run, <code>47429</code> in the revised run, summary written both times) and sent another turn with grok-4.6 selected: Pi still answered with <code>gpt-5-mini</code> both times (and a third time for the independent verifier, <code>tokensBefore=33854</code>). No code path rebuilds or re-models the session on compaction (section 5). What resynchronised the reporter's thread was almost certainly a session rebuild (<code>thread/resume</code>) that happened around the same time: daemon restart (they run nightlies with auto-update), bridge recovery, or the idle reaper. I demonstrated that <code>bb thread stop</code> + a new turn does switch the model (revised run: seq 51 <code>thread/identity</code>, then a <code>grok-4.6</code> assistant message; original run: seq 60).</td></tr>
+    <tr><td>The compaction itself used the stale model and may consume unintended quota.</td><td class="ok">Verified (code + pricing)</td><td><code>AgentSession.compact()</code> summarises with <code>this.model</code> (the stale one). The compaction entry records no model, but its usage cost (305 input tokens at $7.6e-05, i.e. $0.25/M) matches gpt-5-mini pricing, not grok-4.6.</td></tr>
+    <tr><td>This was real inference, not usage-dashboard polling.</td><td class="ok">Verified</td><td>Pi's assistant messages carry <code>usage.input</code> of 106 to 47583 tokens (84 to 29958 in the original run) with the stale model name; those are real requests.</td></tr>
+    <tr><td>Starting a new thread is the safest workaround.</td><td class="ok">Verified</td><td>A fresh thread constructs a new session with the picked model (<code>thr_chmuwwhpyh</code> on grok-4.6 answered as grok-4.6). A cheaper workaround that keeps history: <code>bb thread stop &lt;id&gt;</code> (release) and then send the next message; the resume rebuilds the session with the current model.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb monorepo at <code>fcada5a3b88302acb9944aa74b11db4ecaa215a0</code> (main, 2026-08-21; packaged version 0.39.0). Reporter was on <code>0.39.1-nightly.32358956903.1</code>; both contain the regressing commit <code>c5b53caab</code>. <code>origin/main</code> (2 commits ahead) does not touch <code>packages/agent-runtime/src/pi</code>.</li>
+    <li>macOS 26.5.2, node v22.23.1, bundled Pi SDK <code>@earendil-works/pi-coding-agent</code> 0.84.0 (same as the reporter's bundled Pi 0.84.0).</li>
+    <li>Pi model providers authenticated on this machine: anthropic, openai-codex, github-copilot. Anthropic and openai-codex OAuth refreshes failed during the run (token reuse on the shared <code>~/.pi/agent/auth.json</code>), so the live repro switches between two <strong>github-copilot</strong> models. The bug is model-level, not provider-level, so the cross-model switch exercises the same code path as the reporter's cross-provider switch.</li>
+    <li>Isolated dev instances from <code>scripts/bb-dev-app current</code>: original run App <code>:17835</code> / Server <code>:25835</code> / Host daemon <code>:33835</code>; revised run (the output shown in section 4a) App <code>:15047</code> / Server <code>:23047</code> / Host daemon <code>:31047</code>, data dir <code>~/.bb-dev/…wf_21e66a79-f02-13-8d26b48f1e80</code>; independent verifier <code>:16919</code>/<code>:24919</code>/<code>:32919</code>. All data dirs deleted at cleanup. None of the helper scripts hardcode a port: they read <code>BB_SERVER_URL</code> from <code>eval "$(scripts/bb-dev-app env)"</code>. The Pi bridge always writes session files to <code>~/.bb/pi-bridge-sessions/</code> regardless of data dir, because <code>BB_PI_BRIDGE_SESSION_DIR</code> is stripped with every other <code>BB_*</code> var from bridge children; my thread files were copied to the repro dir and then removed.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <h3>4a. Live (real Pi SDK, bb CLI)</h3>
+  <ol>
+    <li>From your bb worktree, start an isolated dev instance and load its env. Every helper script below reads <code>BB_SERVER_URL</code> / <code>BB_HOST_DAEMON_PORT</code> from this env, so run all steps from the same shell (or re-run the <code>eval</code> in each new one): <pre>scripts/bb-dev-app current            # prints App / Server / Host daemon URLs and the data dir
+eval "$(scripts/bb-dev-app env)"
+unset BB_THREAD_ID BB_ENVIRONMENT_ID BB_THREAD_STORAGE   # only needed if you run this from inside a bb thread</pre></li>
+    <li>Create a scratch repo and project: <pre>mkdir -p /tmp/bb-2160-qa &amp;&amp; git -C /tmp/bb-2160-qa init -q &amp;&amp; echo &quot;# qa&quot; &gt; /tmp/bb-2160-qa/README.md \
+  &amp;&amp; git -C /tmp/bb-2160-qa add -A &amp;&amp; git -C /tmp/bb-2160-qa -c user.email=qa@example.com -c user.name=qa commit -qm init
+curl -s -X POST $BB_SERVER_URL/api/v1/projects -H &#x27;content-type: application/json&#x27; \
+  -d &#x27;{&quot;name&quot;:&quot;qa&quot;,&quot;source&quot;:{&quot;type&quot;:&quot;local_path&quot;,&quot;path&quot;:&quot;/tmp/bb-2160-qa&quot;,&quot;hostId&quot;:&quot;&lt;host id from: pnpm bb:dev machine list&gt;&quot;}}&#x27;
+# -&gt; {&quot;id&quot;:&quot;proj_6uckkwts97&quot;, ...}      (your id will differ; use it in the next step)
+export BB_PROJECT_ID=proj_6uckkwts97</pre></li>
+    <li>Spawn a Pi thread on model A and wait for it to go idle (the paths below assume the report's <code>2160/repro/</code> directory; any two models you are authenticated for in Pi will do): <pre>pnpm bb:dev thread spawn --project $BB_PROJECT_ID --provider pi --model github-copilot/gpt-5-mini \
+  --reasoning-level low --title "2160 repro" --prompt "Reply only with ok." --json
+# -> "id": "thr_ahgjgq8fc9"
+2160/repro/wait-idle.sh thr_ahgjgq8fc9            # polls $BB_SERVER_URL until idle</pre>
+<pre>08:48:39 poll 2 status=starting
+08:48:43 poll 4 status=active
+08:48:46 poll 5 status=idle</pre></li>
+    <li>Send a new turn with model B selected (this is exactly what the composer's picker does): <pre>pnpm bb:dev thread tell thr_ahgjgq8fc9 --model github-copilot/grok-4.6 --mode auto "Reply only with ok."
+2160/repro/wait-idle.sh thr_ahgjgq8fc9</pre></li>
+    <li>Compare what bb recorded with what Pi used (the Pi bridge always writes its session files under <code>~/.bb/pi-bridge-sessions/</code>, even for a dev instance; see section 3): <pre>python3 2160/repro/bb-turn-models.py thr_ahgjgq8fc9                                # bb's event log, via $BB_SERVER_URL
+2160/repro/pi-assistant-models.sh ~/.bb/pi-bridge-sessions/thr_ahgjgq8fc9.jsonl   # Pi's session file</pre>
+<pre>expected (Pi session file): second assistant message is github-copilot/grok-4.6
+actual:
+2026-08-21T15:48:42.946Z	model_change	github-copilot/gpt-5-mini
+2026-08-21T15:48:42.961Z	user	&#x27;Reply only with ok.&#x27;
+2026-08-21T15:48:45.403Z	assistant	github-copilot/gpt-5-mini	in=5338 out=28
+2026-08-21T15:48:52.370Z	user	&#x27;Reply only with ok.&#x27;
+2026-08-21T15:48:55.173Z	assistant	github-copilot/gpt-5-mini	in=106 out=25   &lt;-- requested as grok-4.6, answered by gpt-5-mini
+
+bb event log for the same turns:
+1 client/turn/requested model=github-copilot/gpt-5-mini source=spawn
+2 client/thread/start
+7 thread/identity
+8 turn/started
+13 agentMessage &quot;ok&quot;
+15 turn/completed completed
+16 client/turn/requested model=github-copilot/grok-4.6 source=tell
+17 turn/started
+22 agentMessage &quot;ok&quot;
+24 turn/completed completed</pre></li>
+    <li>Test the "compaction syncs it" claim. A real compaction needs more than 20k tokens of history (Pi's default <code>keepRecentTokens</code>), so generate ~160 KB of filler, send it as one turn, then compact, then send another turn: <pre>2160/repro/make-filler.sh                                   # writes /tmp/bb-2160-qa/filler.txt (2000 lines, 164088 bytes)
+2160/repro/tell-file.sh thr_ahgjgq8fc9 github-copilot/grok-4.6 /tmp/bb-2160-qa/filler.txt
+2160/repro/wait-idle.sh thr_ahgjgq8fc9
+pnpm bb:dev thread compact thr_ahgjgq8fc9
+2160/repro/wait-idle.sh thr_ahgjgq8fc9
+pnpm bb:dev thread tell thr_ahgjgq8fc9 --model github-copilot/grok-4.6 --mode auto "Reply only with ok."
+2160/repro/wait-idle.sh thr_ahgjgq8fc9
+2160/repro/pi-assistant-models.sh ~/.bb/pi-bridge-sessions/thr_ahgjgq8fc9.jsonl</pre>
+<pre>expected: the turn after the compaction is github-copilot/grok-4.6
+actual:
+2026-08-21T15:49:07.158Z	user	&#x27;Do not reply to the text below, it is filler for a compactio&#x27;
+2026-08-21T15:49:11.889Z	assistant	github-copilot/gpt-5-mini	in=42138 out=43
+2026-08-21T15:49:23.740Z	compaction	tokensBefore=47429
+2026-08-21T15:49:26.610Z	user	&#x27;Reply only with ok.&#x27;
+2026-08-21T15:49:30.205Z	assistant	github-copilot/gpt-5-mini	in=47583 out=28   &lt;-- still gpt-5-mini after a real compaction (tokensBefore=47429, summary written)</pre>
+(The filler is one ~42k-token message, larger than <code>keepRecentTokens</code>, so Pi keeps it whole and the post-compaction <code>in=</code> does not drop. That is a property of Pi's compaction cut-point, not of this bug; the compaction itself is real: a <code>compaction</code> entry with a summary was appended to the session file, and bb emitted <code>thread/compacted</code> at seq 38.)</li>
+    <li>Show what <em>does</em> switch the model: release the runtime so the next turn resumes (rebuilds) the Pi session: <pre>pnpm bb:dev thread stop thr_ahgjgq8fc9
+pnpm bb:dev thread tell thr_ahgjgq8fc9 --model github-copilot/grok-4.6 --mode auto "Reply only with ok."
+2160/repro/wait-idle.sh thr_ahgjgq8fc9
+2160/repro/pi-assistant-models.sh ~/.bb/pi-bridge-sessions/thr_ahgjgq8fc9.jsonl | tail -2
+python3 2160/repro/bb-turn-models.py thr_ahgjgq8fc9 | tail -5</pre>
+<pre>2026-08-21T15:49:45.088Z	user	&#x27;Reply only with ok.&#x27;
+2026-08-21T15:49:49.444Z	assistant	github-copilot/grok-4.6	in=47794 out=12   &lt;-- first turn after the rebuild: grok-4.6
+
+bb event log: seq 51 thread/identity (= thread/resume, new Pi session) precedes the grok-4.6 turn
+50 client/turn/requested model=github-copilot/grok-4.6 source=tell
+51 thread/identity
+52 turn/started
+61 agentMessage &quot;ok&quot;
+63 turn/completed completed</pre>
+The stop/resume cycle took about 6 s here and about 9 s for the independent verifier. (In the original run the first resumed turn hung once for ~4 minutes and had to be interrupted; the retry worked. That one-off is not part of this bug and not reproducible; see the caveats in section 9.)</li>
+  </ol>
+  <figure><img src="assets/2160-thread-view.png" alt="bb thread view showing Grok 4.6 selected in the composer while the turns above were answered by gpt-5-mini"><figcaption>The bb thread after step 7 (original run, <code>thr_iyyz7w3cxf</code>). The composer shows <strong>Grok 4.6 · Low</strong> as the thread's model, and every "ok" above it was requested with that model; Pi's session file shows all but the last one were answered by gpt-5-mini.</figcaption></figure>
+  <figure><img src="assets/2160-model-picker.png" alt="bb model picker open on the Pi thread"><figcaption>The model picker (shift-cmd-M) on the same thread. Picking a model here only changes the <code>options.model</code> that rides the next <code>turn/start</code>; the Pi bridge never reads it.</figcaption></figure>
+
+  <h3>4b. Unit-level repro (fails on base, no network)</h3>
+  <p>File: <code>2160/repro/model-switch.repro.test.ts</code> (lives at <code>packages/agent-runtime/src/pi/bridge/__tests__/</code>). It drives the real bridge (<code>handleLine</code>) through the canonical JSON-RPC harness with the Pi SDK's session constructor mocked by a stand-in that tracks its model the way <code>AgentSession</code> does (<code>model</code> getter, <code>setModel</code>, <code>modelRuntime</code>). Run with:</p>
+  <pre>cd packages/agent-runtime &amp;&amp; pnpm exec vitest run src/pi/bridge/__tests__/model-switch.repro.test.ts</pre>
+  <p>On <code>fcada5a3b</code> both tests fail (<code>full log</code>). The first assertion shows the second prompt still going to <code>xai/grok-4.6</code> with no <code>setModel</code> call and no rebuild; the second shows the compaction and both turns after a model change still on the construction model:</p>
+  <pre>⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL   @bb/agent-runtime:isolated  src/pi/bridge/__tests__/model-switch.repro.test.ts &gt; pi bridge model switch (#2160) &gt; applies a model that changed between turns before prompting pi
+AssertionError: expected { setModelCalls: [], …(2) } to deeply equal { …(3) }
+
+- Expected
++ Received
+
+  {
+    &quot;promptModelsPerSession&quot;: [
+      [
+        &quot;xai/grok-4.6&quot;,
+-       &quot;openai-codex/gpt-5.6-sol&quot;,
++       &quot;xai/grok-4.6&quot;,
+      ],
+    ],
+    &quot;rebuilt&quot;: false,
+-   &quot;setModelCalls&quot;: [
+-     [
+-       {
+-         &quot;id&quot;: &quot;gpt-5.6-sol&quot;,
+-         &quot;provider&quot;: &quot;openai-codex&quot;,
+-       },
+-     ],
+-   ],
++   &quot;setModelCalls&quot;: [],
+  }
+
+ ❯ src/pi/bridge/__tests__/model-switch.repro.test.ts:253:10
+    251|         rebuilt,
+    252|         promptModelsPerSession: sessions.map((s) =&gt; s.promptModels),
+    253|       }).toEqual({
+       |          ^
+    254|         setModelCalls: rebuilt ? [] : [[SOL]],
+    255|         rebuilt,
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL   @bb/agent-runtime:isolated  src/pi/bridge/__tests__/model-switch.repro.test.ts &gt; pi bridge model switch (#2160) &gt; does not resynchronize the model on /compact either
+AssertionError: expected { allPromptModels: [ …(2) ], …(1) } to deeply equal { allPromptModels: [ …(2) ], …(1) }
+
+- Expected
++ Received
+
+  {
+    &quot;allCompactModels&quot;: [
+-     &quot;openai-codex/gpt-5.6-sol&quot;,
++     &quot;xai/grok-4.6&quot;,
+    ],
+    &quot;allPromptModels&quot;: [
+-     &quot;openai-codex/gpt-5.6-sol&quot;,
+-     &quot;openai-codex/gpt-5.6-sol&quot;,
++     &quot;xai/grok-4.6&quot;,
++     &quot;xai/grok-4.6&quot;,
+    ],
+  }
+
+ ❯ src/pi/bridge/__tests__/model-switch.repro.test.ts:308:53
+    306|       // Expected: the compaction and every turn after the picker chan…
+    307|       // on the selected model.
+    308|       expect({ allPromptModels, allCompactModels }).toEqual({
+       |                                                     ^
+    309|         allPromptModels: [&quot;openai-codex/gpt-5.6-sol&quot;, &quot;openai-codex/gp…
+    310|         allCompactModels: [&quot;openai-codex/gpt-5.6-sol&quot;],
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  2 failed (2)
+   Start at  08:13:38
+   Duration  1.28s (transform 247ms, setup 0ms, import 1.17s, tests 29ms, environment 0ms)
+</pre>
+  <details><summary>Test source</summary><pre>/**
+ * Repro for get-bb/bb#2160: &quot;Pi keeps using previous model after model
+ * picker change until /compact&quot;.
+ *
+ * The canonical bridge protocol says execution options ride every command and
+ * the bridge reconciles them (&quot;apply live where it can, rebuild its provider
+ * session where it must&quot;, `bridgeExecutionOptionsSchema` docs). The runtime&#x27;s
+ * generic adapter therefore classifies every option change as &quot;live&quot; and never
+ * sends thread/resume for a model change.
+ *
+ * The pi bridge reads `options.model` only in `buildSessionOptions()` during
+ * thread/start|resume|fork. `handleTurnStart` ignores `params.options`, so a
+ * turn that arrives with a different model neither calls
+ * `AgentSession.setModel` nor rebuilds the session. Pi keeps answering with
+ * whatever model the session was constructed with.
+ */
+import { beforeEach, describe, expect, it, vi } from &quot;vitest&quot;;
+import type { AgentSessionEvent } from &quot;@earendil-works/pi-coding-agent&quot;;
+
+const GROK = { provider: &quot;xai&quot;, id: &quot;grok-4.6&quot; };
+const SOL = { provider: &quot;openai-codex&quot;, id: &quot;gpt-5.6-sol&quot; };
+
+const {
+  mockCreateAgentSession,
+  mockCreateAgentSessionServices,
+  mockModelRuntime,
+} = vi.hoisted(() =&gt; {
+  const models = [
+    { provider: &quot;xai&quot;, id: &quot;grok-4.6&quot; },
+    { provider: &quot;openai-codex&quot;, id: &quot;gpt-5.6-sol&quot; },
+  ];
+  const mockModelRuntime = {
+    getAvailable: vi.fn(async () =&gt; models),
+    getModel: vi.fn((provider: string, id: string) =&gt;
+      models.find((m) =&gt; m.provider === provider &amp;&amp; m.id === id),
+    ),
+    getModels: vi.fn(() =&gt; models),
+    hasConfiguredAuth: vi.fn(() =&gt; true),
+    checkAuth: vi.fn(async () =&gt; true),
+    refresh: vi.fn(async () =&gt; ({ aborted: false, errors: new Map() })),
+  };
+  const mockSettingsManager = {
+    getShellCommandPrefix: vi.fn(() =&gt; undefined),
+    getShellPath: vi.fn(() =&gt; undefined),
+  };
+  const mockCreateAgentSessionServices = vi.fn(
+    async (options: { agentDir: string; cwd: string }) =&gt; ({
+      agentDir: options.agentDir,
+      cwd: options.cwd,
+      diagnostics: [],
+      modelRuntime: mockModelRuntime,
+      resourceLoader: { options },
+      settingsManager: mockSettingsManager,
+    }),
+  );
+  return {
+    mockCreateAgentSession: vi.fn(),
+    mockCreateAgentSessionServices,
+    mockModelRuntime,
+  };
+});
+
+vi.mock(&quot;@earendil-works/pi-coding-agent&quot;, async (importOriginal) =&gt; {
+  const actual =
+    await importOriginal&lt;typeof import(&quot;@earendil-works/pi-coding-agent&quot;)&gt;();
+  return {
+    ...actual,
+    createAgentSessionFromServices: mockCreateAgentSession,
+    createAgentSessionServices: mockCreateAgentSessionServices,
+    getAgentDir: vi.fn(() =&gt; &quot;/tmp/pi-agent&quot;),
+    SessionManager: {
+      forkFrom: actual.SessionManager.forkFrom.bind(actual.SessionManager),
+      open: vi.fn((path: string, dir?: string, cwd?: string) =&gt;
+        actual.SessionManager.open(path, dir, cwd),
+      ),
+      inMemory: vi.fn((cwd?: string) =&gt; ({ kind: &quot;in-memory&quot;, cwd })),
+    },
+  };
+});
+
+vi.mock(&quot;../configured-services.js&quot;, () =&gt; ({
+  createConfiguredPiServices: mockCreateAgentSessionServices,
+}));
+
+vi.mock(&quot;../model-runtime.js&quot;, () =&gt; ({
+  getPiModelRuntime: vi.fn(async () =&gt; mockModelRuntime),
+}));
+
+import { handleLine } from &quot;../bridge.js&quot;;
+import { PI_BRIDGE_SESSION_DIR_ENV } from &quot;../session-paths.js&quot;;
+import { createBridgeJsonRpcTestHarness } from &quot;@bb/provider-bridge-protocol/testing&quot;;
+import { createStandaloneBuiltinCompactCommandInput } from &quot;@bb/domain&quot;;
+import { mkdtempSync } from &quot;node:fs&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+
+const CANONICAL_OPTIONS = {
+  approvalReviewer: null,
+  permissionEscalation: null,
+  permissionMode: &quot;full&quot;,
+  permissionScope: &quot;full&quot;,
+} as const;
+
+/**
+ * A controllable stand-in for pi&#x27;s AgentSession that tracks the model the
+ * way the real one does: `model` is what the session was constructed with and
+ * `setModel` swaps it. `prompt` records the model that each run would use.
+ */
+function createModelTrackingPiSession(constructedModel: {
+  provider: string;
+  id: string;
+}) {
+  const listeners: Array&lt;(event: AgentSessionEvent) =&gt; void&gt; = [];
+  const session = {
+    model: constructedModel,
+    modelRuntime: mockModelRuntime,
+    promptModels: [] as string[],
+    compactModels: [] as string[],
+    setModel: vi.fn(async (model: { provider: string; id: string }) =&gt; {
+      session.model = model;
+    }),
+    setThinkingLevel: vi.fn(),
+    thinkingLevel: &quot;medium&quot;,
+    abort: vi.fn(async () =&gt; undefined),
+    bindExtensions: vi.fn(async () =&gt; undefined),
+    compact: vi.fn(async () =&gt; {
+      session.compactModels.push(`${session.model.provider}/${session.model.id}`);
+      emit({ type: &quot;compaction_start&quot;, reason: &quot;manual&quot; });
+      emit({
+        type: &quot;compaction_end&quot;,
+        reason: &quot;manual&quot;,
+        result: undefined,
+        aborted: false,
+        willRetry: false,
+      } as AgentSessionEvent);
+    }),
+    dispose: vi.fn(),
+    extensionRunner: { emit: vi.fn(async () =&gt; undefined) },
+    getActiveToolNames: vi.fn(() =&gt; []),
+    getContextUsage: vi.fn(() =&gt; undefined),
+    hasExtensionHandlers: vi.fn(() =&gt; false),
+    isStreaming: false,
+    prompt: vi.fn(
+      async (
+        _text: string,
+        options?: { preflightResult?: (accepted: boolean) =&gt; void },
+      ) =&gt; {
+        options?.preflightResult?.(true);
+        session.promptModels.push(
+          `${session.model.provider}/${session.model.id}`,
+        );
+        emit({ type: &quot;agent_start&quot; } as AgentSessionEvent);
+        emit({
+          type: &quot;agent_end&quot;,
+          messages: [],
+          willRetry: false,
+        } as AgentSessionEvent);
+      },
+    ),
+    sessionManager: { getLeafId: vi.fn(() =&gt; &quot;pi-entry-checkpoint&quot;) },
+    setActiveToolsByName: vi.fn(),
+    subscribe: vi.fn((listener: (event: AgentSessionEvent) =&gt; void) =&gt; {
+      listeners.push(listener);
+      return () =&gt; {
+        const index = listeners.indexOf(listener);
+        if (index !== -1) listeners.splice(index, 1);
+      };
+    }),
+  };
+  function emit(event: AgentSessionEvent): void {
+    for (const listener of [...listeners]) listener(event);
+  }
+  return session;
+}
+
+function turnStart(threadId: string, model: string, text: string) {
+  return {
+    clientRequestId: &quot;creq_abcdefghjk&quot;,
+    input: [{ type: &quot;text&quot;, text }],
+    options: { ...CANONICAL_OPTIONS, model },
+    providerThreadId: threadId,
+    threadId,
+  };
+}
+
+describe(&quot;pi bridge model switch (#2160)&quot;, () =&gt; {
+  const sessions: ReturnType&lt;typeof createModelTrackingPiSession&gt;[] = [];
+
+  beforeEach(() =&gt; {
+    vi.clearAllMocks();
+    sessions.length = 0;
+    process.env[PI_BRIDGE_SESSION_DIR_ENV] = mkdtempSync(
+      join(tmpdir(), &quot;bb-2160-pi-sessions-&quot;),
+    );
+    // Construct a session with whatever model the bridge resolved, like the
+    // real createAgentSessionFromServices does.
+    mockCreateAgentSession.mockImplementation(
+      async (options: { model?: { provider: string; id: string } }) =&gt; {
+        const session = createModelTrackingPiSession(options.model ?? GROK);
+        sessions.push(session);
+        return { session };
+      },
+    );
+  });
+
+  it(&quot;applies a model that changed between turns before prompting pi&quot;, async () =&gt; {
+    const bridge = createBridgeJsonRpcTestHarness(handleLine);
+    const threadId = &quot;thread-2160&quot;;
+    try {
+      // 1. Start the thread on Grok.
+      bridge.sendRequest(1, &quot;thread/start&quot;, {
+        cwd: &quot;/tmp/worktree&quot;,
+        instructionMode: &quot;append&quot;,
+        options: { ...CANONICAL_OPTIONS, model: `${GROK.provider}/${GROK.id}` },
+        threadId,
+      });
+      const started = await bridge.waitForResponse(1);
+      expect(started.error).toBeUndefined();
+      expect(mockCreateAgentSession).toHaveBeenCalledWith(
+        expect.objectContaining({ model: GROK }),
+      );
+
+      // 2. First turn on Grok.
+      bridge.sendRequest(
+        2,
+        &quot;turn/start&quot;,
+        turnStart(threadId, `${GROK.provider}/${GROK.id}`, &quot;Reply only with ok.&quot;),
+      );
+      await bridge.waitForResponse(2);
+      await bridge.flushWork();
+
+      // 3. The user picks an OpenAI model in bb. The runtime classifies the
+      //    change as &quot;live&quot; and sends it on the next turn/start.
+      bridge.sendRequest(
+        3,
+        &quot;turn/start&quot;,
+        turnStart(threadId, `${SOL.provider}/${SOL.id}`, &quot;Reply only with ok.&quot;),
+      );
+      const response = await bridge.waitForResponse(3);
+      expect(response.error).toBeUndefined();
+      await bridge.flushWork();
+
+      // The bridge must have reconciled the model somehow: either by calling
+      // setModel on the live session, or by rebuilding the session with the
+      // new model (reported via session/replaced). On main it does neither.
+      const live = sessions.at(-1);
+      expect(live).toBeDefined();
+      const setModelCalls = sessions.flatMap((s) =&gt; s.setModel.mock.calls);
+      const rebuilt = mockCreateAgentSession.mock.calls.length &gt; 1;
+      expect({
+        setModelCalls,
+        rebuilt,
+        promptModelsPerSession: sessions.map((s) =&gt; s.promptModels),
+      }).toEqual({
+        setModelCalls: rebuilt ? [] : [[SOL]],
+        rebuilt,
+        promptModelsPerSession: rebuilt
+          ? [[&quot;xai/grok-4.6&quot;], [&quot;openai-codex/gpt-5.6-sol&quot;]]
+          : [[&quot;xai/grok-4.6&quot;, &quot;openai-codex/gpt-5.6-sol&quot;]],
+      });
+    } finally {
+      bridge.restore();
+    }
+  });
+
+  it(&quot;does not resynchronize the model on /compact either&quot;, async () =&gt; {
+    const bridge = createBridgeJsonRpcTestHarness(handleLine);
+    const threadId = &quot;thread-2160-compact&quot;;
+    try {
+      bridge.sendRequest(1, &quot;thread/start&quot;, {
+        cwd: &quot;/tmp/worktree&quot;,
+        instructionMode: &quot;append&quot;,
+        options: { ...CANONICAL_OPTIONS, model: `${GROK.provider}/${GROK.id}` },
+        threadId,
+      });
+      await bridge.waitForResponse(1);
+
+      bridge.sendRequest(
+        2,
+        &quot;turn/start&quot;,
+        turnStart(threadId, `${SOL.provider}/${SOL.id}`, &quot;Reply only with ok.&quot;),
+      );
+      await bridge.waitForResponse(2);
+      await bridge.flushWork();
+
+      // bb&#x27;s manual compaction is a turn/start carrying the builtin /compact
+      // mention, and it carries the selected model like every turn.
+      bridge.sendRequest(3, &quot;turn/start&quot;, {
+        ...turnStart(threadId, `${SOL.provider}/${SOL.id}`, &quot;&quot;),
+        input: JSON.parse(
+          JSON.stringify(createStandaloneBuiltinCompactCommandInput()),
+        ),
+      });
+      await bridge.waitForResponse(3);
+      await bridge.flushWork();
+
+      bridge.sendRequest(
+        4,
+        &quot;turn/start&quot;,
+        turnStart(threadId, `${SOL.provider}/${SOL.id}`, &quot;Reply only with ok.&quot;),
+      );
+      await bridge.waitForResponse(4);
+      await bridge.flushWork();
+
+      const allPromptModels = sessions.flatMap((s) =&gt; s.promptModels);
+      const allCompactModels = sessions.flatMap((s) =&gt; s.compactModels);
+      // Expected: the compaction and every turn after the picker change run
+      // on the selected model.
+      expect({ allPromptModels, allCompactModels }).toEqual({
+        allPromptModels: [&quot;openai-codex/gpt-5.6-sol&quot;, &quot;openai-codex/gpt-5.6-sol&quot;],
+        allCompactModels: [&quot;openai-codex/gpt-5.6-sol&quot;],
+      });
+    } finally {
+      bridge.restore();
+    }
+  });
+});
+</pre></details>
+  <p>Repro files: <code>2160/repro/</code>: helper scripts (<code>wait-idle.sh</code>, <code>tell-file.sh</code>, <code>make-filler.sh</code>, <code>bb-turn-models.py</code>, <code>pi-assistant-models.sh</code>; all take the server from <code>$BB_SERVER_URL</code>), the full Pi session files (<code>pi-session-thr_ahgjgq8fc9.jsonl</code> for the run shown above, <code>pi-session-thr_iyyz7w3cxf.jsonl</code> / <code>pi-session-thr_chmuwwhpyh.jsonl</code> for the original run), bb event dumps (<code>thread-events-thr_ahgjgq8fc9.json</code>, <code>thread-events-final.json</code> for the original run), logs, and the prototype patch. The verifier's independent artifacts are in <code>2160/verify/</code>.</p>
+
+  <h2>5. Root cause</h2>
+  <p><strong>The contract.</strong> Since #1640 the canonical bridge protocol declares that execution options are never diffed by the runtime; they ride every command and each bridge reconciles them:</p>
+  <pre>/**
+ * The runtime never diffs these options. They ride every command; the bridge
+ * reconciles internally (apply live where it can, rebuild its provider
+ * session where it must) and a rebuild is always reported via the
+ * `session/replaced` notification — never silent.
+ */</pre>
+  <p><a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/packages/provider-bridge-protocol/src/execution-options.ts#L17-L23">packages/provider-bridge-protocol/src/execution-options.ts#L17-L23</a>. The generic adapter the runtime uses for every bridge therefore answers <code>"live"</code> for every change (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/packages/agent-runtime/src/bridge-protocol-adapter.ts#L318-L319">packages/agent-runtime/src/bridge-protocol-adapter.ts#L318-L319</a>), and <code>reconfigureThreadIfNeeded</code> only stores the new options instead of sending <code>thread/resume</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/packages/agent-runtime/src/runtime.ts#L971-L1001">packages/agent-runtime/src/runtime.ts#L971-L1001</a>):</p>
+  <pre>    if (settingsChange !== &quot;session&quot;) {
+      // Live settings ride on the next turn command; record them without
+      // replacing the session (which would kill its background tasks).
+      setThreadRuntimeConfig(args.threadId, { ...currentConfig, options: nextOptions });
+      return;
+    }</pre>
+  <p><strong>The Pi bridge's half of the contract is missing.</strong> <code>options.model</code> and <code>options.reasoningLevel</code> are consumed in exactly one place, the session-construction mapping used by <code>thread/start</code>, <code>thread/resume</code> and <code>thread/fork</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/packages/agent-runtime/src/pi/bridge/bridge.ts#L552-L571">packages/agent-runtime/src/pi/bridge/bridge.ts#L552-L571</a> then <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/packages/agent-runtime/src/pi/bridge/sdk-session.ts#L301-L324">packages/agent-runtime/src/pi/bridge/sdk-session.ts#L301-L324</a>):</p>
+  <pre>    const configuredModel = resolveConfiguredModel(services.modelRuntime, this.options.model);
+    ...
+    const { session } = await createAgentSessionFromServices({
+      services,
+      sessionManager: ...,
+      ...(configuredModel ? { model: configuredModel } : {}),
+      ...(this.options.thinkingLevel ? { thinkingLevel: this.options.thinkingLevel } : {}),
+      customTools,
+    });</pre>
+  <p><code>handleTurnStart</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/packages/agent-runtime/src/pi/bridge/bridge.ts#L963-L1002">packages/agent-runtime/src/pi/bridge/bridge.ts#L963-L1002</a>) reads <code>params.threadId</code>, <code>params.input</code> and <code>params.clientRequestId</code> and nothing else; it goes straight to <code>startPiCompaction</code> or <code>startPiPrompt</code> on whatever <code>PiSdkSession</code> is registered for the thread. <code>PiSdkSession</code> has no method that touches the model after <code>start()</code>, even though the SDK exposes <code>AgentSession.setModel(model)</code>, <code>setThinkingLevel(level)</code>, <code>model</code> and <code>modelRuntime</code>. So the live Pi <code>Agent</code> keeps <code>state.model</code> from construction, and every <code>prompt()</code> and <code>compact()</code> (which summarises with <code>this.model</code>) uses it.</p>
+  <p><strong>Why compaction does not help.</strong> bb's manual compaction is a <code>turn/start</code> whose input is the standalone builtin <code>/compact</code> mention (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/routes/threads/actions.ts#L135-L164">apps/server/src/routes/threads/actions.ts#L135-L164</a>); the bridge routes it to <code>session.compact()</code> on the same unchanged session (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/packages/agent-runtime/src/pi/bridge/bridge.ts#L977-L981">packages/agent-runtime/src/pi/bridge/bridge.ts#L977-L981</a>). Nothing in the server, runtime or bridge rebuilds a session after <code>compaction_end</code>. The only things that construct a new Pi session, and thus pick up the current model, are <code>thread/start</code>, <code>thread/resume</code> and <code>thread/fork</code>. A resume is triggered by: the user releasing the thread (<code>bb thread stop</code>, verified above), a daemon/app restart, bridge-process recovery, or the idle-session reaper (30 min, behind the <code>providerSessionReaping</code> experiment which defaults to off). The reporter, on a nightly with auto-update, most plausibly hit one of those near their <code>/compact</code>.</p>
+  <p><strong>How it regressed.</strong> Before <code>c5b53caab</code> (#1640, "Agent providers as a first-class plugin surface") the legacy Pi adapter was built with <code>classifyExecutionSettingsChange: classifySessionExecutionSettingsChange</code>, which returns <code>"session"</code> for any model/reasoning/serviceTier change (<code>git show c5b53caab -- packages/agent-runtime/src/pi/adapter.ts</code>). The runtime then sent <code>thread/resume</code> with the new options, and <code>startPiThreadSession</code> closed the old <code>PiSdkSession</code> and constructed a new one on the same session file with the new model. #1640 deleted the per-provider classification (every bridge is now <code>"live"</code>) and moved the responsibility into each bridge. Codex (<code>requireLiveSessionForTurn</code>, <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/provider-codex/src/bridge/bridge.ts#L1363-L1396">plugins/provider-codex/src/bridge/bridge.ts#L1363-L1396</a>) and Claude (<code>applyLiveSessionSettings</code> calling <code>session.setModel</code>, <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/provider-claude-code/src/bridge/bridge.ts#L580-L588">plugins/provider-claude-code/src/bridge/bridge.ts#L580-L588</a>) got that code; the Pi bridge did not.</p>
+  <p><strong>Deeper issue.</strong> The same gap covers <code>reasoningLevel</code>: Pi's thinking level is also applied only at construction, so changing "Low" to "High" in the picker mid-thread is silently ignored too (not live-tested; same code path). And the Pi bridge's conformance/bridge tests never send a <code>turn/start</code> whose <code>options</code> differ from the construction options, which is why the contract gap was invisible.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>Make the Pi bridge honour the contract: reconcile <code>options.model</code> and <code>options.reasoningLevel</code> on every <code>turn/start</code> (and <code>turn/steer</code>) before dispatching, applying them live to the existing <code>AgentSession</code>. The prototype below does this and turns both repro tests green while the 11 pre-existing Pi suites (147 tests) stay green (12 files / 149 tests with the repro file included) and <code>pnpm exec turbo run typecheck --filter=@bb/agent-runtime --force</code> passes. It is saved as <code>2160/repro/prototype-fix.patch</code>.</p>
+  <pre>diff --git a/packages/agent-runtime/src/pi/bridge/bridge.ts b/packages/agent-runtime/src/pi/bridge/bridge.ts
+index cdac5438d..667774fa4 100644
+--- a/packages/agent-runtime/src/pi/bridge/bridge.ts
++++ b/packages/agent-runtime/src/pi/bridge/bridge.ts
+@@ -50,6 +50,7 @@ import type { ImageContent } from &quot;@earendil-works/pi-ai&quot;;
+ import { createPiDeltaTranslator } from &quot;../delta-translation.js&quot;;
+ import {
+   buildPiSessionParams,
++  toPiThinkingLevel,
+   type PiSessionParams,
+ } from &quot;../session-params.js&quot;;
+ import { PiSdkSession, type PiSdkSessionOptions } from &quot;./sdk-session.js&quot;;
+@@ -971,6 +972,20 @@ async function handleTurnStart(
+     return;
+   }
+ 
++  // Execution options ride every turn command and the runtime never diffs
++  // them (#2160): a model or reasoning level picked after the session was
++  // constructed is applied to the live session here, before dispatch.
++  try {
++    await threadSession.session.applyTurnOptions({
++      model: params.options.model,
++      thinkingLevel: toPiThinkingLevel(params.options.reasoningLevel),
++    });
++  } catch (error) {
++    const message = error instanceof Error ? error.message : String(error);
++    sendError(id, -32000, message);
++    return;
++  }
++
+   // A standalone builtin `/compact` mention is bb&#x27;s manual-compaction request,
+   // not model input. Prompting with the literal text would make the model talk
+   // about compaction while the context keeps growing.
+diff --git a/packages/agent-runtime/src/pi/bridge/sdk-session.ts b/packages/agent-runtime/src/pi/bridge/sdk-session.ts
+index df3d8ad07..b1b79ad17 100644
+--- a/packages/agent-runtime/src/pi/bridge/sdk-session.ts
++++ b/packages/agent-runtime/src/pi/bridge/sdk-session.ts
+@@ -435,6 +435,49 @@ export class PiSdkSession {
+     this.monitorSteerConsumption(tracked.promise);
+   }
+ 
++  /**
++   * Reconcile the execution options a turn command carries with the live
++   * session. Options ride every command (the runtime never diffs them), so a
++   * model or thinking level the user changed after construction is applied
++   * here, before the input is dispatched. Unchanged values are a no-op.
++   */
++  async applyTurnOptions(args: {
++    model: string | undefined;
++    thinkingLevel: CreateAgentSessionOptions[&quot;thinkingLevel&quot;] | undefined;
++  }): Promise&lt;void&gt; {
++    if (!this.session) {
++      throw new Error(&quot;No active Pi SDK session&quot;);
++    }
++    if (args.model !== undefined) {
++      const next = resolveConfiguredModel(this.session.modelRuntime, args.model);
++      const current = this.session.model;
++      if (
++        next &amp;&amp;
++        (current === undefined ||
++          current.provider !== next.provider ||
++          current.id !== next.id)
++      ) {
++        this.recordSdkBoundary(&quot;bridge→provider&quot;, {
++          method: &quot;setModel&quot;,
++          params: { provider: next.provider, id: next.id },
++        });
++        await this.session.setModel(next);
++        this.options.model = args.model;
++      }
++    }
++    if (
++      args.thinkingLevel !== undefined &amp;&amp;
++      args.thinkingLevel !== this.session.thinkingLevel
++    ) {
++      this.recordSdkBoundary(&quot;bridge→provider&quot;, {
++        method: &quot;setThinkingLevel&quot;,
++        params: { level: args.thinkingLevel },
++      });
++      this.session.setThinkingLevel(args.thinkingLevel);
++      this.options.thinkingLevel = args.thinkingLevel;
++    }
++  }
++
+   async compact(): Promise&lt;void&gt; {
+     if (!this.session) {
+       throw new Error(&quot;No active Pi SDK session&quot;);
+diff --git a/packages/agent-runtime/src/pi/session-params.ts b/packages/agent-runtime/src/pi/session-params.ts
+index d0e07b03e..fa0fef9ca 100644
+--- a/packages/agent-runtime/src/pi/session-params.ts
++++ b/packages/agent-runtime/src/pi/session-params.ts
+@@ -13,7 +13,7 @@ type PiReasoningLevel = &quot;off&quot; | &quot;low&quot; | &quot;medium&quot; | &quot;high&quot; | &quot;xhigh&quot; | &quot;max&quot;;
+ // Levels Pi does not support (&quot;ultracode&quot;, &quot;ultra&quot;) are dropped so the bridge
+ // never receives a value it would reject; reconciliation picks the closest
+ // supported level before this point, so this is a defensive floor.
+-function toPiThinkingLevel(
++export function toPiThinkingLevel(
+   reasoningLevel: ReasoningLevel | undefined,
+ ): PiReasoningLevel | undefined {
+   switch (reasoningLevel) {
+</pre>
+  <p>What to watch when turning this into a real PR:</p>
+  <ul>
+    <li><strong><code>AgentSession.setModel</code> has a side effect the bridge must not ship as-is:</strong> besides <code>agent.state.model = model</code> and <code>sessionManager.appendModelChange</code>, it calls <code>settingsManager.setDefaultModelAndProvider(...)</code>, which <em>writes the user's global <code>~/.pi/agent/settings.json</code></em> (<code>defaultProvider</code>/<code>defaultModel</code>). Session construction does not do that today, so a per-thread bb pick would start rewriting the user's pi CLI default. <code>setThinkingLevel</code> likewise calls <code>setDefaultThinkingLevel</code>. Prefer the SDK's lower-level pieces (<code>modelRuntime.checkAuth</code>, then <code>session.agent.state.model = next</code> + <code>session.sessionManager.appendModelChange(...)</code> + <code>session.setThinkingLevel(session.thinkingLevel)</code> to re-clamp, and emit the <code>model_select</code> extension event), or ask upstream for a <code>setModel(model, { persist: false })</code>. This is why I did not live-test the prototype against the user's Pi config.</li>
+    <li>Apply before both branches of <code>handleTurnStart</code> (prompt <em>and</em> <code>/compact</code>) so the summarisation request also goes to the selected model, and in <code>handleTurnSteer</code> for parity with the Claude bridge.</li>
+    <li>Keep the resolution semantics of <code>resolveConfiguredModel</code> (provider prefix authoritative; ambiguous bare ids rejected). A failed resolution should fail the turn with a clear error rather than silently keep the old model; the prototype does that via <code>sendError</code>.</li>
+    <li>Mid-run arrival: <code>turn/start</code> can reach the bridge while a run is live (pi queues it as a follow-up). Setting the model on a live run is what pi's own TUI does, so applying live is fine; a rebuild strategy would not be (it would abort the run). If a rebuild is ever chosen, it must emit <code>session/replaced</code>.</li>
+    <li>Add a bridge test that sends <code>turn/start</code> with a different <code>options.model</code>/<code>reasoningLevel</code> than <code>thread/start</code> (the repro test is a starting point), and ideally a conformance rule so no bridge can ship without reconciling options.</li>
+    <li>No <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump needed: nothing on the server-daemon wire changes; the fix is entirely inside the bridge.</li>
+  </ul>
+
+  <h2>7. PR review</h2>
+  <p>No open PRs are linked to this issue.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li>#1640: the provider-bridge-protocol migration that removed the per-provider "session" classification (regression source).</li>
+    <li>#1236: "Apply Claude turn settings without replacing live sessions", the Claude-side precedent for live <code>setModel</code> reconciliation that Pi lacks.</li>
+    <li>#1268: <code>session/replaced</code> must never be silent (relevant if a rebuild strategy is chosen instead).</li>
+    <li>#2035 (Pi session persistence), #1103 / #1721 (manual compaction behaviour): cited by the reporter; unrelated to the model gap, but #1103/#1721 readers should know compaction also runs on the stale model.</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Pi session file, assistant/model per message (<code>pi-assistant-models.txt</code>)</h3>
+  <pre>2026-08-21T15:48:42.946Z	model_change	github-copilot/gpt-5-mini
+2026-08-21T15:48:42.961Z	user	&#x27;Reply only with ok.&#x27;
+2026-08-21T15:48:45.403Z	assistant	github-copilot/gpt-5-mini	in=5338 out=28
+2026-08-21T15:48:52.370Z	user	&#x27;Reply only with ok.&#x27;
+2026-08-21T15:48:55.173Z	assistant	github-copilot/gpt-5-mini	in=106 out=25
+2026-08-21T15:49:07.158Z	user	&#x27;Do not reply to the text below, it is filler for a compactio&#x27;
+2026-08-21T15:49:11.889Z	assistant	github-copilot/gpt-5-mini	in=42138 out=43
+2026-08-21T15:49:23.740Z	compaction	tokensBefore=47429
+2026-08-21T15:49:26.610Z	user	&#x27;Reply only with ok.&#x27;
+2026-08-21T15:49:30.205Z	assistant	github-copilot/gpt-5-mini	in=47583 out=28
+2026-08-21T15:49:45.088Z	user	&#x27;Reply only with ok.&#x27;
+2026-08-21T15:49:49.444Z	assistant	github-copilot/grok-4.6	in=47794 out=12
+</pre>
+  <h3>bb event log, model per requested turn (<code>bb-turn-models.txt</code>)</h3>
+  <pre>1 client/turn/requested model=github-copilot/gpt-5-mini source=spawn
+2 client/thread/start
+7 thread/identity
+8 turn/started
+13 agentMessage &quot;ok&quot;
+15 turn/completed completed
+16 client/turn/requested model=github-copilot/grok-4.6 source=tell
+17 turn/started
+22 agentMessage &quot;ok&quot;
+24 turn/completed completed
+25 client/turn/requested model=github-copilot/grok-4.6 source=tell
+26 turn/started
+31 agentMessage &quot;ok&quot;
+33 turn/completed completed
+34 client/turn/requested model=github-copilot/grok-4.6 source=tell
+35 turn/started
+38 thread/compacted
+39 turn/completed completed
+41 client/turn/requested model=github-copilot/grok-4.6 source=tell
+42 turn/started
+47 agentMessage &quot;ok&quot;
+49 turn/completed completed
+50 client/turn/requested model=github-copilot/grok-4.6 source=tell
+51 thread/identity
+52 turn/started
+61 agentMessage &quot;ok&quot;
+63 turn/completed completed
+</pre>
+  <h3>Compaction entry (model-less; cost matches gpt-5-mini)</h3>
+  <pre># pi-session-thr_ahgjgq8fc9.jsonl (revised run; summary text elided)
+{&quot;type&quot;: &quot;compaction&quot;, &quot;id&quot;: &quot;f023936f&quot;, &quot;timestamp&quot;: &quot;2026-08-21T15:49:23.740Z&quot;,
+ &quot;firstKeptEntryId&quot;: &quot;d9bce5e5&quot;, &quot;tokensBefore&quot;: 47429,
+ &quot;usage&quot;: {&quot;input&quot;: 305, &quot;output&quot;: 305, &quot;reasoning&quot;: 64, &quot;totalTokens&quot;: 610,
+           &quot;cost&quot;: {&quot;input&quot;: 7.625e-05, &quot;output&quot;: 0.00061, &quot;total&quot;: 0.00068625}}, &quot;fromHook&quot;: false}
+# original run, pi-session-thr_iyyz7w3cxf.jsonl: same shape, tokensBefore 30011, cost.input 7.625e-05 for 305 input tokens</pre>
+  <h3>Regression evidence</h3>
+  <pre>$ git log --oneline -S&#x27;classifyExecutionSettingsChange: () =&gt; &quot;live&quot;&#x27; -- packages/agent-runtime/src/bridge-protocol-adapter.ts
+c5b53caab Agent providers as a first-class plugin surface (provider bridge protocol) (#1640)
+
+$ git show c5b53caab -- packages/agent-runtime/src/pi/ | grep -n classifySessionExecutionSettingsChange
+-import { classifySessionExecutionSettingsChange } from &quot;../execution-options.js&quot;;
+-      classifyExecutionSettingsChange: classifySessionExecutionSettingsChange,
+
+$ git log fcada5a3b..origin/main --oneline -- packages/agent-runtime/src/pi
+(empty: not fixed on origin/main as of 2026-08-21)</pre>
+  <h3>Prototype verification</h3>
+  <pre>$ pnpm exec vitest run src/pi/bridge/__tests__/model-switch.repro.test.ts   # with prototype-fix.patch
+ Test Files  1 passed (1)
+      Tests  2 passed (2)
+$ pnpm exec vitest run src/pi      # base, before adding the repro file: the 11 pre-existing suites
+ Test Files  11 passed (11)
+      Tests  147 passed (147)
+$ pnpm exec vitest run src/pi      # with prototype-fix.patch + the repro file
+ Test Files  12 passed (12)
+      Tests  149 passed (149)
+$ pnpm exec turbo run typecheck --filter=@bb/agent-runtime --force
+ Tasks:    4 successful, 4 total
+Cached:    0 cached, 4 total</pre>
+  <h3>All commands run (abridged)</h3>
+  <pre>gh issue view 2160 --comments
+pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build
+git fetch origin main &amp;&amp; git log fcada5a3b..origin/main --oneline -- packages/agent-runtime/src/pi
+cd packages/agent-runtime &amp;&amp; pnpm exec vitest run src/pi/bridge/__tests__/model-switch.repro.test.ts   # fails on base
+scripts/bb-dev-app current ; eval &quot;$(scripts/bb-dev-app env)&quot;
+curl -s -X POST $BB_SERVER_URL/api/v1/projects ... /tmp/bb-2160-qa
+pnpm bb:dev thread spawn --provider pi --model anthropic/claude-haiku-4-5 ...      # provider/error: OAuth refresh failed (anthropic)
+pnpm bb:dev thread spawn --provider pi --model openai-codex/gpt-5.4-mini ...      # provider/error: refresh_token_reused (openai-codex)
+pnpm bb:dev thread spawn --provider pi --model github-copilot/gpt-5-mini ...      # original run: thr_iyyz7w3cxf
+pnpm bb:dev thread tell thr_iyyz7w3cxf --model github-copilot/grok-4.6 --mode auto &quot;Reply only with ok.&quot;   # x2
+2160/repro/tell-file.sh thr_iyyz7w3cxf github-copilot/grok-4.6 /tmp/bb-2160-qa/filler.txt
+pnpm bb:dev thread compact thr_iyyz7w3cxf
+pnpm bb:dev thread tell thr_iyyz7w3cxf --model github-copilot/grok-4.6 --mode auto &quot;Reply only with ok.&quot;
+pnpm bb:dev thread stop thr_iyyz7w3cxf ; pnpm bb:dev thread tell ... (hung 4 min once, interrupted) ; stop ; tell again (ok, grok-4.6)
+pnpm bb:dev thread spawn --provider pi --model github-copilot/grok-4.6 ...        # thr_chmuwwhpyh, grok-4.6 works fresh
+doobie --headless &lt; 2160/repro/screenshot-thread.js ; ... screenshot-picker.js
+# revised run (section 4a output), same commands via the env-based helper scripts, thread thr_ahgjgq8fc9:
+pnpm bb:dev thread spawn --project proj_6uckkwts97 --provider pi --model github-copilot/gpt-5-mini ...
+pnpm bb:dev thread tell thr_ahgjgq8fc9 --model github-copilot/grok-4.6 --mode auto &quot;Reply only with ok.&quot;
+2160/repro/make-filler.sh ; 2160/repro/tell-file.sh thr_ahgjgq8fc9 github-copilot/grok-4.6 /tmp/bb-2160-qa/filler.txt
+pnpm bb:dev thread compact thr_ahgjgq8fc9 ; pnpm bb:dev thread tell thr_ahgjgq8fc9 --model github-copilot/grok-4.6 ...
+pnpm bb:dev thread stop thr_ahgjgq8fc9 ; pnpm bb:dev thread tell thr_ahgjgq8fc9 --model github-copilot/grok-4.6 ...
+python3 2160/repro/bb-turn-models.py thr_ahgjgq8fc9 ; 2160/repro/pi-assistant-models.sh ~/.bb/pi-bridge-sessions/thr_ahgjgq8fc9.jsonl
+pnpm dev:stop ; cleanup</pre>
+  <h3>Caveats and observations outside this issue</h3>
+  <ul>
+    <li>One-off, not reproducible: in the original run (<code>thr_iyyz7w3cxf</code>) the first turn after <code>bb thread stop</code> + resume hung for about 4 minutes with <code>turn/started</code> but no Pi response (its session file shows an assistant message with <code>in=0 out=0</code> written when it was interrupted; bb seq 58 <code>turn/completed interrupted</code>). The retry worked in 11 s, a fresh grok-4.6 thread answered in 6 s, the revised run's stop/resume completed in ~6 s, and the independent verifier's in ~9 s. Could be a stop/resume race or copilot-side latency; not investigated further and not part of #2160.</li>
+    <li><code>BB_PI_BRIDGE_SESSION_DIR</code> cannot be set for a running daemon (all <code>BB_*</code> env is stripped from bridge children), so dev instances share the real <code>~/.bb/pi-bridge-sessions</code>. Minor isolation wart for QA.</li>
+    <li>Live repro used two github-copilot models rather than a cross-provider pair because the anthropic and openai-codex OAuth refreshes failed on this machine during the run. The code path (<code>options.model</code> ignored on <code>turn/start</code>) is identical.</li>
+  </ul>
+  <h2>10. Verification</h2>
+  <p>An independent verifier (own worktree at <code>fcada5a3b</code>, own dev instance App <code>:16919</code> / Server <code>:24919</code> / daemon <code>:32919</code>) followed both repros. Unit repro: both tests fail on base exactly as in section 4b (<code>setModelCalls: []</code>, <code>rebuilt: false</code>; compaction and later prompts still on <code>xai/grok-4.6</code>), log <code>2160/verify/unit-test-base.log</code>. Live repro on <code>thr_66n5vx94kr</code>: spawn on <code>github-copilot/gpt-5-mini</code>, <code>tell --model github-copilot/grok-4.6</code> recorded as grok-4.6 by bb (seq 16) but answered by gpt-5-mini (<code>in=86 out=30</code>); a real compaction (<code>tokensBefore=33854</code>) followed by another grok-4.6 turn was still answered by gpt-5-mini (<code>in=34019</code>); <code>thread stop</code> + a new turn produced <code>thread/identity</code> (seq 51) and the next assistant messages were grok-4.6. The prototype patch applied cleanly; with it the repro tests pass and the Pi tree and <code>@bb/agent-runtime</code> typecheck are green (<code>2160/verify/pi-suite-with-fix.log</code>). The author's 4-minute hang after stop/resume did not recur.</p>
+  <p><strong>Verifier findings and what changed in this revision.</strong></p>
+  <ul>
+    <li><em>Major: helper scripts were hardwired to the author's instance</em> (<code>wait-idle.sh</code> and <code>bb-turn-models.py</code> defaulted to <code>http://localhost:25835</code>; <code>tell-file.sh</code> hardcoded the server URL, daemon port and project id; the filler file was never shown how to create). Fixed, not just reworded: all scripts now take the server from <code>$BB_SERVER_URL</code> (set by <code>eval "$(scripts/bb-dev-app env)"</code>) or an explicit argument and fail with a clear message if neither is set; <code>tell-file.sh</code> takes <code>&lt;thread&gt; &lt;model&gt; &lt;file&gt;</code> with nothing hardcoded; a new <code>make-filler.sh</code> generates the filler. The whole live repro in section 4a was then re-run from scratch on a fresh dev instance (<code>:23047</code>) with exactly the commands now printed in the steps; the output shown is from that re-run (<code>thr_ahgjgq8fc9</code>) and matches the original run and the verifier's run (bug, compaction refutation, and stop/resume switch all reproduced).</li>
+    <li><em>Minor: "12 Pi suites (149 tests)" counted the repro file.</em> Re-measured on base: 11 pre-existing files / 147 tests; 12 / 149 with the repro file. Corrected in section 6 and the appendix (<code>pi-suite-base.log</code>, <code>pi-suite-with-fix.log</code>).</li>
+    <li><em>Minor: the 4-minute hang in step 7 read like part of the flow.</em> Step 7 now shows the clean re-run (stop/resume in ~6 s) and marks the hang as a one-off that neither the re-run nor the verifier reproduced; details kept in the caveats.</li>
+  </ul>
+</main></body></html>

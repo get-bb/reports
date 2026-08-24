@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2308 Idle provider bridge processes are never retired for non-Codex providers</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  .callout { border-left:4px solid var(--warn); background:#fff8ec; padding:8px 12px; margin:12px 0; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2308 · Idle provider bridge processes are never retired for non-Codex providers</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill high">Priority: High</span> <span class="pill">Effort: low (per issue)</span>
+    <span class="pill">perf</span> <span class="pill">providers</span> <span class="pill">host</span>
+    <a href="https://github.com/get-bb/bb/issues/2308">open on GitHub</a>
+    <span>2026-08-24 · base <code>494f66526</code> (== <code>origin/main</code> at investigation time)</span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="ok">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high</p>
+  <p class="callout"><strong>Scope note.</strong> The issue was written against <code>8bd6acc9</code>. Between the report and the base commit, <a href="https://github.com/get-bb/bb/pull/2325">#2325</a> (<code>e42a4ef48</code>, merged 2026-08-24) deleted the Codex thread-scoped process special case. On <code>494f66526</code> the Codex carve-out the issue describes no longer exists: <em>every</em> provider's bridge, Codex included, stays resident with zero threads until the daemon exits. The title's "non-Codex" qualifier is stale; the leak is now universal.</p>
+
+  <h2>1. TL;DR</h2>
+  <p>Every environment that has ever run an agent thread keeps one <code>bridge-worker</code> node process per provider alive for the life of the host daemon, even after the thread is stopped and the agent child has exited. A user with 37 environments sees ~1 GB of node processes that serve nothing. The runtime spawns one bridge per <code>(environment, provider artifact)</code> and has exactly one retirement path on thread release, <code>retireSupersededBridgeProcessIfIdle</code>, which only fires when the bridge's plugin artifact has been replaced by a newer one. A current-artifact bridge with zero threads matches no retirement path, and nothing else (no idle timer, no periodic sweep) ever revisits it. The behaviour is deliberate "keep the process warm for the next thread" design — three existing tests assert it — but the design has no upper bound on warmth, so the process count grows monotonically with environments touched. I reproduced it live on a dev instance (bridge pid 20879 alive with 0 children for minutes after each <code>bb thread stop</code>, across two spawn/stop cycles, 9½ minutes in total) and with a vitest that fails on the base commit for both <code>claude-code</code> and <code>codex</code>.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>When the last thread on a bridge is released, the bridge is shut down only if it is a thread-scoped Codex process.</td><td class="unv">Stale (was true at 8bd6acc9; not at base)</td><td><code>e42a4ef48</code> (#2325) removed <code>isThreadScopedCodexProcess</code> and the Codex branch of <code>releaseIdleProviderProcess</code>. At base the function is a one-liner that calls <code>retireSupersededBridgeProcessIfIdle</code> for every provider (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L485-L489"><code>packages/agent-runtime/src/runtime.ts:485-489</code></a>). Codex bridges now leak the same way — my unit repro fails for <code>codex</code> too.</td></tr>
+    <tr><td>Claude Code and ACP bridges stay resident with zero threads until daemon exit.</td><td class="ok">Verified</td><td>Live: bridge 20879 (claude-code) alive with 0 children at +3 s and +95 s after the first <code>bb thread stop</code>, still alive 3 min 45 s later when a second thread reused it, and after the second stop a 10-second watch shows it with 0 children for 190 s (section 4 steps 5, 9, 10). No timer or sweep exists that could ever retire it (section 5).</td></tr>
+    <tr><td>Non-Codex bridges are keyed per environment, so the retained set grows with environment count.</td><td class="ok">Verified</td><td>Process key is <code>providerId#bridge:&lt;artifact-hash&gt;</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L410-L418"><code>packages/agent-runtime/src/runtime.ts:410-418</code></a>) inside a runtime entry that is keyed by environment: <code>this.entries.set(args.environmentId, entry)</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/runtime-manager.ts#L1033"><code>apps/host-daemon/src/runtime-manager.ts:1033</code></a>) / <code>get(environmentId)</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/runtime-manager.ts#L366-L368"><code>apps/host-daemon/src/runtime-manager.ts:366-368</code></a>); the comment at <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/runtime-manager.ts#L358-L360"><code>apps/host-daemon/src/runtime-manager.ts:358-360</code></a> states the intent ("Provider runtimes are environment-scoped and may host multiple threads"). Second thread in the same environment reused bridge 20879 instead of spawning (section 4 step 6).</td></tr>
+    <tr><td>One spawn/stop cycle in an environment with no loaded runtime permanently adds one bridge process.</td><td class="ok">Verified</td><td>Section 4: 0 bridges before (step 2), 1 stranded bridge after spawn+stop, still present across a second spawn/archive/stop cycle and 3 min after the second stop (step 10).</td></tr>
+    <tr><td>~78 MB per stranded bridge; 12 stranded bridges = 960 MB on the reporter's machine.</td><td class="unv">Unverified (plausible)</td><td>I cannot see the reporter's machine. On my dev instance the bridge runs via <code>tsx</code> from source and sat at 190–256 MB RSS while idle, dropping to 96 MB after a GC about 90 s after the second stop (<code>watch</code>); a packaged <code>host.mjs</code> bridge will be smaller. The per-environment multiplication is what matters and is verified.</td></tr>
+    <tr><td><code>retireSupersededBridgeProcessIfIdle</code> returns early unless the artifact hash is superseded.</td><td class="ok">Verified</td><td><a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime-provider-process.ts#L295-L310"><code>packages/agent-runtime/src/runtime-provider-process.ts:295-310</code></a>: <code>if (currentKey === undefined || currentKey === providerProcess.processKey) return;</code></td></tr>
+    <tr><td>All callers route through that guard (archive, staged rewind, failed construction, thread/stop user + reaper).</td><td class="ok">Verified</td><td>At base: L506 (<code>abandonFailedSessionConstruction</code>), L1319 (archive/unarchive), L1610 (staged rewind discard), L2325 and L2335 (<code>stopThread</code>, which the reaper calls at L2632). All five go to the same one-line function.</td></tr>
+    <tr><td><code>bb thread archive</code> is not equivalent: the agent process keeps running, so the bridge keeps its thread.</td><td class="ok">Verified</td><td>Section 4 step 7: after <code>bb thread archive thr_jxijqce242</code> the <code>claude</code> child 29995 stayed alive under bridge 20879. Cause: the claude-code plugin declares <code>supportsThreadArchive: false</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/plugins/provider-claude-code/server.ts#L70"><code>plugins/provider-claude-code/server.ts:70</code></a>), so the server never forwards archive to the runtime (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/threads/thread-commands.ts#L170-L179"><code>apps/server/src/services/threads/thread-commands.ts:170-179</code></a>).</td></tr>
+    <tr><td>The #1604 session reaper is enabled and working; this is the bridge the reaper leaves behind.</td><td class="unv">Partially verified</td><td>The reaper path does end in the same no-op: <code>reapIdleProviderSessions → runtime.stopThread</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L2593-L2650"><code>packages/agent-runtime/src/runtime.ts:2593-2650</code></a>) → <code>releaseIdleProviderProcess</code>, and the test at <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.process-lifecycle.test.ts#L1044"><code>packages/agent-runtime/src/runtime.process-lifecycle.test.ts:1044</code></a> explicitly asserts the bridge survives a reap ("resumes it later on the same process"). <strong>But it is not enabled for non-Codex providers by default.</strong> <code>findReapableIdleProviderSession</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L1008-L1018"><code>packages/agent-runtime/src/runtime.ts:1008-1018</code></a>) only considers a claude-code/ACP session when <code>providerSessionReapingEnabled</code> is true; without the experiment it reaps Codex sessions only (<code>runtimeConfig.providerId !== CODEX_PROVIDER_ID → return null</code>). That flag is the <code>providerSessionReaping</code> experiment, default <code>false</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/domain/src/experiments.ts#L34"><code>packages/domain/src/experiments.ts:34</code></a>), read by the server at <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/internal/session.ts#L43"><code>apps/server/src/internal/session.ts:43</code></a> and fetched by the daemon sweep via <code>getRuntimePolicy().providerSessionReaping</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/app.ts#L700-L704"><code>apps/host-daemon/src/app.ts:700-704</code></a>). With default settings a stopped-via-archive claude-code session is therefore never reaped; only an explicit <code>bb thread stop</code> (or daemon exit) releases it. This does not change the root cause (stop already strands the bridge), but the "reaper leaves the bridge behind" framing only applies with the experiment on.</td></tr>
+    <tr><td>Proposed fix: drop the Codex guard so zero threads always shuts the bridge down; <code>retireSupersededBridgeProcessIfIdle</code> becomes redundant.</td><td class="no">Refuted as written</td><td>There is no guard left to drop. Making <code>releaseIdleProviderProcess</code> unconditionally shut down a zero-thread process breaks 8 existing tests that assert warm reuse (section 6, <code>log</code>), including the reaper's resume-on-same-process contract. The correct shape is a bounded idle retirement (timer or sweep), which the issue itself offers as an alternative.</td></tr>
+    <tr><td>Respawn cost 0.66–1.22 s for the 2.5 MB host.js import.</td><td class="unv">Unverified</td><td>Not measured; irrelevant to a grace-timer fix.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb <code>494f66526913557ab076e048218236f0a6610927</code> (branch main; <code>packages/bb-app</code> 0.39.0). <code>git fetch origin main</code>: <code>origin/main</code> is the same commit — nothing newer to check.</li>
+    <li>macOS 26.5.2 (25F84) arm64, Node v22.23.1, pnpm from PATH.</li>
+    <li>Providers: claude-code (Claude Code 2.1.241 at <code>~/.local/bin/claude</code>), codex-cli 0.149.1; others installed but unused.</li>
+    <li>Dev instance (own worktree, <code>scripts/bb-dev-app current</code>): App :14861, Server :22861, Host daemon :30861 (pid 17027), data dir <code>~/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-21-ed43ce155abd</code>. Stopped and deleted after the investigation. (The first version of this report used a sibling worktree on ports 19273/27273; every live artifact below was re-captured on this instance.)</li>
+    <li>Scratch repo <code>/tmp/bb-2308-qa</code>, project <code>proj_iwzvzf2fev</code>, environment <code>env_uhhfyvdjc9</code>, host <code>host_shpa39kdsp</code>. Threads <code>thr_7ptec8hm8d</code> (first cycle) and <code>thr_jxijqce242</code> (second cycle).</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <h3>4a. Unit test (fails on base, no providers needed)</h3>
+  <p>Drop <code>runtime.idle-bridge-retirement.test.ts</code> into <code>packages/agent-runtime/src/</code> and run it from <code>packages/agent-runtime</code>. It uses the repo's scripted-echo bridge, so it exercises the real <code>RuntimeProviderProcessManager</code> and real child processes.</p>
+  <pre>cd packages/agent-runtime
+pnpm exec vitest run src/runtime.idle-bridge-retirement.test.ts</pre>
+  <pre>// Repro for get-bb/bb#2308: the provider bridge process is never retired when
+// its last thread is released. Place this file at
+//   packages/agent-runtime/src/runtime.idle-bridge-retirement.test.ts
+// and run it from packages/agent-runtime with
+//   pnpm exec vitest run src/runtime.idle-bridge-retirement.test.ts
+//
+// On 494f66526 the &quot;retires&quot; cases FAIL (the bridge stays resident with zero
+// threads); the &quot;keeps&quot; case passes. A fix that shuts the bridge down when
+// threadIds reaches 0 makes all three pass.
+import { mkdtempSync, rmSync } from &quot;node:fs&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { afterEach, beforeEach, describe, expect, it } from &quot;vitest&quot;;
+import type { ThreadEvent } from &quot;@bb/domain&quot;;
+import {
+  createScriptedEchoProcessLog,
+  createScriptedEchoRuntime,
+  fullRuntimeOptions,
+  waitForRuntimeState,
+} from &quot;./test/runtime-test-harness.js&quot;;
+
+describe(&quot;#2308 idle bridge retirement&quot;, () =&gt; {
+  let tmpDir: string;
+  beforeEach(() =&gt; {
+    tmpDir = mkdtempSync(join(tmpdir(), &quot;bb-2308-&quot;));
+  });
+  afterEach(() =&gt; {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function createRuntime(args: { pluginId: string }) {
+    const events: ThreadEvent[] = [];
+    const processLog = createScriptedEchoProcessLog();
+    const runtime = createScriptedEchoRuntime({
+      runtime: {
+        workspacePath: tmpDir,
+        env: processLog.env,
+        onEvent: (event) =&gt; events.push(event),
+      },
+      launch: { pluginId: args.pluginId, scripted: { identifyProcess: true } },
+    });
+    const spawned = () =&gt;
+      processLog.read().filter((l) =&gt; l.startsWith(&quot;spawn:&quot;)).length;
+    const exited = () =&gt;
+      processLog.read().filter((l) =&gt; l.startsWith(&quot;exit:&quot;)).length;
+    return { events, runtime, spawned, exited };
+  }
+
+  for (const [pluginId, providerId] of [
+    [&quot;provider-claude-code&quot;, &quot;claude-code&quot;],
+    [&quot;provider-codex&quot;, &quot;codex&quot;],
+  ] as const) {
+    it(`retires the ${providerId} bridge when thread/stop releases its last thread`, async () =&gt; {
+      const { runtime, spawned, exited } = createRuntime({ pluginId });
+      try {
+        await runtime.startThread({
+          environmentId: &quot;env-1&quot;,
+          threadId: &quot;t1&quot;,
+          projectId: &quot;p1&quot;,
+          providerId,
+          options: fullRuntimeOptions,
+        });
+        expect(spawned()).toBe(1);
+        expect(runtime.listRunningProviders()).toEqual([providerId]);
+
+        // The user stops the thread (`bb thread stop`), or the idle reaper
+        // does (reapIdleProviderSessions -&gt; stopThread). Either way the bridge
+        // now owns zero threads.
+        await runtime.stopThread({ threadId: &quot;t1&quot; });
+        expect(runtime.hasThread(&quot;t1&quot;)).toBe(false);
+
+        // BUG: the bridge is still resident with nothing to serve.
+        await waitForRuntimeState({
+          label: &quot;the idle bridge process exited&quot;,
+          predicate: () =&gt;
+            exited() === 1 &amp;&amp; runtime.listRunningProviders().length === 0,
+          timeoutMs: 3_000,
+        });
+      } finally {
+        await runtime.shutdown();
+      }
+    });
+  }
+
+  it(&quot;keeps the bridge while another thread still runs on it&quot;, async () =&gt; {
+    const { runtime, spawned, exited } = createRuntime({
+      pluginId: &quot;provider-claude-code&quot;,
+    });
+    try {
+      for (const threadId of [&quot;t1&quot;, &quot;t2&quot;]) {
+        await runtime.startThread({
+          environmentId: &quot;env-1&quot;,
+          threadId,
+          projectId: &quot;p1&quot;,
+          providerId: &quot;claude-code&quot;,
+          options: fullRuntimeOptions,
+        });
+      }
+      expect(spawned()).toBe(1);
+      await runtime.stopThread({ threadId: &quot;t1&quot; });
+      expect(exited()).toBe(0);
+      expect(runtime.listRunningProviders()).toEqual([&quot;claude-code&quot;]);
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+});
+</pre>
+  <p>Output on <code>494f66526</code> (<code>full log</code>). The assertion that fails is the <code>waitForRuntimeState</code> at line 73: the bridge never logs <code>exit:</code> and <code>listRunningProviders()</code> still reports the provider after its only thread was stopped. The third case ("keeps the bridge while another thread still runs") passes, so the failure is specifically "zero threads, still resident".</p>
+  <pre> RUN  v4.1.1 /Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_846839f8-f8a-21/packages/agent-runtime
+ ❯  @bb/agent-runtime  src/runtime.idle-bridge-retirement.test.ts (3 tests | 2 failed) 7107ms
+     × retires the claude-code bridge when thread/stop releases its last thread 3655ms
+     × retires the codex bridge when thread/stop releases its last thread 3243ms
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+ FAIL   @bb/agent-runtime  src/runtime.idle-bridge-retirement.test.ts &gt; #2308 idle bridge retirement &gt; retires the claude-code bridge when thread/stop releases its last thread
+ FAIL   @bb/agent-runtime  src/runtime.idle-bridge-retirement.test.ts &gt; #2308 idle bridge retirement &gt; retires the codex bridge when thread/stop releases its last thread
+Error: Timed out after 3000ms waiting for the idle bridge process exited
+ ❯ waitForRuntimeConditionUnsafe src/test/runtime-wait-helpers.ts:187:9
+    185|   const failureDetail = options.describeFailure?.();
+    186|   const detail = failureDetail ? `\n${failureDetail}` : &quot;&quot;;
+    187|   throw new Error(
+       |         ^
+    188|     `Timed out after ${timeoutMs}ms waiting for ${label}${detail}`,
+    189|   );
+ ❯ waitForRuntimeState src/test/runtime-wait-helpers.ts:195:3
+ ❯ src/runtime.idle-bridge-retirement.test.ts:73:9
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+ Test Files  1 failed (1)
+      Tests  2 failed | 1 passed (3)
+   Start at  09:50:17
+   Duration  9.15s (transform 1.35s, setup 0ms, import 1.64s, tests 7.11s, environment 0ms)
+EXIT 1
+</pre>
+
+  <h3>4b. Live, on a dev instance (what the user sees)</h3>
+  <p>Helper scripts (all under <code>2308/repro/</code>): <code>bbdev.sh</code> runs the bb CLI against <em>your</em> isolated instance — it takes the checkout from <code>BB_REPO</code> (default: the current directory) and the ports from <code>scripts/bb-dev-app env</code>, so nothing in it needs editing; run it as <code>BB_REPO=/path/to/bb bash bbdev.sh …</code>. <code>setup-project.sh</code> creates the scratch repo and project the same way, and <code>wait-idle.sh</code> polls a thread until it is idle. <code>bridges.sh</code> lists the host daemon's children and their children, printing the executable name plus the last 100 characters of each command line so a process is identifiable from the snapshot itself: <code>…/plugins/provider-claude-code/bridge-data</code> is a provider bridge (<code>bridge-worker-entry.ts</code>), <code>…/plugins/&lt;id&gt;/host-data</code> is a plugin-host worker, <code>claude …</code> is the agent child, and the <code>esbuild --service … --ping</code> children are tsx's dev-only compile helpers (ignore them). Find the daemon pid with <code>lsof -nP -iTCP:$BB_HOST_DAEMON_PORT -sTCP:LISTEN</code>.</p>
+  <ol>
+    <li>Start the instance and create a project on a scratch repo (<code>setup-project.sh</code> does exactly this; the host id comes from <code>bb machine list --json</code>):
+<pre>scripts/bb-dev-app current            # prints Server http://localhost:22861, Host daemon :30861
+mkdir /tmp/bb-2308-qa &amp;&amp; cd /tmp/bb-2308-qa &amp;&amp; git init -q &amp;&amp; echo hi &gt; README.md &amp;&amp; git add . &amp;&amp; git commit -qm init
+curl -s -X POST http://localhost:22861/api/v1/projects -H 'content-type: application/json' \
+  -d '{"name":"qa","source":{"type":"local_path","path":"/tmp/bb-2308-qa","hostId":"host_shpa39kdsp"}}'
+HOST_ID=host_shpa39kdsp
+{&quot;id&quot;:&quot;proj_iwzvzf2fev&quot;,&quot;kind&quot;:&quot;standard&quot;,&quot;name&quot;:&quot;qa&quot;,&quot;gitRemoteUrl&quot;:null,&quot;createdAt&quot;:1787590143021,&quot;updatedAt&quot;:1787590143021,&quot;sources&quot;:[{&quot;id&quot;:&quot;src_4xy4duan5e&quot;,&quot;projectId&quot;:&quot;proj_iwzvzf2fev&quot;,&quot;type&quot;:&quot;local_path&quot;,&quot;hostId&quot;:&quot;host_shpa39kdsp&quot;,&quot;path&quot;:&quot;/tmp/bb-2308-qa&quot;,&quot;isDefault&quot;:true,&quot;createdAt&quot;:1787590143021,&quot;updatedAt&quot;:1787590143021}]}
+</pre></li>
+    <li>Baseline (<code>snapshot</code>): the daemon (pid 17027, from <code>lsof -nP -iTCP:30861 -sTCP:LISTEN</code>) has no bridge children — only tsx's esbuild helper, the parcel watcher and two plugin-host workers (<code>…/plugins/keep-awake/host-data</code>, <code>…/plugins/provider-acp/host-data</code>):
+<pre>daemon pid 17027  (09:49:03)
+PID    PPID   RSS_KB  ETIME    COMMAND (last 110 chars)
+17033 17027  24592 00:24  ...ules/.pnpm/@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+17096 17027  85312 00:23  ...outs/bb/.claude/worktrees/wf_846839f8-f8a-21/packages/host-watcher/src/parcel-subprocess/parcel-child-entry.ts
+    child 17099 17096  20064 00:23  ...ules/.pnpm/@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+17152 17027 109328 00:22  ...155abd/plugins/keep-awake/host-data /var/folders/xx/xxxxxxxxxxxxxxxxxxxxxxxxxx/T/bb-host-keep-awake-z3wYGm
+    child 17165 17152  18880 00:22  ...ules/.pnpm/@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+17196 17027 154496 00:21  ...bd/plugins/provider-acp/host-data /var/folders/xx/xxxxxxxxxxxxxxxxxxxxxxxxxx/T/bb-host-provider-acp-O1gWBL
+</pre></li>
+    <li>Spawn one claude-code thread:
+<pre>BB_REPO=$PWD bash bbdev.sh thread spawn --project proj_iwzvzf2fev --environment /tmp/bb-2308-qa \
+  --provider claude-code --prompt "Reply only with ok." --json
+{
+  &quot;id&quot;: &quot;thr_7ptec8hm8d&quot;,
+  &quot;projectId&quot;: &quot;proj_iwzvzf2fev&quot;,
+  &quot;environmentId&quot;: null,
+  &quot;providerId&quot;: &quot;claude-code&quot;,
+  &quot;title&quot;: null,
+  &quot;titleFallback&quot;: &quot;Reply only with ok.&quot;,
+  &quot;sectionId&quot;: null,
+… (20 more lines)</pre>
+    Two <code>…/plugins/provider-claude-code/bridge-data</code> processes appear (both are <code>bridge-worker-entry.ts</code> running the plugin's <code>host.mjs</code>): 20603 is the daemon's provider-maintenance runtime (used for model listing; it only has an esbuild helper child) and 20879 is the environment runtime's bridge, with the <code>claude</code> agent 20880 under it (<code>snapshot</code>, 33 s after spawn):
+<pre>daemon pid 17027  (09:49:42)
+PID    PPID   RSS_KB  ETIME    EXE + last 100 chars of COMMAND
+17033 17027  24608 01:03  esbuild .../@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+17096 17027  85584 01:02  node ...laude/worktrees/wf_846839f8-f8a-21/packages/host-watcher/src/parcel-subprocess/parcel-child-entry.ts
+    child 17099 17096  20096 01:02  esbuild .../@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+17152 17027  98336 01:01  node ...gins/keep-awake/host-data /var/folders/xx/xxxxxxxxxxxxxxxxxxxxxxxxxx/T/bb-host-keep-awake-z3wYGm
+    child 17165 17152  18880 01:01  esbuild .../@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+17196 17027 107552 01:00  node .../provider-acp/host-data /var/folders/xx/xxxxxxxxxxxxxxxxxxxxxxxxxx/T/bb-host-provider-acp-O1gWBL
+20603 17027 195840 00:35  node ...ckouts-bb-.claude-worktrees-wf_846839f8-f8a-21-ed43ce155abd/plugins/provider-claude-code/bridge-data
+    child 20604 20603  17456 00:35  esbuild .../@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+20879 17027 255696 00:33  node ...ckouts-bb-.claude-worktrees-wf_846839f8-f8a-21-ed43ce155abd/plugins/provider-claude-code/bridge-data
+    child 20880 20879 505392 00:32  claude ...nes-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-21-ed43ce155abd/thread-storage&quot;]}}}
+</pre></li>
+    <li>Wait for <code>status: "idle"</code> (<code>bash wait-idle.sh thr_7ptec8hm8d</code>, or <code>bash bbdev.sh thread show thr_7ptec8hm8d --json</code>), then stop it:
+<pre>$ BB_REPO=$PWD bash bbdev.sh thread stop thr_7ptec8hm8d
+Thread thr_7ptec8hm8d stopped</pre></li>
+    <li><strong>Actual:</strong> 3 s later the <code>claude</code> agent 20880 is gone but bridge 20879 is still there with no children. <strong>Expected:</strong> a bridge with nothing to serve goes away (immediately, or after a bounded grace period). (<code>snapshot</code>)
+<pre>daemon pid 17027  (09:50:03)
+PID    PPID   RSS_KB  ETIME    EXE + last 100 chars of COMMAND
+17033 17027  24608 01:24  esbuild .../@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+17096 17027  85680 01:23  node ...laude/worktrees/wf_846839f8-f8a-21/packages/host-watcher/src/parcel-subprocess/parcel-child-entry.ts
+    child 17099 17096  20112 01:23  esbuild .../@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+17152 17027  98432 01:22  node ...gins/keep-awake/host-data /var/folders/xx/xxxxxxxxxxxxxxxxxxxxxxxxxx/T/bb-host-keep-awake-z3wYGm
+    child 17165 17152  18880 01:22  esbuild .../@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+17196 17027 107552 01:21  node .../provider-acp/host-data /var/folders/xx/xxxxxxxxxxxxxxxxxxxxxxxxxx/T/bb-host-provider-acp-O1gWBL
+20603 17027 195936 00:55  node ...ckouts-bb-.claude-worktrees-wf_846839f8-f8a-21-ed43ce155abd/plugins/provider-claude-code/bridge-data
+    child 20604 20603  17456 00:55  esbuild .../@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+20879 17027 217520 00:53  node ...ckouts-bb-.claude-worktrees-wf_846839f8-f8a-21-ed43ce155abd/plugins/provider-claude-code/bridge-data
+</pre>
+    95 s later (<code>snapshot</code>) the <em>maintenance</em> bridge 20603 has been retired by <code>PROVIDER_MAINTENANCE_IDLE_TIMEOUT_MS</code> (60 s) — proof that the daemon knows how to retire an idle bridge — while the environment bridge 20879 stays (age 2:31, 0 children, 217 MB RSS):
+<pre>daemon pid 17027  (09:51:41)
+PID    PPID   RSS_KB  ETIME    EXE + last 100 chars of COMMAND
+17033 17027  24608 03:02  esbuild .../@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+17096 17027  86240 03:01  node ...laude/worktrees/wf_846839f8-f8a-21/packages/host-watcher/src/parcel-subprocess/parcel-child-entry.ts
+    child 17099 17096  20624 03:01  esbuild .../@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+17152 17027  98944 03:00  node ...gins/keep-awake/host-data /var/folders/xx/xxxxxxxxxxxxxxxxxxxxxxxxxx/T/bb-host-keep-awake-z3wYGm
+    child 17165 17152  19392 03:00  esbuild .../@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+17196 17027 107552 02:59  node .../provider-acp/host-data /var/folders/xx/xxxxxxxxxxxxxxxxxxxxxxxxxx/T/bb-host-provider-acp-O1gWBL
+20879 17027 217520 02:31  node ...ckouts-bb-.claude-worktrees-wf_846839f8-f8a-21-ed43ce155abd/plugins/provider-claude-code/bridge-data
+</pre></li>
+    <li>3 min 45 s after the stop, spawn a second thread in the same environment (<code>spawn-2.json</code>, <code>thr_jxijqce242</code>). No new environment bridge: 20879 (now 4:43 old) is reused and gets a fresh <code>claude</code> child 29995. A new maintenance bridge 29912 appears (and is gone again by step 7, 60 s later, as before). This confirms both the per-environment keying and that "warm reuse" is what the resident process buys. By now the two plugin-host workers from step 2 have also been retired by their own 5-minute idle bound. (<code>snapshot</code>)
+<pre>daemon pid 17027  (09:53:53)
+PID    PPID   RSS_KB  ETIME    EXE + last 100 chars of COMMAND
+17033 17027  24608 05:14  esbuild .../@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+17096 17027  86960 05:13  node ...laude/worktrees/wf_846839f8-f8a-21/packages/host-watcher/src/parcel-subprocess/parcel-child-entry.ts
+    child 17099 17096  20736 05:13  esbuild .../@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+20879 17027 190048 04:43  node ...ckouts-bb-.claude-worktrees-wf_846839f8-f8a-21-ed43ce155abd/plugins/provider-claude-code/bridge-data
+    child 29995 20879 497648 00:04  claude ...nes-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-21-ed43ce155abd/thread-storage&quot;]}}}
+29912 17027 439312 00:07  node ...ckouts-bb-.claude-worktrees-wf_846839f8-f8a-21-ed43ce155abd/plugins/provider-claude-code/bridge-data
+</pre></li>
+    <li>Archive that thread once idle (<code>BB_REPO=$PWD bash bbdev.sh thread archive thr_jxijqce242</code> → <code>Thread thr_jxijqce242 archived</code>). The agent child 29995 is still alive: claude-code does not support provider-side archive, so the session is untouched and the bridge still owns the thread. Archiving therefore does not cause the stranding; it defers it to the idle reaper (30 min) <em>if</em> the <code>providerSessionReaping</code> experiment is enabled (it is off by default, see the claims table), and otherwise until an explicit stop or daemon exit. (<code>snapshot</code>)
+<pre>daemon pid 17027  (09:54:59)
+PID    PPID   RSS_KB  ETIME    EXE + last 100 chars of COMMAND
+17033 17027  24608 06:20  esbuild .../@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+17096 17027  87248 06:19  node ...laude/worktrees/wf_846839f8-f8a-21/packages/host-watcher/src/parcel-subprocess/parcel-child-entry.ts
+    child 17099 17096  20832 06:19  esbuild .../@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+20879 17027 190480 05:49  node ...ckouts-bb-.claude-worktrees-wf_846839f8-f8a-21-ed43ce155abd/plugins/provider-claude-code/bridge-data
+    child 29995 20879 504576 01:10  claude ...nes-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-21-ed43ce155abd/thread-storage&quot;]}}}
+</pre></li>
+    <li>Stop it (<code>BB_REPO=$PWD bash bbdev.sh thread stop thr_jxijqce242</code> → <code>Thread thr_jxijqce242 stopped</code>). The agent exits; bridge 20879 remains, now 6:03 old with zero threads and nothing that will ever retire it short of daemon shutdown (<code>snapshot</code>):
+<pre>daemon pid 17027  (09:55:13)
+PID    PPID   RSS_KB  ETIME    EXE + last 100 chars of COMMAND
+17033 17027  24608 06:34  esbuild .../@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+17096 17027  87296 06:33  node ...laude/worktrees/wf_846839f8-f8a-21/packages/host-watcher/src/parcel-subprocess/parcel-child-entry.ts
+    child 17099 17096  20832 06:33  esbuild .../@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+20879 17027 190496 06:03  node ...ckouts-bb-.claude-worktrees-wf_846839f8-f8a-21-ed43ce155abd/plugins/provider-claude-code/bridge-data
+</pre></li>
+    <li>Watch it (<code>bash watch-bridge.sh 20879 190</code>, <code>log</code>): one line every 10 s with the bridge's age, RSS and child count. It never exits and never gets a child; RSS drops from 190 MB to 96 MB at +90 s (a GC, not a retirement):
+<pre>09:55:25 +0s pid/ppid/etime/rss_kb:20879 17027 06:15 190496  children: 0
+09:55:35 +10s pid/ppid/etime/rss_kb:20879 17027 06:25 190496  children: 0
+09:55:45 +20s pid/ppid/etime/rss_kb:20879 17027 06:35 190496  children: 0
+09:55:55 +30s pid/ppid/etime/rss_kb:20879 17027 06:45 190496  children: 0
+09:56:06 +40s pid/ppid/etime/rss_kb:20879 17027 06:56 190496  children: 0
+09:56:16 +50s pid/ppid/etime/rss_kb:20879 17027 07:06 190496  children: 0
+09:56:26 +60s pid/ppid/etime/rss_kb:20879 17027 07:16 190496  children: 0
+09:56:36 +70s pid/ppid/etime/rss_kb:20879 17027 07:26 190496  children: 0
+09:56:46 +80s pid/ppid/etime/rss_kb:20879 17027 07:36 190496  children: 0
+09:56:56 +90s pid/ppid/etime/rss_kb:20879 17027 07:46  96032  children: 0
+09:57:06 +100s pid/ppid/etime/rss_kb:20879 17027 07:56  96032  children: 0
+09:57:16 +110s pid/ppid/etime/rss_kb:20879 17027 08:06  96032  children: 0
+09:57:26 +120s pid/ppid/etime/rss_kb:20879 17027 08:16  96032  children: 0
+09:57:36 +130s pid/ppid/etime/rss_kb:20879 17027 08:26  96032  children: 0
+09:57:47 +140s pid/ppid/etime/rss_kb:20879 17027 08:37  96032  children: 0
+09:57:57 +150s pid/ppid/etime/rss_kb:20879 17027 08:47  96032  children: 0
+09:58:07 +160s pid/ppid/etime/rss_kb:20879 17027 08:57  96032  children: 0
+09:58:17 +170s pid/ppid/etime/rss_kb:20879 17027 09:07  96032  children: 0
+09:58:27 +180s pid/ppid/etime/rss_kb:20879 17027 09:17  96032  children: 0
+09:58:37 +190s pid/ppid/etime/rss_kb:20879 17027 09:27  96032  children: 0
+</pre></li>
+    <li>Final state, 3 min 28 s after the second stop (<code>snapshot</code>; <code>+95 s</code> is the same): the daemon's only children are its dev-tooling processes and the stranded bridge. Nothing else will happen to 20879 until the daemon exits.
+<pre>daemon pid 17027  (09:58:38)
+PID    PPID   RSS_KB  ETIME    EXE + last 100 chars of COMMAND
+17033 17027  13408 09:59  esbuild .../@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+17096 17027  51104 09:58  node ...laude/worktrees/wf_846839f8-f8a-21/packages/host-watcher/src/parcel-subprocess/parcel-child-entry.ts
+    child 17099 17096  12896 09:58  esbuild .../@esbuild+darwin-arm64@0.28.1/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.28.1 --ping
+20879 17027  96032 09:28  node ...ckouts-bb-.claude-worktrees-wf_846839f8-f8a-21-ed43ce155abd/plugins/provider-claude-code/bridge-data
+</pre></li>
+  </ol>
+  <p>No screenshots: the bug has no UI surface; the evidence is process-table snapshots, saved verbatim under <code>2308/repro/</code>.</p>
+
+  <h2>5. Root cause</h2>
+  <p><strong>Mechanism.</strong> The runtime keys one bridge process per provider artifact inside an environment-scoped runtime, and explicitly never scopes a process to a thread (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L403-L418"><code>packages/agent-runtime/src/runtime.ts:403-418</code></a>):</p>
+  <pre>/**
+ * One process per provider artifact: every thread of a provider in this
+ * environment runs on the same bridge process, and the bridge supervises
+ * whatever children it needs … The runtime never scopes a process to a
+ * thread.
+ */
+function resolveProviderProcessKey(args) {
+  return `${args.providerId}#bridge:${bridgeLaunchProcessKey(args.bridgeLaunch)}`;
+}</pre>
+  <p>When a thread is released (stop, reaper, archive, rewind discard, failed construction) the only thing that runs is (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L478-L489"><code>packages/agent-runtime/src/runtime.ts:478-489</code></a>):</p>
+  <pre>/**
+ * Releasing a thread is the moment a process can become retirable: a
+ * bridge process superseded by a plugin update was only being kept alive
+ * by the threads still running on it. A current process stays up for the
+ * provider's next thread; …
+ */
+async function releaseIdleProviderProcess(proc) {
+  await providerProcesses.retireSupersededBridgeProcessIfIdle(proc);
+}</pre>
+  <p>and that helper returns early for a current-artifact process (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime-provider-process.ts#L295-L310"><code>packages/agent-runtime/src/runtime-provider-process.ts:295-310</code></a>):</p>
+  <pre>async retireSupersededBridgeProcessIfIdle(providerProcess) {
+  if (providerProcess.identity.threadIds.size &gt; 0) return;
+  const currentKey = this.currentProcessKeyByProviderId.get(providerProcess.providerId);
+  if (currentKey === undefined || currentKey === providerProcess.processKey) return;   // ← always taken for a current bridge
+  await this.shutdownProvider({ … });
+}</pre>
+  <p>So "zero threads on a current bridge" is, by design, a no-op. What makes it a leak is that nothing ever revisits the process later:</p>
+  <ul>
+    <li>The daemon's periodic sweep (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/app.ts#L65-L66"><code>apps/host-daemon/src/app.ts:65-66</code></a>: every 5 min, sessions idle ≥ 30 min) only reaps <em>sessions</em> via <code>stopThread</code>; it lands in the same no-op. And for non-Codex providers it does not even get that far unless the <code>providerSessionReaping</code> experiment (default off, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/domain/src/experiments.ts#L34"><code>packages/domain/src/experiments.ts:34</code></a>) is on: <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L1008-L1018"><code>packages/agent-runtime/src/runtime.ts:1008-1018</code></a> returns <code>null</code> for every non-Codex session when the flag is false.</li>
+    <li><code>RuntimeManager.evictIdleEnvironments()</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/runtime-manager.ts#L1259-L1285"><code>apps/host-daemon/src/runtime-manager.ts:1259-1285</code></a>) would shut idle runtimes (and their bridges) down, but it is only called from tests — grep finds no production caller. <code>evictIdleRuntimeEntries()</code> runs only when the base shell env changes (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/runtime-manager.ts#L640-L650"><code>apps/host-daemon/src/runtime-manager.ts:640-650</code></a>).</li>
+    <li>The two neighbouring pools that <em>do</em> have idle bounds show the intended pattern: the provider-maintenance runtime dies after 60 s idle (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/runtime-manager.ts#L51"><code>apps/host-daemon/src/runtime-manager.ts:51</code></a>, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/runtime-manager.ts#L888-L912"><code>apps/host-daemon/src/runtime-manager.ts:888-912</code></a>) and plugin-host workers after 5 min (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/plugin-host-manager.ts#L123"><code>apps/host-daemon/src/plugin-host-manager.ts:123</code></a>; my daemon log shows "Host plugin worker stopped … host plugin worker became idle"). Environment bridges have no equivalent.</li>
+  </ul>
+  <p><strong>Why the symptom follows.</strong> A bridge is created on the first thread in an environment and released only by daemon shutdown, so the resident set is the set of environments that have ever hosted a thread for that provider since the daemon started — 29 bridges for 37 environments on the reporter's machine, 12 of them with zero threads because their sessions had been stopped or reaped.</p>
+  <p><strong>History.</strong> The warm-process intent dates from <code>c5b53caab</code> (#1640), which added the test "keeps the current-hash bridge process when a thread is released" (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.process-lifecycle.test.ts#L347-L368"><code>packages/agent-runtime/src/runtime.process-lifecycle.test.ts:347-368</code></a>). Before <code>e42a4ef48</code> Codex was exempt because its process was thread-scoped (<code>codex:thread:&lt;id&gt;</code> keys) and was shut down at zero threads; #2325 collapsed Codex onto the shared one-bridge-per-artifact model and, with it, onto the same leak. <code>Diff of runtime.ts in e42a4ef48</code>.</p>
+  <p><strong>Deeper issue.</strong> Process lifetime is tied to "is anything using it right now" with no notion of "has anything used it recently". Every other pooled resource in the daemon has an idle bound; this one doesn't. The fix is to add the bound, not to remove warm reuse.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p><strong>What I tried first (and why it is wrong).</strong> The issue's patch — shut down whenever <code>threadIds.size === 0</code> — applied to base (<code>diff</code>) makes my repro pass but fails 8 existing tests across four files (<code>summary</code>):</p>
+  <pre> ❯  @bb/agent-runtime  src/runtime.acp-topology.test.ts (1 test | 1 failed) 1035ms
+     × releases the thread on the bridge when a construction times out on the runtime&#x27;s side 1034ms
+ ❯  @bb/agent-runtime  src/runtime.codex-topology.test.ts (4 tests | 2 failed) 3836ms
+     × interrupt-stop settles the turn on the wire and then releases the thread&#x27;s child 681ms
+     × releases the thread on the bridge when a construction times out on the runtime&#x27;s side 647ms
+ ❯  @bb/agent-runtime  src/runtime.lifecycle.test.ts (28 tests | 2 failed) 11527ms
+       × forgets a thread whose thread/resume request was rejected 738ms
+       × keeps the provider running after thread stop 367ms
+ ❯  @bb/agent-runtime:isolated  src/runtime.process-lifecycle.test.ts (35 tests | 3 failed) 15008ms
+     × keeps the codex provider process when one session construction fails 298ms
+     × reaps a codex session after a terminal provider error before turn start 456ms
+     × reaps an idle codex session and resumes it later on the same process 443ms
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 8 ⎯⎯⎯⎯⎯⎯⎯
+ FAIL   @bb/agent-runtime  src/runtime.acp-topology.test.ts &gt; acp process topology &gt; releases the thread on the bridge when a construction times out on the runtime&#x27;s side
+ ❯ src/runtime.acp-topology.test.ts:104:44
+ FAIL   @bb/agent-runtime  src/runtime.codex-topology.test.ts &gt; codex process topology &gt; interrupt-stop settles the turn on the wire and then releases the thread&#x27;s child
+ ❯ src/runtime.codex-topology.test.ts:314:44
+ FAIL   @bb/agent-runtime  src/runtime.codex-topology.test.ts &gt; codex process topology &gt; releases the thread on the bridge when a construction times out on the runtime&#x27;s side
+ ❯ src/runtime.codex-topology.test.ts:334:44
+ FAIL   @bb/agent-runtime  src/runtime.lifecycle.test.ts &gt; createAgentRuntime lifecycle &gt; thread setup and configuration &gt; forgets a thread whose thread/resume request was rejected
+ ❯ src/runtime.lifecycle.test.ts:240:51
+ FAIL   @bb/agent-runtime  src/runtime.lifecycle.test.ts &gt; createAgentRuntime lifecycle &gt; turn execution and thread commands &gt; keeps the provider running after thread stop
+ ❯ src/runtime.lifecycle.test.ts:914:46
+ FAIL   @bb/agent-runtime:isolated  src/runtime.process-lifecycle.test.ts &gt; createAgentRuntime process lifecycle &gt; keeps the codex provider process when one session construction fails
+ ❯ src/runtime.process-lifecycle.test.ts:902:44
+ FAIL   @bb/agent-runtime:isolated  src/runtime.process-lifecycle.test.ts &gt; createAgentRuntime process lifecycle &gt; reaps a codex session after a terminal provider error before turn start
+ ❯ src/runtime.process-lifecycle.test.ts:1035:46
+ FAIL   @bb/agent-runtime:isolated  src/runtime.process-lifecycle.test.ts &gt; createAgentRuntime process lifecycle &gt; reaps an idle codex session and resumes it later on the same process
+ ❯ src/runtime.process-lifecycle.test.ts:1103:46
+ Test Files  4 failed | 4 passed (8)
+      Tests  8 failed | 101 passed (109)
+EXIT 1
+</pre>
+  <p>These are not stale assertions: "reaps an idle codex session and resumes it later on the same process" is the contract the #1604 reaper was built on (reap the agent child, keep the bridge warm), and "keeps the codex provider process when one session construction fails" / the ACP and Codex "construction times out" cases protect against a failed start tearing down a bridge that other work is about to use. <code>forgets a thread whose thread/resume request was rejected</code> breaks because the respawned bridge re-runs its scripted failure — a harness artifact, but it shows the respawn is observable. The naive change also re-introduces a spawn+initialize round trip between every stop and the next start in an environment.</p>
+  <p><strong>Recommended change: bounded idle retirement of zero-thread bridges.</strong></p>
+  <ol>
+    <li><code>packages/agent-runtime/src/runtime-provider-process.ts</code>: add <code>idleSinceMs: number | null</code> to <code>RuntimeProviderProcess</code>. Set it at spawn; set it to <code>now</code> whenever <code>identity.threadIds</code> becomes empty (the release sites already call <code>forgetThreadRuntimeStateForProviderState</code>, so hook it there or in <code>releaseIdleProviderProcess</code>); clear it when a thread is attached (<code>threadIds.add</code> in the identity registry / <code>ensureProvider</code> for a thread).</li>
+    <li>Add <code>retireIdleProviderProcesses({ idleForMs, nowMs })</code> to the manager: for each process with <code>threadIds.size === 0</code>, <code>idleSinceMs !== null</code>, <code>nowMs - idleSinceMs ≥ idleForMs</code>, not in <code>providerStarting</code>, and no pending requests, call the existing <code>shutdownProvider</code> (it already bumps <code>expectedShutdownExpectations</code> so the exit is not reported as a crash). Keep <code>retireSupersededBridgeProcessIfIdle</code> as is — a superseded bridge should still go immediately.</li>
+    <li>Expose it on <code>AgentRuntime</code> and call it from the existing daemon sweep: in <code>runtime.reapIdleProviderSessions</code> after the session loop (or as a sibling call in <code>RuntimeManager.reapIdleProviderSessions</code>, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/runtime-manager.ts#L611-L634"><code>apps/host-daemon/src/runtime-manager.ts:611-634</code></a>). The sweep already runs every 5 min; use a shorter threshold for bridges than for sessions — 5 min idle matches the plugin-host worker bound, or reuse the 60 s maintenance bound. Make it independent of the <code>providerSessionReaping</code> experiment: a zero-thread bridge holds no session state, so retiring it loses nothing.</li>
+    <li>Tests: the repro in 4a adapted to call the sweep (fails before, passes after); one test that a bridge younger than the threshold, or with a thread attached, survives the sweep; one that a sweep during <code>ensureProvider</code> startup does not kill the starting process. All 109 existing agent-runtime lifecycle tests keep passing because none of them advance a clock past the threshold.</li>
+  </ol>
+  <p><strong>What could go wrong.</strong> (a) Race with a construction in flight: <code>threadIds</code> is empty between <code>ensureProvider</code> and the <code>thread/identity</code> notification — the <code>providerStarting</code> / pending-request checks plus the idle threshold cover it. (b) Retiring a bridge whose exit the runtime then reports through <code>onProcessExit</code> as unexpected — <code>shutdownProvider</code> already handles this for the superseded case. (c) Daemon/server wire shape: none changes, so no <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump is needed; if the threshold is made a server policy field, bump it. (d) Alternative of wiring <code>evictIdleEnvironments()</code> into the sweep is simpler but tears down the whole runtime entry (turn state, staged rewinds, status watchers) and is broader than the bug; I would not start there.</p>
+
+  <h2>7. PR review</h2>
+  <p>No open pull request is linked to this issue.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/1604">#1604</a> Idle agent processes are never reclaimed for non-Codex providers (open) — the agent-child half; its reaper is what leaves these bridges behind.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1660">#1660</a> bb host process grew to 77GB RSS and froze the machine (open) — different mechanism (orphaned dev processes), same family of unbounded host-side process growth.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1363">#1363</a> Provider processes need one host-daemon lease owner tied to active turns (open) — a lease design would subsume this if it carried an idle bound.</li>
+    <li><a href="https://github.com/get-bb/bb/pull/2325">#2325</a> (merged) — removed the Codex exemption; this issue's title should drop "non-Codex".</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Artifacts</h3>
+  <ul>
+    <li><code>runtime.idle-bridge-retirement.test.ts</code> — repro test; <code>unit-test-base.txt</code> — its output on base.</li>
+    <li><code>candidate-fix-naive.diff</code>, <code>unit-test-with-fix-summary.txt</code>, <code>unit-test-with-fix.log</code> — the issue's proposed patch and the 8 tests it breaks.</li>
+    <li><code>ps-baseline.txt</code>, <code>ps-after-spawn.txt</code>, <code>ps-after-stop.txt</code>, <code>ps-after-stop-plus-95s.txt</code>, <code>ps-after-spawn-2.txt</code>, <code>ps-after-archive-2.txt</code>, <code>ps-after-stop-2.txt</code>, <code>ps-after-stop-2-plus-95s.txt</code>, <code>ps-after-stop-2-plus-190s.txt</code> — process-table snapshots (<code>bridges.sh</code> output); <code>ps-bridge-watch.txt</code> — 10-second watch of the stranded bridge (<code>watch-bridge.sh</code> output).</li>
+    <li><code>project-create.txt</code>, <code>spawn-1.json</code>, <code>spawn-2.json</code>, <code>stop-1.txt</code>, <code>archive-2.txt</code>, <code>stop-2.txt</code> — CLI/API transcripts.</li>
+    <li>Scripts: <code>bbdev.sh</code>, <code>setup-project.sh</code>, <code>wait-idle.sh</code>, <code>bridges.sh</code>, <code>watch-bridge.sh</code>, <code>run-naive-fix.sh</code> (applies the issue's patch, runs the eight test files, reverts).</li>
+    <li><code>e42a4ef48-runtime.diff</code> — how #2325 changed runtime.ts; <code>issue-body.md</code> — the issue as filed; <code>dev-app-start.log</code> (first run), <code>revise-dev-app-start.log</code>, <code>revise-build.log</code> (this run).</li>
+  </ul>
+  <h3>Helper scripts</h3>
+  <pre>#!/bin/bash
+# Runs the bb CLI against YOUR isolated dev instance (the one started by
+# `scripts/bb-dev-app current` in your bb checkout). Nothing is hardcoded:
+# set BB_REPO to your checkout (default: the directory this script is run
+# from) and the server/daemon ports come from `scripts/bb-dev-app env`.
+# Usage: BB_REPO=/path/to/bb bash bbdev.sh &lt;bb args...&gt;
+BB_REPO=${BB_REPO:-$PWD}
+cd &quot;$BB_REPO&quot; || exit 1
+eval &quot;$(scripts/bb-dev-app env)&quot;   # exports BB_SERVER_URL, BB_HOST_DAEMON_PORT, BB_PROJECT_ID
+exec node packages/scripts/dist/commands/run-cli.js &quot;$@&quot;
+</pre>
+  <pre>#!/bin/bash
+# Lists the host daemon&#x27;s direct children (provider bridges, plugin-host
+# workers, the parcel watcher) with their own children (agent processes).
+# The command column shows the executable&#x27;s basename, then the LAST 100
+# characters of the command line, so the script or data dir that identifies
+# each process is visible:
+#   node ... /plugins/provider-&lt;id&gt;/bridge-data  -&gt; a provider bridge (bridge-worker-entry.ts)
+#   node ... /plugins/&lt;id&gt;/host-data             -&gt; a plugin-host worker (plugin-host-worker.ts)
+#   claude ...                                   -&gt; the claude-code agent child of a bridge
+#   esbuild --service ... --ping                 -&gt; tsx&#x27;s esbuild helper (dev-only, ignore)
+# Usage: bash bridges.sh &lt;host-daemon-pid&gt;
+# Find the pid with: lsof -nP -iTCP:$BB_HOST_DAEMON_PORT -sTCP:LISTEN
+DAEMON=${1:?host daemon pid}
+cmd() { ps -o command= -p &quot;$1&quot; | awk &#x27;{n=split($1,a,&quot;/&quot;); exe=a[n]; s=$0; if (length(s)&gt;100) s=&quot;...&quot; substr(s,length(s)-99); print exe &quot; &quot; s}&#x27;; }
+echo &quot;daemon pid $DAEMON  ($(date +%H:%M:%S))&quot;
+printf &#x27;%-6s %-6s %-7s %-8s %s\n&#x27; PID PPID RSS_KB ETIME &#x27;EXE + last 100 chars of COMMAND&#x27;
+for p in $(pgrep -P &quot;$DAEMON&quot;); do
+  ps -o pid=,ppid=,rss=,etime= -p &quot;$p&quot; | tr -d &#x27;\n&#x27;; echo -n &quot;  &quot;; cmd &quot;$p&quot;
+  for c in $(pgrep -P &quot;$p&quot;); do
+    echo -n &quot;    child &quot;; ps -o pid=,ppid=,rss=,etime= -p &quot;$c&quot; | tr -d &#x27;\n&#x27;; echo -n &quot;  &quot;; cmd &quot;$c&quot;
+  done
+done
+</pre>
+  <h3>Commands run (in order)</h3>
+  <pre>gh issue view 2308 --repo get-bb/bb --json ...            # issue + comments (none)
+pnpm install --frozen-lockfile --prefer-offline; pnpm exec turbo run build
+git fetch origin main; git rev-parse origin/main             # == 494f66526
+git log -S isThreadScopedCodexProcess --oneline -- packages/agent-runtime/src/runtime.ts   # e42a4ef48, c5b53caab, 2a84ecfdc
+git show e42a4ef48 -- packages/agent-runtime/src/runtime.ts
+grep -rn evictIdleEnvironments apps packages                  # runtime-manager.ts + tests only
+cp repro/runtime.idle-bridge-retirement.test.ts packages/agent-runtime/src/
+cd packages/agent-runtime &amp;&amp; pnpm exec vitest run src/runtime.idle-bridge-retirement.test.ts          # 2 failed / 1 passed on base
+scripts/bb-dev-app current                                   # Server :22861, Host daemon :30861
+BB_REPO=$PWD bash repro/setup-project.sh                     # /tmp/bb-2308-qa, proj_iwzvzf2fev
+lsof -nP -iTCP:30861 -sTCP:LISTEN                            # daemon pid 17027
+bash repro/bridges.sh 17027 &gt; ps-baseline.txt
+BB_REPO=$PWD bash repro/bbdev.sh thread spawn --project proj_iwzvzf2fev --environment /tmp/bb-2308-qa --provider claude-code --prompt "Reply only with ok." --json
+bash repro/bridges.sh 17027   (repeated after each step)
+BB_REPO=$PWD bash repro/wait-idle.sh thr_7ptec8hm8d; BB_REPO=$PWD bash repro/bbdev.sh thread stop thr_7ptec8hm8d
+sleep 92; bash repro/bridges.sh 17027 &gt; ps-after-stop-plus-95s.txt
+BB_REPO=$PWD bash repro/bbdev.sh thread spawn ... (same project/environment) ...      # thr_jxijqce242
+BB_REPO=$PWD bash repro/wait-idle.sh thr_jxijqce242; BB_REPO=$PWD bash repro/bbdev.sh thread archive thr_jxijqce242
+BB_REPO=$PWD bash repro/bbdev.sh thread stop thr_jxijqce242
+bash repro/watch-bridge.sh 20879 190 &gt; ps-bridge-watch.txt; bash repro/bridges.sh 17027 &gt; ps-after-stop-2-plus-190s.txt
+BB_REPO=$PWD bash repro/run-naive-fix.sh &gt; unit-test-with-fix.log   # applies candidate-fix-naive.diff, 8 failed / 101 passed, reverts
+pnpm dev:stop; rm -rf &lt;data dir&gt; /tmp/bb-2308-qa</pre>
+  <h3>Daemon log excerpt (plugin-host workers do get an idle bound; from the first run's daemon log — in this run the same retirement is visible as workers 17152/17196 present at 09:51:41 and gone at 09:53:53)</h3>
+  <pre>{"level":30,"component":"host-daemon","pluginId":"keep-awake","reason":"host plugin worker became idle","uptimeMs":300472,"exitCode":0,"msg":"Host plugin worker stopped"}
+{"level":30,"component":"host-daemon","pluginId":"provider-acp","reason":"host plugin worker became idle","uptimeMs":304965,"exitCode":0,"msg":"Host plugin worker stopped"}</pre>
+  <h2>10. Verification</h2>
+  <p><strong>What the independent verifier did.</strong> Followed both reproductions literally on base <code>494f66526</code> in a separate worktree and dev instance (server :20871, daemon :28871). The unit test gave the same 2 failed / 1 passed with the same <code>waitForRuntimeState</code> timeout for claude-code and codex; the issue's naive patch gave the same 8 failures / 101 passed; live, <code>thread stop</code> left a zero-child <code>provider-claude-code/bridge-data</code> process resident while the maintenance bridge was retired at 60 s, and a second spawn in the same environment reused it. Every code permalink and line number was checked against the base commit; no linked PR exists; origin/main was still the base commit.</p>
+  <p><strong>Findings and what changed in this revision.</strong></p>
+  <ul>
+    <li><em>Major — the "#1604 reaper is enabled and working" row was over-claimed.</em> Confirmed in code: <code>findReapableIdleProviderSession</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/agent-runtime/src/runtime.ts#L1008-L1018"><code>packages/agent-runtime/src/runtime.ts:1008-1018</code></a>) returns <code>null</code> for every non-Codex session unless <code>providerSessionReapingEnabled</code> is true, and that is the <code>providerSessionReaping</code> experiment, default <code>false</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/packages/domain/src/experiments.ts#L34"><code>packages/domain/src/experiments.ts:34</code></a>), read at <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/internal/session.ts#L43"><code>apps/server/src/internal/session.ts:43</code></a> and fetched by the daemon sweep at <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/app.ts#L700-L704"><code>apps/host-daemon/src/app.ts:700-704</code></a>. The claims row is now "Partially verified" with that gating spelled out, step 7 and the section 5 sweep bullet say the reaper only applies with the experiment on, and section 6 keeps the recommendation that bridge retirement must not depend on the experiment. The root cause is unchanged: an explicit stop strands the bridge with or without the experiment.</li>
+    <li><em>Minor — snapshots did not identify bridges.</em> <code>bridges.sh</code> now prints the executable name plus the last 100 characters of each command line, and every live artifact was re-captured on a fresh instance (section 3) so <code>…/plugins/provider-claude-code/bridge-data</code> versus <code>…/plugins/&lt;id&gt;/host-data</code> is readable in the snapshots themselves. A 10-second <code>watch-bridge.sh</code> log was added as continuous evidence.</li>
+    <li><em>Minor — hardcoded ports in bbdev.sh.</em> The script now derives the checkout from <code>BB_REPO</code> and the ports from <code>scripts/bb-dev-app env</code>; <code>setup-project.sh</code> and <code>wait-idle.sh</code> were added so the whole live repro runs without editing anything.</li>
+    <li><em>Minor — weak citation for per-environment keying.</em> The claims row now points at <code>this.entries.set(args.environmentId, entry)</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/runtime-manager.ts#L1033"><code>apps/host-daemon/src/runtime-manager.ts:1033</code></a>) and <code>get(environmentId)</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/host-daemon/src/runtime-manager.ts#L366-L368"><code>apps/host-daemon/src/runtime-manager.ts:366-368</code></a>) instead of only the comment.</li>
+  </ul>
+  <p><strong>Re-run results (this revision, worktree <code>wf_846839f8-f8a-21</code>, same base).</strong> Unit test on base: 2 failed / 1 passed (<code>log</code>). Naive patch: 8 failed / 101 passed, identical list (<code>summary</code>). Live: bridge 20879 survived two stop cycles and was last seen 9 min 28 s old with 0 children, 3 min 28 s after the final stop. One wrinkle worth recording: while re-running, a background capture of the +95 s snapshot initially appeared to be missing the bridge; re-reading the file on disk showed the bridge line was present (the capture had simply been read before its last line was flushed), and the later reuse of the same pid 20879 with a consistent start time confirms it never exited. Dev instance stopped, data dir and scratch repo deleted, ports 14861/22861/30861 confirmed free afterwards.</p>
+</main></body></html>

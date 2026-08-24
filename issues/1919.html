@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1919 storage.database() opens a new SQLite handle on every call</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-ok { color:var(--high); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1919 · storage.database() opens a new SQLite handle on every call; plugins leak fds until dispose</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill high">Priority: High</span> <span class="pill">Effort: small</span> <span class="pill">plugins</span>
+    <a href="https://github.com/get-bb/bb/issues/1919">open on GitHub</a>
+    <span>2026-08-19 · base <code>d81fee6f</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict v-ok">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>The plugin host API <code>bb.storage.database()</code> is documented (SDK contract comment) and simulated (the SDK's <code>FakePluginHost</code>) as returning one reused better-sqlite3 handle per plugin. The production implementation in <code>apps/server/src/services/plugins/plugin-api.ts</code> instead constructs <code>new Database(...)</code> on every call and only appends it to a <code>databaseHandles</code> array that is drained on plugin dispose/reload. Each handle holds open file descriptors on <code>data.db</code> and <code>data.db-wal</code>, so a plugin that calls <code>database()</code> inside hot service methods accumulates fds linearly for the life of the server process. I reproduced this on a fresh dev instance at <code>d81fee6f</code>: 300 HTTP calls to a plugin route that calls <code>database()</code> raised the server's open-fd count on <code>data.db</code> from 1 to 301 (601 new fds total), and <code>bb plugin reload</code> dropped it back to 0. A unit test in the server package fails on <code>d81fee6f</code> (200 calls → 200 distinct handles) and passes with a six-line fix that caches the handle per plugin generation; the existing plugin test suite (381 tests) still passes with the fix.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td><code>PluginStorage.database()</code> opens a new connection on every call and pushes it onto <code>databaseHandles</code>; no reuse.</td><td class="ok">Verified</td><td><a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/apps/server/src/services/plugins/plugin-api.ts#L599-L608">plugin-api.ts#L599-L608</a>; unit test: 200 calls → 200 distinct handles (<code>log</code>).</td></tr>
+    <tr><td>Handles are only closed on plugin dispose/reload.</td><td class="ok">Verified</td><td>Only drain sites are <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/apps/server/src/services/plugins/plugin-runtime.ts#L1505">plugin-runtime.ts#L1505</a>, <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/apps/server/src/services/plugins/plugin-runtime.ts#L1542">#L1542</a>, <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/apps/server/src/services/plugins/plugin-runtime.ts#L1576">#L1576</a>, <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/apps/server/src/services/plugins/plugin-runtime.ts#L1681">#L1681</a> (candidate rollback, host-artifact failure, swap, dispose). Live: <code>bb plugin reload fdleak</code> took data.db fds 301 → 0.</td></tr>
+    <tr><td>SDK comment says "Open (or reuse the path of)"; the fake host caches one handle; production does not.</td><td class="ok">Verified</td><td><a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/packages/plugin-sdk/src/backend-contract.ts#L117-L123">backend-contract.ts#L117-L123</a>; <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/packages/plugin-sdk/src/testing/fake-plugin-host.ts#L890-L902">fake-plugin-host.ts#L890-L902</a>. The comment wording is ambiguous ("reuse the <em>path</em>"), but the fake host and the plugin-authoring SKILL both present it as <em>the</em> plugin database, and every first-party plugin treats the return as a singleton.</td></tr>
+    <tr><td>Each call leaks fds on <code>data.db</code> and <code>data.db-wal</code> (shm stays small).</td><td class="ok">Verified</td><td>Live repro after 300 calls: 301 × data.db, 300 × data.db-wal, 1 × data.db-shm (<code>log</code>). SQLite WAL mode shares one shm mapping per process, which is why shm stays at 1.</td></tr>
+    <tr><td>Measured 42,498 fds on a Factory install; ~85,080 open files; <code>spawn EBADF</code> for <code>execFile("ps")</code> for ~2 days.</td><td class="unv">Unverified (plausible)</td><td>I do not have the Factory plugin or that machine. The mechanism is confirmed and fd growth is unbounded, so exhaustion of the per-process fd limit (and the resulting EBADF from libuv's spawn path) follows. On Linux the dev server's soft limit is 524288, so it would take longer to hit than on macOS (138,240 reported).</td></tr>
+    <tr><td>The leak restarts immediately after reload.</td><td class="ok">Verified</td><td>Nothing changes on reload; the new generation has the same <code>database()</code> implementation. Re-running the live script after reload shows the same growth.</td></tr>
+    <tr><td>Expected: one reused handle per plugin, close only on dispose.</td><td class="ok">Agree</td><td>Six-line change to <code>plugin-api.ts</code> verified below (unit + live).</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb commit <code>d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3</code> (main, 2026-08-19). No later commit on origin/main touches <code>plugin-api.ts</code> or <code>backend-contract.ts</code> (checked <code>git log d81fee6f..origin/main</code>; only #1912 and #1923 landed after).</li>
+    <li>Linux 7.0.0-29-generic x86_64, Node v24.18.0, better-sqlite3 via <code>@bb/server</code>.</li>
+    <li>Dev instance from <code>scripts/bb-dev-app current</code>: server <code>http://localhost:23917</code>, host daemon <code>:31917</code>, app <code>:15917</code>, data dir <code>~/.bb-dev/projects-bb-.claude-worktrees-wf_d5c47f31-487-2-d2c2aa35cd26</code> (deleted at cleanup). No providers/turns needed.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <h3>A. Unit test (fails on d81fee6f)</h3>
+  <ol>
+    <li>Save the test below as <code>apps/server/test/services/plugins/plugin-database-handle-reuse.test.ts</code> (copy: <code>1919/repro/plugin-database-handle-reuse.test.ts</code>). It installs a throwaway plugin whose factory calls <code>bb.storage.database()</code> 200 times and then counts distinct handles and the process's open fds under the plugin's data dir (via <code>/proc/self/fd</code>, Linux only).</li>
+    <li>Run it from <code>apps/server</code>: <pre>pnpm exec vitest run test/services/plugins/plugin-database-handle-reuse.test.ts</pre></li>
+    <li>Expected: pass (1 distinct handle, ≤1 fd on data.db). Actual on d81fee6f:
+<pre>[#1919] 200 database() calls -&gt; 200 distinct handles; open fds under /tmp/bb-plugin-db-reuse-8Qj7MN/data/plugins/chatty: { &#x27;data.db-wal&#x27;: 199, &#x27;data.db&#x27;: 200, &#x27;data.db-shm&#x27;: 1 }
+
+AssertionError: expected 200 to be 1 // Object.is equality
+  ❯ test/services/plugins/plugin-database-handle-reuse.test.ts:123:27
+    expect(distinct.size).toBe(1); // FAILS on d81fee6f: 200 distinct handles
+
+ Test Files  1 failed (1)
+      Tests  1 failed (1)</pre></li>
+  </ol>
+  <pre>// Repro for get-bb/bb#1919: storage.database() opens a new better-sqlite3
+// connection on every call instead of reusing one handle per plugin, so a
+// chatty plugin leaks file descriptors until dispose/reload.
+import {
+  mkdtemp,
+  mkdir,
+  readdir,
+  readlink,
+  rm,
+  writeFile,
+} from &quot;node:fs/promises&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { afterEach, beforeEach, describe, expect, it } from &quot;vitest&quot;;
+import { createConnection, migrate, type DbConnection } from &quot;@bb/db&quot;;
+import type { Logger } from &quot;@bb/logger&quot;;
+import {
+  createPluginService,
+  type PluginService,
+} from &quot;../../../src/services/plugins/plugin-service.js&quot;;
+import { testLogger } from &quot;../../helpers/test-app.js&quot;;
+import { createNoopTelemetryService } from &quot;../../../src/services/system/telemetry.js&quot;;
+
+const logger = testLogger as unknown as Logger;
+
+/** Count open fds in this process that point at files under `dir`. */
+async function openFdsUnder(dir: string): Promise&lt;Record&lt;string, number&gt;&gt; {
+  const counts: Record&lt;string, number&gt; = {};
+  for (const fd of await readdir(&quot;/proc/self/fd&quot;)) {
+    let target: string;
+    try {
+      target = await readlink(join(&quot;/proc/self/fd&quot;, fd));
+    } catch {
+      continue;
+    }
+    if (target.startsWith(dir)) {
+      const name = target.slice(dir.length + 1);
+      counts[name] = (counts[name] ?? 0) + 1;
+    }
+  }
+  return counts;
+}
+
+describe(&quot;storage.database() handle reuse (#1919)&quot;, () =&gt; {
+  let db: DbConnection;
+  let workDir: string;
+  let dataDir: string;
+  let service: PluginService;
+
+  beforeEach(async () =&gt; {
+    db = createConnection(&quot;:memory:&quot;);
+    migrate(db);
+    workDir = await mkdtemp(join(tmpdir(), &quot;bb-plugin-db-reuse-&quot;));
+    dataDir = join(workDir, &quot;data&quot;);
+    service = createPluginService({
+      telemetry: createNoopTelemetryService(),
+      db,
+      hub: {
+        getDaemonSessionIdForHost: () =&gt; null,
+        notifyPluginSignal: () =&gt; 0,
+        notifySystem: () =&gt; {},
+      },
+      logger,
+      dataDir,
+      appVersion: &quot;0.9.0&quot;,
+      loadTimeoutMs: 2000,
+    });
+  });
+
+  afterEach(async () =&gt; {
+    await service.stop();
+    await rm(workDir, { recursive: true, force: true });
+  });
+
+  it(&quot;returns one reused handle per plugin instead of opening a connection per call&quot;, async () =&gt; {
+    const CALLS = 200;
+    const rootDir = join(workDir, &quot;bb-plugin-chatty&quot;);
+    await mkdir(rootDir, { recursive: true });
+    await writeFile(
+      join(rootDir, &quot;package.json&quot;),
+      JSON.stringify({
+        name: &quot;bb-plugin-chatty&quot;,
+        version: &quot;0.1.0&quot;,
+        bb: {
+          name: &quot;Chatty&quot;,
+          description: &quot;Calls storage.database() on every service method.&quot;,
+          branding: { icon: &quot;Zap&quot; },
+          server: &quot;./server.ts&quot;,
+        },
+      }),
+    );
+    await writeFile(
+      join(rootDir, &quot;server.ts&quot;),
+      `
+      export default function plugin(bb: any) {
+        const g = globalThis as any;
+        g.__chatty = { bb, handles: [] as unknown[] };
+        // Simulates a plugin whose every service method calls database().
+        for (let i = 0; i &lt; ${CALLS}; i++) {
+          const db = bb.storage.database();
+          db.prepare(&quot;SELECT 1&quot;).get();
+          g.__chatty.handles.push(db);
+        }
+      }
+      `,
+    );
+    const entry = await service.installPath(rootDir);
+    expect(entry.status).toBe(&quot;running&quot;);
+
+    const state = (globalThis as Record&lt;string, unknown&gt;).__chatty as {
+      handles: unknown[];
+    };
+    const distinct = new Set(state.handles);
+    const pluginDir = join(dataDir, &quot;plugins&quot;, &quot;chatty&quot;);
+    const fds = await openFdsUnder(pluginDir);
+    // eslint-disable-next-line no-console
+    console.log(
+      `[#1919] ${CALLS} database() calls -&gt; ${distinct.size} distinct handles; open fds under ${pluginDir}:`,
+      fds,
+    );
+
+    // Contract (backend-contract.ts / fake-plugin-host.ts): one reused handle.
+    expect(distinct.size).toBe(1); // FAILS on d81fee6f: 200 distinct handles
+    expect(fds[&quot;data.db&quot;] ?? 0).toBeLessThanOrEqual(1); // FAILS: 200 fds on data.db
+  });
+});
+</pre>
+
+  <h3>B. Live repro against a running bb server</h3>
+  <ol>
+    <li>Start your dev instance (<code>scripts/bb-dev-app current</code>) and note the Server URL and Data dir.</li>
+    <li>Create a tiny plugin at <code>/tmp/bb-1919-plugin/bb-plugin-fdleak/</code> (files in <code>1919/repro/bb-plugin-fdleak/</code>). Its one route calls <code>database()</code> per request, exactly like a plugin that does so in each service method:
+<pre>// Mimics a chatty plugin (e.g. Factory) that calls bb.storage.database()
+// inside every service method instead of caching it at load time.
+export default function plugin(bb: any) {
+  bb.http.route(
+    &quot;GET&quot;,
+    &quot;/ping&quot;,
+    async () =&gt; {
+      const db = bb.storage.database();
+      const row = db.prepare(&quot;SELECT 1 AS one&quot;).get();
+      return Response.json({ ok: true, one: row.one, pid: process.pid });
+    },
+    { auth: &quot;none&quot; },
+  );
+}
+</pre></li>
+    <li>Install it: <pre>BB_SERVER_URL=http://localhost:23917 pnpm bb:dev plugin install /tmp/bb-1919-plugin/bb-plugin-fdleak --yes
+# Installed: fdleak@0.1.0  running</pre></li>
+    <li>Run <code>1919/repro/live-repro.sh</code>, which hits the route 300 times and counts fds in the server process via <code>/proc/&lt;pid&gt;/fd</code>:
+<pre>BB_SERVER_URL=http://localhost:23917 BB_DATA_DIR=~/.bb-dev/&lt;instance&gt; bash live-repro.sh 300</pre>
+Expected: fds on data.db stay at 1. Actual (verbatim):
+<pre>server pid=3125178  data.db=/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_d5c47f31-487-2-d2c2aa35cd26/plugins/fdleak/data.db
+before: fds on data.db=1  total fds=49  (soft limit: 524288)
+after 300 GET http://localhost:23917/api/v1/plugins/fdleak/http/ping:
+after : fds on data.db=301  total fds=650
+by file:
+    301 plugins/fdleak/data.db
+      1 plugins/fdleak/data.db-shm
+    300 plugins/fdleak/data.db-wal
+</pre></li>
+    <li><code>pnpm bb:dev plugin reload fdleak</code> then recount: <code>0</code> fds on data.db — reload closes them, matching the issue.</li>
+  </ol>
+  <p>Repro files: <code>1919/repro/</code></p>
+
+  <h2>5. Root cause</h2>
+  <p><a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/apps/server/src/services/plugins/plugin-api.ts#L597-L608">plugin-api.ts#L597-L608</a> (introduced unchanged in <code>e83d58fba</code>, "Plugin SDK 0.3", #716):</p>
+  <pre>  const storage: PluginStorage = {
+    kv,
+    database() {
+      assertLive();
+      const dir = join(dataDir, &quot;plugins&quot;, pluginId);
+      mkdirSync(dir, { recursive: true });
+      const database = new Database(join(dir, &quot;data.db&quot;));   // &lt;-- new connection EVERY call
+      database.pragma(&quot;journal_mode = WAL&quot;);
+      database.pragma(&quot;busy_timeout = 5000&quot;);
+      databaseHandles.push(database);                          // &lt;-- only drained on dispose/reload
+      return database;
+    },</pre>
+  <p>Every call constructs a fresh <code>better-sqlite3</code> <code>Database</code>. Each open connection holds an fd on <code>data.db</code> and, once WAL is enabled by the pragma, an fd on <code>data.db-wal</code> (the <code>-shm</code> mapping is shared per process, so it stays at 1). The handles are retained in <code>databaseHandles</code> so the host can close them later, which is also what keeps them from being garbage-collected, so the fd count is strictly monotonic until one of the four drain sites in <code>plugin-runtime.ts</code> runs (<a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/apps/server/src/services/plugins/plugin-runtime.ts#L1681-L1683">dispose</a>, <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/apps/server/src/services/plugins/plugin-runtime.ts#L1576-L1578">swap on reload</a>, and the two failed-load rollbacks). Nothing in the normal request path ever closes a handle.</p>
+  <p>The contract the plugin author sees promises reuse. <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/packages/plugin-sdk/src/backend-contract.ts#L117-L123">backend-contract.ts</a>:</p>
+  <pre>  /**
+   * Open (or reuse the path of) the plugin&#x27;s own SQLite database at
+   * &lt;dataDir&gt;/plugins/&lt;id&gt;/data.db — the server&#x27;s better-sqlite3, WAL mode,
+   * busy_timeout 5000. Handles are host-tracked and closed on
+   * dispose/reload; a closed handle throws on use.
+   */
+  database(): Database.Database;</pre>
+  <p>And the SDK's <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/packages/plugin-sdk/src/testing/fake-plugin-host.ts#L890-L902">fake host</a>, which is what plugin tests run against, caches one handle, so a plugin that calls <code>database()</code> per method passes its tests and leaks only in production:</p>
+  <pre>  // One shared temp-file handle: every database() call sees the same data,
+  // like the host&#x27;s handles over one on-disk file.
+  let databaseHandle: Database.Database | undefined;
+  const storage: PluginStorage = {
+    kv,
+    database() {
+      assertLive();
+      if (!databaseHandle) {
+        databaseHandle = new Database(join(storageRoot, &quot;data.db&quot;));
+        databaseHandle.pragma(&quot;busy_timeout = 5000&quot;);
+      }
+      return databaseHandle;
+    },</pre>
+  <p>Why the symptom follows: the server process's fd table fills with SQLite handles; once it reaches the per-process limit, any syscall that needs a new fd fails. libuv's <code>uv_spawn</code> opens pipes/dups before fork, so <code>child_process.execFile("ps")</code> surfaces as <code>spawn EBADF</code> (the issue's symptom); pure-SQLite work on already-open handles keeps working, which matches "SQLite-only schedules stayed ok".</p>
+  <p>Deeper note: the first-party plugins (<code>automations</code>, <code>docs</code>, <code>github</code>, <code>memory</code>, <code>tasks</code>, <code>workflows</code>) all call <code>database()</code> exactly once at factory load and hold the handle, which is why this was not noticed in-tree. Nothing enforces that pattern, and the fake host actively hides the difference.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>Make production match the contract and the fake host: cache one handle per plugin generation in <code>createPluginApi</code>, reopen only if the plugin itself closed it (<code>db.open === false</code>), keep pushing into <code>databaseHandles</code> so the existing dispose/reload/rollback paths close it unchanged. Verified diff (<code>proposed-fix.diff</code>):</p>
+  <pre>diff --git a/apps/server/src/services/plugins/plugin-api.ts b/apps/server/src/services/plugins/plugin-api.ts
+index 47e0a2473..62e4de48e 100644
+--- a/apps/server/src/services/plugins/plugin-api.ts
++++ b/apps/server/src/services/plugins/plugin-api.ts
+@@ -594,15 +594,21 @@ export function createPluginApi(options: {
+     },
+   };
+ 
++  // One reused handle per plugin generation (the SDK contract and the fake
++  // host both promise reuse). A plugin that closes the handle itself gets a
++  // fresh one on the next call; the host closes whatever is open on dispose.
++  let databaseHandle: Database.Database | undefined;
+   const storage: PluginStorage = {
+     kv,
+     database() {
+       assertLive();
++      if (databaseHandle?.open) return databaseHandle;
+       const dir = join(dataDir, &quot;plugins&quot;, pluginId);
+       mkdirSync(dir, { recursive: true });
+       const database = new Database(join(dir, &quot;data.db&quot;));
+       database.pragma(&quot;journal_mode = WAL&quot;);
+       database.pragma(&quot;busy_timeout = 5000&quot;);
++      databaseHandle = database;
+       databaseHandles.push(database);
+       return database;
+     },
+</pre>
+  <p>Verification: the repro test passes; <code>pnpm exec vitest run test/services/plugins/</code> passes 35 files / 381 tests (<code>log</code>), including the existing "closes handles on reload" test; <code>turbo typecheck --filter=@bb/server</code> passes; live re-run of the script with the patched server: 300 calls → still 1 fd on data.db (<code>log</code>):</p>
+  <pre>server pid=3138971  data.db=/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_d5c47f31-487-2-d2c2aa35cd26/plugins/fdleak/data.db
+before: fds on data.db=1  total fds=51  (soft limit: 524288)
+after 300 GET http://localhost:23917/api/v1/plugins/fdleak/http/ping:
+after : fds on data.db=1  total fds=51
+by file:
+      1 plugins/fdleak/data.db
+      1 plugins/fdleak/data.db-shm
+      1 plugins/fdleak/data.db-wal
+</pre>
+  <p>What could go wrong / things to decide:</p>
+  <ul>
+    <li>Any plugin that relied on getting <em>independent</em> connections (e.g. to run a long read on one while writing on another, or to call <code>db.close()</code> on a "private" handle) now shares one. better-sqlite3 is synchronous, so concurrent use of a single handle is not an issue; a plugin calling <code>close()</code> on the shared handle would break its own other callers, but the <code>.open</code> check makes the next <code>database()</code> call self-heal. No first-party plugin does either.</li>
+    <li>The <code>databaseHandles</code> array may now hold a closed handle (if a plugin closed it) followed by the replacement; <code>close()</code> on an already-closed better-sqlite3 handle is a no-op, and all drain sites are try/catch anyway.</li>
+    <li>The SDK contract comment ("reuse the path of") should be tightened to "returns the same handle for the lifetime of this plugin load"; the fake host already behaves that way. Consider also adding the <code>.open</code> re-open behaviour to the fake host so they stay aligned. No <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump is needed: nothing crosses the server/daemon wire.</li>
+    <li>Keep the repro test as a regression test (the fd assertion is Linux-only because of <code>/proc/self/fd</code>; the <code>distinct.size</code> assertion alone is portable and sufficient).</li>
+  </ul>
+
+  <h2>7. PR review</h2>
+  <p>No open PRs are linked to this issue.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/pull/716">#716</a> Plugin SDK 0.3 — introduced this <code>database()</code> implementation and the fake host.</li>
+    <li>The Factory plugin's own workaround (caching in the plugin) is tracked in that repo per the issue; it is not a host fix.</li>
+    <li>No duplicate bb issue found (searched "database handle", "fd leak", "EBADF", "storage.database").</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Commands run</h3>
+  <pre>git checkout d81fee6f; git fetch origin main; git log d81fee6f..origin/main --oneline -- apps/server/src/services/plugins/plugin-api.ts packages/plugin-sdk/src/backend-contract.ts   # empty
+pnpm install --frozen-lockfile --prefer-offline; pnpm exec turbo run build
+cd apps/server && pnpm exec vitest run test/services/plugins/plugin-database-handle-reuse.test.ts   # FAILS on base
+scripts/bb-dev-app current   # Server http://localhost:23917
+BB_SERVER_URL=http://localhost:23917 pnpm bb:dev plugin install /tmp/bb-1919-plugin/bb-plugin-fdleak --yes
+BB_SERVER_URL=http://localhost:23917 BB_DATA_DIR=... bash /tmp/bb-reports/issues/1919/repro/live-repro.sh 300   # 301 fds
+BB_SERVER_URL=http://localhost:23917 pnpm bb:dev plugin reload fdleak   # back to 0 fds
+# apply proposed-fix.diff, turbo build --filter=@bb/server, restart dev instance
+bash live-repro.sh 300   # stays at 1 fd
+pnpm exec vitest run test/services/plugins/   # 381 passed
+pnpm exec turbo run typecheck --filter=@bb/server   # ok
+pnpm dev:stop</pre>
+  <h3>Unit test output on d81fee6f (full)</h3>
+  <pre>
+ RUN  v4.1.1 /home/USER/projects/bb/.claude/worktrees/wf_d5c47f31-487-2/apps/server
+
+stdout | test/services/plugins/plugin-database-handle-reuse.test.ts &gt; storage.database() handle reuse (#1919) &gt; returns one reused handle per plugin instead of opening a connection per call
+[#1919] 200 database() calls -&gt; 200 distinct handles; open fds under /tmp/bb-plugin-db-reuse-8Qj7MN/data/plugins/chatty: { &#x27;data.db-wal&#x27;: 199, &#x27;data.db&#x27;: 200, &#x27;data.db-shm&#x27;: 1 }
+
+ ❯  @bb/server  test/services/plugins/plugin-database-handle-reuse.test.ts (1 test | 1 failed) 241ms
+     × returns one reused handle per plugin instead of opening a connection per call 240ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL   @bb/server  test/services/plugins/plugin-database-handle-reuse.test.ts &gt; storage.database() handle reuse (#1919) &gt; returns one reused handle per plugin instead of opening a connection per call
+AssertionError: expected 200 to be 1 // Object.is equality
+
+- Expected
++ Received
+
+- 1
++ 200
+
+ ❯ test/services/plugins/plugin-database-handle-reuse.test.ts:123:27
+    121|
+    122|     // Contract (backend-contract.ts / fake-plugin-host.ts): one reuse…
+    123|     expect(distinct.size).toBe(1); // FAILS on d81fee6f: 200 distinct …
+       |                           ^
+    124|     expect(fds[&quot;data.db&quot;] ?? 0).toBeLessThanOrEqual(1); // FAILS: 200 …
+    125|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed (1)
+   Start at  15:03:50
+   Duration  2.75s (transform 1.39s, setup 0ms, import 2.43s, tests 241ms, environment 0ms)
+
+</pre>
+  <h3>Live repro before fix</h3>
+  <pre>server pid=3125178  data.db=/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_d5c47f31-487-2-d2c2aa35cd26/plugins/fdleak/data.db
+before: fds on data.db=1  total fds=49  (soft limit: 524288)
+after 300 GET http://localhost:23917/api/v1/plugins/fdleak/http/ping:
+after : fds on data.db=301  total fds=650
+by file:
+    301 plugins/fdleak/data.db
+      1 plugins/fdleak/data.db-shm
+    300 plugins/fdleak/data.db-wal
+</pre>
+  <h3>Live repro after fix</h3>
+  <pre>server pid=3138971  data.db=/home/USER/.bb-dev/projects-bb-.claude-worktrees-wf_d5c47f31-487-2-d2c2aa35cd26/plugins/fdleak/data.db
+before: fds on data.db=1  total fds=51  (soft limit: 524288)
+after 300 GET http://localhost:23917/api/v1/plugins/fdleak/http/ping:
+after : fds on data.db=1  total fds=51
+by file:
+      1 plugins/fdleak/data.db
+      1 plugins/fdleak/data.db-shm
+      1 plugins/fdleak/data.db-wal
+</pre>
+</main></body></html>

@@ -1,0 +1,1028 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2166 automation update writes an over-cap prompt despite rejecting it</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; max-height:520px; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:16px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:4px; }
+  details summary { cursor:pointer; font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2166 · automation update writes an over-cap prompt despite rejecting it, then no read of that project's automations succeeds</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill high">Priority: High</span> <span class="pill">Effort: Small</span> <span class="pill">cli</span> <span class="pill">automations</span>
+    <a href="https://github.com/get-bb/bb/issues/2166">open on GitHub</a>
+    <span>2026-08-21 · base <code>fcada5a3b</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="no">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>Running <code>bb automation update &lt;id&gt; --prompt "&lt;more than 8000 characters&gt;"</code> prints a Zod <code>too_big</code> rejection and exits 1, but the new prompt is already in the database by the time the error is produced. The same is true for <code>bb automation create</code>. From then on <code>bb automation show &lt;id&gt;</code>, <code>bb automation list --project …</code> (which hides every other automation in the project), the app's automation detail page, and any repairing <code>bb automation update</code> all fail with the identical <code>too_big</code> error, so the only way out is a manual SQLite edit.</p>
+  <p>The mechanism: the <code>bb automation</code> CLI handler builds the request object by hand and calls the plugin service directly, never running it through the Zod request schema that the RPC route (used by the web app) applies. The service writes the row, and only then serializes it for the response using <code>automationExecutionSchema</code>, which carries the same <code>.max(8000)</code> cap. That cap is also used to parse every stored row on every read, so a single over-cap row poisons <code>list</code>, <code>show</code> and <code>update</code>. One claim in the issue is wrong: the corrupted automation does <em>not</em> keep running on schedule; the scheduler parses the stored row with the same schema, logs <code>Skipping due automation … with invalid stored configuration</code> every 10 s, and never advances it.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td><code>bb automation update … --prompt</code> (8039 chars) returns the <code>too_big</code> validation error and writes the row anyway</td><td class="ok">Verified</td><td>Live repro step 3: CLI exits 1 with the Zod issue array; <code>sqlite3</code> shows <code>prompt_len</code> 19 → 8039 for the victim row. Unit test <code>rejects the update without persisting it</code> fails on main with <code>expected 8039 to be 19</code>.</td></tr>
+    <tr><td><code>bb automation show &lt;id&gt;</code> on the affected row fails with the same error</td><td class="ok">Verified</td><td>Live repro step 4, exit 1 with the identical issue array. App detail page shows <em>Couldn't load automation: … too_big</em> (screenshot).</td></tr>
+    <tr><td><code>bb automation list --project</code> fails for the whole project, hiding healthy automations</td><td class="ok">Verified</td><td>Live repro step 4: <code>list</code> exits 1 and prints nothing about <code>healthy-A</code>. <code>service.list</code> maps every row through the parser with no per-row catch (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/service.ts#L430-L435">service.ts#L430-L435</a>).</td></tr>
+    <tr><td><code>bb automation show</code> on another id in the same project still works (fault is per-row)</td><td class="ok">Verified</td><td>Live repro step 4: <code>show auto_yhtjhct4oum</code> exits 0.</td></tr>
+    <tr><td>A repairing <code>update</code> with a shorter prompt fails with the same error and changes nothing</td><td class="ok">Verified</td><td>Live repro step 5: exit 1, <code>prompt_len</code> still 8039. <code>service.update</code> calls <code>parseAutomationExecution(current.execution)</code> before writing (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/service.ts#L562">service.ts#L562</a>).</td></tr>
+    <tr><td>Direct SQLite rewrite of <code>execution.prompt</code> restores everything without a restart</td><td class="ok">Verified</td><td>Reads parse the row fresh on every call; the repro's <code>recovers an already-corrupted row</code> test seeds/fixes the row via SQL and the prototype fix confirms no caching is involved.</td></tr>
+    <tr><td>"The automation keeps running on schedule throughout, so nothing surfaces the broken state"</td><td class="no">Refuted</td><td>The sweep parses the stored execution with the same schema and bails: <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/sweep.ts#L69-L87">sweep.ts#L69-L87</a>. Live: server log prints <code>ERROR … Skipping due automation auto_mcgeq09mobi with invalid stored configuration</code> every 10 s after the due time, <code>run_count</code> stays 0, <code>automation_runs</code> stays empty, <code>next_run_at</code> never advances (repro/sweep-skip.log). Unit test <code>claim check: the scheduler SKIPS</code> passes on main. The scheduler code is byte-identical between <code>desktop-v0.39.0</code> and the base commit. What is true: the app's overview (<code>automations_overview</code>) silently drops the row with only a <code>WARN</code> log, so the UI shows no trace of it.</td></tr>
+    <tr><td>The cap is used in three places in the bundle (agent execution schema, agent update schema, response schema)</td><td class="ok">Verified</td><td><a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/rpc-types.ts#L125">rpc-types.ts#L125</a>, <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/rpc-types.ts#L210">#L210</a>, and the response/stored schema reuses the first (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/rpc-types.ts#L186-L191">#L186-L191</a>). It is also the schema used to parse every stored row (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/data.ts#L260-L264">data.ts#L260-L264</a>).</td></tr>
+    <tr><td>"the request-side schemas carry the same <code>.max()</code>, so I would have expected the update to be rejected before persisting" (reporter could not explain the write)</td><td class="ok">Explained</td><td>Request-side schemas are only applied by the RPC dispatcher (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/services/plugins/plugin-service.ts#L2027-L2040">plugin-service.ts#L2027-L2040</a>). The CLI handler never parses its hand-built request (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/cli.ts#L548-L595">cli.ts#L548-L595</a>, <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/cli.ts#L868">#L868</a>). The same payload through the RPC route is rejected with HTTP 400 and the row is untouched (repro/rpc-contrast.log).</td></tr>
+    <tr><td>Versions: bb 0.39.0</td><td class="ok">Verified</td><td>Base commit is 0.39.0 (<code>pnpm bb:dev --version</code> → 0.39.0). <code>git diff desktop-v0.39.0..fcada5a3b -- plugins/automations</code> contains only SQL column-list refactors; no behaviour change. Nothing newer on <code>origin/main</code> touches the plugin.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb <code>fcada5a3b88302acb9944aa74b11db4ecaa215a0</code> (main, 2026-08-21; reports as 0.39.0), <code>origin/main</code> has no later commits under <code>plugins/automations</code> or the plugin host</li>
+    <li>macOS 26.5.2 (25F84), arm64; Node v22.23.1; codex-cli 0.149.0 (provider never actually invoked; the affected automations were paused/skipped)</li>
+    <li>Isolated dev instance from <code>scripts/bb-dev-app current</code>: App <code>http://localhost:17399</code>, Server <code>http://localhost:25399</code>, Host daemon <code>127.0.0.1:33399</code>, data dir <code>~/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_21e66a79-f02-2-08c5b3ffbf63</code> (deleted at cleanup)</li>
+    <li>Scratch project <code>qa-2166</code> (<code>proj_avnv4kc427</code>) on local host <code>host_nkt2g9f5h8</code>, repo <code>/tmp/bb-2166-qa-repo</code></li>
+    <li>Plugin DB: <code>&lt;data dir&gt;/plugins/automations/data.db</code>, table <code>automations</code>, column <code>execution</code> (JSON)</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <p>Unit-level (fastest, no running app): drop <code>repro/issue-2166.test.ts</code> into <code>plugins/automations/src/</code> and run <code>pnpm exec vitest run src/issue-2166.test.ts</code> from <code>plugins/automations</code>. On main the two tests that assert the desired behaviour fail, the test that asserts the buggy behaviour passes, and the scheduler claim check passes (the scheduler skips the row). Full output: <code>repro/vitest-main.log</code>.</p>
+  <pre>
+ RUN  v4.1.1 /Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_21e66a79-f02-2/plugins/automations
+
+ ❯ src/issue-2166.test.ts (4 tests | 2 failed) 30ms
+     × rejects the update without persisting it (BUG: row is written) 21ms
+     × keeps list/show/update working for the project after a rejected update (BUG: all fail) 3ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/issue-2166.test.ts &gt; issue #2166: over-cap prompt update &gt; rejects the update without persisting it (BUG: row is written)
+AssertionError: expected 8039 to be 19 // Object.is equality
+
+- Expected
++ Received
+
+- 19
++ 8039
+
+ ❯ src/issue-2166.test.ts:166:36
+    164|     // ... but the row was written anyway. BUG: this assertion fails o…
+    165|     // (stored length is 8039, not 19).
+    166|     expect(storedPromptLength(id)).toBe(&quot;Reply only with ok.&quot;.length);
+       |                                    ^
+    167|   });
+    168|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  src/issue-2166.test.ts &gt; issue #2166: over-cap prompt update &gt; keeps list/show/update working for the project after a rejected update (BUG: all fail)
+AssertionError: [
+  {
+    &quot;origin&quot;: &quot;string&quot;,
+    &quot;code&quot;: &quot;too_big&quot;,
+    &quot;maximum&quot;: 8000,
+    &quot;inclusive&quot;: true,
+    &quot;path&quot;: [
+      &quot;prompt&quot;
+    ],
+    &quot;message&quot;: &quot;Too big: expected string to have &lt;=8000 characters&quot;
+  }
+]
+: expected 1 to be +0 // Object.is equality
+
+- Expected
++ Received
+
+- 0
++ 1
+
+ ❯ src/issue-2166.test.ts:179:40
+    177|     // `bb automation list --project proj_test` takes the healthy row …
+    178|     const list = await cli.run([&quot;list&quot;, &quot;--project&quot;, &quot;proj_test&quot;], ctx…
+    179|     expect(list.exitCode, list.stderr).toBe(0); // BUG: exit 1, too_big
+       |                                        ^
+    180|     expect(list.stdout).toContain(healthyId);
+    181|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  2 failed | 2 passed (4)
+   Start at  08:11:46
+   Duration  211ms (transform 65ms, setup 0ms, import 116ms, tests 30ms, environment 0ms)
+</pre>
+
+  <p>Live, against a dev instance (<code>repro/live-repro.sh</code>, full log <code>repro/live-cli.log</code>). <code>$PROJ</code> is a project id; <code>DATA_DIR</code> is the instance data dir.</p>
+  <ol>
+    <li>Create two healthy agent automations in one project.
+      <pre>$ pnpm bb:dev automation create --project proj_avnv4kc427 --name healthy-A --cron */5 * * * * --timezone UTC --prompt Reply only with ok. --provider codex --model gpt-5
+Automation created: auto_yhtjhct4oum
+  ID:        auto_yhtjhct4oum
+  Name:      healthy-A
+  Enabled:   yes
+  Mode:      agent
+  Schedule:  */5 * * * * (UTC)
+  Next run:  8/21/2026, 8:15:00 AM
+  Last run:  -
+  Runs:      0
+  Origin:    agent
+[exit 0]
+$ pnpm bb:dev automation create --project proj_avnv4kc427 --name victim-B --cron */5 * * * * --timezone UTC --prompt Reply only with ok. --provider codex --model gpt-5
+Automation created: auto_mcgeq09mobi
+  ID:        auto_mcgeq09mobi
+  Name:      victim-B
+  Enabled:   yes
+  Mode:      agent
+  Schedule:  */5 * * * * (UTC)
+  Next run:  8/21/2026, 8:15:00 AM
+  Last run:  -
+  Runs:      0
+  Origin:    agent
+[exit 0]</pre></li>
+    <li>Confirm both list fine and both store a 19-char prompt.
+      <pre>$ pnpm bb:dev automation list --project proj_avnv4kc427
+ID                Name       On   Schedule           Next run               Runs  Origin
+auto_mcgeq09mobi  victim-B   yes  */5 * * * * (UTC)  8/21/2026, 8:15:00 AM  0     agent
+auto_yhtjhct4oum  healthy-A  yes  */5 * * * * (UTC)  8/21/2026, 8:15:00 AM  0     agent
+[exit 0]
+$ sqlite3 /Users/USER/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_21e66a79-f02-2-08c5b3ffbf63/plugins/automations/data.db select id, name, length(execution) as execution_len, length(json_extract(execution,&#x27;$.prompt&#x27;)) as prompt_len from automations where project_id=&#x27;proj_avnv4kc427&#x27;;
+auto_yhtjhct4oum|healthy-A|149|19
+auto_mcgeq09mobi|victim-B|149|19
+[exit 0]</pre></li>
+    <li>Update <code>victim-B</code> with an 8039-character prompt. <strong>Expected:</strong> rejected, nothing written. <strong>Actual:</strong> rejected <em>and</em> written (<code>prompt_len</code> 19 → 8039, <code>updated_at</code> bumped).
+      <pre>prompt length:     8039
+$ pnpm bb:dev automation update auto_mcgeq09mobi --project proj_avnv4kc427 --prompt x…(8039 × x)…x
+[
+  {
+    &quot;origin&quot;: &quot;string&quot;,
+    &quot;code&quot;: &quot;too_big&quot;,
+    &quot;maximum&quot;: 8000,
+    &quot;inclusive&quot;: true,
+    &quot;path&quot;: [
+      &quot;prompt&quot;
+    ],
+    &quot;message&quot;: &quot;Too big: expected string to have &lt;=8000 characters&quot;
+  }
+]
+ ELIFECYCLE  Command failed with exit code 1.
+[exit 1]
+$ sqlite3 /Users/USER/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_21e66a79-f02-2-08c5b3ffbf63/plugins/automations/data.db select id, name, length(execution) as execution_len, length(json_extract(execution,&#x27;$.prompt&#x27;)) as prompt_len, updated_at from automations where project_id=&#x27;proj_avnv4kc427&#x27;;
+auto_yhtjhct4oum|healthy-A|149|19|1787325183047
+auto_mcgeq09mobi|victim-B|8169|8039|1787325189737
+[exit 0]</pre></li>
+    <li>Every read of that row, and the whole-project <code>list</code>, now fail. <code>show</code> of the untouched <code>healthy-A</code> still works. <strong>Expected:</strong> list shows both rows. <strong>Actual:</strong>
+      <pre>$ pnpm bb:dev automation show auto_mcgeq09mobi --project proj_avnv4kc427
+[
+  {
+    &quot;origin&quot;: &quot;string&quot;,
+    &quot;code&quot;: &quot;too_big&quot;,
+    &quot;maximum&quot;: 8000,
+    &quot;inclusive&quot;: true,
+    &quot;path&quot;: [
+      &quot;prompt&quot;
+    ],
+    &quot;message&quot;: &quot;Too big: expected string to have &lt;=8000 characters&quot;
+  }
+]
+ ELIFECYCLE  Command failed with exit code 1.
+[exit 1]
+$ pnpm bb:dev automation list --project proj_avnv4kc427
+[
+  {
+    &quot;origin&quot;: &quot;string&quot;,
+    &quot;code&quot;: &quot;too_big&quot;,
+    &quot;maximum&quot;: 8000,
+    &quot;inclusive&quot;: true,
+    &quot;path&quot;: [
+      &quot;prompt&quot;
+    ],
+    &quot;message&quot;: &quot;Too big: expected string to have &lt;=8000 characters&quot;
+  }
+]
+ ELIFECYCLE  Command failed with exit code 1.
+[exit 1]
+$ pnpm bb:dev automation show auto_yhtjhct4oum --project proj_avnv4kc427
+  ID:        auto_yhtjhct4oum
+  Name:      healthy-A
+  Enabled:   yes
+  Mode:      agent
+  Schedule:  */5 * * * * (UTC)
+  Next run:  8/21/2026, 8:15:00 AM
+  Last run:  -
+  Runs:      0
+  Origin:    agent
+[exit 0]</pre></li>
+    <li>Recovery is locked out: a valid short prompt gets the same error and the row is unchanged.
+      <pre>$ pnpm bb:dev automation update auto_mcgeq09mobi --project proj_avnv4kc427 --prompt short again
+[
+  {
+    &quot;origin&quot;: &quot;string&quot;,
+    &quot;code&quot;: &quot;too_big&quot;,
+    &quot;maximum&quot;: 8000,
+    &quot;inclusive&quot;: true,
+    &quot;path&quot;: [
+      &quot;prompt&quot;
+    ],
+    &quot;message&quot;: &quot;Too big: expected string to have &lt;=8000 characters&quot;
+  }
+]
+ ELIFECYCLE  Command failed with exit code 1.
+[exit 1]
+$ sqlite3 /Users/USER/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_21e66a79-f02-2-08c5b3ffbf63/plugins/automations/data.db select id, length(json_extract(execution,&#x27;$.prompt&#x27;)) as prompt_len from automations where id=&#x27;auto_mcgeq09mobi&#x27;;
+auto_mcgeq09mobi|8039
+[exit 0]</pre></li>
+    <li>The scheduler never runs it (contradicts the issue): no runs, <code>run_count</code> 0, <code>next_run_at</code> stuck at the first due time, and the server log repeats the skip every sweep (10 s).
+      <pre>$ pnpm bb:dev automation runs auto_mcgeq09mobi --project proj_avnv4kc427
+No runs found
+[exit 0]</pre>
+      <pre>225:@bb/server:dev: [08:15:05] ERROR: [server] [plugin:automations] Skipping due automation auto_mcgeq09mobi with invalid stored configuration: [
+226-@bb/server:dev:   {
+227-@bb/server:dev:     &quot;origin&quot;: &quot;string&quot;,
+228-@bb/server:dev:     &quot;code&quot;: &quot;too_big&quot;,
+229-@bb/server:dev:     &quot;maximum&quot;: 8000,
+230-@bb/server:dev:     &quot;inclusive&quot;: true,
+231-@bb/server:dev:     &quot;path&quot;: [
+232-@bb/server:dev:       &quot;prompt&quot;
+233-@bb/server:dev:     ],
+234-@bb/server:dev:     &quot;message&quot;: &quot;Too big: expected string to have &lt;=8000 characters&quot;
+235-@bb/server:dev:   }
+236-@bb/server:dev: ]
+237:@bb/server:dev: [08:15:15] ERROR: [server] [plugin:automations] Skipping due automation auto_mcgeq09mobi with invalid stored configuration: [
+238-@bb/server:dev:   {
+239-@bb/server:dev:     &quot;origin&quot;: &quot;string&quot;,
+240-@bb/server:dev:     &quot;code&quot;: &quot;too_big&quot;,
+auto_yhtjhct4oum|healthy-A|0|0||
+auto_mcgeq09mobi|victim-B|1|0|2026-08-21 15:15:00|
+0
+Fri Aug 21 15:15:36 UTC 2026
+</pre></li>
+    <li>Same defect on <code>create</code> (<code>repro/live-create.sh</code>): the row is inserted, then the response serializer rejects it.
+      <pre>$ sqlite3 /Users/USER/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_21e66a79-f02-2-08c5b3ffbf63/plugins/automations/data.db select count(*) as rows_before from automations where project_id=&#x27;proj_avnv4kc427&#x27;;
+2
+[exit 0]
+$ pnpm bb:dev automation create --project proj_avnv4kc427 --name created-over-cap --cron */5 * * * * --timezone UTC --prompt z…(8039 × z)…z --provider codex --model gpt-5
+[
+  {
+    &quot;origin&quot;: &quot;string&quot;,
+    &quot;code&quot;: &quot;too_big&quot;,
+    &quot;maximum&quot;: 8000,
+    &quot;inclusive&quot;: true,
+    &quot;path&quot;: [
+      &quot;prompt&quot;
+    ],
+    &quot;message&quot;: &quot;Too big: expected string to have &lt;=8000 characters&quot;
+  }
+]
+ ELIFECYCLE  Command failed with exit code 1.
+[exit 1]
+$ sqlite3 /Users/USER/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_21e66a79-f02-2-08c5b3ffbf63/plugins/automations/data.db select id, name, length(json_extract(execution,&#x27;$.prompt&#x27;)) as prompt_len from automations where project_id=&#x27;proj_avnv4kc427&#x27; order by created_at;
+auto_yhtjhct4oum|healthy-A|19
+auto_mcgeq09mobi|victim-B|8039
+auto_yfbp1u951ks|created-over-cap|8039
+[exit 0]</pre></li>
+    <li>Contrast: the same over-cap update via the RPC route the web app uses is rejected before the handler runs (HTTP 400, <code>invalid_input</code>) and the row is untouched (<code>repro/rpc-contrast.sh</code>).
+      <pre>$ curl -s -X POST $BB_SERVER_URL/api/v1/plugins/automations/rpc/automations_update -H &#x27;content-type: application/json&#x27; -d &#x27;{&quot;projectId&quot;:&quot;proj_avnv4kc427&quot;,&quot;automationId&quot;:&quot;auto_yhtjhct4oum&quot;,&quot;agent&quot;:{&quot;prompt&quot;:&quot;&lt;8039 chars&gt;&quot;}}&#x27;
+HTTP 400
+{&quot;ok&quot;:false,&quot;error&quot;:{&quot;code&quot;:&quot;invalid_input&quot;,&quot;message&quot;:&quot;rpc input validation failed&quot;,&quot;issues&quot;:[{&quot;message&quot;:&quot;Too big: expected string to have &lt;=8000 characters&quot;,&quot;path&quot;:[&quot;agent&quot;,&quot;prompt&quot;]}]}}
+$ sqlite3 data.db &quot;select id, length(json_extract(execution,&#x27;$.prompt&#x27;)) from automations where id=&#x27;auto_yhtjhct4oum&#x27;;&quot;
+auto_yhtjhct4oum|19
+</pre></li>
+  </ol>
+  <figure><img src="assets/2166-app-overview.png" alt="Automations overview showing only healthy-A"><figcaption>App → Automations after step 3. Only <code>healthy-A</code> is listed; <code>victim-B</code> has vanished without any error (the overview RPC drops malformed rows with a server-side WARN only). The toggle is off because I paused healthy-A to avoid a real provider run.</figcaption></figure>
+  <figure><img src="assets/2166-app-detail-victim.png" alt="Automation detail page failing with too_big"><figcaption>App detail page for <code>victim-B</code> (<code>/plugins/automations/automations/&lt;project&gt;/&lt;id&gt;</code>): <em>Couldn't load automation: … "code": "too_big" …</em>. The RPC <code>automations_get</code> returns HTTP 500.</figcaption></figure>
+  <p>Repro files: <code>2166/repro/</code></p>
+
+  <h2>5. Root cause</h2>
+  <p>Three things combine. The first is the defect; the second and third turn it from a one-row glitch into a project-wide, self-locking failure.</p>
+
+  <h3>5a. The CLI path skips request validation and writes before it serializes</h3>
+  <p><code>bb automation …</code> is routed by the server to the plugin's registered CLI (<code>registration.run(argv, ctx)</code>, <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/services/plugins/plugin-service.ts#L2089-L2096">plugin-service.ts#L2089-L2096</a>). Inside the plugin, <code>buildAgentExecutionUpdate</code> copies the <code>--prompt</code> string straight into a TypeScript-typed object and <code>buildUpdateRequest</code> hands it to <code>service.update</code> with no Zod parse anywhere (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/cli.ts#L525">cli.ts#L525</a>, <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/cli.ts#L548-L595">#L548-L595</a>, <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/cli.ts#L868">#L868</a>). By contrast the RPC dispatcher validates <code>updateAutomationInputSchema</code> before invoking the handler (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/apps/server/src/services/plugins/plugin-service.ts#L2027-L2040">plugin-service.ts#L2027-L2040</a>), which is why the web app cannot trigger this.</p>
+  <p><code>service.update</code> then merges the patch and writes it with <code>updateAutomation</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/service.ts#L610-L616">service.ts#L610-L616</a>), which just <code>JSON.stringify</code>s the execution (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/data.ts#L397-L441">data.ts#L397-L441</a>). Only on the last line does it build the response via <code>toStoredAutomationResponse</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/service.ts#L645">service.ts#L645</a>) → <code>toAutomationResponse</code> → <code>parseAutomationExecution</code>, which runs <code>automationExecutionSchema.parse</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/data.ts#L260-L264">data.ts#L260-L264</a>). That schema carries <code>prompt: z.string().min(1).max(AUTOMATION_PROMPT_MAX_LENGTH)</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/rpc-types.ts#L122-L132">rpc-types.ts#L122-L132</a>), so the parse throws a <code>ZodError</code> whose <code>.message</code> is the JSON issue array the user sees. The CLI's catch-all turns it into <code>exitCode 1</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/cli.ts#L974-L979">cli.ts#L974-L979</a>). The UPDATE has already committed. <code>service.create</code> has the identical shape (write at <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/service.ts#L530-L552">service.ts#L530-L552</a>, serialize last), so <code>bb automation create --prompt &lt;over-cap&gt;</code> inserts a poisoned row too (step 7).</p>
+  <pre>// plugins/automations/src/cli.ts (base commit)
+  const update: AgentExecutionUpdate = {};
+  if (args.flags.has(&quot;prompt&quot;)) update.prompt = requireFlag(args, &quot;prompt&quot;);   // L525 — no schema parse
+  ...
+  return { request, ...(scriptSource ? { scriptSource } : {}) };              // L594 — still no parse
+  ...
+          const updated = await service.update(request);                       // L868
+
+// plugins/automations/src/service.ts
+      updated = updateAutomation(db, { ..., patch });                          // L612 — row committed here
+      ...
+      return toStoredAutomationResponse(pluginDataDir, updated);               // L645 — throws too_big here</pre>
+
+  <h3>5b. The same capped schema is used to parse stored rows, on every read</h3>
+  <p><code>parseAutomationExecution</code> is the single decoder for the <code>execution</code> column, and it is the request-policy schema with <code>.max(8000)</code>. A cap is a policy about what a client may send; applying it to what the store already contains means any row that violates it (whatever the reason: this bug, a future cap reduction, a legacy import) becomes unreadable. Every read goes through it: <code>get</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/service.ts#L436-L441">service.ts#L436-L441</a>), <code>list</code>, <code>executionOptions</code>, <code>run</code>, the sweep, and, critically, the pre-write read in <code>update</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/service.ts#L562">service.ts#L562</a>), which is what locks out the repair.</p>
+
+  <h3>5c. <code>list</code> has no per-row tolerance, unlike <code>overview</code></h3>
+  <p><code>service.list</code> is a bare <code>rows.map(toStoredAutomationResponse)</code> (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/service.ts#L430-L435">service.ts#L430-L435</a>), so one bad row throws for the whole project. The cross-project <code>overview</code> used by the app already wraps each row in a try/catch and logs a warning (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/service.ts#L400-L428">service.ts#L400-L428</a>), which is why the app overview silently drops the row instead of erroring; the two paths are inconsistent.</p>
+
+  <h3>Secondary observations</h3>
+  <ul>
+    <li>The CLI's own request shape already diverges from the RPC contract: for <code>--script-file</code> it sends both <code>script</code> (content) and <code>scriptFile</code> (path), which <code>automationExecutionRequestSchema</code>'s <code>requireExactlyOneScriptSource</code> refine would reject (<a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/cli.ts#L487-L497">cli.ts#L487-L497</a> vs <a href="https://github.com/get-bb/bb/blob/fcada5a3b88302acb9944aa74b11db4ecaa215a0/plugins/automations/src/rpc-types.ts#L160-L178">rpc-types.ts#L160-L178</a>). So a blanket <code>updateAutomationInputSchema.parse()</code> in the CLI breaks <code>--script-file</code> (I tried it; three existing tests fail). The fix has to validate the agent branch specifically or move the policy check into the service.</li>
+    <li>The inline <code>--script</code> cap (<code>AUTOMATION_SCRIPT_MAX_LENGTH</code> = 262144) is in the same stored schema and has the same failure mode for script automations.</li>
+    <li>The scheduler's skip is logged at ERROR level every 10 s for as long as the row exists (the due automation is never claimed, so <code>next_run_at</code> never advances). Noisy, but it does surface the state in the server log.</li>
+    <li>The bug dates from the plugin rewrite (<code>138f67802</code>, #516), when the cap and the CLI-direct-to-service call were both introduced; the RPC handlers parsed input explicitly then (<code>service.update(updateAutomationInputSchema.parse(input))</code>) and the CLI never did.</li>
+  </ul>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>Confidence high; I prototyped it and it makes the repro's desired-behaviour tests pass while the 78 existing plugin tests and <code>typecheck</code> stay green (<code>repro/prototype-fix.diff</code>, <code>repro/turbo-with-fix.log</code>). Two changes, both in <code>plugins/automations</code>:</p>
+  <ol>
+    <li><strong>Validate at the argv boundary, exactly like the RPC route.</strong> In <code>cli.ts</code>, return <code>agentExecutionUpdateSchema.parse(update)</code> from <code>buildAgentExecutionUpdate</code>, and parse the agent branch of <code>buildExecution</code> with an exported agent-only request schema (<code>automationAgentExecutionSchema.extend({ prompt: …max(AUTOMATION_PROMPT_MAX_LENGTH) })</code>). Do not parse the whole <code>update</code>/<code>create</code> request with the RPC input schema: the CLI's <code>--script-file</code> shape intentionally carries both <code>script</code> and <code>scriptFile</code> and would be rejected (see 5c's secondary note). Export the two schemas from <code>rpc-types.ts</code>.</li>
+    <li><strong>Separate request policy from stored/response shape.</strong> Remove <code>.max()</code> from <code>automationAgentExecutionSchema.prompt</code> and <code>automationScriptExecutionSchema.script</code> (the schemas used by <code>parseAutomationExecution</code> and <code>automationResponseSchema</code>), and re-apply the caps only in <code>automationExecutionRequestSchema</code> and <code>agentExecutionUpdateSchema</code>. This keeps the RPC and CLI inputs capped, but makes existing over-cap rows readable, listable, and repairable with a plain <code>bb automation update --prompt</code>, which is the recovery path the reporter needed. Anyone already affected is fixed by upgrading, no migration required.</li>
+  </ol>
+  <p>Optional hardening: give <code>service.list</code> the same per-row try/catch as <code>overview</code> so one malformed row (any cause) cannot hide a project's others, and format <code>ZodError</code>s in the CLI (<code>Too big: expected string to have &lt;=8000 characters (prompt)</code>) rather than dumping the raw issue array.</p>
+  <p>What could go wrong: (a) the detail view's <code>&lt;textarea maxLength={AUTOMATION_PROMPT_MAX_LENGTH}&gt;</code> import is unchanged, so the UI still truncates at 8000; (b) <code>AutomationExecution</code>'s inferred type does not change, so no callers move; (c) no wire shape between server and host daemon changes, so no <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump is needed; (d) the sweep would now happily run a previously poisoned row with its over-cap prompt; that is the intended behaviour since the user asked for it and the provider does not care about 8000 vs 8039 characters.</p>
+  <details><summary>Prototype diff (not committed, not pushed)</summary><pre>diff --git a/plugins/automations/src/cli.ts b/plugins/automations/src/cli.ts
+index 4c00b774d..b87e98fb9 100644
+--- a/plugins/automations/src/cli.ts
++++ b/plugins/automations/src/cli.ts
+@@ -24,6 +24,8 @@ import {
+ import {
+   AUTOMATION_SCRIPT_TIMEOUT_DEFAULT_MS,
+   automationScriptInterpreterSchema,
++  agentExecutionUpdateSchema,
++  automationAgentExecutionRequestSchema,
+ } from &quot;./rpc-types.js&quot;;
+ 
+ const DURATION_PATTERN =
+@@ -442,7 +444,9 @@ async function buildExecution(
+     validateAgentTargetOptions(args);
+     const environment = await buildAgentEnvironment(bb, args);
+     return {
+-      execution: {
++      // argv is a system boundary: apply the rpc request policy (prompt cap)
++      // before the service persists anything (#2166).
++      execution: automationAgentExecutionRequestSchema.parse({
+         mode: &quot;agent&quot;,
+         prompt,
+         providerId: provider,
+@@ -457,7 +461,7 @@ async function buildExecution(
+         ...(flag(args, &quot;target-thread&quot;)
+           ? { targetThreadId: flag(args, &quot;target-thread&quot;) }
+           : {}),
+-      },
++      }),
+     };
+   }
+   if (
+@@ -542,7 +546,10 @@ async function buildAgentExecutionUpdate(
+       environment: await buildAgentEnvironment(bb, args),
+     };
+   }
+-  return update;
++  // argv is a system boundary: apply the same request policy as the rpc
++  // route so an over-cap prompt is rejected before anything is persisted
++  // (#2166).
++  return agentExecutionUpdateSchema.parse(update);
+ }
+ 
+ async function buildUpdateRequest(
+diff --git a/plugins/automations/src/rpc-types.ts b/plugins/automations/src/rpc-types.ts
+index 41be2cb59..8b44d7962 100644
+--- a/plugins/automations/src/rpc-types.ts
++++ b/plugins/automations/src/rpc-types.ts
+@@ -119,10 +119,12 @@ export const automationTriggerSchema = z.discriminatedUnion(&quot;triggerType&quot;, [
+ ]);
+ export type AutomationTrigger = z.infer&lt;typeof automationTriggerSchema&gt;;
+ 
++// Stored/response shape. Length caps are request policy only: a cap applied
++// here would make an already-persisted row unreadable and unrepairable (#2166).
+ const automationAgentExecutionSchema = z
+   .object({
+     mode: z.literal(&quot;agent&quot;),
+-    prompt: z.string().min(1).max(AUTOMATION_PROMPT_MAX_LENGTH),
++    prompt: z.string().min(1),
+     providerId: z.string().min(1),
+     model: z.string().min(1),
+     permissionMode: permissionModeSchema,
+@@ -134,7 +136,7 @@ const automationAgentExecutionSchema = z
+ const automationScriptExecutionSchema = z
+   .object({
+     mode: z.literal(&quot;script&quot;),
+-    script: z.string().min(1).max(AUTOMATION_SCRIPT_MAX_LENGTH).optional(),
++    script: z.string().min(1).optional(),
+     scriptFile: z
+       .string()
+       .min(1)
+@@ -173,9 +175,19 @@ function requireExactlyOneScriptSource(
+   }
+ }
+ 
+-const automationExecutionRequestSchema = automationExecutionSchema.superRefine(
+-  requireExactlyOneScriptSource,
+-);
++export const automationAgentExecutionRequestSchema =
++  automationAgentExecutionSchema.extend({
++    prompt: z.string().min(1).max(AUTOMATION_PROMPT_MAX_LENGTH),
++  });
++
++const automationExecutionRequestSchema = z
++  .discriminatedUnion(&quot;mode&quot;, [
++    automationAgentExecutionRequestSchema,
++    automationScriptExecutionSchema.extend({
++      script: z.string().min(1).max(AUTOMATION_SCRIPT_MAX_LENGTH).optional(),
++    }),
++  ])
++  .superRefine(requireExactlyOneScriptSource);
+ 
+ /**
+  * Execution as returned to clients. Script automations add `storedScriptPath`:
+@@ -205,7 +217,7 @@ const agentExecutionTargetSchema = z.discriminatedUnion(&quot;type&quot;, [
+     .strict(),
+ ]);
+ 
+-const agentExecutionUpdateSchema = z
++export const agentExecutionUpdateSchema = z
+   .object({
+     prompt: z.string().min(1).max(AUTOMATION_PROMPT_MAX_LENGTH).optional(),
+     model: z.string().min(1).optional(),
+</pre></details>
+  <details><summary>Repro test results with the prototype applied</summary><p>The two tests that assert today's buggy behaviour now fail, as they should; the three desired-behaviour tests pass.</p><pre>
+ RUN  v4.1.1 /Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_21e66a79-f02-2/plugins/automations
+
+ ❯ src/issue-2166.test.ts (5 tests | 2 failed) 32ms
+     × documents the current (buggy) behaviour precisely 4ms
+     × claim check: the scheduler SKIPS (not runs) the corrupted automation 3ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/issue-2166.test.ts &gt; issue #2166: over-cap prompt update &gt; documents the current (buggy) behaviour precisely
+AssertionError: expected 19 to be 8039 // Object.is equality
+
+- Expected
++ Received
+
+- 8039
++ 19
+
+ ❯ src/issue-2166.test.ts:214:42
+    212|     );
+    213|     expect(update.exitCode).toBe(1);
+    214|     expect(storedPromptLength(brokenId)).toBe(overCap.length); // writ…
+       |                                          ^
+    215|
+    216|     const list = await cli.run([&quot;list&quot;, &quot;--project&quot;, &quot;proj_test&quot;], ctx…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  src/issue-2166.test.ts &gt; issue #2166: over-cap prompt update &gt; claim check: the scheduler SKIPS (not runs) the corrupted automation
+AssertionError: expected 1 to be +0 // Object.is equality
+
+- Expected
++ Received
+
+- 0
++ 1
+
+ ❯ src/issue-2166.test.ts:297:29
+    295|     });
+    296|     const after = getAutomation(db, brokenId);
+    297|     expect(after?.runCount).toBe(0);
+       |                             ^
+    298|     expect(after?.nextRunAt).toBe(before.nextRunAt); // never advances
+    299|     expect(
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  2 failed | 3 passed (5)
+   Start at  08:16:29
+   Duration  214ms (transform 65ms, setup 0ms, import 113ms, tests 32ms, environment 0ms)
+</pre><pre>bb-plugin-automations:typecheck: cache miss, executing f4b1569ec2cdd224
+bb-plugin-automations:typecheck: 
+bb-plugin-automations:typecheck: &gt; bb-plugin-automations@0.1.0 typecheck /Users/USER/.bb-machines/HOST.getbb.app/checkouts/bb/.claude/worktrees/wf_21e66a79-f02-2/plugins/automations
+bb-plugin-automations:typecheck: &gt; tsc --noEmit
+bb-plugin-automations:typecheck: 
+bb-plugin-automations:test:  ✓ src/option-request-gate.test.ts (1 test) 1ms
+bb-plugin-automations:test:  ✓ src/model-label.test.ts (15 tests) 4ms
+bb-plugin-automations:test:  ✓ src/format-schedule.test.ts (9 tests) 7ms
+bb-plugin-automations:test:      ✓ rejects the update without persisting it (BUG: row is written) 22ms
+bb-plugin-automations:test:      ✓ keeps list/show/update working for the project after a rejected update (BUG: all fail) 4ms
+bb-plugin-automations:test:      × documents the current (buggy) behaviour precisely 6ms
+bb-plugin-automations:test:      × claim check: the scheduler SKIPS (not runs) the corrupted automation 3ms
+bb-plugin-automations:test:      ✓ recovers an already-corrupted row (the reporter&#x27;s situation) via list/show/update 3ms
+bb-plugin-automations:test:  ✓ src/server-harness.test.ts (16 tests) 181ms
+bb-plugin-automations:test:  ✓ src/automations.test.ts (36 tests) 1301ms
+bb-plugin-automations:test:      ✓ terminates descendant processes when a script times out  1236ms
+bb-plugin-automations:test:  ✓ src/automation-execution-options.test.tsx (1 test) 10ms
+bb-plugin-automations:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+bb-plugin-automations:test:  Test Files  1 failed | 6 passed (7)
+bb-plugin-automations:test:       Tests  2 failed | 81 passed (83)
+ Tasks:    5 successful, 6 total</pre></details>
+
+  <h2>7. PR review</h2>
+  <p>No open pull requests are linked to this issue.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/pull/516">#516</a> Rewrite automations as a builtin plugin: introduced both the 8000-char cap and the CLI calling the service directly without schema validation.</li>
+    <li><a href="https://github.com/get-bb/bb/pull/967">#967</a> Enable direct automation configuration: added the partial <code>agent</code> update path (<code>agentExecutionUpdateSchema</code>) exercised here.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1649">#1649</a> / <a href="https://github.com/get-bb/bb/pull/1808">#1808</a>: the <code>--script-file</code> CLI shape (both <code>script</code> and <code>scriptFile</code>) that makes a blanket CLI-side <code>updateAutomationInputSchema.parse</code> unusable.</li>
+    <li>No other open issue reports <code>too_big</code> / unreadable automation rows (searched "automation prompt", "automation list fails", label <code>automations</code>).</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Repro test (also at <code>2166/repro/issue-2166.test.ts</code>)</h3>
+  <pre>// Repro for get-bb/bb#2166: `bb automation update --prompt &lt;over-cap&gt;` writes
+// the row before the response serializer rejects it, leaving a row that every
+// later read (list/show/update) rejects with the same `too_big` issue.
+//
+// Expected (desired) behaviour: the update is rejected before anything is
+// persisted, and list/show/update keep working. Every assertion below that is
+// marked BUG currently fails on main (fcada5a3b).
+import { mkdtemp, rm } from &quot;node:fs/promises&quot;;
+import { join } from &quot;node:path&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import Database from &quot;better-sqlite3&quot;;
+import type { PluginCliRegistration } from &quot;@get-bb/plugin-sdk&quot;;
+import { afterEach, beforeEach, describe, expect, it } from &quot;vitest&quot;;
+import {
+  getAutomation,
+  listAutomationRuns,
+  migrations,
+  type Db,
+} from &quot;./data.js&quot;;
+import { sweepDueAutomations } from &quot;./sweep.js&quot;;
+import { createAutomationService } from &quot;./service.js&quot;;
+import { registerAutomationCli } from &quot;./cli.js&quot;;
+import { AUTOMATION_PROMPT_MAX_LENGTH } from &quot;./rpc-types.js&quot;;
+
+function createTestDb(): Db {
+  const db = new Database(&quot;:memory:&quot;);
+  for (const migration of migrations) db.exec(migration);
+  return db;
+}
+
+function fakeBb() {
+  return {
+    sdk: {
+      projects: {
+        get: async ({ projectId }: { projectId: string }) =&gt; ({
+          id: projectId,
+          kind: &quot;standard&quot; as const,
+          name: &quot;Test Project&quot;,
+          gitRemoteUrl: null,
+          createdAt: 1,
+          updatedAt: 1,
+          sources: [],
+        }),
+        list: async () =&gt; [],
+      },
+      providers: {
+        list: async () =&gt;
+          [
+            {
+              id: &quot;codex&quot;,
+              capabilities: {
+                permissionModes: [&quot;accept-edits&quot;, &quot;auto&quot;, &quot;full&quot;],
+              },
+            },
+          ] as never,
+      },
+      hosts: { list: async () =&gt; [] },
+      threads: {
+        get: async () =&gt; {
+          throw new Error(&quot;not expected&quot;);
+        },
+        send: async () =&gt; {
+          throw new Error(&quot;not expected&quot;);
+        },
+        spawn: async () =&gt; {
+          throw new Error(&quot;not expected&quot;);
+        },
+      },
+    },
+    realtime: { publish: () =&gt; undefined },
+    log: {
+      debug: () =&gt; undefined,
+      error: () =&gt; undefined,
+      info: () =&gt; undefined,
+      warn: () =&gt; undefined,
+    },
+  };
+}
+
+describe(&quot;issue #2166: over-cap prompt update&quot;, () =&gt; {
+  let db: Db;
+  let pluginDataDir: string;
+  let cli: PluginCliRegistration;
+  const ctx = { cwd: &quot;/&quot;, threadId: undefined } as never;
+  // 8039 chars, the same length as in the report.
+  const overCap = &quot;x&quot;.repeat(AUTOMATION_PROMPT_MAX_LENGTH + 39);
+
+  beforeEach(async () =&gt; {
+    db = createTestDb();
+    pluginDataDir = await mkdtemp(join(tmpdir(), &quot;bb-2166-&quot;));
+    const bb = fakeBb();
+    const service = createAutomationService({
+      bb,
+      db,
+      pluginDataDir,
+      serverUrl: &quot;http://127.0.0.1:1&quot;,
+    });
+    let registered: PluginCliRegistration | undefined;
+    registerAutomationCli({
+      bb: {
+        sdk: bb.sdk as never,
+        cli: {
+          register: (registration) =&gt; {
+            registered = registration;
+          },
+        },
+      },
+      service,
+    });
+    if (!registered) throw new Error(&quot;automation CLI was not registered&quot;);
+    cli = registered;
+  });
+
+  afterEach(async () =&gt; {
+    await rm(pluginDataDir, { recursive: true, force: true });
+  });
+
+  async function createHealthy(): Promise&lt;string&gt; {
+    const created = await cli.run(
+      [
+        &quot;create&quot;,
+        &quot;--project&quot;,
+        &quot;proj_test&quot;,
+        &quot;--name&quot;,
+        &quot;issue-2166&quot;,
+        &quot;--cron&quot;,
+        &quot;*/5 * * * *&quot;,
+        &quot;--timezone&quot;,
+        &quot;UTC&quot;,
+        &quot;--prompt&quot;,
+        &quot;Reply only with ok.&quot;,
+        &quot;--provider&quot;,
+        &quot;codex&quot;,
+        &quot;--model&quot;,
+        &quot;gpt-5&quot;,
+      ],
+      ctx,
+    );
+    expect(created.exitCode, created.stderr).toBe(0);
+    const id = /Automation created: (\S+)/.exec(created.stdout ?? &quot;&quot;)?.[1];
+    if (!id) throw new Error(`no id in: ${created.stdout}`);
+    return id;
+  }
+
+  function storedPromptLength(id: string): number {
+    const row = db
+      .prepare(&quot;SELECT execution FROM automations WHERE id = ?&quot;)
+      .get(id) as { execution: string };
+    return (JSON.parse(row.execution) as { prompt: string }).prompt.length;
+  }
+
+  it(&quot;rejects the update without persisting it (BUG: row is written)&quot;, async () =&gt; {
+    const id = await createHealthy();
+    expect(storedPromptLength(id)).toBe(&quot;Reply only with ok.&quot;.length);
+
+    const update = await cli.run(
+      [&quot;update&quot;, id, &quot;--project&quot;, &quot;proj_test&quot;, &quot;--prompt&quot;, overCap],
+      ctx,
+    );
+    // The CLI does report a rejection ...
+    expect(update.exitCode).toBe(1);
+    expect(update.stderr).toContain(&quot;too_big&quot;);
+
+    // ... but the row was written anyway. BUG: this assertion fails on main
+    // (stored length is 8039, not 19).
+    expect(storedPromptLength(id)).toBe(&quot;Reply only with ok.&quot;.length);
+  });
+
+  it(&quot;keeps list/show/update working for the project after a rejected update (BUG: all fail)&quot;, async () =&gt; {
+    const healthyId = await createHealthy();
+    const brokenId = await createHealthy();
+    await cli.run(
+      [&quot;update&quot;, brokenId, &quot;--project&quot;, &quot;proj_test&quot;, &quot;--prompt&quot;, overCap],
+      ctx,
+    );
+
+    // `bb automation list --project proj_test` takes the healthy row down too.
+    const list = await cli.run([&quot;list&quot;, &quot;--project&quot;, &quot;proj_test&quot;], ctx);
+    expect(list.exitCode, list.stderr).toBe(0); // BUG: exit 1, too_big
+    expect(list.stdout).toContain(healthyId);
+
+    // `bb automation show &lt;brokenId&gt;` sends no prompt, still too_big.
+    const show = await cli.run(
+      [&quot;show&quot;, brokenId, &quot;--project&quot;, &quot;proj_test&quot;],
+      ctx,
+    );
+    expect(show.exitCode, show.stderr).toBe(0); // BUG: exit 1, too_big
+
+    // Recovery with a valid, short prompt is locked out: update reads
+    // (and validates) the stored row before it writes.
+    const repair = await cli.run(
+      [
+        &quot;update&quot;,
+        brokenId,
+        &quot;--project&quot;,
+        &quot;proj_test&quot;,
+        &quot;--prompt&quot;,
+        &quot;short again&quot;,
+      ],
+      ctx,
+    );
+    expect(repair.exitCode, repair.stderr).toBe(0); // BUG: exit 1, too_big
+    expect(storedPromptLength(brokenId)).toBe(&quot;short again&quot;.length);
+  });
+
+  it(&quot;documents the current (buggy) behaviour precisely&quot;, async () =&gt; {
+    const healthyId = await createHealthy();
+    const brokenId = await createHealthy();
+    const update = await cli.run(
+      [&quot;update&quot;, brokenId, &quot;--project&quot;, &quot;proj_test&quot;, &quot;--prompt&quot;, overCap],
+      ctx,
+    );
+    expect(update.exitCode).toBe(1);
+    expect(storedPromptLength(brokenId)).toBe(overCap.length); // written anyway
+
+    const list = await cli.run([&quot;list&quot;, &quot;--project&quot;, &quot;proj_test&quot;], ctx);
+    expect(list.exitCode).toBe(1);
+    expect(list.stderr).toContain(&quot;too_big&quot;);
+    expect(list.stdout ?? &quot;&quot;).not.toContain(healthyId); // healthy row hidden
+
+    const showHealthy = await cli.run(
+      [&quot;show&quot;, healthyId, &quot;--project&quot;, &quot;proj_test&quot;],
+      ctx,
+    );
+    expect(showHealthy.exitCode).toBe(0); // per-row: other ids still work
+
+    const repair = await cli.run(
+      [
+        &quot;update&quot;,
+        brokenId,
+        &quot;--project&quot;,
+        &quot;proj_test&quot;,
+        &quot;--prompt&quot;,
+        &quot;short again&quot;,
+      ],
+      ctx,
+    );
+    expect(repair.exitCode).toBe(1);
+    expect(repair.stderr).toContain(&quot;too_big&quot;);
+    expect(storedPromptLength(brokenId)).toBe(overCap.length); // unchanged: locked out
+  });
+
+  it(&quot;claim check: the scheduler SKIPS (not runs) the corrupted automation&quot;, async () =&gt; {
+    // The issue says &quot;the automation keeps running on schedule throughout&quot;.
+    // The sweep parses the stored execution with the same schema and bails.
+    const brokenId = await createHealthy();
+    await cli.run(
+      [&quot;update&quot;, brokenId, &quot;--project&quot;, &quot;proj_test&quot;, &quot;--prompt&quot;, overCap],
+      ctx,
+    );
+    const errors: string[] = [];
+    const bb = {
+      sdk: {
+        hosts: {
+          list: async () =&gt; [
+            {
+              id: &quot;host_test&quot;,
+              name: &quot;host&quot;,
+              type: &quot;persistent&quot;,
+              status: &quot;connected&quot;,
+              lastSeenAt: null,
+              createdAt: 1,
+              updatedAt: 1,
+            },
+          ],
+        },
+        threads: {
+          get: async () =&gt; {
+            throw new Error(&quot;not expected&quot;);
+          },
+          send: async () =&gt; {
+            throw new Error(&quot;not expected&quot;);
+          },
+          spawn: async () =&gt; {
+            throw new Error(&quot;sweep tried to spawn a thread&quot;);
+          },
+        },
+      },
+      realtime: { publish: () =&gt; undefined },
+      log: {
+        debug: () =&gt; undefined,
+        error: (message: string) =&gt; {
+          errors.push(message);
+        },
+        info: () =&gt; undefined,
+        warn: () =&gt; undefined,
+      },
+    };
+    const before = getAutomation(db, brokenId);
+    if (!before || before.nextRunAt === null) throw new Error(&quot;no nextRunAt&quot;);
+    await sweepDueAutomations(bb, db, {
+      pluginDataDir,
+      serverUrl: &quot;http://127.0.0.1:1&quot;,
+      now: before.nextRunAt + 1,
+    });
+    const after = getAutomation(db, brokenId);
+    expect(after?.runCount).toBe(0);
+    expect(after?.nextRunAt).toBe(before.nextRunAt); // never advances
+    expect(
+      listAutomationRuns(db, { automationId: brokenId, limit: 10 }),
+    ).toHaveLength(0);
+    expect(errors.join(&quot;\n&quot;)).toContain(
+      `Skipping due automation ${brokenId} with invalid stored configuration`,
+    );
+  });
+
+  it(&quot;recovers an already-corrupted row (the reporter&#x27;s situation) via list/show/update&quot;, async () =&gt; {
+    // Seed the corrupt row directly, as a user who already hit the bug has it.
+    const healthyId = await createHealthy();
+    const brokenId = await createHealthy();
+    db.prepare(
+      &quot;UPDATE automations SET execution = json_set(execution, &#x27;$.prompt&#x27;, ?) WHERE id = ?&quot;,
+    ).run(overCap, brokenId);
+    expect(storedPromptLength(brokenId)).toBe(overCap.length);
+
+    const list = await cli.run([&quot;list&quot;, &quot;--project&quot;, &quot;proj_test&quot;], ctx);
+    expect(list.exitCode, list.stderr).toBe(0); // BUG on main
+    expect(list.stdout).toContain(healthyId);
+    expect(list.stdout).toContain(brokenId);
+
+    const show = await cli.run(
+      [&quot;show&quot;, brokenId, &quot;--project&quot;, &quot;proj_test&quot;],
+      ctx,
+    );
+    expect(show.exitCode, show.stderr).toBe(0); // BUG on main
+
+    const repair = await cli.run(
+      [&quot;update&quot;, brokenId, &quot;--project&quot;, &quot;proj_test&quot;, &quot;--prompt&quot;, &quot;short again&quot;],
+      ctx,
+    );
+    expect(repair.exitCode, repair.stderr).toBe(0); // BUG on main
+    expect(storedPromptLength(brokenId)).toBe(&quot;short again&quot;.length);
+  });
+});
+</pre>
+  <h3>Commands run</h3>
+  <pre># setup
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+git fetch origin main &amp;&amp; git log fcada5a3b..origin/main --oneline -- plugins/automations apps/server/src/services/plugins   # (empty)
+git diff desktop-v0.39.0 fcada5a3b --stat -- plugins/automations                                                            # SQL column-list refactors only
+
+# unit repro (from plugins/automations)
+pnpm exec vitest run src/issue-2166.test.ts            &gt; repro/vitest-main.log
+
+# live repro
+scripts/bb-dev-app current                             # App :17399, Server :25399, Host daemon :33399
+curl -s -X POST $BB_SERVER_URL/api/v1/projects -H &#x27;content-type: application/json&#x27; \
+  -d &#x27;{&quot;name&quot;:&quot;qa-2166&quot;,&quot;source&quot;:{&quot;type&quot;:&quot;local_path&quot;,&quot;path&quot;:&quot;/tmp/bb-2166-qa-repo&quot;,&quot;hostId&quot;:&quot;host_nkt2g9f5h8&quot;}}&#x27;
+BB_SERVER_URL=http://localhost:25399 BB_HOST_DAEMON_PORT=33399 PROJ=proj_avnv4kc427 DATA_DIR=&lt;data dir&gt; repro/live-repro.sh
+pnpm bb:dev automation pause auto_yhtjhct4oum --project proj_avnv4kc427      # avoid a real codex run
+doobie --headless &lt; repro/screenshots.js               # assets/2166-app-overview.png, assets/2166-app-detail-victim.png
+until grep -q &quot;Skipping due automation&quot; &lt;dev.log&gt;; do sleep 2; done          # sweep evidence -&gt; repro/sweep-skip.log
+BB_SERVER_URL=... PROJ=... HEALTHY=auto_yhtjhct4oum DATA_DIR=... repro/rpc-contrast.sh
+BB_SERVER_URL=... PROJ=... DATA_DIR=... repro/live-create.sh
+
+# prototype fix
+&lt;apply repro/prototype-fix.diff&gt;
+pnpm exec turbo run typecheck test --filter=bb-plugin-automations &gt; repro/turbo-with-fix.log
+git checkout -- plugins/automations/src/rpc-types.ts plugins/automations/src/cli.ts
+
+# cleanup
+pnpm dev:stop; rm -rf &lt;data dir&gt; /tmp/bb-2166-qa-repo /tmp/bb-2166-prompt.md</pre>
+  <h3>Full live CLI log</h3>
+  <details><summary>repro/live-cli.log (turbo noise stripped, 8039-char prompt elided)</summary><pre>$ pnpm bb:dev --version
+0.39.0
+[exit 0]
+$ pnpm bb:dev automation create --project proj_avnv4kc427 --name healthy-A --cron */5 * * * * --timezone UTC --prompt Reply only with ok. --provider codex --model gpt-5
+Automation created: auto_yhtjhct4oum
+  ID:        auto_yhtjhct4oum
+  Name:      healthy-A
+  Enabled:   yes
+  Mode:      agent
+  Schedule:  */5 * * * * (UTC)
+  Next run:  8/21/2026, 8:15:00 AM
+  Last run:  -
+  Runs:      0
+  Origin:    agent
+[exit 0]
+$ pnpm bb:dev automation create --project proj_avnv4kc427 --name victim-B --cron */5 * * * * --timezone UTC --prompt Reply only with ok. --provider codex --model gpt-5
+Automation created: auto_mcgeq09mobi
+  ID:        auto_mcgeq09mobi
+  Name:      victim-B
+  Enabled:   yes
+  Mode:      agent
+  Schedule:  */5 * * * * (UTC)
+  Next run:  8/21/2026, 8:15:00 AM
+  Last run:  -
+  Runs:      0
+  Origin:    agent
+[exit 0]
+healthy-A=auto_yhtjhct4oum victim-B=auto_mcgeq09mobi
+$ pnpm bb:dev automation list --project proj_avnv4kc427
+ID                Name       On   Schedule           Next run               Runs  Origin
+auto_mcgeq09mobi  victim-B   yes  */5 * * * * (UTC)  8/21/2026, 8:15:00 AM  0     agent
+auto_yhtjhct4oum  healthy-A  yes  */5 * * * * (UTC)  8/21/2026, 8:15:00 AM  0     agent
+[exit 0]
+$ sqlite3 /Users/USER/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_21e66a79-f02-2-08c5b3ffbf63/plugins/automations/data.db select id, name, length(execution) as execution_len, length(json_extract(execution,&#x27;$.prompt&#x27;)) as prompt_len from automations where project_id=&#x27;proj_avnv4kc427&#x27;;
+auto_yhtjhct4oum|healthy-A|149|19
+auto_mcgeq09mobi|victim-B|149|19
+[exit 0]
+prompt length:     8039
+$ pnpm bb:dev automation update auto_mcgeq09mobi --project proj_avnv4kc427 --prompt x…(8039 × x)…x
+[
+  {
+    &quot;origin&quot;: &quot;string&quot;,
+    &quot;code&quot;: &quot;too_big&quot;,
+    &quot;maximum&quot;: 8000,
+    &quot;inclusive&quot;: true,
+    &quot;path&quot;: [
+      &quot;prompt&quot;
+    ],
+    &quot;message&quot;: &quot;Too big: expected string to have &lt;=8000 characters&quot;
+  }
+]
+ ELIFECYCLE  Command failed with exit code 1.
+[exit 1]
+$ sqlite3 /Users/USER/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_21e66a79-f02-2-08c5b3ffbf63/plugins/automations/data.db select id, name, length(execution) as execution_len, length(json_extract(execution,&#x27;$.prompt&#x27;)) as prompt_len, updated_at from automations where project_id=&#x27;proj_avnv4kc427&#x27;;
+auto_yhtjhct4oum|healthy-A|149|19|1787325183047
+auto_mcgeq09mobi|victim-B|8169|8039|1787325189737
+[exit 0]
+$ pnpm bb:dev automation show auto_mcgeq09mobi --project proj_avnv4kc427
+[
+  {
+    &quot;origin&quot;: &quot;string&quot;,
+    &quot;code&quot;: &quot;too_big&quot;,
+    &quot;maximum&quot;: 8000,
+    &quot;inclusive&quot;: true,
+    &quot;path&quot;: [
+      &quot;prompt&quot;
+    ],
+    &quot;message&quot;: &quot;Too big: expected string to have &lt;=8000 characters&quot;
+  }
+]
+ ELIFECYCLE  Command failed with exit code 1.
+[exit 1]
+$ pnpm bb:dev automation list --project proj_avnv4kc427
+[
+  {
+    &quot;origin&quot;: &quot;string&quot;,
+    &quot;code&quot;: &quot;too_big&quot;,
+    &quot;maximum&quot;: 8000,
+    &quot;inclusive&quot;: true,
+    &quot;path&quot;: [
+      &quot;prompt&quot;
+    ],
+    &quot;message&quot;: &quot;Too big: expected string to have &lt;=8000 characters&quot;
+  }
+]
+ ELIFECYCLE  Command failed with exit code 1.
+[exit 1]
+$ pnpm bb:dev automation show auto_yhtjhct4oum --project proj_avnv4kc427
+  ID:        auto_yhtjhct4oum
+  Name:      healthy-A
+  Enabled:   yes
+  Mode:      agent
+  Schedule:  */5 * * * * (UTC)
+  Next run:  8/21/2026, 8:15:00 AM
+  Last run:  -
+  Runs:      0
+  Origin:    agent
+[exit 0]
+$ pnpm bb:dev automation update auto_mcgeq09mobi --project proj_avnv4kc427 --prompt short again
+[
+  {
+    &quot;origin&quot;: &quot;string&quot;,
+    &quot;code&quot;: &quot;too_big&quot;,
+    &quot;maximum&quot;: 8000,
+    &quot;inclusive&quot;: true,
+    &quot;path&quot;: [
+      &quot;prompt&quot;
+    ],
+    &quot;message&quot;: &quot;Too big: expected string to have &lt;=8000 characters&quot;
+  }
+]
+ ELIFECYCLE  Command failed with exit code 1.
+[exit 1]
+$ sqlite3 /Users/USER/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_21e66a79-f02-2-08c5b3ffbf63/plugins/automations/data.db select id, length(json_extract(execution,&#x27;$.prompt&#x27;)) as prompt_len from automations where id=&#x27;auto_mcgeq09mobi&#x27;;
+auto_mcgeq09mobi|8039
+[exit 0]
+$ pnpm bb:dev automation runs auto_mcgeq09mobi --project proj_avnv4kc427
+No runs found
+[exit 0]</pre></details>
+</main></body></html>

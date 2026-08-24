@@ -1,0 +1,536 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2286 bb plugin list reports `handlers: 0 errors` while a plugin throws on every call</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+  figure { margin:18px 0; } figure img { max-width:100%; border:1px solid var(--line); border-radius:6px; } figcaption { font-size:13px; color:var(--muted); margin-top:6px; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2286 · bb plugin list reports <code>handlers: 0 errors</code> while a plugin throws on every call</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill high">Priority: High</span> <span class="pill">Effort: (unset)</span> <span class="pill">cli</span> <span class="pill">plugins</span>
+    <a href="https://github.com/get-bb/bb/issues/2286">open on GitHub</a>
+    <span>2026-08-24 · base <code>494f66526</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>A plugin that fails on every tick of its background work shows up in <code>bb plugin list</code> (and in <code>GET /api/v1/plugins</code>) as <code>running</code> with <code>handlerStats.errorCount: 0</code>. The reporter inferred "the counter only sees exceptions that escape the handler"; the real picture is narrower and worse. <code>errorCount</code> is incremented in exactly one place, <code>invokeWrapped</code> in <code>apps/server/src/services/plugins/plugin-runtime.ts</code>, which wraps only request-shaped surfaces (http routes, rpc, CLI, agent tools, thread events, mention providers, cron schedules, host signals). The three ways a long-running plugin actually fails — (A) it catches its own exception and reports it through <code>bb.log.error</code>, (B) a timer/socket callback inside a background service throws uncaught, (C) a background service's <code>start()</code> rejects after activation and crash-loops — never pass through <code>invokeWrapped</code>. For B and C the supervisor restarts the service with backoff and writes a <code>WARN</code> to the <em>server</em> log only; the plugin's status stays <code>running</code>, <code>statusDetail</code> stays <code>null</code>, and nothing is counted. For A bb has no hook at all today even though the plugin explicitly told bb about the failure via <code>bb.log.error</code>. I reproduced all three live on a dev instance (229 logged throws / 9 crash-restarts / 9 uncaught-exception restarts, all with <code>errorCount: 0</code> and <code>running</code>) and with a vitest file whose three "desired behaviour" assertions fail on <code>494f66526</code>.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td><code>bb plugin list</code> reported the plugin as <code>running</code> throughout a 55 h outage</td><td class="ok">Verified (mechanism)</td><td>Live repro: three fixture plugins that fail every 1–16 s show <code>running</code> for the whole session (<code>plugin-list-final.txt</code>, §4). Service crash (<code>onServiceSettled</code>) and uncaught-exception (<code>handleUncaughtException</code>) paths never call <code>setStatus</code> after activation.</td></tr>
+    <tr><td>Its counter read <code>handlers: 0 errors</code></td><td class="ok">Verified, with a nuance</td><td><code>errorCount</code> stayed 0 for all three failing fixtures (API JSON in §4). Nuance: the CLI does not literally print <code>handlers: 0 errors</code> — <code>printPlugin</code> omits the whole <code>handlers:</code> line when <code>count === 0</code> and omits the <code>, N errors</code> suffix when <code>errorCount === 0</code>. The reporter most likely read the JSON (<code>--json</code> / API / mobile detail screen), where it is literally <code>"errorCount":0</code>.</td></tr>
+    <tr><td>The plugin's own log carried 196 throws (<code>bb.sdk.threads.rateLimitRecovery is not a function</code>)</td><td class="unv">Unverified (their log); mechanism verified</td><td><code>&lt;dataDir&gt;/plugins/&lt;id&gt;/logs/plugin.log</code> receives <em>only</em> <code>bb.log.*</code> lines from the plugin itself (<code>plugin-log.ts</code>, <code>plugin-api.ts emitLog</code>). Server-side supervisor warnings about crashes do <em>not</em> go there. So for the throws to appear in that file the plugin must have logged them itself — consistent with case A (caught + <code>bb.log.error</code>) or with a plugin that logs and then rethrows (B/C). <code>rateLimitRecovery</code> does not exist anywhere in the bb SDK; the plugin was calling a nonexistent method.</td></tr>
+    <tr><td>The counter "works for whatever it does count" (<code>handlers: 24 errors</code> seen elsewhere)</td><td class="ok">Verified</td><td>Control fixture: 3 calls to a throwing rpc handler → <code>handlers: 3 calls / … , 3 errors</code> and <code>statusDetail</code> "rpc boom failed: …".</td></tr>
+    <tr><td>Inference: the counter increments only on exceptions that escape the handler; exceptions caught inside never reach it</td><td class="ok">Verified, and incomplete</td><td>True for the surfaces <code>invokeWrapped</code> wraps. But exceptions that <em>escape</em> a background service (cases B and C) are not counted either — the gap is not "caught vs escaped", it is "which surface". See §5.</td></tr>
+    <tr><td>Adjacent to #2128 but a different case</td><td class="ok">Verified</td><td>#2128 (merged, <code>2ff85986e</code>) stops the server process from dying on a service's uncaught exception by aborting + restarting the service. It deliberately keeps the plugin <code>running</code> and adds no counter — case B in this report is exactly the post-#2128 behaviour.</td></tr>
+    <tr><td>Version bb 0.39.0</td><td class="ok">Verified</td><td><code>packages/bb-app/package.json</code> on the base commit is 0.39.0; <code>git log 494f66526..origin/main</code> touches none of the plugin runtime files, so the behaviour is unchanged on <code>origin/main</code> as of 2026-08-24.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb <code>494f66526913557ab076e048218236f0a6610927</code> (main, 2026-08-24), app version 0.39.0; worktree <code>…/.claude/worktrees/wf_846839f8-f8a-3</code></li>
+    <li>macOS 26.5.2 (Darwin 25.5.0), Apple Silicon; Node v22.23.1; pnpm + turbo 2.8.3; vitest 4.1.1</li>
+    <li>Dev instance via <code>scripts/bb-dev-app current</code>: App <code>http://localhost:12411</code>, Server <code>http://localhost:20411</code>, Host daemon <code>:28411</code>, data dir <code>~/.bb-dev/bb-machines-HOST.getbb.app-checkouts-bb-.claude-worktrees-wf_846839f8-f8a-3-8e08fbc3307b</code> (deleted after the run)</li>
+    <li>No provider turns were needed; the fixtures are pure <code>path:</code> plugins.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <h3>4a. Unit-level (fails on 494f66526)</h3>
+  <ol>
+    <li>Copy <code>issue-2286-handler-error-visibility.test.ts</code> to <code>apps/server/test/services/plugins/</code>.</li>
+    <li>Run it from <code>apps/server</code>:
+<pre>pnpm exec vitest run test/services/plugins/issue-2286-handler-error-visibility.test.ts</pre></li>
+    <li>Expected (what an operator needs): every failing plugin has <code>errorCount &gt; 0</code> or a non-<code>running</code> status. Actual:
+<pre> ❯  @bb/server  test/services/plugins/issue-2286-handler-error-visibility.test.ts (4 tests | 3 failed) 638ms
+     × A. an exception caught inside the plugin and reported via bb.log.error leaves errorCount 0 and status running 167ms
+     × B. an uncaught throw from a service timer is supervised (#2128) but never counted 168ms
+     × C. a service that crash-loops after activation keeps status running and errorCount 0 170ms
+
+ FAIL  … &gt; A. …
+AssertionError: expected 0 to be greater than 0
+ ❯ test/services/plugins/issue-2286-handler-error-visibility.test.ts:179:44
+    179|     expect(entry?.handlerStats.errorCount).toBeGreaterThan(0);
+
+ FAIL  … &gt; B. …
+AssertionError: expected 0 to be greater than 0
+ ❯ test/services/plugins/issue-2286-handler-error-visibility.test.ts:221:46
+    221|       expect(entry?.handlerStats.errorCount).toBeGreaterThan(0);
+
+ FAIL  … &gt; C. …
+AssertionError: expected 0 to be greater than 0
+ ❯ test/services/plugins/issue-2286-handler-error-visibility.test.ts:258:44
+    258|     expect(entry?.handlerStats.errorCount).toBeGreaterThan(0);
+
+ Test Files  1 failed (1)
+      Tests  3 failed | 1 passed (4)</pre>
+      Every assertion <em>before</em> the failing one passes, i.e. on the base commit each failing plugin reports <code>status === "running"</code>, <code>statusDetail === null</code>, and (for A) at least ten <code>"level":"error"</code> lines already in its <code>plugin.log</code>. The control test ("a throwing rpc handler IS counted") passes: <code>errorCount === 1</code>, <code>statusDetail</code> contains <code>rpc boom failed</code>. Full output: <code>vitest-main-clean.log</code>.</li>
+  </ol>
+
+  <h3>4b. Live, with the CLI (what the reporter saw)</h3>
+  <ol>
+    <li>Start a dev instance and point the CLI at it:
+<pre>scripts/bb-dev-app current
+eval "$(scripts/bb-dev-app env)"</pre></li>
+    <li>Install the four fixture plugins from <code>2286/repro/</code> (each is a 20-line <code>path:</code> plugin; sources below):
+<pre>for p in caught timerthrow crashloop control; do
+  pnpm bb:dev plugin install /tmp/bb-reports/issues/2286/repro/bb-plugin-$p --yes
+done</pre></li>
+    <li>Exercise the control plugin's rpc three times (this is the only kind of failure the counter sees):
+<pre>curl -s -X POST $BB_SERVER_URL/api/v1/plugins/control/rpc/boom -H 'content-type: application/json' -d '{}'
+{"ok":false,"error":{"code":"handler_error","message":"bb.sdk.threads.rateLimitRecovery is not a function"}}</pre></li>
+    <li>Wait ~3 minutes, then list. Expected: the three plugins that fail every tick are visibly unhealthy. Actual (<code>pnpm bb:dev plugin list</code>, 16:03 UTC, ~4 min after install):
+<pre>caught@0.1.0  running
+  source: path:/tmp/bb-reports/issues/2286/repro/bb-plugin-caught
+  service poller: running
+control@0.1.0  running  (rpc boom failed: bb.sdk.threads.rateLimitRecovery is not a function)
+  source: path:/tmp/bb-reports/issues/2286/repro/bb-plugin-control
+  handlers: 3 calls / 0ms total / 0ms max, 3 errors
+crashloop@0.1.0  running
+  source: path:/tmp/bb-reports/issues/2286/repro/bb-plugin-crashloop
+  service sync: backoff
+timerthrow@0.1.0  running
+  source: path:/tmp/bb-reports/issues/2286/repro/bb-plugin-timerthrow
+  service poller: backoff</pre>
+      Only <code>control</code> — whose failures go through an rpc handler — gets a <code>handlers: … 3 errors</code> line and a status detail. The others show no <code>handlers:</code> line at all (the line is suppressed when <code>count === 0</code>). <code>service …: backoff</code> flickers between <code>backoff</code> and <code>running</code> as the supervisor restarts; <code>caught</code> never even flickers.</li>
+    <li>Same data as JSON from the server (<code>curl -s $BB_SERVER_URL/api/v1/plugins</code>, full dump in <code>plugins-api.json</code>):
+<pre>{"id":"caught","status":"running","statusDetail":null,"handlerStats":{"count":0,"totalMs":0,"maxMs":0,"errorCount":0},"services":[{"name":"poller","state":"running"}]}
+{"id":"control","status":"running","statusDetail":"rpc boom failed: bb.sdk.threads.rateLimitRecovery is not a function","handlerStats":{"count":3,"totalMs":0.289,"maxMs":0.160,"errorCount":3},"services":[]}
+{"id":"crashloop","status":"running","statusDetail":null,"handlerStats":{"count":0,"totalMs":0,"maxMs":0,"errorCount":0},"services":[{"name":"sync","state":"backoff"}]}
+{"id":"timerthrow","status":"running","statusDetail":null,"handlerStats":{"count":0,"totalMs":0,"maxMs":0,"errorCount":0},"services":[{"name":"poller","state":"backoff"}]}</pre></li>
+    <li>Meanwhile the plugins' own logs are full of throws, exactly as the reporter described (<code>pnpm bb:dev plugin logs caught -n 3</code>):
+<pre>{"ts":1787587230221,"level":"error","message":"poll failed: bb.sdk.threads.rateLimitRecovery is not a function"}
+{"ts":1787587231222,"level":"error","message":"poll failed: bb.sdk.threads.rateLimitRecovery is not a function"}
+{"ts":1787587232223,"level":"error","message":"poll failed: bb.sdk.threads.rateLimitRecovery is not a function"}</pre>
+      Counts at 16:03 UTC: <code>caught</code> 229 error lines, <code>crashloop</code> 9 error lines (one per crash), <code>timerthrow</code> 9 restarts ("poller started"), and 18 <code>service … crashed</code> warnings in the <em>server</em> log (<code>server-log-excerpt.txt</code>) — none of which reach <code>errorCount</code> or <code>status</code>.</li>
+  </ol>
+
+  <figure><img src="assets/2286-ui-installed-fixtures.png" alt="Installed plugins list showing the four fixtures with no health signal"><figcaption>Desktop app, Extensions → Installed plugins, ~3 min after install. "Caught", "Crash loop" and "Timer throw" have been failing every 1–16 s; nothing in the row distinguishes them from a healthy plugin. (The UI deliberately never renders <code>handlerStats</code> — see §5.)</figcaption></figure>
+  <figure><img src="assets/2286-ui-crashloop.png" alt="Crash loop plugin detail page showing status Restarting for service sync"><figcaption>Detail page for <code>crashloop</code>: the only hint is the transient "Restarting" state of its service (it reads "Running" between crashes). No error count, no banner, no status change.</figcaption></figure>
+  <figure><img src="assets/2286-ui-caught.png" alt="Caught plugin detail page showing Running"><figcaption>Detail page for <code>caught</code> — the case that mirrors the reporter's plugin. 229 logged errors so far; the page says "Running" and nothing else.</figcaption></figure>
+
+  <h3>Fixture sources</h3>
+  <p><code>bb-plugin-caught/server.ts</code> (case A — mirrors the reporter's plugin):</p>
+<pre>export default function plugin(bb: any) {
+  bb.background.service("poller", {
+    async start(signal: AbortSignal) {
+      const timer = setInterval(() =&gt; {
+        try {
+          bb.sdk.threads.rateLimitRecovery(); // does not exist on the SDK
+        } catch (error) {
+          bb.log.error(`poll failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }, 1000);
+      await new Promise&lt;void&gt;((resolve) =&gt;
+        signal.addEventListener("abort", () =&gt; { clearInterval(timer); resolve(); }));
+    },
+  });
+}</pre>
+  <p><code>bb-plugin-timerthrow/server.ts</code> (case B — uncaught throw from a timer inside a service):</p>
+<pre>export default function plugin(bb: any) {
+  bb.background.service("poller", {
+    async start(signal: AbortSignal) {
+      bb.log.info("poller started");
+      const timer = setTimeout(() =&gt; { bb.sdk.threads.rateLimitRecovery(); }, 1500);
+      await new Promise&lt;void&gt;((resolve) =&gt;
+        signal.addEventListener("abort", () =&gt; { clearTimeout(timer); resolve(); }));
+    },
+  });
+}</pre>
+  <p><code>bb-plugin-crashloop/server.ts</code> (case C — <code>start()</code> rejects after activation):</p>
+<pre>export default function plugin(bb: any) {
+  bb.background.service("sync", {
+    async start(signal: AbortSignal) {
+      await new Promise((r) =&gt; setTimeout(r, 1500));
+      if (signal.aborted) return;
+      bb.log.error("sync failed: bb.sdk.threads.rateLimitRecovery is not a function");
+      throw new TypeError("bb.sdk.threads.rateLimitRecovery is not a function");
+    },
+  });
+}</pre>
+  <p><code>bb-plugin-control/server.ts</code> (counted):</p>
+<pre>const passthrough = { "~standard": { version: 1, vendor: "issue-2286", validate: (value: unknown) =&gt; ({ value }) } };
+export default function plugin(bb: any) {
+  bb.rpc.register({ boom: { input: passthrough, output: passthrough } }, {
+    boom: async () =&gt; { bb.sdk.threads.rateLimitRecovery(); },
+  });
+}</pre>
+  <p>Repro test (inline, also at <code>2286/repro/issue-2286-handler-error-visibility.test.ts</code>):</p>
+<pre>/**
+ * Repro for get-bb/bb#2286: `bb plugin list` reports `handlers: 0 errors`
+ * (and status `running`) while a plugin fails on every call.
+ *
+ * `handlerStats.errorCount` is only incremented by `invokeWrapped` in
+ * plugin-runtime.ts, which wraps request-shaped surfaces (http, rpc, cli,
+ * tools, thread events, mention providers, schedules, host signals). Three
+ * failure paths that a long-running plugin actually takes never touch it:
+ *
+ *   A. the plugin catches its own exception and reports it via bb.log.error
+ *   B. a timer callback inside a background service throws uncaught
+ *      (routed to the supervisor by #2128, service aborted + restarted)
+ *   C. a background service's start() rejects after activation
+ *      (onServiceSettled: backoff + restart, logger.warn in the server log)
+ *
+ * The first test is a control proving the counter works for an rpc handler.
+ * Tests A/B/C assert the health signal a reader of `bb plugin list` would
+ * need; on 494f66526 they FAIL (errorCount stays 0, status stays "running").
+ */
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createConnection, migrate, type DbConnection } from "@bb/db";
+import type { Logger } from "@bb/logger";
+import { createAiServiceRegistry } from "../../../src/services/ai/ai-service-registry.js";
+import {
+  createPluginService,
+  type PluginService,
+} from "../../../src/services/plugins/plugin-service.js";
+import { testLogger } from "../../helpers/test-app.js";
+import { createNoopTelemetryService } from "../../../src/services/system/telemetry.js";
+
+const logger = testLogger as unknown as Logger;
+const globals = globalThis as Record&lt;string, unknown&gt;;
+
+async function writePlugin(
+  dir: string,
+  options: { name: string; serverSource: string },
+): Promise&lt;string&gt; {
+  const rootDir = join(dir, options.name);
+  await mkdir(rootDir, { recursive: true });
+  await writeFile(
+    join(rootDir, "package.json"),
+    JSON.stringify({
+      name: options.name,
+      version: "0.1.0",
+      bb: {
+        name: "2286 fixture",
+        description: "Handler error visibility fixture.",
+        branding: { icon: "Zap" },
+        server: "./server.ts",
+      },
+    }),
+  );
+  await writeFile(join(rootDir, "server.ts"), options.serverSource);
+  return rootDir;
+}
+
+describe("#2286 handler error visibility", () =&gt; {
+  let db: DbConnection;
+  let workDir: string;
+  let dataDir: string;
+  let service: PluginService;
+
+  beforeEach(async () =&gt; {
+    db = createConnection(":memory:");
+    migrate(db);
+    workDir = await mkdtemp(join(tmpdir(), "bb-2286-"));
+    dataDir = join(workDir, "data");
+    service = createPluginService({
+      aiServices: createAiServiceRegistry(),
+      telemetry: createNoopTelemetryService(),
+      db,
+      hub: {
+        getDaemonSessionIdForHost: () =&gt; null,
+        notifyPluginSignal: () =&gt; 0,
+        notifySystem: () =&gt; {},
+      },
+      logger,
+      dataDir,
+      appVersion: "0.9.0",
+      loadTimeoutMs: 2000,
+      serviceStopTimeoutMs: 100,
+      serviceRestartBaseMs: 5,
+    });
+  });
+
+  afterEach(async () =&gt; {
+    await service.stop();
+    await rm(workDir, { recursive: true, force: true });
+  });
+
+  it("control: a throwing rpc handler IS counted", async () =&gt; {
+    const rootDir = await writePlugin(workDir, {
+      name: "bb-plugin-control",
+      serverSource: `
+        export default function plugin(bb: any) {
+          const passthrough = {
+            "~standard": { version: 1, vendor: "test", validate: (value: any) =&gt; ({ value }) },
+          };
+          bb.rpc.register(
+            { boom: { input: passthrough, output: passthrough } },
+            {
+              boom: async () =&gt; {
+                const sdk: any = { threads: {} };
+                sdk.threads.rateLimitRecovery();
+              },
+            },
+          );
+        }
+      `,
+    });
+    await service.installPath(rootDir);
+    const lookup = service.getRpcHandler("control", "boom");
+    expect(lookup.outcome).toBe("found");
+    if (lookup.outcome !== "found") return;
+    const result = await service.invokeRpcHandler(
+      "control",
+      "boom",
+      lookup.value,
+      {},
+    );
+    expect(result.ok).toBe(false);
+    const entry = service.list().find((p) =&gt; p.id === "control");
+    expect(entry?.handlerStats.errorCount).toBe(1);
+    expect(entry?.statusDetail).toContain("rpc boom failed");
+  });
+
+  it("A. an exception caught inside the plugin and reported via bb.log.error leaves errorCount 0 and status running", async () =&gt; {
+    const rootDir = await writePlugin(workDir, {
+      name: "bb-plugin-caught",
+      serverSource: `
+        export default function plugin(bb: any) {
+          const g = globalThis as any;
+          g.__caughtThrows = 0;
+          bb.background.service("poller", {
+            async start(signal: any) {
+              // Stand-in for bb.sdk (not bound in this harness): same TypeError shape.
+              const sdk: any = { threads: {} };
+              const timer = setInterval(() =&gt; {
+                try {
+                  sdk.threads.rateLimitRecovery();
+                } catch (error) {
+                  g.__caughtThrows += 1;
+                  bb.log.error("poll failed: " + (error as Error).message);
+                }
+              }, 5);
+              await new Promise&lt;void&gt;((resolve) =&gt;
+                signal.addEventListener("abort", () =&gt; { clearInterval(timer); resolve(); }));
+            },
+          });
+        }
+      `,
+    });
+    await service.installPath(rootDir);
+    await vi.waitFor(
+      () =&gt; expect(globals.__caughtThrows as number).toBeGreaterThanOrEqual(10),
+      { timeout: 2000 },
+    );
+    // The plugin's own log file carries every throw...
+    const log = await readFile(
+      join(dataDir, "plugins", "caught", "logs", "plugin.log"),
+      "utf8",
+    );
+    const errorLines = log
+      .split("\n")
+      .filter((l) =&gt; l.includes('"level":"error"'));
+    expect(errorLines.length).toBeGreaterThanOrEqual(10);
+    expect(errorLines[0]).toContain(
+      "sdk.threads.rateLimitRecovery is not a function",
+    );
+    // ...but nothing a `bb plugin list` reader sees reflects it.
+    const entry = service.list().find((p) =&gt; p.id === "caught");
+    expect(entry?.status).toBe("running");
+    expect(entry?.statusDetail).toBeNull();
+    expect(entry?.services).toEqual([{ name: "poller", state: "running" }]);
+    // Desired: the health signal reflects the failures. FAILS on 494f66526.
+    expect(entry?.handlerStats.errorCount).toBeGreaterThan(0);
+  });
+
+  it("B. an uncaught throw from a service timer is supervised (#2128) but never counted", async () =&gt; {
+    const rootDir = await writePlugin(workDir, {
+      name: "bb-plugin-timerthrow",
+      serverSource: `
+        export default function plugin(bb: any) {
+          const g = globalThis as any;
+          g.__timerStarts = 0;
+          bb.background.service("poller", {
+            async start(signal: any) {
+              g.__timerStarts += 1;
+              const sdk: any = { threads: {} };
+              const timer = setTimeout(() =&gt; {
+                sdk.threads.rateLimitRecovery();
+              }, 5);
+              await new Promise&lt;void&gt;((resolve) =&gt;
+                signal.addEventListener("abort", () =&gt; { clearTimeout(timer); resolve(); }));
+            },
+          });
+        }
+      `,
+    });
+    const vitestListeners = process.listeners("uncaughtException");
+    process.removeAllListeners("uncaughtException");
+    const unclaimed: unknown[] = [];
+    process.on("uncaughtException", (error) =&gt; {
+      if (!service.handleUncaughtException(error)) unclaimed.push(error);
+    });
+    try {
+      await service.installPath(rootDir);
+      // Every start throws from its timer → abort → backoff → restart.
+      await vi.waitFor(
+        () =&gt; expect(globals.__timerStarts as number).toBeGreaterThanOrEqual(4),
+        { timeout: 3000 },
+      );
+      expect(unclaimed).toEqual([]);
+      const entry = service.list().find((p) =&gt; p.id === "timerthrow");
+      expect(entry?.status).toBe("running");
+      expect(entry?.statusDetail).toBeNull();
+      // Desired: the repeated uncaught exceptions show up. FAILS on 494f66526.
+      expect(entry?.handlerStats.errorCount).toBeGreaterThan(0);
+    } finally {
+      process.removeAllListeners("uncaughtException");
+      for (const listener of vitestListeners) {
+        process.on("uncaughtException", listener);
+      }
+    }
+  });
+
+  it("C. a service that crash-loops after activation keeps status running and errorCount 0", async () =&gt; {
+    const rootDir = await writePlugin(workDir, {
+      name: "bb-plugin-crashloop",
+      serverSource: `
+        export default function plugin(bb: any) {
+          const g = globalThis as any;
+          g.__crashStarts = 0;
+          bb.background.service("sync", {
+            async start(signal: any) {
+              g.__crashStarts += 1;
+              // Survive the activation window, then fail like a real sync loop.
+              await new Promise((r) =&gt; setTimeout(r, 5));
+              if (signal.aborted) return;
+              throw new TypeError("bb.sdk.threads.rateLimitRecovery is not a function");
+            },
+          });
+        }
+      `,
+    });
+    await service.installPath(rootDir);
+    await vi.waitFor(
+      () =&gt; expect(globals.__crashStarts as number).toBeGreaterThanOrEqual(5),
+      { timeout: 3000 },
+    );
+    const entry = service.list().find((p) =&gt; p.id === "crashloop");
+    expect(entry?.status).toBe("running");
+    expect(entry?.statusDetail).toBeNull();
+    // Desired: five crashes of the only service are visible. FAILS on 494f66526.
+    expect(entry?.handlerStats.errorCount).toBeGreaterThan(0);
+  });
+});</pre>
+  <p>Repro files: <code>2286/repro/</code> · logs: <code>2286/logs/</code></p>
+
+  <h2>5. Root cause</h2>
+  <p><strong>One counter, one increment site, covering only request-shaped surfaces.</strong> <code>handlerStats.errorCount</code> is owned by <code>plugin-runtime.ts</code> and incremented only inside <code>invokeWrapped</code>'s <code>catch</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/plugins/plugin-runtime.ts#L779-L818">plugin-runtime.ts#L779-L818</a>):</p>
+<pre>async function invokeWrapped&lt;T&gt;(id, label, run) {
+  const stats = statsFor(id);
+  …
+  try {
+    return { ok: true, value: await runEventLoopWork(`plugin:${id} ${label}`, run) };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    stats.errorCount += 1;                                     // ← the only increment
+    logger.warn(`[plugin:${id}] ${label} failed: ${message}`);
+    if (statuses.get(id)?.status === "running") {
+      setStatus(id, "running", `${label} failed: ${message}`); // ← the only statusDetail for failures
+    }
+    return { ok: false, error: message, cause: error };
+  } finally { stats.count += 1; … }
+}</pre>
+  <p>Its callers are the request/event surfaces in <code>plugin-service.ts</code>: host worker exit and host signals (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/plugins/plugin-service.ts#L1963-L1998">L1963-L1998</a>), http routes and rpc (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/plugins/plugin-service.ts#L2084-L2121">L2084-L2121</a>), the CLI command (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/plugins/plugin-service.ts#L2164">L2164</a>), agent configure and agent tools (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/plugins/plugin-service.ts#L2235-L2313">L2235-L2313</a>), mention search/resolve (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/plugins/plugin-service.ts#L2354-L2455">L2354-L2455</a>), cron schedules (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/plugins/plugin-service.ts#L2523-L2533">L2523-L2533</a>), plus thread events in the runtime (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/plugins/plugin-runtime.ts#L862-L873">plugin-runtime.ts#L862-L873</a>).</p>
+
+  <p><strong>Background services are supervised by a different path that counts nothing.</strong> <code>runService</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/plugins/plugin-runtime.ts#L575-L606">L575-L606</a>) watches the <code>start()</code> promise and hands both a rejection (case C) and an uncaught exception from the service's async context (case B, via <code>handleUncaughtException</code>, <a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/plugins/plugin-runtime.ts#L614-L655">L614-L655</a>) to <code>onServiceSettled</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/plugins/plugin-runtime.ts#L657-L713">L657-L713</a>). After the activation window it does this:</p>
+<pre>if (stabilizingPluginIds.has(id)) {          // only during load → status "error"
+  service.state = "stopped";
+  setStatus(id, "error", `service ${name} crashed: ${message}`);
+  …
+  return;
+}
+if (Date.now() - service.startedAt &gt;= SERVICE_HEALTHY_RESET_MS) service.consecutiveCrashes = 0;
+const delayMs = Math.min(serviceRestartBaseMs * 2 ** service.consecutiveCrashes, SERVICE_RESTART_MAX_MS);
+service.consecutiveCrashes += 1;
+service.state = "backoff";
+logger.warn(`[plugin:${id}] service ${name} crashed: ${message} — restarting in ${delayMs}ms`);
+const timer = setTimeout(() =&gt; { … runService(id, service); }, delayMs);</pre>
+  <p>No <code>statsFor(id)</code>, no <code>setStatus</code>, no persisted "last crash". The crash is recorded in exactly one place, <code>logger.warn</code> into the <em>server</em> log, and the only externally visible trace is <code>services[].state</code> toggling to <code>backoff</code> for at most <code>SERVICE_RESTART_MAX_MS = 60 s</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/plugins/plugin-runtime.ts#L340-L342">L340-L342</a>) before flipping back to <code>running</code>. A service that works for five minutes between crashes (<code>SERVICE_HEALTHY_RESET_MS</code>) has its backoff reset too, so a slow-failing loop — like the reporter's one-throw-per-17-minutes — looks permanently healthy. #2128 (<code>2ff85986e</code>) added the case-B path on purpose to keep the server alive, and its own test asserts the plugin stays <code>running</code> afterwards; it did not add any health signal.</p>
+
+  <p><strong>Case A has no hook today.</strong> <code>bb.log.error</code> is <code>emitLog</code> in <code>plugin-api.ts</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/plugins/plugin-api.ts#L582-L596">L582-L596</a>): it prefixes the server log and appends a JSONL line to <code>&lt;dataDir&gt;/plugins/&lt;id&gt;/logs/plugin.log</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/plugins/plugin-log.ts#L5-L10">plugin-log.ts#L5-L10</a>). Nothing aggregates log levels into <code>list()</code>. The issue's ask "count handler-caught exceptions" is literally impossible for bb (it cannot observe a <code>catch</code> inside plugin code), but the plugin <em>did</em> hand bb an explicit error signal 196 times and bb dropped it on the floor as far as health goes.</p>
+
+  <p><strong>Why the symptom follows.</strong> <code>list()</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/server/src/services/plugins/plugin-service.ts#L1398-L1459">plugin-service.ts#L1398-L1459</a>) copies <code>handlerStats</code> and <code>statuses</code> verbatim, so the API/CLI/mobile all report <code>errorCount: 0</code> and <code>running</code>. The CLI's <code>printPlugin</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/cli/src/commands/plugin.ts#L786-L800">apps/cli/src/commands/plugin.ts#L786-L800</a>) then suppresses the whole <code>handlers:</code> line when <code>count === 0</code>, which is why a never-invoked-but-constantly-failing plugin prints only <code>running</code> + <code>service x: running</code>.</p>
+
+  <p><strong>Deeper issue: the desktop UI has no health signal for this at all, by design.</strong> <code>plugin-status.ts</code> maps only <code>error / incompatible / missing / needs-configuration / degraded</code> to a visible signal; <code>running</code> maps to <code>null</code> regardless of <code>handlerStats</code>, and <code>ToolsView.plugin-detail.test.tsx</code> (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/app/src/views/ToolsView.plugin-detail.test.tsx#L683-L697">L683-L697</a>, "does not promote cumulative handler diagnostics into a page banner") guards that <code>errorCount: 3</code> renders nothing. Only the mobile detail screen (<a href="https://github.com/get-bb/bb/blob/494f66526913557ab076e048218236f0a6610927/apps/mobile/src/screens/plugins/PluginDetailScreen.tsx#L467-L470">PluginDetailScreen.tsx#L467-L470</a>) and the CLI/API show the counter. So even after fixing the counter, a desktop user would still see nothing; the counter is a CLI/API/mobile-only signal.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>The counter is fine; its coverage is not. Two small server-side changes in <code>plugin-runtime.ts</code> close B and C, and one in <code>plugin-api.ts</code> closes A. None of them cross the server/daemon boundary or change the wire protocol to the host daemon, so no <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump. The <code>/api/v1/plugins</code> response shape changes only if a new field is added (see 3).</p>
+  <ol>
+    <li><strong>Count service crashes as handler errors and surface the last one as status detail.</strong> In <code>onServiceSettled</code>'s crash branch (after the <code>stabilizingPluginIds</code> check): <code>statsFor(id).errorCount += 1;</code> and, when <code>statuses.get(id)?.status === "running"</code>, <code>setStatus(id, "running", `service ${name} crashed: ${message}`)</code> — the same convention <code>invokeWrapped</code> already uses for rpc/http. This makes <code>crashloop</code> and <code>timerthrow</code> print <code>running (service sync crashed: …)</code> and <code>handlers: … N errors</code>. Risk: <code>stats.count</code> is not incremented (a crash is not a "call"), so <code>printPlugin</code> would still hide the line when <code>count === 0</code>; change the CLI condition to <code>stats.count &gt; 0 || stats.errorCount &gt; 0</code>. Also clear the detail on a later healthy stretch (e.g. in the <code>SERVICE_HEALTHY_RESET_MS</code> reset or when <code>start()</code> next resolves cleanly) so a one-off crash from last week does not read as current.</li>
+    <li><strong>Treat the uncaught-exception path the same way.</strong> Case B already funnels into <code>onServiceSettled</code> with <code>crashed: true</code>, so change 1 covers it; add a test that the #2128 path increments the counter (my test B).</li>
+    <li><strong>Give <code>bb.log.error</code> a health signal.</strong> In <code>plugin-api.ts emitLog</code>, when <code>level === "error"</code>, bump a per-plugin counter (simplest: <code>statsFor(id).errorCount</code>; cleaner: a new <code>handlerStats.loggedErrorCount</code> so consumers can tell "bb saw the handler fail" from "the plugin said it failed") and set <code>statusDetail</code> to the latest message. Plugins that log noisy non-fatal errors would then show a growing count, which is arguably correct and is exactly what the reporter's backstop was trying to grep for. If a separate field is added, it is an additive change to <code>pluginHandlerStatsSchema</code> in <code>packages/server-contract</code> (CLI, app, mobile all read it through the schema) — update <code>printPlugin</code> and the mobile detail screen in the same change.</li>
+    <li><strong>Optional, addresses the deeper issue:</strong> have <code>pluginRowSignal</code> / the detail page show a warning-tone "Failing" signal when <code>errorCount</code> (or the new field) grew recently, replacing the "cumulative diagnostics are not a banner" rule with a time-windowed one.</li>
+  </ol>
+  <p>What could go wrong: counting every crash makes a plugin that crashes once per day over months show a large cumulative number with no time window; the reporter explicitly accepts that trade ("would have surfaced this on the first throw"). If that is a concern, keep <code>errorCount</code> cumulative and add <code>lastErrorAt</code>. The three failing tests in §4a become the regression tests; the existing "restarts a crashed service with backoff" and #2128 tests in <code>plugin-background.test.ts</code> keep asserting the service recovers and the plugin stays <code>running</code>, which remains true.</p>
+
+  <h2>7. PR review</h2>
+  <p>No open PR is linked to this issue.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/2128">#2128</a> Route plugin service uncaught exceptions to the service supervisor (merged, <code>2ff85986e</code>) — created the case-B path that keeps the plugin <code>running</code> after an uncaught exception without counting it.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/1746">#1746</a> — the server crash-loop that #2128 fixed; its report is at <a href="1746.html">1746.html</a>.</li>
+    <li><a href="https://github.com/get-bb/bb/pull/636">#636</a> introduced the service crash → backoff → restart sequence without a status or counter change.</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Commands run</h3>
+<pre>gh issue view 2286 --repo get-bb/bb --comments
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+git fetch origin main &amp;&amp; git log 494f66526..origin/main --oneline -- apps/server/src/services/plugins packages/plugin-sdk apps/server/src/cli packages/cli   # (empty)
+grep -rn "errorCount" apps/server/src packages/*/src          # single increment site
+grep -n "invokeWrapped(" apps/server/src/services/plugins/plugin-service.ts
+git log --oneline -S consecutiveCrashes -- apps/server/src/services/plugins/plugin-runtime.ts   # e22c2641d (#636)
+git log --oneline -S handleUncaughtException -- apps/server/src/services/plugins/plugin-runtime.ts   # 2ff85986e (#2128)
+gh search code rateLimitRecovery          # no bb-related hits; the method does not exist in the SDK
+scripts/bb-dev-app current
+export BB_SERVER_URL=http://localhost:20411 BB_HOST_DAEMON_PORT=28411 BB_PROJECT_ID=proj_personal
+pnpm bb:dev plugin install /tmp/bb-reports/issues/2286/repro/bb-plugin-{caught,timerthrow,crashloop,control} --yes
+pnpm bb:dev plugin reload control
+curl -s -X POST $BB_SERVER_URL/api/v1/plugins/control/rpc/boom -H 'content-type: application/json' -d '{}'   # x3
+pnpm bb:dev plugin list ; pnpm bb:dev plugin logs caught -n 3 ; curl -s $BB_SERVER_URL/api/v1/plugins
+cd apps/server &amp;&amp; pnpm exec vitest run test/services/plugins/issue-2286-handler-error-visibility.test.ts
+doobie --headless &lt; shot-plugins.js   # screenshots
+pnpm dev:stop ; rm -rf ~/.bb-dev/…wf_846839f8-f8a-3-8e08fbc3307b</pre>
+  <h3>Server log excerpt (first seconds after install)</h3>
+<pre>[08:59:47] ERROR: [server] [plugin:caught] poll failed: bb.sdk.threads.rateLimitRecovery is not a function
+[08:59:48] INFO:  [server] [plugin:timerthrow] poller started
+[08:59:49] WARN:  [server] [plugin:timerthrow] service poller raised an uncaught exception outside start(): bb.sdk.threads.rateLimitRecovery is not a function — aborting it
+[08:59:49] WARN:  [server] [plugin:timerthrow] service poller crashed: bb.sdk.threads.rateLimitRecovery is not a function — restarting in 1000ms
+[08:59:51] ERROR: [server] [plugin:crashloop] sync failed: bb.sdk.threads.rateLimitRecovery is not a function
+[08:59:51] WARN:  [server] [plugin:crashloop] service sync crashed: bb.sdk.threads.rateLimitRecovery is not a function — restarting in 1000ms
+[09:00:01] WARN:  [server] [plugin:timerthrow] service poller crashed: … — restarting in 8000ms
+[09:00:10] WARN:  [server] [plugin:timerthrow] service poller crashed: … — restarting in 16000ms</pre>
+  <p>Full excerpt: <code>server-log-excerpt.txt</code> (102 lines). Full <code>bb plugin list</code>: <code>plugin-list.txt</code>. Install/build logs: <code>install.log</code>, <code>build.log</code>.</p>
+  <h3>Notes on fidelity</h3>
+  <ul>
+    <li>The reporter's plugin is not public, so which of A/B/C it hit is unverifiable. Its cadence (196 throws in 55.4 h ≈ one per 17 min, all landing in the plugin's own log) fits A (a periodic job with try/catch + <code>bb.log.error</code>) or B (a periodic timer that throws uncaught; the service restarts and re-arms the timer). It does not fit C well (a start() crash loop at the 60 s max backoff would produce ~3,300 crashes), and it does not fit a <code>bb.background.schedule</code> job (those go through <code>invokeWrapped</code> and would have been counted and shown as <code>last: error</code>).</li>
+    <li>In the vitest harness <code>bb.sdk</code> is not bound, so the fixtures use a local <code>{ threads: {} }</code> stand-in to produce the same <code>TypeError</code> shape; the live fixtures call the real <code>bb.sdk.threads.rateLimitRecovery()</code>.</li>
+  </ul>
+</main></body></html>

@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1873 Uncaught C++ exception from PtyFork crashes the whole app (SIGABRT, no JS error frame)</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1873 · Uncaught C++ exception from PtyFork crashes the whole app (SIGABRT, no JS error frame)</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill high">Priority: High</span> <span class="pill">Effort: n/a</span> <span class="pill">desktop</span> <span class="pill">workspaces</span>
+    <a href="https://github.com/get-bb/bb/issues/1873">open on GitHub</a>
+    <span>2026-08-19 · base <code>d81fee6f</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict">REPRODUCED</span> (mechanism reproduced end to end: binary evidence on the exact macOS prebuilt addons bb ships, addon load order of the shipped daemon bundle, and a live Linux analog that terminates the process with the same uncaught <code>Napi::Error</code>; the macOS SIGABRT itself was not re-run because no macOS host was available) · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>The bb host daemon (which on the packaged desktop runs as a separate Electron-as-Node process, hence the "Electron Framework" frames) loads two native addons into the same process: <code>@parcel/watcher</code>'s <code>watcher.node</code> and <code>node-pty</code>'s <code>pty.node</code>. Both are built against <code>node-addon-api</code> and both export the <em>same</em> weak C++ template instantiation <code>Napi::details::CallbackData&lt;...&gt;::Wrapper</code> — the N-API trampoline that is supposed to convert a thrown <code>Napi::Error</code> into a JavaScript exception. <code>node-pty</code> is compiled with <code>NAPI_CPP_EXCEPTIONS</code> (its Wrapper has a <code>try/catch</code>); <code>@parcel/watcher</code> is compiled with <code>NAPI_DISABLE_CPP_EXCEPTIONS</code> (its Wrapper has no <code>try/catch</code>). On macOS, dyld coalesces weak definitions across all loaded images, so whichever addon loads first owns the symbol. The shipped daemon bundle loads <code>watcher.node</code> first (esbuild hoists host-watcher's "lazy" import to a static top-level import), so <code>PtyFork</code> is invoked through <strong>watcher.node's</strong> exception-unaware Wrapper. When a PTY spawn fails (fd/process exhaustion, etc.), <code>PtyFork</code> does <code>throw Napi::Error</code>, nothing on the stack can catch it, <code>std::terminate</code> runs, and the daemon dies with SIGABRT — exactly the crash report in the issue (<code>PtyFork</code> directly above a <code>watcher.node</code> Wrapper frame). There is no JS error because the frame that would have produced one was never on the stack.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table><tr><th>Claim from the issue</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td><code>PtyFork</code> throws a C++ exception that reaches <code>std::terminate</code>; nothing catches it at the N-API boundary.</td><td class="ok">Verified</td><td><code>src/unix/pty.cc</code> in node-pty 1.1.0 does <code>throw Napi::Error::New(...)</code> on spawn failure (lines 373/376/416). The catcher is <code>Napi::details::CallbackData&lt;...&gt;::Wrapper</code> → <code>details::WrapCallback</code> (napi-inl.h L76-L89) — which only has a <code>try/catch</code> when compiled with <code>NAPI_CPP_EXCEPTIONS</code>. pty.node has that copy, but its GOT slot for the symbol is a dyld <em>weak bind</em> (see §5) and is rebound to watcher.node's copy, compiled with <code>NAPI_DISABLE_CPP_EXCEPTIONS</code> (no try/catch).</td></tr>
+    <tr><td>The crash stack shows <code>watcher.node Napi::details::CallbackData&lt;...&gt;::Wrapper</code> directly beneath <code>pty.node PtyFork</code>; "both native addons were live in the same callback path".</td><td class="ok">Verified (mechanism refined)</td><td>They are not both "in the callback path": pty.node's call to its own Wrapper was coalesced by dyld to watcher.node's identical-named weak symbol. The reporter's frame layout is precisely what this produces, and it is the key clue. Confirmed that the daemon bundle loads watcher.node before pty.node (<code>log</code>).</td></tr>
+    <tr><td>No JS error frame, no <code>uncaughtException</code>; "silent native death".</td><td class="ok">Verified</td><td>With watcher.node's Wrapper on the stack there is no handler, so <code>__cxa_throw</code> → <code>failed_throw</code> → <code>terminate</code>. Reproduced on Linux by forcing the same symbol binding: <code>terminate called after throwing an instance of 'Napi::Error'</code> and the process dies (<code>log</code>). With the normal binding the same spawn failure is an ordinary catchable JS error <code>forkpty(3) failed.</code> (<code>log</code>).</td></tr>
+    <tr><td>Likely trigger: <code>fork</code>/<code>posix_spawn</code> failing with EAGAIN/EMFILE/ENFILE under load.</td><td class="unv">Plausible, unverified</td><td>On macOS node-pty 1.1.0 throws <code>"posix_spawnp failed."</code> whenever <code>pty_posix_spawn</code> leaves <code>err != 0</code> — including <code>posix_openpt</code> failing (EMFILE/ENFILE), <code>grantpt</code>/<code>unlockpt</code>/<code>ioctl</code> failing, or <code>posix_spawnp</code> returning EAGAIN/ENOMEM. Any of these fits; the specific errno on the reporter's machine is not in the report. What is certain is that the failure is fatal only because of the symbol coalescing.</td></tr>
+    <tr><td>"Catch at the N-API boundary" (wrap PtyFork's body) is the correctness fix.</td><td class="ok">Verified as a valid upstream fix; bb-side fix is different</td><td>A <code>try/catch</code> inside <code>PtyFork</code> (or <code>-fvisibility=hidden</code> / <code>NAPI_CPP_CUSTOM_NAMESPACE</code> for node-pty's build) would make pty.node immune to the binding. bb cannot change the prebuilt; the bb-side root cause is loading watcher.node into the daemon parent at all (§6).</td></tr>
+    <tr><td>bb 0.38.0 affected.</td><td class="ok">Verified</td><td>bb-app 0.38.0 (<code>45145e51a</code>) pins <code>node-pty@1.1.0</code> and <code>@parcel/watcher@2.5.6</code>, same as base <code>d81fee6f</code>; host-watcher's lazy-import code is identical. Not fixed on <code>origin/main</code> as of 2026-08-19 (no commits touch these paths after the base).</td></tr>
+    <tr><td>Recovery clean, no corruption.</td><td class="unv">Unverified (out of scope)</td><td>Consistent with a daemon crash being restarted by the desktop supervisor; not investigated.</td></tr>
+    <tr><td>Adjacent note: <code>bb.sdk.threads.rateLimitRecovery</code> removed in 0.39.0.</td><td class="unv">Not investigated</td><td>Filed separately per the reporter; unrelated to this crash.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>bb base commit <code>d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3</code>; <code>node-pty@1.1.0</code> (bundles node-addon-api 7.1.1, built with <code>node_addon_api_except</code> = <code>NAPI_CPP_EXCEPTIONS</code>); <code>@parcel/watcher@2.5.6</code> (built with <code>NAPI_DISABLE_CPP_EXCEPTIONS</code>).</li>
+    <li>Investigation host: Linux 7.0.0-29-generic x86_64, Node v24.18.0. No macOS host was available; the macOS-specific dyld behaviour is shown by inspecting the actual <code>darwin-arm64</code> prebuilt binaries bb ships and by forcing the equivalent symbol binding on Linux.</li>
+    <li>Own dev instance (started only to confirm process layout; not needed for the repro): App :13621, Server :21621, Host daemon :29621, data dir <code>~/.bb-dev/projects-bb-.claude-worktrees-wf_d5c47f31-487-3-067348fd471c</code> (stopped and deleted at the end).</li>
+    <li>Revision pass (after verification): all repro logs were regenerated in a fresh worktree (<code>wf_d5c47f31-487-11</code>, checked out at <code>d81fee6f</code>, fresh <code>pnpm install</code> + <code>turbo build</code>) with <code>NODE_PATH</code> unset; no dev instance was started for it. Paths in the logs are shown as <code>&lt;repo&gt;</code>.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <p>Three independent pieces of evidence. Repro files: <code>1873/repro/</code>.</p>
+
+  <h3>4a. The shipped macOS binaries export the same weak symbol and pty.node weak-binds to it</h3>
+  <ol>
+    <li>From a bb checkout at <code>d81fee6f</code> (after <code>pnpm install</code>), fetch the macOS parcel prebuilt and run the Mach-O inspector (<code>macho-weak-syms.py</code>, no dependencies):
+<pre>mkdir /tmp/pack && cd /tmp/pack && npm pack @parcel/watcher-darwin-arm64@2.5.6 && tar xzf parcel-watcher-darwin-arm64-2.5.6.tgz
+python3 macho-weak-syms.py 'CallbackData.*Wrapper' \
+  &lt;repo&gt;/apps/host-daemon/node_modules/node-pty/prebuilds/darwin-arm64/pty.node \
+  package/watcher.node
+# or, to regenerate the full log incl. the node-pty beta prebuilt: bash run-macho-check.sh &lt;repo&gt; /tmp/pack</pre>
+    Actual output (<code>full log</code>, regenerated with <code>run-macho-check.sh</code>; the <code>addr=</code> column is the symbol's address inside its own image):
+<pre>&lt;repo&gt;/apps/host-daemon/node_modules/node-pty/prebuilds/darwin-arm64/pty.node
+  cputype=0x100000c filetype=8 flags=0x18085 MH_WEAK_DEFINES=True MH_BINDS_TO_WEAK=True
+  DEF   ext=False weak_def=True weak_ref=False addr=0x4c98 __ZN4Napi7details12WrapCallbackIZNS0_12CallbackDataIPFNS_5ValueERKNS_12CallbackInfoEES3_E7WrapperEP10napi_env__P20napi_callback_info__EUlvE_EEP12napi_value__T_
+  DEF   ext=True weak_def=True weak_ref=False addr=0x4c60 __ZN4Napi7details12CallbackDataIPFNS_5ValueERKNS_12CallbackInfoEES2_E7WrapperEP10napi_env__P20napi_callback_info__
+package/watcher.node
+  cputype=0x100000c filetype=8 flags=0x18085 MH_WEAK_DEFINES=True MH_BINDS_TO_WEAK=True
+  DEF   ext=True weak_def=True weak_ref=False addr=0x79a4 __ZN4Napi7details12CallbackDataIPFNS_5ValueERKNS_12CallbackInfoEES2_E7WrapperEP10napi_env__P20napi_callback_info__
+--- dyld bind / import entries ---
+&lt;repo&gt;/apps/host-daemon/node_modules/node-pty/prebuilds/darwin-arm64/pty.node
+  weak_bind: __ZN4Napi7details12CallbackDataIPFNS_5ValueERKNS_12CallbackInfoEES2_E7WrapperEP10napi_env__P20napi_callback_info__ (flags=0x0)
+package/watcher.node
+  weak_bind: __ZN4Napi7details12CallbackDataIPFNS_5ValueERKNS_12CallbackInfoEES2_E7WrapperEP10napi_env__P20napi_callback_info__ (flags=0x0)</pre>
+    Expected (for a safe pair of addons): the symbol would be hidden/non-external in at least one of them, or pty.node would have no <code>weak_bind</code> for it. Actual: both export it as an external weak definition and pty.node's pointer to it is a dyld weak bind — dyld will point it at whichever image defined it first. The same is true for the newest <code>node-pty@1.2.0-beta.15</code> prebuilt (bottom of the log), so upgrading node-pty alone does not help.<br>
+    Reading notes: pty.node's <code>ext=False</code> <code>WrapCallback&lt;...&gt;</code> line is the private lambda instantiation that the Wrapper calls, not a second Wrapper. An earlier version of this log also showed <code>ext=False weak_def=False</code> duplicates of both names — those were STABS <code>N_FUN</code> debug entries (n_type 0x24) aliasing the same address (0x4c60), not non-weak local copies; the inspector now skips <code>N_STAB</code> entries. Independently, the verifier dumped pty.node's weak-bind target: it is the GOT slot at 0x8020 whose initial value is 0x4c60, i.e. pty.node's own Wrapper — exactly the slot dyld rebinds to the first image that defines the symbol. watcher.node contains zero <code>Napi::Error</code> typeinfo strings (pty.node has 4), so watcher's Wrapper cannot catch a <code>Napi::Error</code>.</li>
+  </ol>
+
+  <h3>4b. The shipped daemon bundle loads watcher.node before pty.node, in the parent</h3>
+  <ol start="2">
+    <li>Build the daemon (<code>pnpm exec turbo run build --filter=@bb/host-daemon</code>) and run the real bundle with a preload that logs <code>process.dlopen</code> (<code>log-dlopen.cjs</code>); any bogus flag makes it exit right after module evaluation:
+<pre>cd apps/host-daemon && cp /path/to/log-dlopen.cjs .
+node --require ./log-dlopen.cjs dist/daemon-bundle.mjs --definitely-not-a-flag 2&gt;&amp;1 | grep -E '^\[dlopen|^\[exit'
+# or: bash run-load-order.sh &lt;repo&gt;</pre>
+    Expected (per the comment in <code>packages/host-watcher/src/real-parcel-watcher.ts</code>: "leaving the parent parcel-free"): only <code>pty.node</code>. Actual (<code>log</code>):
+<pre>[dlopen #1] &lt;repo&gt;/node_modules/.pnpm/@parcel+watcher-linux-x64-glibc@2.5.6/node_modules/@parcel/watcher-linux-x64-glibc/watcher.node
+[dlopen #2] &lt;repo&gt;/node_modules/.pnpm/node-pty@1.1.0/node_modules/node-pty/build/Release/pty.node
+[exit] code=1 addons loaded=2</pre>
+    Why: <code>grep -o 'import [A-Za-z]* from"@parcel/watcher"' dist/daemon-bundle.mjs</code> shows esbuild hoisted <code>import VYr from "@parcel/watcher"</code> to the top level of the ESM bundle (offset ~407 KB, well before the <code>node-pty</code> import at ~5.6 MB), because the "lazy" <code>await import("./real-parcel-watcher.js")</code> targets an <em>internal</em> module, which esbuild inlines, and the external static import inside it cannot stay lazy in ESM output. A vitest that bundles the host-watcher entry the same way and asserts no static import FAILS on the base commit: <code>parcel-watcher-not-loaded-in-parent.test.ts</code> (<code>output</code>):
+<pre>AssertionError: static top-level import(s) of @parcel/watcher found in the bundle; watcher.node would load at daemon startup:
+import parcelWatcher from "@parcel/watcher";: expected [ Array(1) ] to be null</pre></li>
+  </ol>
+
+  <h3>4c. Live analog: force the same binding and a failing spawn → uncaught Napi::Error → terminate</h3>
+  <ol start="3">
+    <li>Linux does not coalesce across <code>RTLD_LOCAL</code> addons, so to observe exactly the binding dyld performs on macOS, load watcher.node with <code>RTLD_GLOBAL</code> first, then node-pty, then make the spawn fail by clamping <code>RLIMIT_NOFILE</code> to the already-open count (<code>napi-wrapper-coalesce-linux.cjs</code>; pty.node on Linux references the Wrapper through the GOT, <code>R_X86_64_GLOB_DAT</code>, so it is interposable):
+<pre>cd &lt;repo&gt;/apps/host-daemon && cp /path/to/napi-wrapper-coalesce-linux.cjs .
+node napi-wrapper-coalesce-linux.cjs --local    # control: default binding
+node napi-wrapper-coalesce-linux.cjs            # watcher.node first, RTLD_GLOBAL
+# or: bash run-linux-analog.sh &lt;repo&gt;   (does the same with NODE_PATH unset and rewrites the two logs)</pre>
+    The script resolves the platform package (<code>@parcel/watcher-linux-x64-glibc</code>, which pnpm does not hoist) relative to <code>@parcel/watcher</code> via <code>createRequire(require.resolve("@parcel/watcher"))</code>, so it works in a fresh clone with no <code>NODE_PATH</code>. It needs <code>prlimit</code> (util-linux) and a glibc x86_64/arm64 host.<br>
+    Control — expected and actual (<code>log</code>, <code>NODE_PATH</code> unset):
+<pre>loaded watcher.node RTLD_LOCAL: &lt;repo&gt;/node_modules/.pnpm/@parcel+watcher-linux-x64-glibc@2.5.6/node_modules/@parcel/watcher-linux-x64-glibc/watcher.node
+loaded node-pty &lt;repo&gt;/node_modules/.pnpm/node-pty@1.1.0/node_modules/node-pty/lib/index.js
+caught JS error: forkpty(3) failed.
+process still alive, exiting normally
+exit=0</pre>
+    Coalesced binding — actual (<code>log</code>); expected would be the same catchable JS error:
+<pre>loaded watcher.node RTLD_GLOBAL: &lt;repo&gt;/node_modules/.pnpm/@parcel+watcher-linux-x64-glibc@2.5.6/node_modules/@parcel/watcher-linux-x64-glibc/watcher.node
+loaded node-pty &lt;repo&gt;/node_modules/.pnpm/node-pty@1.1.0/node_modules/node-pty/lib/index.js
+terminate called after throwing an instance of 'Napi::Error'
+run-linux-analog.sh: line 13: 3288463 Segmentation fault         (core dumped) node napi-wrapper-coalesce-linux.cjs
+exit=139</pre>
+    Same spawn failure, same addons, only the symbol binding differs: the JS <code>try/catch</code> in <code>terminal-manager.ts</code> never gets a chance. (libstdc++'s verbose terminate handler ends in SIGSEGV here; on macOS libc++abi's <code>demangling_terminate_handler</code> calls <code>abort()</code>, giving the reporter's SIGABRT.)</li>
+  </ol>
+
+  <h2>5. Root cause</h2>
+  <p><strong>Mechanism.</strong> <code>node-addon-api</code> is header-only; every addon instantiates the trampoline <code>Napi::details::CallbackData&lt;Napi::Value(*)(const Napi::CallbackInfo&amp;), Napi::Value&gt;::Wrapper</code> and passes its address to <code>napi_create_function</code>. The body of that trampoline depends on a compile-time macro (<a href="https://github.com/nodejs/node-addon-api/blob/main/napi-inl.h">napi-inl.h</a>, node-addon-api 7.1.1 L76-L89 / L108-L123):</p>
+<pre>template &lt;typename Callable&gt;
+inline napi_value WrapCallback(Callable callback) {
+#ifdef NAPI_CPP_EXCEPTIONS
+  try {
+    return callback();
+  } catch (const Error&amp; e) {
+    e.ThrowAsJavaScriptException();
+    return nullptr;
+  }
+#else   // NAPI_CPP_EXCEPTIONS
+  // When C++ exceptions are disabled, errors are immediately thrown as JS
+  // exceptions, so there is no need to catch and rethrow them here.
+  return callback();
+#endif  // NAPI_CPP_EXCEPTIONS
+}</pre>
+  <p>Two addons with different settings produce two functions with the <em>same mangled name</em> and different bodies (an ODR violation across images). node-pty builds with <code>node_addon_api_except</code> (<code>binding.gyp</code> target_defaults) and throws C++ exceptions: <code>src/unix/pty.cc</code> L373 <code>throw Napi::Error::New(napiEnv, "posix_spawnp failed.")</code>, L416 <code>"forkpty(3) failed."</code>. @parcel/watcher builds with <code>"defines": ["NAPI_DISABLE_CPP_EXCEPTIONS"]</code> (<code>binding.gyp</code> L5). Neither sets <code>-fvisibility=hidden</code> / <code>GCC_SYMBOLS_PRIVATE_EXTERN</code> (node-gyp's <code>common.gypi</code> does not either), so both export the symbol as a weak external definition and both images are flagged <code>MH_WEAK_DEFINES | MH_BINDS_TO_WEAK</code> (§4a).</p>
+  <p>On macOS dyld performs weak-definition coalescing across <em>all</em> loaded images (RTLD_LOCAL does not opt out), binding every weak reference to the first definition in load order. In the daemon process watcher.node loads first (§4b), so pty.node's <code>Wrapper</code> pointer is patched to watcher.node's copy — the one with no <code>try/catch</code>. That is literally the reporter's stack: <code>pty.node PtyFork</code> called from <code>watcher.node Napi::details::CallbackData&lt;...&gt;::Wrapper</code>, called from Electron/V8. When <code>PtyFork</code> throws, unwinding walks up through watcher.node's Wrapper (no handler), into V8/Electron (compiled <code>-fno-exceptions</code>) → <code>__cxa_throw</code> finds no handler → <code>failed_throw</code> → <code>std::terminate</code> → <code>abort()</code> → SIGABRT. No JS exception is ever created, so no log line, no <code>uncaughtException</code>.</p>
+  <p><strong>Why watcher.node is in the daemon at all (the bb-side bug).</strong> Since <a href="https://github.com/get-bb/bb/commit/cba0b9e89">#250</a> the daemon is supposed to run @parcel/watcher only in a forked child (<a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/apps/host-daemon/src/start-host-daemon.ts#L220-L238">start-host-daemon.ts L220-L238</a>). The in-process fallback is meant to be lazy (<a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/packages/host-watcher/src/parcel-watcher-backend.ts#L39-L48">parcel-watcher-backend.ts L39-L48</a>):</p>
+<pre>function createInProcessBackend(): ParcelWatcherBackend {
+  return {
+    async subscribe(dir, callback, opts) {
+      // Lazy import keeps the native addon out of the parent unless we actually
+      // watch in-process.
+      const { realParcelWatcher } = await import("./real-parcel-watcher.js");
+      return realParcelWatcher.subscribe(dir, callback, opts);
+    },
+  };
+}</pre>
+  <p>and <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/packages/host-watcher/src/real-parcel-watcher.ts#L1-L7">real-parcel-watcher.ts</a> does <code>import parcelWatcher from "@parcel/watcher";</code>. But the daemon is shipped as a single esbuild ESM bundle (<a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/apps/host-daemon/scripts/build-bundles.mjs#L22-L43">build-bundles.mjs</a>: <code>bundle: true, format: "esm"</code>, natives external). esbuild inlines the internal dynamic import into a lazy <code>__esm</code> initializer, but the <em>external</em> static import inside it has to become a top-level <code>import VYr from "@parcel/watcher"</code> of the bundle — which runs at startup and executes @parcel/watcher's <code>index.js</code>, whose first statement is <code>require('@parcel/watcher-darwin-arm64')</code> → <code>watcher.node</code>. So the "parcel-free parent" guarantee from #250 silently does not hold in production builds (it does hold in <code>pnpm dev</code>, which runs from source via tsx — one reason this was never noticed locally). The result is two node-addon-api addons with conflicting exception modes in one process, watcher first.</p>
+  <p><strong>Why the symptom follows.</strong> bb's JS layer is correct: <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/apps/host-daemon/src/terminals/terminal-manager.ts#L600-L685">terminal-manager.ts openTerminal</a> wraps <code>this.ptyAdapter.spawn</code> in <code>try/catch</code> and would send <code>terminal_open_failed</code>; <a href="https://github.com/get-bb/bb/blob/d81fee6f47178c75f6ecf23d80bb69c4a3e9e5c3/apps/host-daemon/src/provider-cli-health.ts#L1075-L1088">provider-cli-health.ts</a> also spawns PTYs. None of that runs because the exception never becomes a JS value. The trigger can be anything that makes <code>pty_posix_spawn</code> fail — with dozens of threads/worktrees/terminals, <code>posix_openpt</code> EMFILE or <code>posix_spawnp</code> EAGAIN are the obvious candidates, matching the reporter's hypothesis — but the bug is that a recoverable failure is fatal.</p>
+  <p><strong>Deeper issue.</strong> This is a latent hazard for <em>any</em> pair of node-addon-api addons with mismatched exception settings in one process on macOS; the general cure lives upstream (build addons with <code>-fvisibility=hidden</code>/<code>GCC_SYMBOLS_PRIVATE_EXTERN</code> as node-addon-api's setup docs recommend, or <code>NAPI_CPP_CUSTOM_NAMESPACE</code>). bb ships prebuilts for both and cannot rebuild them, but it <em>can</em> keep them out of the same process, which was already the design intent.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <ol>
+    <li><strong>Make the in-process parcel fallback truly lazy</strong> (<code>packages/host-watcher/src/parcel-watcher-backend.ts</code>): dynamically import the <em>external</em> package, not an internal wrapper — <code>const { default: parcelWatcher } = await import("@parcel/watcher");</code>. esbuild keeps a dynamic import of an external module as a real <code>import()</code>, so nothing loads at startup. <code>real-parcel-watcher.ts</code> stays for the child entry. Prototype diff: <code>proposed-fix-lazy-parcel-import.diff</code>. Verified: after rebuilding, the daemon bundle loads only <code>pty.node</code> (<code>log</code>); the repro vitest passes (<code>log</code>); <code>@bb/host-watcher</code> typecheck + 45 tests pass (<code>log</code>). With pty.node alone (better-sqlite3 does not use node-addon-api — 0 <code>Napi</code> symbols), there is no competing Wrapper, so a failed spawn becomes the JS error <code>terminal_open_failed</code> / a rejected provider install as designed.</li>
+    <li><strong>Guard it</strong>: add the repro test (or an assertion in <code>apps/host-daemon/scripts/check-bundles.mjs</code>) that the daemon bundle has no static top-level <code>import ... from "@parcel/watcher"</code>, so a future refactor cannot re-hoist it. A daemon startup smoke test that asserts <code>process.dlopen</code> was never called for <code>watcher.node</code> would be even stronger.</li>
+    <li><strong>Defense in depth (optional)</strong>: load <code>node-pty</code> as the first native addon in the daemon entry so that, if some addon without exceptions ever does get loaded, pty.node's exception-aware Wrapper wins the coalescing (the reverse binding is harmless: watcher's callbacks never throw). Weaker than (1) because it depends on ordering.</li>
+    <li><strong>Upstream</strong>: file against microsoft/node-pty — either wrap each native entry point's body in <code>try/catch</code> + <code>ThrowAsJavaScriptException()</code> (the reporter's ask), or add <code>GCC_SYMBOLS_PRIVATE_EXTERN: YES</code> / <code>-fvisibility=hidden</code> to <code>binding.gyp</code>; and/or against parcel-bundler/watcher for hidden visibility. <code>node-pty@1.2.0-beta.15</code> still has the issue.</li>
+  </ol>
+  <p>What could go wrong: (1) changes nothing for the child process path the daemon actually uses; the in-process fallback is only used when <code>setParcelWatcherBackend</code> was not called (tests, embedders). The type import <code>typeof import("@parcel/watcher")</code> remains type-only. No wire-protocol change, so no <code>HOST_DAEMON_PROTOCOL_VERSION</code> bump needed.</p>
+
+  <h2>7. PR review</h2>
+  <p>No open pull requests are linked to this issue.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/pull/250">#250 Run @parcel/watcher in a self-healing child process</a> — established the "parent is parcel-free" intent that the bundle defeats.</li>
+    <li><a href="https://github.com/get-bb/bb/pull/1506">#1506 Survive a broken pipe to the watcher child</a> — same subsystem.</li>
+    <li>Upstream: node-addon-api <code>doc/setup.md</code> recommends <code>-fvisibility=hidden</code>/<code>GCC_SYMBOLS_PRIVATE_EXTERN</code> for macOS; <code>NAPI_CPP_CUSTOM_NAMESPACE</code> exists "to avoid symbol conflicts between different instances of node-addon-api". Apple developer forum thread "Two-level namespace and coalesced typeinfos" describes the same cross-image weak coalescing.</li>
+    <li>The reporter's adjacent note about <code>bb.sdk.threads.rateLimitRecovery</code> is a separate issue and was not investigated.</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <h3>Commands run</h3>
+<pre>gh issue view 1873 --repo get-bb/bb --json title,body,labels,state,comments
+git checkout d81fee6f && pnpm install --frozen-lockfile --prefer-offline && pnpm exec turbo run build
+grep -n "throw\|NAPI" apps/host-daemon/node_modules/node-pty/src/unix/pty.cc apps/host-daemon/node_modules/node-pty/binding.gyp
+cat node_modules/.pnpm/@parcel+watcher@2.5.6/node_modules/@parcel/watcher/binding.gyp     # NAPI_DISABLE_CPP_EXCEPTIONS
+grep -n "GCC_SYMBOLS_PRIVATE_EXTERN\|fvisibility" ~/.cache/node-gyp/24.18.0/include/node/common.gypi   # none
+npm pack @parcel/watcher-darwin-arm64@2.5.6 ; npm pack node-pty@1.2.0-beta.15
+python3 macho-weak-syms.py 'CallbackData.*Wrapper' pty.node watcher.node
+nm -D .../pty.node | grep Wrapper ; objdump -R .../pty.node | grep Wrapper      # W symbol, R_X86_64_GLOB_DAT
+grep -bo 'from"@parcel/watcher"\|from"node-pty"' apps/host-daemon/dist/daemon-bundle.mjs  # 406933 vs 5585398
+node --require ./log-dlopen.cjs dist/daemon-bundle.mjs --definitely-not-a-flag     # or: bash run-load-order.sh &lt;repo&gt;
+node napi-wrapper-coalesce-linux.cjs --local ; node napi-wrapper-coalesce-linux.cjs   # or: bash run-linux-analog.sh &lt;repo&gt;  (NODE_PATH unset)
+strace -f -e trace=none -e signal=all node napi-wrapper-coalesce-linux.cjs
+pnpm exec vitest run test/parcel-watcher-not-loaded-in-parent.test.ts   # fails on base, passes with diff
+pnpm exec turbo run typecheck test --filter=@bb/host-watcher            # with diff: 45 passed
+git fetch origin main && git log d81fee6f..origin/main --oneline -- packages/host-watcher apps/host-daemon/src/terminals apps/host-daemon/scripts   # nothing
+git show 45145e51a:packages/bb-app/package.json | grep "node-pty\|parcel"   # 0.38.0 pins the same versions</pre>
+  <h3>Signal sequence of the Linux analog (strace)</h3>
+<pre>terminate called after throwing an instance of 'Napi::Error'
+[pid N] --- SIGSEGV {si_signo=SIGSEGV, si_code=SEGV_ACCERR, ...} ---
+[pid N] --- SIGSEGV {si_signo=SIGSEGV, si_code=SI_TKILL, ...} ---
++++ killed by SIGSEGV (core dumped) +++</pre>
+  <h3>Extra evidence</h3>
+  <ul>
+    <li>Linux control without any symbol trick (<code>forkpty-eagain-linux.cjs</code>): <code>caught JS error: forkpty(3) failed.</code> — i.e. the throw in <code>PtyFork</code> is designed to be catchable; only the wrong Wrapper makes it fatal.</li>
+    <li>Desktop process layout: <code>apps/desktop/src/bb-process.ts</code> runs bb-app with <code>ELECTRON_RUN_AS_NODE=1</code> and the bb-app launcher spawns the daemon bundle with <code>process.execPath</code> (the Electron binary) — this is why the crash report shows Electron Framework frames for what is the host daemon process.</li>
+    <li>Only two native addons load during daemon module evaluation (watcher.node, pty.node); better-sqlite3 loads later and has no node-addon-api symbols.</li>
+  </ul>
+
+  <h3>Verification</h3>
+  <p>An independent verifier followed all three repro legs in a separate worktree at <code>d81fee6f</code> (fresh <code>pnpm install</code> + <code>turbo build</code>):</p>
+  <ul>
+    <li><strong>4a</strong> reproduced byte-for-byte (same weak symbol exported by both darwin-arm64 prebuilts, same <code>weak_bind</code> in pty.node). The verifier additionally dumped the weak-bind target (GOT slot 0x8020, initial value 0x4c60 = pty.node's own Wrapper) and confirmed watcher.node carries no <code>Napi::Error</code> typeinfo. Finding: the earlier full log listed <code>ext=False weak_def=False</code> duplicates that looked like a non-weak second copy; they were STABS debug entries. <em>Changed:</em> <code>macho-weak-syms.py</code> now skips <code>N_STAB</code> symbols and prints <code>addr=</code>; <code>macho-weak-syms-output.log</code> regenerated; explanatory note added under 4a.</li>
+    <li><strong>4b</strong> reproduced (watcher.node first, pty.node second, <code>addons loaded=2</code>; static <code>import VYr from"@parcel/watcher"</code> at ~407 KB). Re-run in this pass with <code>NODE_PATH</code> unset via <code>run-load-order.sh</code>; same result. The repro vitest fails on base with the same assertion and passes after <code>git apply</code> of the proposed diff (re-confirmed here); the rebuilt bundle then loads only pty.node (<code>after-fix log</code>, regenerated).</li>
+    <li><strong>4c</strong> reproduced (<code>caught JS error: forkpty(3) failed.</code> / exit 0 vs <code>terminate called after throwing an instance of 'Napi::Error'</code> / SIGSEGV exit 139) — but only because the verifier's shell, like the author's, had a <code>NODE_PATH</code> pointing at a <code>.pnpm/node_modules</code> dir; with <code>NODE_PATH</code> unset the original script failed with <code>Cannot find module '@parcel/watcher-linux-x64-glibc/watcher.node'</code> (major finding). <em>Changed:</em> <code>napi-wrapper-coalesce-linux.cjs</code> now resolves the platform package through <code>createRequire(require.resolve("@parcel/watcher"))</code>; its usage comment now says "terminate (SIGSEGV on Linux, SIGABRT on macOS)" instead of "SIGABRT"; both <code>linux-rtld-*.log</code> files were regenerated from this worktree with <code>NODE_PATH</code> unset (<code>run-linux-analog.sh</code>) and still show the same two outcomes.</li>
+    <li>Source claims checked by the verifier and found accurate: node-pty 1.1.0 <code>binding.gyp</code> uses <code>node_addon_api_except</code>; <code>pty.cc</code> throws <code>Napi::Error</code> at L373/376/416; @parcel/watcher 2.5.6 defines <code>NAPI_DISABLE_CPP_EXCEPTIONS</code>; napi-inl.h 7.1.1 L76-L89 only has the try/catch under <code>NAPI_CPP_EXCEPTIONS</code>; the host-watcher excerpts match; <code>origin/main</code> (4 commits past the base) does not touch host-watcher/host-daemon. No macOS host was available to either party, so the SIGABRT itself is still inferred from the binary evidence, the reporter's stack, and the Linux analog.</li>
+  </ul>
+</main></body></html>

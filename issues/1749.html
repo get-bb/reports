@@ -1,0 +1,708 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #1749 timelineWindowEventBudget assumes 0.06ms/event</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .pill.med { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#1749 · timelineWindowEventBudget assumes 0.06ms/event; measured 0.479ms/event on a 4-core host</h1>
+  <p class="meta">
+    <span class="pill">Performance</span> <span class="pill med">Medium</span> <span class="pill">Effort: unknown</span>
+    <span class="pill">perf</span> <span class="pill">host</span>
+    <a href="https://github.com/get-bb/bb/issues/1749">open on GitHub</a>
+    <span>2026-08-18</span>
+    <span>base <code>16ceb3a540f81c1189efaffb27a39b1d9443abf5</code> (main)</span>
+  </p>
+  <p class="meta">
+    <span class="verdict v-partial">Verdict: PARTIALLY REPRODUCED</span>
+    <span>· root-cause confidence: <b>high</b> (mechanism) / <b>low</b> (the reporter's exact numbers)</span>
+    <span>· linked open PRs: <a href="https://github.com/get-bb/bb/pull/1756">#1756</a> (docs only)</span>
+  </p>
+
+  <h2>TL;DR</h2>
+  <p><b>Plain-language framing.</b> Every time the app or CLI asks the server for a thread's timeline, the server rebuilds it from the thread's stored events: it reads the newest N event rows out of SQLite, <code>JSON.parse</code>s each one, and projects them into rows. That work is synchronous, so while it runs the server's single event loop is blocked for <em>everyone</em>, including the host daemon which waits on the server before each dynamic tool call. To bound that work, PR #882 capped a timeline "window" at <code>timelineWindowEventBudget = 1500</code> events, justified in a source comment by "~0.06&nbsp;ms/event, so a cold build stays near 100&nbsp;ms".</p>
+  <p>The reporter runs bb on a 4-core VPS and derived ~0.48&nbsp;ms/event (p50) from the server's own <code>Thread timeline build blocked the event loop</code> log lines, i.e. a full 1500-event window costs ~700&nbsp;ms there, not 100&nbsp;ms. This is not a functional bug: nothing is wrong, lost or crashing. It is a calibration problem: the budget is a fixed <em>event count</em>, but the cost per event is dominated by CPU speed and by payload bytes (SQLite read + JSON decode are ~80% of a build), both of which vary a lot between hosts. The env var <code>BB_FF_TIMELINE_WINDOW_EVENT_BUDGET</code> already exists as an escape hatch and is documented in <code>docs/configuration.md</code>.</p>
+  <p>What I could verify: the mechanism, the code path, the cache-invalidation-per-event claim, and that the build cost scales with available CPU. On this Ryzen 7 workstation the constant is actually <em>conservative</em> (0.024&nbsp;ms/event, 36&nbsp;ms for a full 1500-event window at ~0.9&nbsp;KB/event). Throttled to ~25% of one core the same window takes 124&nbsp;ms and the "100&nbsp;ms" premise fails; on the reporter's VPS it is presumably far worse. What I could not verify: the reporter's exact 0.479&nbsp;ms/event, which comes from a <em>biased sample</em> — the slow-build logger only emits for builds &ge; 150&nbsp;ms, so per-event cost computed from those lines is conditioned on the build already being slow (see Claims). PR #1756 only adds documentation and copies those numbers into a source comment; it does not change behavior.</p>
+
+  <h2>Claims vs findings</h2>
+  <table>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>The constant is calibrated at "~0.06&nbsp;ms/event", 1500 &rarr; "cold build near 100&nbsp;ms"</td><td class="ok">Verified</td><td><a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/domain/src/feature-flags.ts#L31-L37">feature-flags.ts#L31-L37</a>; origin is PR #882 ("Bound timeline windows by event count"), measured on a production bundle against a real DB.</td></tr>
+    <tr><td>Measured 0.479&nbsp;ms/event p50 (p90 0.964, max 5.55) on a 4-core/4.9&nbsp;GiB VPS from 541 slow-build log samples</td><td class="unv">Unverifiable, and biased upward by construction</td><td>I do not have that hardware. The <code>Thread timeline build blocked the event loop</code> line is emitted only when <code>totalDurationMs &ge; 150</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/timeline-build-log.ts#L17">timeline-build-log.ts#L17</a>) and at most once per thread per 30&nbsp;s. Every sampled build is therefore one that was already slow; builds at 0.06&nbsp;ms/event (a 1257-event window = 75&nbsp;ms) never appear. The p50 across such lines is a p50 of the slow tail, not of all builds. The 5.55&nbsp;ms/event max also almost certainly includes GC pauses or other synchronous work landing inside the timed region.</td></tr>
+    <tr><td>Per-event cost is hardware dependent (~8x spread)</td><td class="ok">Verified in direction, magnitude unverified</td><td>Repro test: 0.024&nbsp;ms/event on this workstation; 0.083&ndash;0.12&nbsp;ms/event when the same test is pinned to one core shared with three busy loops (~4x). Cost is CPU-bound and linear in bytes (see table below), so a slow vCPU with steal time can plausibly reach the reported range.</td></tr>
+    <tr><td>Representative build: 1257 events / 1.48&nbsp;MB read and decoded to return 96 rows; <code>event-json-decode</code> the dominant stage</td><td class="ok">Consistent with code and my measurements</td><td>On the seeded fixture, <code>event-query</code> + <code>event-json-decode</code> are ~80% of a build; projection ~10&ndash;15%. Both dominant stages scale with payload bytes.</td></tr>
+    <tr><td>Only 2 of 76 threads exceed 1500 events, so the budget "rarely binds"</td><td class="unv">Unverifiable for their DB; mechanism verified</td><td>The budget floor is <code>OFFSET eventBudget</code> on a descending scan (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/db/src/data/events.ts#L2471-L2491">events.ts#L2471-L2491</a>); when the thread has fewer events it returns <code>undefined</code> and only the segment (user-message) limit of 20 bounds the read. On the seeded 60-thread fixture the budget bound 20 threads; the segment limit bound the rest at &le; ~900 events.</td></tr>
+    <tr><td>Cache key includes <code>maxSeq</code>, so every appended event invalidates the entry and an active thread rebuilds continuously</td><td class="ok">Verified (cache key) / <span class="unv">Partially</span> (rebuild rate)</td><td><b>Cache key:</b> verified. <b>"Continuously":</b> overstated &mdash; the client paces its trailing refetch to the observed fetch duration (min 50&nbsp;ms, max 1&nbsp;s, "caps that duty cycle near 50%") and coalesces events that arrive mid-fetch (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/hooks/cache-owners/realtime-cache-registry.ts#L135-L157">realtime-cache-registry.ts#L135-L157</a>, introduced by PR #882), so during a streaming turn rebuilds are <em>sustained</em> but coalesced &mdash; roughly one build per (build duration, floored at 50&nbsp;ms), not one per appended event. <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/timeline-cache.ts#L124-L129">timeline-cache.ts#L124-L129</a>; the route computes <code>maxSeq = getLatestThreadSequence(...)</code> per request (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/routes/threads/data.ts#L321-L361">data.ts#L321-L361</a>). Delta responses still rebuild the full window first ("Reprojecting the full window first keeps every ... case correct by construction"). This is by design (see comment in <code>timeline-build-log.ts</code>: "a viewed long thread rebuilds back-to-back for the whole turn").</td></tr>
+    <tr><td>Each build churns 0.5&ndash;1.5&nbsp;MB of transient parsed JSON</td><td class="ok">Plausible / consistent</td><td>My full-window builds read 1.3&nbsp;MiB of stored JSON per build (<code>windowKiB=1302</code>); the parsed object graph is larger. Heap impact itself not measured here.</td></tr>
+    <tr><td>Lowering to 400 via <code>BB_FF_TIMELINE_WINDOW_EVENT_BUDGET</code> works as an operator workaround (~190&nbsp;ms cold builds on their host)</td><td class="ok">Verified as a mechanism</td><td>Env var wired in <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/config/src/feature-flags.ts#L27-L32">config/feature-flags.ts#L27-L32</a>. In the repro, budget 400 cut the window from 1500 to 500 events and the build from 36&nbsp;ms to 12&nbsp;ms (contended: 124&nbsp;ms &rarr; 41&nbsp;ms). Note the window is 500 not 400: a whole finished turn is always returned even when it exceeds the budget (deliberate, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/timeline.ts#L1219-L1227">timeline.ts#L1219-L1227</a>).</td></tr>
+    <tr><td>Event-loop stall samples: maxDelay p95 5&nbsp;s, max 50.6&nbsp;s</td><td class="unv">Unverifiable; unlikely to be timeline builds alone</td><td>A 50&nbsp;s stall at even 5&nbsp;ms/event would need a 10k-event window, which the budget forbids. Other synchronous work (GC, SQLite checkpoints, other stall sources) is more likely; the stall monitor attributes work by label and that attribution was not shared.</td></tr>
+    <tr><td>"The env var should be mentioned somewhere discoverable"</td><td class="no">Already documented</td><td><code>docs/configuration.md</code> "Thread Timeline Window" section, the built-in guide template <code>packages/templates/src/templates/bb-guide-customization.md:121</code> and the <code>bb-cli</code> skill <code>SKILL.md:118</code> all name <code>BB_FF_TIMELINE_WINDOW_EVENT_BUDGET</code> at base.</td></tr>
+  </table>
+
+  <h2>Environment</h2>
+  <ul>
+    <li>bb <code>16ceb3a54</code> (main, 2026-08-18), worktree <code>/home/USER/projects/bb/.claude/worktrees/wf_242c3e11-a10-4</code>. <code>git log 16ceb3a54..origin/main -- apps/server/src/services/threads packages/domain/src/feature-flags.ts docs/configuration.md</code> is empty: nothing later on main touches this.</li>
+    <li>Linux 7.0.0-29-generic x86_64, AMD Ryzen 7 255 (16 logical CPUs, ~83% scaling), 57&nbsp;GiB RAM, node v24.18.0. Reporter: bb 0.38.0, Ubuntu 22.04.5, 4 cores / 4.9&nbsp;GiB, node v24.19.0.</li>
+    <li>No dev instance was needed: the repro calls <code>buildThreadTimelineWithProfile</code>, the exact function the <code>GET /api/v1/threads/:id/timeline</code> route calls, with the same options the route passes (<code>segmentLimit 20</code>, <code>DEFAULT_MAX_INLINE_OUTPUT_CHARS</code>), against in-memory SQLite (<code>createConnection(":memory:")</code> + <code>migrate</code>) seeded with the repo's own <code>seedPerfFixture</code> (the generator behind <code>pnpm seed:perf</code>). No provider processes are involved.</li>
+  </ul>
+
+  <h2>Minimal reproduction</h2>
+  <p>The repro is one vitest file: <code>1749/repro/timeline-event-budget-cost.repro.test.ts</code> (copy it to <code>apps/server/test/services/threads/</code>). It has two scenarios; the second one carries the assertion. Both print a table via <code>console.log</code> and, because the server's vitest config silences passing-test stdout (<code>silent: "passed-only"</code>), also append it to <code>$REPRO_1749_OUT</code> when set.</p>
+  <ol>
+    <li>Build once: <code>pnpm install --frozen-lockfile --prefer-offline &amp;&amp; pnpm exec turbo run build</code>.</li>
+    <li>Copy the test in and run it on the idle machine:
+      <pre>cp /tmp/bb-reports/issues/1749/repro/timeline-event-budget-cost.repro.test.ts apps/server/test/services/threads/
+cd apps/server
+REPRO_1749_OUT=/tmp/repro-1749.txt pnpm exec vitest run test/services/threads/timeline-event-budget-cost.repro.test.ts
+cat /tmp/repro-1749.txt</pre>
+      <b>Expected</b> (documented premise): ~0.06&nbsp;ms/event and a full 1500-event window at ~100&nbsp;ms. <b>Actual on this workstation</b> (<code>repro-output-main.txt</code>) — faster than documented, so the assertion passes here:
+      <pre>host: x64 node v24.18.0
+threads=60 budget=1500 threadsWhereBudgetBinds=20
+ms/event (threads&gt;=200 events, n=44): p50=0.028 p90=0.032 max=0.033  (documented: 0.06)
+ms/KiB  (same threads): p50=0.053 p90=0.063
+
+threadEvents  windowEvents  windowKiB  bytes/evt  strategy  respRows  buildMs  ms/evt   query  decode  project
+        1512           908        483        545  standard-window       100     23.6   0.026    13.1     8.9      2.8
+        2210           876        448        523  standard-window       106     24.8   0.028     8.2    12.8      2.5
+        2668           866        511        604  standard-window        93     23.9   0.028     9.8     9.1      3.0
+        ...
+budget=1500: strategy=standard-window windowEvents=1500 windowKiB=1302 bytes/evt=889 respRows=12 segments=3 build p50=36.4ms max=48.1ms ms/evt=0.024 [query=19.8 decode=22.1 project=5.1]
+budget=400:  strategy=standard-window windowEvents=500  windowKiB=434  bytes/evt=889 respRows=4  segments=1 build p50=12.1ms max=15.8ms ms/evt=0.024 [query=5.5 decode=7.7 project=2.1]</pre>
+    </li>
+    <li>Now run the same test with the CPU budget of a small, oversubscribed vCPU: pin vitest to one core and share that core with three busy loops (script <code>1749/repro/run-contended.sh</code>, usage <code>run-contended.sh &lt;worktree-root&gt; &lt;out-file&gt;</code>; set <code>CORE=</code> to pick the core, <code>LOOPS=</code> for the number of busy loops, default 3). <b>Prerequisites:</b> Linux with <code>taskset</code> (util-linux); the script exits 2 otherwise. This is a <em>simulation</em> of slow hardware, not the reporter's VPS, and the outcome is host-dependent: the assertion (<code>p50 &le; 100 ms</code> for a 1500-event window) fails only once the throttled per-event cost exceeds 100/1500 &asymp; 0.067&nbsp;ms/event. On a CPU much faster than this Ryzen 7 three loops may not be enough &mdash; raise <code>LOOPS</code>. Measured on this box: 124.5&nbsp;ms (original run), 141.9&nbsp;ms (independent verifier, same machine), 186.4&nbsp;ms (re-run for this revision, <code>repro-output-contended-revised.txt</code>) &mdash; same failing assertion each time, magnitude varies with whatever else the box is doing.
+      <pre>bash /tmp/bb-reports/issues/1749/repro/run-contended.sh "$PWD" /tmp/repro-1749-contended.txt</pre>
+      <b>Actual</b> (<code>repro-output-contended.txt</code>) — the same code, same data, ~4x the per-event cost, and the documented "cold build near 100&nbsp;ms" premise fails:
+      <pre>× long agentic turns: a full 1500-event window at ~1.2KB/event vs the 100ms target 3007ms
+AssertionError: expected 124.5 to be less than or equal to 100
+
+ms/event (threads&gt;=200 events, n=44): p50=0.119 p90=0.146 max=0.167  (documented: 0.06)
+ms/KiB  (same threads): p50=0.237 p90=0.285
+budget=1500: strategy=standard-window windowEvents=1500 windowKiB=1302 bytes/evt=889 respRows=12 segments=3 build p50=124.5ms max=140.7ms ms/evt=0.083 [query=44.6 decode=73.0 project=22.1]
+budget=400:  strategy=standard-window windowEvents=500  windowKiB=434  bytes/evt=889 respRows=4  segments=1 build p50=41.0ms  max=67.5ms  ms/evt=0.082 [query=12.5 decode=22.7 project=1.2]</pre>
+      The assertion that fails is <code>expect(defaultBudgetP50).toBeLessThanOrEqual(100)</code>: the p50 of nine builds of a window that fills the default budget (1500 events, ~1.3&nbsp;MiB) is 124.5&nbsp;ms, i.e. the budget no longer delivers what its comment promises once the CPU is slower. Read the <code>ms/evt</code> column: 0.024 idle vs 0.083&ndash;0.12 contended for identical input — cost per event is a property of the host, not of the constant.
+    </li>
+  </ol>
+  <p>Notes on the fixture: <code>seedPerfFixture</code> turns are short (8&ndash;60 items), so with <code>segmentLimit 20</code> the segment limit binds at ~900 events before the event budget does; that first scenario is informational (it shows cost per event/KiB across 44 threads). The second scenario builds 6 turns × 500 events at ~0.9&nbsp;KB/event (command executions with multi-KB output plus agent-message deltas), so the newest 3 whole turns exactly fill the 1500 budget — the shape the issue reports (1257 events, 1.18&nbsp;KB/event, 96 rows from 20 segments).</p>
+
+  <h3>Repro test source</h3>
+  <pre>/**
+ * Repro / measurement for get-bb/bb#1749.
+ *
+ * `defaultFeatureFlags.timelineWindowEventBudget` (1500) is justified by a
+ * &quot;~0.06ms/event&quot; figure and a &quot;cold build near 100ms&quot; target. This test seeds
+ * a realistic long-tail fixture (the same generator `pnpm seed:perf` uses),
+ * builds the latest page for every thread the way the route does, and prints
+ * the measured cost per event so the reader can compare with that figure.
+ *
+ * The one assertion encodes the *documented* budget: a full 1500-event window
+ * must build in &lt;= 100ms at p50 on the machine running the test. It passes on
+ * fast hardware and fails on slow hardware, which is precisely the issue.
+ */
+import { appendFileSync } from &quot;node:fs&quot;;
+import { describe, expect, it } from &quot;vitest&quot;;
+import { sql } from &quot;drizzle-orm&quot;;
+import {
+  createConnection,
+  createProject,
+  createThread,
+  getThread,
+  insertEvents,
+  migrate,
+  noopNotifier,
+  upsertHost,
+} from &quot;@bb/db&quot;;
+import type { DbConnection } from &quot;@bb/db&quot;;
+import {
+  defaultFeatureFlags,
+  encodeClientTurnRequestIdNumber,
+  threadScope,
+  turnScope,
+} from &quot;@bb/domain&quot;;
+import type { Thread } from &quot;@bb/domain&quot;;
+import { seedPerfFixture } from &quot;../../../../../packages/scripts/src/lib/seed-perf-fixture.js&quot;;
+import { buildThreadTimelineWithProfile } from &quot;../../../src/services/threads/timeline.js&quot;;
+import { DEFAULT_MAX_INLINE_OUTPUT_CHARS } from &quot;../../../src/services/threads/timeline-output-truncation.js&quot;;
+
+const EVENT_BUDGET = defaultFeatureFlags.timelineWindowEventBudget;
+
+/** vitest silences passing-test stdout here, so also append to a file when asked. */
+function report(text: string): void {
+  // eslint-disable-next-line no-console
+  console.log(text);
+  const out = process.env[&quot;REPRO_1749_OUT&quot;];
+  if (out) appendFileSync(out, `${text}\n\n`);
+}
+const DOCUMENTED_MS_PER_EVENT = 0.06;
+const DOCUMENTED_COLD_BUILD_TARGET_MS = 100;
+
+interface Sample {
+  threadId: string;
+  totalEvents: number;
+  eventRowCount: number;
+  eventDataBytes: number;
+  strategy: string;
+  responseRows: number;
+  ms: number;
+  stages: Record&lt;string, number&gt;;
+}
+
+function percentile(values: number[], p: number): number {
+  const sorted = [...values].sort((a, b) =&gt; a - b);
+  const idx = Math.min(
+    sorted.length - 1,
+    Math.floor((p / 100) * sorted.length),
+  );
+  return sorted[idx] ?? 0;
+}
+
+function build(db: DbConnection, threadId: string, budget: number) {
+  const thread = getThread(db, threadId);
+  if (!thread) throw new Error(&quot;missing thread&quot;);
+  return buildThreadTimelineWithProfile(db, thread, {
+    eventBudget: budget,
+    includeProviderUnhandledOperations: false,
+    includeNestedRows: false,
+    maxInlineOutputChars: DEFAULT_MAX_INLINE_OUTPUT_CHARS,
+    maxSeq: 0,
+    page: { kind: &quot;latest&quot;, segmentLimit: 20 },
+    planCommand: null,
+    summaryOnly: false,
+  });
+}
+
+describe(&quot;#1749 timelineWindowEventBudget calibration&quot;, () =&gt; {
+  it(&quot;per-event build cost across the perf fixture (informational; segment limit binds before the event budget)&quot;, () =&gt; {
+    const db = createConnection(&quot;:memory:&quot;);
+    migrate(db);
+    const seeded = seedPerfFixture(db, {
+      hostId: &quot;host_repro_1749&quot;,
+      workspacesRootPath: &quot;/tmp/repro-1749&quot;,
+      projectCount: 2,
+      threadCount: 60,
+      eventCount: 60_000,
+      randomSeed: 1749,
+    });
+    const totalEventsByThread = new Map&lt;string, number&gt;();
+    for (const row of db.all&lt;{ threadId: string; n: number }&gt;(
+      sql`select thread_id as threadId, count(*) as n from events group by thread_id`,
+    )) {
+      totalEventsByThread.set(row.threadId, row.n);
+    }
+
+    // Warm SQLite page cache + JIT once, then take the measured pass.
+    for (const id of seeded.threadIds) build(db, id, EVENT_BUDGET);
+
+    const samples: Sample[] = [];
+    for (const id of seeded.threadIds) {
+      const runs: number[] = [];
+      let last: ReturnType&lt;typeof build&gt; | null = null;
+      for (let i = 0; i &lt; 5; i += 1) {
+        last = build(db, id, EVENT_BUDGET);
+        runs.push(last.profile.totalDurationMs);
+      }
+      if (!last) continue;
+      const p = last.profile;
+      const stages: Record&lt;string, number&gt; = {};
+      for (const s of p.stageTimings) stages[s.stage] = s.durationMs;
+      samples.push({
+        threadId: id,
+        totalEvents: totalEventsByThread.get(id) ?? 0,
+        eventRowCount: p.eventRowCount,
+        eventDataBytes: p.eventDataBytes,
+        strategy: p.selectionStrategy,
+        responseRows: p.responseRowCount,
+        ms: percentile(runs, 50),
+        stages,
+      });
+    }
+
+    samples.sort((a, b) =&gt; b.eventRowCount - a.eventRowCount);
+    const measured = samples.filter((s) =&gt; s.eventRowCount &gt;= 200);
+    const perEvent = measured.map((s) =&gt; s.ms / s.eventRowCount);
+    const perKB = measured.map((s) =&gt; s.ms / (s.eventDataBytes / 1024));
+    const bound = samples.filter((s) =&gt; s.totalEvents &gt; EVENT_BUDGET).length;
+
+    const lines: string[] = [];
+    lines.push(`host: ${process.arch} node ${process.version}`);
+    lines.push(
+      `threads=${samples.length} budget=${EVENT_BUDGET} threadsWhereBudgetBinds=${bound}`,
+    );
+    lines.push(
+      `ms/event (threads&gt;=200 events, n=${perEvent.length}): p50=${percentile(perEvent, 50).toFixed(3)} p90=${percentile(perEvent, 90).toFixed(3)} max=${Math.max(...perEvent).toFixed(3)}  (documented: ${DOCUMENTED_MS_PER_EVENT})`,
+    );
+    lines.push(
+      `ms/KiB  (same threads): p50=${percentile(perKB, 50).toFixed(3)} p90=${percentile(perKB, 90).toFixed(3)}`,
+    );
+    lines.push(&quot;&quot;);
+    lines.push(
+      &quot;threadEvents  windowEvents  windowKiB  bytes/evt  strategy  respRows  buildMs  ms/evt   query  decode  project&quot;,
+    );
+    for (const s of samples.slice(0, 25)) {
+      lines.push(
+        `${String(s.totalEvents).padStart(12)}  ${String(s.eventRowCount).padStart(12)}  ${(s.eventDataBytes / 1024).toFixed(0).padStart(9)}  ${(s.eventDataBytes / Math.max(1, s.eventRowCount)).toFixed(0).padStart(9)}  ${s.strategy.padEnd(8)}  ${String(s.responseRows).padStart(8)}  ${s.ms.toFixed(1).padStart(7)}  ${(s.ms / Math.max(1, s.eventRowCount)).toFixed(3).padStart(6)}  ${(s.stages[&quot;event-query&quot;] ?? 0).toFixed(1).padStart(6)}  ${(s.stages[&quot;event-json-decode&quot;] ?? 0).toFixed(1).padStart(6)}  ${(s.stages[&quot;thread-view-projection&quot;] ?? 0).toFixed(1).padStart(7)}`,
+      );
+    }
+    const fullWindows = samples.filter(
+      (s) =&gt; s.eventRowCount &gt;= EVENT_BUDGET * 0.9,
+    );
+    const fullWindowP50 = percentile(
+      fullWindows.map((s) =&gt; s.ms),
+      50,
+    );
+    lines.push(&quot;&quot;);
+    lines.push(
+      `full-window builds (&gt;= ${EVENT_BUDGET * 0.9} events, n=${fullWindows.length}): p50=${fullWindowP50.toFixed(1)}ms  target=${DOCUMENTED_COLD_BUILD_TARGET_MS}ms`,
+    );
+    // eslint-disable-next-line no-console
+    report(lines.join(&quot;\n&quot;));
+
+    // The seed fixture&#x27;s turns are short (8-60 items), so segmentLimit=20
+    // binds before the event budget does; this scenario is informational.
+    expect(samples.length).toBeGreaterThan(0);
+    void fullWindows;
+    void fullWindowP50;
+  }, 600_000);
+
+  it(&quot;long agentic turns: a full 1500-event window at ~1.2KB/event vs the 100ms target&quot;, () =&gt; {
+    // Shape from the issue&#x27;s representative logged build: eventRowCount 1257,
+    // eventDataBytes 1481754 (~1179 bytes/event), 96 response rows from
+    // segmentLimit 20 — i.e. very few user messages, very many events.
+    const db = createConnection(&quot;:memory:&quot;);
+    migrate(db);
+    const host = upsertHost(db, noopNotifier, {
+      name: &quot;h&quot;,
+      type: &quot;persistent&quot;,
+    });
+    const { project } = createProject(db, noopNotifier, {
+      name: &quot;p&quot;,
+      source: { type: &quot;local_path&quot;, hostId: host.id, path: &quot;/tmp/p&quot; },
+    });
+    const thread = createThread(db, noopNotifier, {
+      projectId: project.id,
+      providerId: &quot;codex&quot;,
+    });
+    insertLongAgenticTurns(db, thread, { turnCount: 6, eventsPerTurn: 500 });
+
+    const rows: string[] = [];
+    let defaultBudgetP50 = Number.NaN;
+    let defaultBudgetWindowEvents = 0;
+    for (const budget of [EVENT_BUDGET, 400]) {
+      for (let i = 0; i &lt; 3; i += 1) build(db, thread.id, budget);
+      const runs: number[] = [];
+      let last = build(db, thread.id, budget);
+      for (let i = 0; i &lt; 9; i += 1) {
+        last = build(db, thread.id, budget);
+        runs.push(last.profile.totalDurationMs);
+      }
+      const p = last.profile;
+      const stages = Object.fromEntries(
+        p.stageTimings.map((s) =&gt; [s.stage, s.durationMs]),
+      );
+      const p50 = percentile(runs, 50);
+      rows.push(
+        `budget=${budget}: strategy=${p.selectionStrategy} windowEvents=${p.eventRowCount} windowKiB=${(p.eventDataBytes / 1024).toFixed(0)} bytes/evt=${(p.eventDataBytes / Math.max(1, p.eventRowCount)).toFixed(0)} respRows=${p.responseRowCount} segments=${p.returnedSegmentCount} build p50=${p50.toFixed(1)}ms max=${Math.max(...runs).toFixed(1)}ms ms/evt=${(p50 / p.eventRowCount).toFixed(3)} [query=${stages[&quot;event-query&quot;]?.toFixed(1)} decode=${stages[&quot;event-json-decode&quot;]?.toFixed(1)} project=${stages[&quot;thread-view-projection&quot;]?.toFixed(1)}]`,
+      );
+      if (budget === EVENT_BUDGET) {
+        defaultBudgetP50 = p50;
+        defaultBudgetWindowEvents = p.eventRowCount;
+      }
+    }
+    // eslint-disable-next-line no-console
+    report(rows.join(&quot;\n&quot;));
+
+    // The one assertion: the documented &quot;cold build near 100ms&quot; target, for a
+    // window that actually fills the default budget. Passes on fast hardware,
+    // fails on slow hardware — which is the issue.
+    expect(defaultBudgetWindowEvents).toBeGreaterThanOrEqual(1_000);
+    expect(defaultBudgetP50).toBeLessThanOrEqual(
+      DOCUMENTED_COLD_BUILD_TARGET_MS,
+    );
+  }, 600_000);
+});
+
+/**
+ * `turnCount` turns of `eventsPerTurn` events each, mixing small deltas with
+ * completed command executions carrying multi-KB output, so the average stored
+ * payload lands near the ~1.2KB/event the issue reports.
+ */
+function insertLongAgenticTurns(
+  db: DbConnection,
+  thread: Thread,
+  shape: { turnCount: number; eventsPerTurn: number },
+): void {
+  const events: Parameters&lt;typeof insertEvents&gt;[2] = [];
+  const providerThreadId = &quot;provider-root&quot;;
+  let sequence = 0;
+  const push = (
+    event: Omit&lt;Parameters&lt;typeof insertEvents&gt;[2][number], &quot;sequence&quot;&gt;,
+  ): void =&gt; {
+    sequence += 1;
+    events.push({ ...event, sequence });
+  };
+  const outputLine =
+    &quot;src/services/threads/timeline.ts:1234:5 - warning TS6133: &#x27;x&#x27; is declared but its value is never read.\n&quot;;
+  const output = (lines: number): string =&gt; outputLine.repeat(lines);
+  const sentence =
+    &quot;I will now look at the timeline projection and the budget floor query to see why the window is not binding. &quot;;
+  const execution = {
+    model: &quot;gpt-5&quot;,
+    serviceTier: &quot;default&quot;,
+    reasoningLevel: &quot;medium&quot;,
+    permissionMode: &quot;full&quot;,
+    source: &quot;client/turn/requested&quot;,
+  } as const;
+  for (let turn = 1; turn &lt;= shape.turnCount; turn += 1) {
+    const turnId = `turn-${turn}`;
+    const clientRequestId = encodeClientTurnRequestIdNumber({ value: turn });
+    push({
+      threadId: thread.id,
+      type: &quot;client/turn/requested&quot;,
+      scope: threadScope(),
+      itemId: null,
+      itemKind: null,
+      data: JSON.stringify({
+        direction: &quot;outbound&quot;,
+        source: &quot;tell&quot;,
+        initiator: &quot;user&quot;,
+        request: { method: &quot;turn/start&quot;, params: {} },
+        requestId: clientRequestId,
+        senderThreadId: null,
+        input: [
+          {
+            type: &quot;text&quot;,
+            text: `Please fix the failing tests in turn ${turn}`,
+            mentions: [],
+          },
+        ],
+        target: turn === 1 ? { kind: &quot;thread-start&quot; } : { kind: &quot;new-turn&quot; },
+        execution,
+      }),
+    });
+    push({
+      threadId: thread.id,
+      type: &quot;turn/started&quot;,
+      scope: turnScope(turnId),
+      providerThreadId,
+      itemId: null,
+      itemKind: null,
+      data: JSON.stringify({ providerThreadId }),
+    });
+    push({
+      threadId: thread.id,
+      type: &quot;turn/input/accepted&quot;,
+      scope: turnScope(turnId),
+      providerThreadId,
+      itemId: null,
+      itemKind: null,
+      data: JSON.stringify({ clientRequestId }),
+    });
+    let emitted = 3;
+    let item = 0;
+    while (emitted &lt; shape.eventsPerTurn - 1) {
+      item += 1;
+      const itemId = `${turnId}-item-${item}`;
+      if (item % 3 === 0) {
+        for (let d = 0; d &lt; 3; d += 1) {
+          push({
+            threadId: thread.id,
+            type: &quot;item/agentMessage/delta&quot;,
+            scope: turnScope(turnId),
+            providerThreadId,
+            itemId,
+            itemKind: null,
+            data: JSON.stringify({ providerThreadId, itemId, delta: sentence }),
+          });
+        }
+        push({
+          threadId: thread.id,
+          type: &quot;item/completed&quot;,
+          scope: turnScope(turnId),
+          providerThreadId,
+          itemId,
+          itemKind: &quot;agentMessage&quot;,
+          data: JSON.stringify({
+            providerThreadId,
+            item: { type: &quot;agentMessage&quot;, id: itemId, text: sentence.repeat(5) },
+          }),
+        });
+        emitted += 4;
+      } else {
+        const command = &quot;pnpm exec turbo run typecheck --filter=@bb/server&quot;;
+        push({
+          threadId: thread.id,
+          type: &quot;item/started&quot;,
+          scope: turnScope(turnId),
+          providerThreadId,
+          itemId,
+          itemKind: &quot;commandExecution&quot;,
+          data: JSON.stringify({
+            providerThreadId,
+            item: {
+              type: &quot;commandExecution&quot;,
+              id: itemId,
+              command,
+              cwd: &quot;&quot;,
+              status: &quot;pending&quot;,
+              approvalStatus: null,
+              aggregatedOutput: &quot;&quot;,
+            },
+          }),
+        });
+        for (let d = 0; d &lt; 2; d += 1) {
+          push({
+            threadId: thread.id,
+            type: &quot;item/commandExecution/outputDelta&quot;,
+            scope: turnScope(turnId),
+            providerThreadId,
+            itemId,
+            itemKind: null,
+            data: JSON.stringify({ providerThreadId, itemId, delta: output(8) }),
+          });
+        }
+        push({
+          threadId: thread.id,
+          type: &quot;item/completed&quot;,
+          scope: turnScope(turnId),
+          providerThreadId,
+          itemId,
+          itemKind: &quot;commandExecution&quot;,
+          data: JSON.stringify({
+            providerThreadId,
+            item: {
+              type: &quot;commandExecution&quot;,
+              id: itemId,
+              command,
+              cwd: &quot;&quot;,
+              status: &quot;completed&quot;,
+              approvalStatus: null,
+              aggregatedOutput: output(24),
+            },
+          }),
+        });
+        emitted += 4;
+      }
+    }
+    push({
+      threadId: thread.id,
+      type: &quot;turn/completed&quot;,
+      scope: turnScope(turnId),
+      providerThreadId,
+      itemId: null,
+      itemKind: null,
+      data: JSON.stringify({ status: &quot;completed&quot;, providerThreadId }),
+    });
+  }
+  insertEvents(db, noopNotifier, events);
+}
+</pre>
+
+  <h2>Root cause</h2>
+  <p><b>Mechanism.</b> A timeline build is synchronous work on the server's event loop: <code>buildThreadTimeline</code> runs inside <code>runEventLoopWorkSync</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/timeline.ts#L1809-L1823">timeline.ts#L1809-L1823</a>). Its cost has three stages, all proportional to the amount of stored event data in the window: <code>event-query</code> (SQLite reads and copies the JSON text), <code>event-json-decode</code> (<code>JSON.parse</code> per row) and <code>thread-view-projection</code>. The only latency bound is the event-count budget resolved in <code>resolveTimelineSegmentWindow</code> via <code>findTimelineWindowBudgetFloorSequence</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/timeline.ts#L1242-L1370">timeline.ts#L1242-L1370</a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/db/src/data/events.ts#L2471-L2491">events.ts#L2471-L2491</a>), whose default is a fixed constant:</p>
+  <pre>// packages/domain/src/feature-flags.ts#L31-L37
+/**
+ * Measured on real threads a build costs ~0.06ms/event across the SQLite
+ * read, JSON decode, and projection. 1500 keeps a cold build near 100ms; the
+ * 10k-event thread that motivated the bound was ~670ms unbounded.
+ */
+timelineWindowEventBudget: 1_500,</pre>
+  <p>An event count is a proxy for two things it does not control: (a) bytes per event, which varies with what the agent did (a 24-line command output is 2.4&nbsp;KB; a delta is 150&nbsp;B), and (b) CPU time per byte, which varies with the host. The comment's "0.06&nbsp;ms/event" was measured once (PR #882, production bundle, presumably a developer machine) and does not travel. On this workstation the true figure is 0.024&nbsp;ms/event at 0.9&nbsp;KB/event; under a 25% share of one core it is 0.083&ndash;0.12; the reporter sees ~0.5 (with the sampling caveat above). Since the budget is what keeps the daemon's <code>/internal/session/events</code> round trip fast (the whole reason PR #882 exists), on slow hosts the bound is simply too loose to do its job.</p>
+  <p><b>Why the symptom is sustained rather than incidental.</b> The build cache is keyed by <code>maxSeq</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/timeline-cache.ts#L124-L129">timeline-cache.ts#L124-L129</a>), the client schedules a trailing refetch whenever an <code>events-appended</code> signal lands, and even the delta path reprojects the full window first (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/routes/threads/data.ts#L363-L378">data.ts#L363-L378</a>). The client does <em>not</em> refetch once per event, though: <code>resolveTrailingRefetchDelayMs</code> waits out the observed fetch duration (min 50&nbsp;ms, max 1&nbsp;s) before the next refetch and coalesces events that arrived meanwhile (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/hooks/cache-owners/realtime-cache-registry.ts#L135-L157">realtime-cache-registry.ts#L135-L157</a>), which caps the server-side duty cycle near 50%. So while a long thread is being viewed during a streaming turn, the server pays the full-window cost repeatedly for the whole turn &mdash; sustained, but coalesced to roughly one build per build-duration. On a fast host that is ~30&nbsp;ms every &ge;50&nbsp;ms; on the reporter's host each build is several hundred ms, so the loop is blocked about half the time the turn streams, which matches "1656 slow builds, 155&nbsp;s blocked in one session" (~94&nbsp;ms average per slow build).</p>
+  <p><b>Deeper issue.</b> There is already a second, byte-based cut in the same pipeline: <code>applyTimelineWindowByteBudget</code> caps a window at <code>THREAD_TIMELINE_EVENT_DATA_BYTE_LIMIT = 4&nbsp;MiB</code> (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/timeline.ts#L177">timeline.ts#L177</a>, <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/services/threads/timeline.ts#L1052-L1118">#L1052-L1118</a>, floor query <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/packages/db/src/data/events.ts#L2714-L2785">events.ts#L2714-L2785</a>). It was added as a memory guard (#1199), is not operator-tunable, and at 4&nbsp;MiB it never engages for latency. Bytes are the better proxy for the two dominant stages, and the machinery to cut on them already exists and is tested. The remaining hardware term (ms per byte) can only be handled by measuring on the host or by getting the work off the event loop. To be fair to the original author: PR #882's own "Known limits" section already states "The budget bounds event <b>count</b>, not bytes" and "1500 is a first guess from cost-per-event &hellip; The new logs are how we'll tune it" &mdash; so the count-vs-bytes gap was anticipated, and this issue is the first tuning signal those logs were meant to produce; what was not anticipated is that the per-event cost varies ~10x across hosts.</p>
+
+  <h2>Proposed fix (first principles)</h2>
+  <p>Cheapest change that addresses the actual cost driver, no new machinery:</p>
+  <ol>
+    <li>Promote the existing 4&nbsp;MiB byte cap to a feature flag <code>timelineWindowByteBudget</code> (env <code>BB_FF_TIMELINE_WINDOW_BYTE_BUDGET</code>) next to <code>timelineWindowEventBudget</code>, and pass it into <code>applyTimelineWindowByteBudget</code> the same way <code>eventBudget</code> is threaded today (server-side only: <code>packages/domain/src/feature-flags.ts</code>, <code>packages/config/src/feature-flags.ts</code> + <code>env-vars.ts</code>, <code>apps/server/src/routes/threads/data.ts</code>, <code>timeline.ts</code>). Default it to something that binds for latency, e.g. 1.5&nbsp;MiB (≈ 1500 events × 1&nbsp;KB, i.e. what the current default already implies), and keep the 4&nbsp;MiB memory guard as the upper clamp. Document both knobs together in <code>docs/configuration.md</code>, the guide template and the <code>bb-cli</code> skill (AGENTS.md requires all surfaces in one change).</li>
+    <li>Reword the source comment to say the count is a proxy and hardware dependent, and point operators at the two knobs and at the <code>Thread timeline build blocked the event loop</code> line — while noting that line samples only builds &ge; 150&nbsp;ms.</li>
+  </ol>
+  <p><b>What could go wrong.</b> (a) A byte cut can split a <em>finished</em> turn (the event-count cut only splits running turns; see the comment on <code>resolveTimelineWindowBounds</code>), so lowering the byte default changes paging UX for threads with huge single turns — the byte-cursor path exists and is tested (#1199), but the default would engage far more often than today, so the pagination suites need to run against the new default. (b) The timeline caches deliberately do not key on the budget (comment at <a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/server/src/routes/threads/data.ts#L329-L333">data.ts#L329-L333</a>); a byte flag resolved once at startup keeps that invariant, but any <em>adaptive</em> scheme (issue option 1: calibrate at runtime) must add the effective budget to the cache and latest-rows keys or a client echoing <code>afterSequence</code> will get deltas against a different row set. That is why I would not start with runtime calibration. (c) Neither knob fixes the structural cost — full reprojection per appended event on the event loop; incremental projection or a worker thread is the real fix and is out of scope for this issue.</p>
+  <p>Not needed to settle: the mechanism is clear. What would sharpen the numbers: run the repro test on the reporter's host (or any 2&ndash;4 vCPU VM) to get an unbiased ms/event and ms/KiB, rather than deriving them from the &ge;150&nbsp;ms log lines.</p>
+
+  <h2>PR review</h2>
+  <h3>#1756 — docs: record that the timeline event budget is hardware dependent (open, by the issue author)</h3>
+  <p><b>What it changes.</b> 14 lines, two files (<code>pr1756.diff</code>): appends a paragraph to the <code>timelineWindowEventBudget</code> JSDoc in <code>packages/domain/src/feature-flags.ts</code> reproducing the VPS numbers (0.479/0.964/5.55&nbsp;ms/event, 541 samples, "roughly 8x", "~720&nbsp;ms"), and inserts a few sentences into <code>docs/configuration.md</code> "Thread Timeline Window" telling operators to divide a logged build's <code>totalDurationMs</code> by <code>eventRowCount</code> and lower the budget. No behavior change; the default stays 1500.</p>
+  <p><b>Does it address the root cause?</b> No, and it says so. It papers over nothing either; it is a note. Checked out (<code>gh pr checkout 1756</code>), <code>pnpm exec turbo run typecheck --filter=@bb/domain</code> passes; there is nothing to test.</p>
+  <table>
+    <tr><th>File:line</th><th>Severity</th><th>Finding</th></tr>
+    <tr><td><code>packages/domain/src/feature-flags.ts:37-43</code></td><td>Medium</td><td>Bakes one host's measurements (core count, RAM, sample count, three percentiles) into a shared-domain source comment. Those numbers are (a) unverifiable, (b) derived from a &ge;150&nbsp;ms-only sample and thus biased upward (see Claims), and (c) already stale the day the reporter upgrades or the projection changes. A source comment should state the invariant ("count is a proxy; per-event cost is host- and payload-dependent; see docs") not a dataset. On my hardware the comment's new "roughly 8x" is off in the other direction (the default is 2.5x conservative), so the comment would mislead in both directions.</td></tr>
+    <tr><td><code>docs/configuration.md:640-646</code></td><td>Low</td><td>The operator recipe "divide <code>totalDurationMs</code> by <code>eventRowCount</code>" is fine as a heuristic but the doc should say the line only appears for builds &ge; 150&nbsp;ms and once per thread per 30&nbsp;s, so the ratio is a slow-tail estimate. It should also mention that a whole finished turn is always returned even if larger than the budget (so lowering the budget below the typical turn size does not shrink the window further; my run: budget 400 &rarr; 500-event window). Also, the sentence was inserted mid-line into an already over-wide line and "Older turns load automatically" now dangles across a wrap — cosmetic.</td></tr>
+    <tr><td><code>docs/configuration.md</code> (whole)</td><td>Low</td><td>PR body offers two follow-ups (startup calibration, or budgeting on bytes). The byte-based cut already exists at 4&nbsp;MiB (<code>applyTimelineWindowByteBudget</code>) — the doc could point at that as the real lever instead of leaving the reader to tune an event count. Startup calibration is the riskier option because of the cache-key invariant noted above.</td></tr>
+    <tr><td>Process</td><td>Info</td><td>Missing the <code>&gt; AGENT GENERATED: by ...</code> footer required by AGENTS.md if the text was agent-written (the phrasing suggests it may be); the PR body says "Refs #1749" rather than fixing it, which is accurate. No <code>HOST_DAEMON_PROTOCOL_VERSION</code> concern (no wire change). No security implications.</td></tr>
+  </table>
+  <p><b>Verdict: REQUEST CHANGES.</b> Harmless but low value as written. Trim the source comment to one hardware-independent sentence pointing at the docs; keep the docs paragraph, add the sampling caveat and the "whole finished turn" caveat, and either land the byte-budget knob in the same change or state that as the follow-up. If maintainers prefer zero doc churn until a real fix, CLOSE in favor of the byte-budget change is also reasonable.</p>
+
+  <h2>Related issues</h2>
+  <ul>
+    <li>PR #882 "Bound timeline windows by event count" — introduced the constant and the 0.06&nbsp;ms/event figure; contains the original production measurements (10,211-event thread: 668&nbsp;ms &rarr; 25&nbsp;ms). Its "Known limits" section already flags "The budget bounds event count, not bytes" and "1500 is a first guess &hellip; The new logs are how we'll tune it", and it introduced the client-side refetch pacing (<code>resolveTrailingRefetchDelayMs</code>) that keeps rebuilds at ~50% duty cycle rather than one per event.</li>
+    <li>PR #891 "Bound thread timeline cost within long-running turns" — mid-turn sequence cut when the newest turn alone exceeds the budget.</li>
+    <li>PR #1199 "Page large finished turns by stored byte size" — the existing 4&nbsp;MiB byte cut (<code>THREAD_TIMELINE_EVENT_DATA_BYTE_LIMIT</code>).</li>
+    <li>PR #1437 "Attribute event-loop stalls to the work that blocked them" — the stall monitor / <code>runEventLoopWorkSync</code> labels the reporter's stall samples come from.</li>
+    <li>The issue mentions a "related heap-sizing issue" (server heap pressure from transient parsed JSON); not linked by number in the issue.</li>
+  </ul>
+
+  <h2>Appendix</h2>
+  <h3>Commands run</h3>
+  <pre>gh issue view 1749 --comments            # no comments at time of investigation
+gh pr view 1756; gh pr diff 1756
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build                # 14 tasks, 10 cached
+git fetch origin main; git log 16ceb3a54..origin/main --oneline -- apps/server/src/services/threads packages/domain/src/feature-flags.ts docs/configuration.md   # empty
+cp 1749/repro/timeline-event-budget-cost.repro.test.ts apps/server/test/services/threads/
+cd apps/server &amp;&amp; REPRO_1749_OUT=/tmp/bb-reports/issues/1749/repro-output-main.txt pnpm exec vitest run test/services/threads/timeline-event-budget-cost.repro.test.ts   # 2 passed
+bash 1749/repro/run-contended.sh &lt;worktree&gt; /tmp/bb-reports/issues/1749/repro-output-contended.txt   # 1 failed (124.5 &gt; 100)
+git stash -u; gh pr checkout 1756; pnpm exec turbo run typecheck --filter=@bb/domain; git diff 16ceb3a54 &gt; 1749/pr1756.diff; git checkout 16ceb3a54; git stash pop</pre>
+  <h3>Full idle-run output</h3>
+  <pre>host: x64 node v24.18.0
+threads=60 budget=1500 threadsWhereBudgetBinds=20
+ms/event (threads&gt;=200 events, n=44): p50=0.028 p90=0.032 max=0.033  (documented: 0.06)
+ms/KiB  (same threads): p50=0.053 p90=0.063
+
+threadEvents  windowEvents  windowKiB  bytes/evt  strategy  respRows  buildMs  ms/evt   query  decode  project
+        1512           908        483        545  standard-window       100     23.6   0.026    13.1     8.9      2.8
+        2210           876        448        523  standard-window       106     24.8   0.028     8.2    12.8      2.5
+        2668           866        511        604  standard-window        93     23.9   0.028     9.8     9.1      3.0
+        2227           863        463        549  standard-window        87     21.6   0.025     8.4     8.9      3.0
+        2424           855        463        555  standard-window        71     23.9   0.028     7.9     8.6      2.9
+        1857           851        422        508  standard-window        84     20.0   0.024     7.5    13.1      2.8
+        1528           833        437        537  standard-window        94     21.3   0.026     8.8     8.1      2.3
+        2014           817        415        521  standard-window        96     22.5   0.028     8.9     8.9      2.9
+        3074           811        445        561  standard-window       105     23.6   0.029     9.4     7.9      2.8
+        2333           805        385        490  standard-window        85     21.1   0.026     9.9     9.4      3.0
+        1120           788        418        544  standard-window        86     18.7   0.024     6.3     8.0      2.6
+        2169           775        416        549  standard-window        71     24.6   0.032     9.6    13.6      2.7
+        1968           772        392        520  standard-window        89     25.4   0.033    12.6     8.1      3.1
+        2759           768        393        524  standard-window        79     21.8   0.028    14.5     7.6      2.4
+        2377           762        378        508  standard-window        74     21.4   0.028     8.5     9.0      2.3
+         855           735        356        496  standard-window        63     19.2   0.026     5.4     7.5      2.4
+        2359           732        373        521  standard-window        73     17.8   0.024     7.1     7.1      2.0
+        1168           731        379        531  standard-window       100     18.0   0.025     6.4     7.8      2.3
+         768           711        360        519  standard-window        74     16.8   0.024     5.1    12.6      3.5
+        1784           699        328        480  standard-window        67     17.5   0.025    10.7     6.9      2.6
+        1799           697        344        505  standard-window        73     21.8   0.031     6.8     7.7      2.5
+        1839           696        353        519  standard-window        72     19.5   0.028     7.4     7.8      2.8
+        3230           684        325        487  standard-window        59     18.9   0.028     8.2     7.0      1.9
+        2419           649        336        530  standard-window        84     19.6   0.030     7.7    11.0      2.0
+         688           640        338        541  standard-window        66     17.9   0.028     6.4     8.1      2.6
+
+full-window builds (&gt;= 1350 events, n=0): p50=0.0ms  target=100ms
+
+budget=1500: strategy=standard-window windowEvents=1500 windowKiB=1302 bytes/evt=889 respRows=12 segments=3 build p50=36.4ms max=48.1ms ms/evt=0.024 [query=19.8 decode=22.1 project=5.1]
+budget=400: strategy=standard-window windowEvents=500 windowKiB=434 bytes/evt=889 respRows=4 segments=1 build p50=12.1ms max=15.8ms ms/evt=0.024 [query=5.5 decode=7.7 project=2.1]
+
+</pre>
+  <h3>Full contended-run output</h3>
+  <pre>host: x64 node v24.18.0
+threads=60 budget=1500 threadsWhereBudgetBinds=20
+ms/event (threads&gt;=200 events, n=44): p50=0.119 p90=0.146 max=0.167  (documented: 0.06)
+ms/KiB  (same threads): p50=0.237 p90=0.285
+
+threadEvents  windowEvents  windowKiB  bytes/evt  strategy  respRows  buildMs  ms/evt   query  decode  project
+        1512           908        483        545  standard-window       100    104.9   0.116    42.5    43.0     21.5
+        2210           876        448        523  standard-window       106     92.3   0.105    27.0    36.0     11.8
+        2668           866        511        604  standard-window        93    103.3   0.119    40.8    47.1     13.6
+        2227           863        463        549  standard-window        87    144.2   0.167    49.4    59.6     24.3
+        2424           855        463        555  standard-window        71    104.6   0.122    36.3    63.2     13.5
+        1857           851        422        508  standard-window        84     92.8   0.109    33.4    36.9     12.0
+        1528           833        437        537  standard-window        94     95.5   0.115    35.6    36.8     12.2
+        2014           817        415        521  standard-window        96    110.6   0.135    38.1    59.9     13.1
+        3074           811        445        561  standard-window       105    126.8   0.156    36.6    47.9     46.5
+        2333           805        385        490  standard-window        85     95.3   0.118    35.8    35.9     11.8
+        1120           788        418        544  standard-window        86     80.7   0.102    24.1    35.2     11.4
+        2169           775        416        549  standard-window        71     83.4   0.108    34.2    35.5     11.6
+        1968           772        392        520  standard-window        89     86.1   0.112    36.2    34.8     11.8
+        2759           768        393        524  standard-window        79     94.4   0.123    36.6    35.4     11.6
+        2377           762        378        508  standard-window        74    111.2   0.146    64.2    48.2     12.7
+         855           735        356        496  standard-window        63     71.4   0.097    23.3    65.5      8.3
+        2359           732        373        521  standard-window        73     88.9   0.121    54.9    35.5     11.9
+        1168           731        379        531  standard-window       100     79.8   0.109    24.7    34.4     13.6
+         768           711        360        519  standard-window        74     82.0   0.115    21.8    49.2     15.8
+        1784           699        328        480  standard-window        67     92.9   0.133    35.8    35.2     12.9
+        1799           697        344        505  standard-window        73     85.6   0.123    34.7    65.3     11.5
+        1839           696        353        519  standard-window        72     79.5   0.114    25.0    25.6      2.2
+        3230           684        325        487  standard-window        59     91.1   0.133    36.6    35.4     11.3
+        2419           649        336        530  standard-window        84     82.8   0.128    25.3    25.6      2.4
+         688           640        338        541  standard-window        66     67.3   0.105    20.9    34.3     11.0
+
+full-window builds (&gt;= 1350 events, n=0): p50=0.0ms  target=100ms
+
+budget=1500: strategy=standard-window windowEvents=1500 windowKiB=1302 bytes/evt=889 respRows=12 segments=3 build p50=124.5ms max=140.7ms ms/evt=0.083 [query=44.6 decode=73.0 project=22.1]
+budget=400: strategy=standard-window windowEvents=500 windowKiB=434 bytes/evt=889 respRows=4 segments=1 build p50=41.0ms max=67.5ms ms/evt=0.082 [query=12.5 decode=22.7 project=1.2]
+
+</pre>
+  <h3>PR #1756 diff</h3>
+  <pre>diff --git a/docs/configuration.md b/docs/configuration.md
+index 0eb5715ee..000f27e89 100644
+--- a/docs/configuration.md
++++ b/docs/configuration.md
+@@ -637,7 +637,13 @@ is synchronous, so it blocked the server&#x27;s event loop — which also delayed
+ dynamic tool call and before registering every interactive request. One slow
+ thread therefore slowed agent work on _every_ thread on the host.
+ 
+-A window is capped at `BB_FF_TIMELINE_WINDOW_EVENT_BUDGET` events (default 1500) and returns however many whole turns fit. Older turns load automatically
++A window is capped at `BB_FF_TIMELINE_WINDOW_EVENT_BUDGET` events (default 1500) and returns however many whole turns fit. The default assumes roughly
++0.06ms per event; that cost varies widely with hardware, and on a small VPS it
++can be closer to 0.5ms, making a full window ~720ms of blocked event loop
++instead of ~100ms. If `Thread timeline build blocked the event loop` appears
++often, divide a logged build&#x27;s `totalDurationMs` by its `eventRowCount` to get
++your real per-event cost and lower this budget until a full window fits your
++latency target. Older turns load automatically
+ as you scroll toward the top of the loaded window; a manual &quot;Load older
+ messages&quot; button remains on surfaces that render no scroll body, and after a
+ failed page so a broken fetch is retried on request rather than in a loop.
+diff --git a/packages/domain/src/feature-flags.ts b/packages/domain/src/feature-flags.ts
+index 7f1902f91..e0fdcce75 100644
+--- a/packages/domain/src/feature-flags.ts
++++ b/packages/domain/src/feature-flags.ts
+@@ -33,6 +33,13 @@ export const defaultFeatureFlags: FeatureFlags = {
+    * Measured on real threads a build costs ~0.06ms/event across the SQLite
+    * read, JSON decode, and projection. 1500 keeps a cold build near 100ms; the
+    * 10k-event thread that motivated the bound was ~670ms unbounded.
++   *
++   * That per-event cost is hardware dependent and the spread is wide: on a
++   * 4-core / 4.9 GiB VPS it measures 0.479ms/event at p50 (p90 0.964,
++   * max 5.55) across 541 samples, roughly 8x the figure above, which puts a
++   * full 1500-event build near 720ms of blocked event loop rather than 100ms.
++   * Operators on modest hardware should lower this via
++   * BB_FF_TIMELINE_WINDOW_EVENT_BUDGET; see docs/configuration.md.
+    */
+   timelineWindowEventBudget: 1_500,
+ };
+</pre>
+  <h3>Things checked and ruled out</h3>
+  <ul>
+    <li>Nothing later on <code>origin/main</code> touches the budget, the timeline service, the cache key or the docs section; not ALREADY FIXED.</li>
+    <li><code>THREAD_TIMELINE_EVENT_DATA_BYTE_LIMIT</code> (4&nbsp;MiB) never engaged in any measured build (largest window 1.3&nbsp;MiB), so the byte guard is not what bounds latency today.</li>
+    <li>The env var is already surfaced in <code>docs/configuration.md</code>, the guide template and the <code>bb-cli</code> skill; the issue's "mention it somewhere discoverable" ask is already met at base.</li>
+    <li>The build path the test exercises is the route's: <code>buildThreadTimelineWithProfile</code> with <code>segmentLimit 20</code>, <code>maxInlineOutputChars = DEFAULT_MAX_INLINE_OUTPUT_CHARS (32000)</code>, <code>includeNestedRows false</code>. Not exercised: <code>truncateTimelineResponseOutputs</code> and JSON serialization of the response, both of which add to the route's wall time but sit outside <code>totalDurationMs</code> as logged.</li>
+  </ul>
+  <h2>Verification</h2>
+  <p>An independent verifier followed the report literally in a fresh worktree at <code>16ceb3a54</code>: install + build, copied the repro test into <code>apps/server/test/services/threads/</code>, ran it idle (2 passed; budget=1500 window p50=30.0&nbsp;ms, 0.020&nbsp;ms/event; budget=400 &rarr; 500-event window p50=9.6&nbsp;ms) and via <code>run-contended.sh</code> (1 failed: <code>expected 141.9 to be less than or equal to 100</code>, ms/event p50 0.189). All permalinks and code excerpts were checked as real at the base commit; <code>gh pr diff 1756</code> matched the saved diff; nothing later on <code>origin/main</code> touches these paths. Verifier outputs: <code>verify/repro-output-main-verify.txt</code>, <code>verify/repro-output-contended-verify.txt</code>.</p>
+  <p><b>Changes made in this revision.</b></p>
+  <ul>
+    <li><b>Major (fixed):</b> the claim "every appended event invalidates the entry and an active thread rebuilds continuously" was marked Verified and the root-cause section said the server pays the full-window cost "per appended event, back-to-back". The cache-key part is true, but the client paces its trailing refetch to the observed build duration (min 50&nbsp;ms, max 1&nbsp;s, ~50% duty cycle) and coalesces events that arrive mid-fetch (<a href="https://github.com/get-bb/bb/blob/16ceb3a540f81c1189efaffb27a39b1d9443abf5/apps/app/src/hooks/cache-owners/realtime-cache-registry.ts#L135-L157">realtime-cache-registry.ts#L135-L157</a>, from PR #882). The claims row is now "Verified (cache key) / Partially (rebuild rate)" and the root-cause paragraph describes sustained-but-coalesced rebuilds.</li>
+    <li><b>Minor (fixed):</b> the first <code>it(...)</code> in the repro test promised a "~100ms cold-build target" check it never made; renamed to "per-event build cost across the perf fixture (informational; &hellip;)" in <code>the repro file</code> and the inline listing. Re-ran idle after the rename: 2 passed, budget=1500 p50=32.3&nbsp;ms, 0.022&nbsp;ms/event (<code>repro-output-main-revised.txt</code>).</li>
+    <li><b>Minor (fixed):</b> credited PR #882's "Known limits" (count-not-bytes, "1500 is a first guess") in the Deeper-issue paragraph and Related issues.</li>
+    <li><b>Minor (fixed):</b> the contended step now states the Linux/<code>taskset</code> prerequisite, the ~0.067&nbsp;ms/event threshold at which the assertion trips, and that the result is host-dependent; <code>run-contended.sh</code> gained a <code>taskset</code> check and a <code>LOOPS</code> override (default unchanged at 3). Re-ran with the revised script: 1 failed, <code>expected 186.4 to be less than or equal to 100</code>, ms/event p50 0.192 (<code>repro-output-contended-revised.txt</code>, log <code>repro-contended-revised-run.log</code>).</li>
+  </ul>
+  <p>Verdict, root cause, proposed fix and the PR #1756 review are unchanged.</p>
+</main></body></html>
