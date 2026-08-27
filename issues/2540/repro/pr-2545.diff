@@ -1,0 +1,231 @@
+diff --git a/plugins/github/README.md b/plugins/github/README.md
+index aafa973242..c5d7a00219 100644
+--- a/plugins/github/README.md
++++ b/plugins/github/README.md
+@@ -34,7 +34,10 @@ it reports needs-configuration. No tokens are stored by the plugin.
+ 
+ - Every BB project source whose checkout has a GitHub `origin` remote
+   (repo → project mapping is also how spawn picks the project).
+-- Plus the `extraRepos` setting: comma-separated `owner/repo` list.
++- Plus the `extraRepos` setting: comma-separated `owner/repo` list. Entries that
++  are not `owner/repo` — a `owner/*` wildcard, a bare owner, a typo — are not
++  tracked; `bb github repos` names them on stderr and the plugin log warns once
++  per distinct set. Wildcards are not supported.
+ - `defaultProject` setting: where threads spawn for repos with no project.
+ 
+ ```
+diff --git a/plugins/github/server.rpc.test.ts b/plugins/github/server.rpc.test.ts
+index 9bf668fb76..bdacac5589 100644
+--- a/plugins/github/server.rpc.test.ts
++++ b/plugins/github/server.rpc.test.ts
+@@ -195,16 +195,61 @@ afterEach(() => {
+   rmSync(binDir, { recursive: true, force: true });
+ });
+ 
+-async function loadPlugin() {
++async function loadPlugin(extraRepos = "acme/widgets") {
+   const host = createFakePluginHost({
+     pluginId: "github",
+-    settings: { extraRepos: "acme/widgets" },
++    settings: { extraRepos },
+   });
+   await plugin(host.bb);
+   return host;
+ }
+ 
+ describe("github plugin RPC behavior", () => {
++  // A stored-but-unusable extraRepos entry used to look exactly like one that
++  // matched nothing: no log line, and `bb github repos` listed the usable names
++  // without mentioning what it had dropped.
++  it("reports extraRepos entries it cannot honor instead of dropping them", async () => {
++    const { harness } = await loadPlugin("acme/widgets, ACME-ORG/*, nonsense");
++
++    await expect(harness.runCli(["repos"])).resolves.toEqual({
++      exitCode: 0,
++      stdout: "acme/widgets",
++      stderr:
++        'ignoring 2 extraRepos entries that are not "owner/repo": ACME-ORG/*, nonsense\n',
++    });
++    expect(harness.logEntries).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({
++          level: "warn",
++          message: 'ignoring 2 extraRepos entries that are not "owner/repo": ACME-ORG/*, nonsense',
++        }),
++      ]),
++    );
++
++    // The warning is emitted per distinct set, not per discovery: `repos`
++    // forces a fresh read every time and a background sync lapses the cache on
++    // its own, so warning per pass would repeat this line forever.
++    await harness.runCli(["repos"]);
++    expect(
++      harness.logEntries.filter(
++        (entry) => entry.level === "warn" && entry.message.includes("extraRepos"),
++      ),
++    ).toHaveLength(1);
++  });
++
++  it("says nothing about extraRepos when every entry is usable", async () => {
++    const { harness } = await loadPlugin("acme/widgets");
++
++    await expect(harness.runCli(["repos"])).resolves.toEqual({
++      exitCode: 0,
++      stdout: "acme/widgets",
++      stderr: "",
++    });
++    expect(
++      harness.logEntries.filter((entry) => entry.message.includes("extraRepos")),
++    ).toEqual([]);
++  });
++
+   it("syncs, filters, mutates, and exposes the same cached issue across surfaces", async () => {
+     const { harness } = await loadPlugin();
+ 
+diff --git a/plugins/github/server.test.ts b/plugins/github/server.test.ts
+index cbe21f132e..fd412da5bc 100644
+--- a/plugins/github/server.test.ts
++++ b/plugins/github/server.test.ts
+@@ -5,6 +5,7 @@ import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+ import {
+   fetchRepoItems,
+   githubRpcContract,
++  parseExtraRepos,
+   parsePaginatedGhApi,
+   validateGithubCliArgs,
+ } from "./server";
+@@ -128,6 +129,30 @@ describe("GitHub RPC contract", () => {
+     );
+   });
+ 
++  it("separates usable extraRepos entries from ones it cannot honor", () => {
++    expect(parseExtraRepos("get-bb/bb, nonsense")).toEqual({
++      repos: ["get-bb/bb"],
++      ignored: ["nonsense"],
++    });
++    // The wildcard from the report: stored, never matched, previously silent.
++    expect(parseExtraRepos("SOME-ORG/*")).toEqual({
++      repos: [],
++      ignored: ["SOME-ORG/*"],
++    });
++    // Separators and blanks are structure, not entries — an empty setting has
++    // nothing to complain about.
++    expect(parseExtraRepos("")).toEqual({ repos: [], ignored: [] });
++    expect(parseExtraRepos("  ,, \n ")).toEqual({ repos: [], ignored: [] });
++    expect(parseExtraRepos(" acme/one\nacme/two , acme/one ")).toEqual({
++      repos: ["acme/one", "acme/two"],
++      ignored: [],
++    });
++    expect(parseExtraRepos("bad/repo/shape acme").ignored).toEqual([
++      "bad/repo/shape",
++      "acme",
++    ]);
++  });
++
+   it("rejects CLI arguments that would otherwise broaden a repository query", () => {
+     expect(validateGithubCliArgs(["issues", "get-bb/bb"])).toBeNull();
+     expect(validateGithubCliArgs(["issues", "bad/repo/shape"])).toContain(
+diff --git a/plugins/github/server.ts b/plugins/github/server.ts
+index 4b26ba1563..4a08c20af6 100644
+--- a/plugins/github/server.ts
++++ b/plugins/github/server.ts
+@@ -345,6 +345,36 @@ function isRepoName(value: unknown): value is string {
+   return typeof value === "string" && /^[\w.-]+\/[\w.-]+$/.test(value);
+ }
+ 
++/**
++ * Split the `extraRepos` setting into the names we track and the entries we
++ * cannot. Anything that is not `owner/repo` — a `SOME-ORG/*` wildcard, a typo,
++ * a bare owner — is reported rather than dropped, so a setting that was stored
++ * but not honored is distinguishable from one that matched nothing.
++ */
++export function parseExtraRepos(raw: string): {
++  repos: string[];
++  ignored: string[];
++} {
++  const repos: string[] = [];
++  const ignored: string[] = [];
++  for (const entry of raw.split(/[\s,]+/)) {
++    if (entry === "") continue;
++    if (isRepoName(entry)) {
++      if (!repos.includes(entry)) repos.push(entry);
++    } else if (!ignored.includes(entry)) {
++      ignored.push(entry);
++    }
++  }
++  return { repos, ignored };
++}
++
++function describeIgnoredExtraRepos(ignored: string[]): string {
++  return (
++    `ignoring ${ignored.length} extraRepos ${ignored.length === 1 ? "entry" : "entries"} ` +
++    `that ${ignored.length === 1 ? "is" : "are"} not "owner/repo": ${ignored.join(", ")}`
++  );
++}
++
+ function run(
+   file: string,
+   args: string[],
+@@ -578,6 +608,11 @@ export default async function plugin(bb: BbPluginApi) {
+   // ------------------------------------------------------------------
+   let repoCache: { repos: RepoInfo[]; fetchedAt: number } | null = null;
+ 
++  // The extraRepos entries the last discovery could not use, kept so `bb github
++  // repos` can say so on the surface the reporter looked at.
++  let ignoredExtraRepos: string[] = [];
++  let lastIgnoredExtraReposKey: string | null = null;
++
+   async function discoverRepos(force = false): Promise<RepoInfo[]> {
+     if (!force && repoCache !== null && Date.now() - repoCache.fetchedAt < 60_000) {
+       return repoCache.repos;
+@@ -609,11 +644,23 @@ export default async function plugin(bb: BbPluginApi) {
+       );
+     }
+     const { extraRepos } = await settings.get();
+-    for (const raw of extraRepos.split(/[\s,]+/)) {
+-      if (isRepoName(raw) && !byRepo.has(raw)) {
++    const parsed = parseExtraRepos(extraRepos);
++    for (const raw of parsed.repos) {
++      if (!byRepo.has(raw)) {
+         byRepo.set(raw, { repo: raw, projectId: null });
+       }
+     }
++    // Warn on the set rather than on every discovery: discoverRepos re-reads
++    // settings whenever the 60s cache lapses, and a background sync would
++    // otherwise repeat the same line forever.
++    const ignoredKey = parsed.ignored.join(",");
++    if (ignoredKey !== lastIgnoredExtraReposKey) {
++      lastIgnoredExtraReposKey = ignoredKey;
++      if (parsed.ignored.length > 0) {
++        bb.log.warn(describeIgnoredExtraRepos(parsed.ignored));
++      }
++    }
++    ignoredExtraRepos = parsed.ignored;
+     const repos = [...byRepo.values()];
+     repoCache = { repos, fetchedAt: Date.now() };
+     return repos;
+@@ -1567,14 +1614,23 @@ export default async function plugin(bb: BbPluginApi) {
+         }
+         if (sub === "repos") {
+           const repos = await discoverRepos(true);
++          const warning =
++            ignoredExtraRepos.length > 0
++              ? { stderr: `${describeIgnoredExtraRepos(ignoredExtraRepos)}\n` }
++              : {};
+           if (repos.length === 0) {
+-            return { exitCode: 0, stdout: "No tracked repos. Attach a project with a GitHub remote or set extraRepos." };
++            return {
++              exitCode: 0,
++              stdout: "No tracked repos. Attach a project with a GitHub remote or set extraRepos.",
++              ...warning,
++            };
+           }
+           return {
+             exitCode: 0,
+             stdout: repos
+               .map((entry) => `${entry.repo}${entry.projectId !== null ? `\t(${entry.projectId})` : ""}`)
+               .join("\n"),
++            ...warning,
+           };
+         }
+         if (sub === "issues" || sub === "prs") {

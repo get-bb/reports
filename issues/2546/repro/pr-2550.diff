@@ -1,0 +1,393 @@
+diff --git a/apps/cli/src/__tests__/helpers/fake-npm.ts b/apps/cli/src/__tests__/helpers/fake-npm.ts
+index af5cfba1ec..0a622d173e 100644
+--- a/apps/cli/src/__tests__/helpers/fake-npm.ts
++++ b/apps/cli/src/__tests__/helpers/fake-npm.ts
+@@ -45,6 +45,14 @@ if (args[0] === "view") {
+   process.exit(0);
+ }
+ 
++// BB_TEST_NPM_INSTALL=fail stands in for the installs that die before they
++// touch the tree — an unwritable cache, a refused proxy, a missing platform
++// binary. npm always explains itself on stderr; the CLI has to pass that on.
++if (process.env.BB_TEST_NPM_INSTALL === "fail") {
++  process.stderr.write("npm error code EPERM\\nnpm error syscall open\\nnpm error Your cache folder contains root-owned files\\n");
++  process.exit(1);
++}
++
+ // npm treats NODE_ENV=production as omit=dev; a command-line --include=dev
+ // outranks it. BB_TEST_NPM_ALWAYS_OMIT_DEV forces the omission to stand in for
+ // an install that silently drops packages.
+diff --git a/apps/cli/src/__tests__/plugin-new.test.ts b/apps/cli/src/__tests__/plugin-new.test.ts
+index d2a9e2a325..e2bfc72812 100644
+--- a/apps/cli/src/__tests__/plugin-new.test.ts
++++ b/apps/cli/src/__tests__/plugin-new.test.ts
+@@ -201,6 +201,19 @@ describe.sequential("bb plugin new dependency install", () => {
+     expect(warned.join("\n")).not.toContain("was not found on npm");
+   });
+ 
++  it("passes npm's own reason through when the install fails", async () => {
++    vi.stubEnv("BB_TEST_NPM_INSTALL", "fail");
++
++    await runPluginNew(["npm-broken"]);
++
++    const warnings = warned.join("\n");
++    expect(warnings).toContain("Could not run npm install");
++    // The reason, not just the symptom: without it the author reruns npm by
++    // hand to discover what the CLI already knew.
++    expect(warnings).toContain("npm error code EPERM");
++    expect(warnings).toContain("Your cache folder contains root-owned files");
++  });
++
+   it("falls back to the manual step when npm is not on PATH", async () => {
+     vi.stubEnv("PATH", join(workDir, "empty-bin"));
+ 
+diff --git a/apps/cli/src/__tests__/plugin-scaffold-dependencies.test.ts b/apps/cli/src/__tests__/plugin-scaffold-dependencies.test.ts
+index 70236261eb..3d1348f01a 100644
+--- a/apps/cli/src/__tests__/plugin-scaffold-dependencies.test.ts
++++ b/apps/cli/src/__tests__/plugin-scaffold-dependencies.test.ts
+@@ -1,6 +1,6 @@
+ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+ import { tmpdir } from "node:os";
+-import { join, relative } from "node:path";
++import { join, relative, resolve } from "node:path";
+ import {
+   PLUGIN_SERVER_EXTERNALS,
+   RUNTIME_SLOT_BY_SPECIFIER,
+@@ -77,6 +77,36 @@ function packageNameOf(specifier: string): string {
+     : (segments[0] ?? specifier);
+ }
+ 
++const repoRoot = resolve(import.meta.dirname, "..", "..", "..", "..");
++const pluginSdkRoot = join(repoRoot, "packages", "plugin-sdk");
++
++/**
++ * Packages the BACKEND test harness (`@get-bb/plugin-sdk/testing`) imports.
++ * `testing/app.tsx` is a separate entrypoint with separate peers (React,
++ * Testing Library, jsdom) that the guide tells the author to add themselves,
++ * so only the `.ts` sources of that directory count here.
++ */
++async function backendTestHarnessImports(): Promise<string[]> {
++  const harnessDir = join(pluginSdkRoot, "src", "testing");
++  const packages = new Set<string>();
++  for (const entry of await readdir(harnessDir, { withFileTypes: true })) {
++    if (!entry.isFile() || !entry.name.endsWith(".ts")) continue;
++    const source = await readFile(join(harnessDir, entry.name), "utf8");
++    for (const specifier of importedSpecifiers(source)) {
++      packages.add(packageNameOf(specifier));
++    }
++  }
++  return [...packages];
++}
++
++/** The packages `@get-bb/plugin-sdk` leaves for its consumer to install. */
++async function sdkOptionalPeers(): Promise<Set<string>> {
++  const manifest: { peerDependencies?: Record<string, string> } = JSON.parse(
++    await readFile(join(pluginSdkRoot, "package.json"), "utf8"),
++  );
++  return new Set(Object.keys(manifest.peerDependencies ?? {}));
++}
++
+ async function scaffoldWithDependencies(workDir: string): Promise<{
+   targetDir: string;
+   dependencies: string[];
+@@ -152,6 +182,31 @@ describe("scaffold dependency classification", () => {
+     ).toEqual([]);
+   });
+ 
++  /**
++   * The authoring skill tells plugin authors to test with
++   * `@get-bb/plugin-sdk/testing`, and every package that harness reaches for is
++   * an OPTIONAL peer of the SDK — npm installs none of them. Whatever it
++   * imports therefore has to come from the scaffold's own manifest. The
++   * scaffold already ships better-sqlite3 and hono for exactly that reason;
++   * cron-parser was missed, so a fresh scaffold's first backend test died on
++   * `Cannot find package 'cron-parser'` with nothing in the guide to explain it.
++   *
++   * Derived from the harness sources and the SDK's own peer list rather than
++   * restated here, so a new import in the harness cannot leave this stale.
++   */
++  it("declares every optional peer the backend test harness imports", async () => {
++    const { dependencies, devDependencies } =
++      await scaffoldWithDependencies(workDir);
++    const declared = new Set([...dependencies, ...devDependencies]);
++    const optionalPeers = await sdkOptionalPeers();
++
++    const missing = (await backendTestHarnessImports()).filter(
++      (name) => optionalPeers.has(name) && !declared.has(name),
++    );
++
++    expect(missing).toEqual([]);
++  });
++
+   it("keeps host-provided packages out of dependencies", async () => {
+     const { dependencies } = await scaffoldWithDependencies(workDir);
+ 
+diff --git a/apps/cli/src/commands/plugin.ts b/apps/cli/src/commands/plugin.ts
+index 7296beadf1..e736ba3796 100644
+--- a/apps/cli/src/commands/plugin.ts
++++ b/apps/cli/src/commands/plugin.ts
+@@ -485,6 +485,28 @@ async function probeSdkVersionPublished(): Promise<
+  * started. Best-effort overall: authors need npm anyway (design §5.5), so a
+  * failure surfaces the manual step rather than failing the scaffold.
+  */
++/** How many trailing lines of npm's own output to quote back. */
++const NPM_FAILURE_DETAIL_LINES = 8;
++
++/**
++ * The tail of npm's own output, indented under the CLI's warning. Empty when
++ * the process produced none — `npm` missing from PATH, for instance, fails
++ * before it can say anything.
++ */
++function npmFailureDetail(cause: unknown): string {
++  const streams = cause as { stderr?: unknown; stdout?: unknown };
++  const text = [streams.stderr, streams.stdout]
++    .map((stream) => (typeof stream === "string" ? stream : ""))
++    .join("\n")
++    .trim();
++  if (text === "") return "";
++  return `\n${text
++    .split("\n")
++    .slice(-NPM_FAILURE_DETAIL_LINES)
++    .map((line) => `  ${line}`)
++    .join("\n")}`;
++}
++
+ async function installScaffoldDependencies(
+   targetDir: string,
+ ): Promise<boolean> {
+@@ -496,9 +518,12 @@ async function installScaffoldDependencies(
+       ["install", "--include=dev", "--no-fund", "--no-audit"],
+       { cwd: targetDir },
+     );
+-  } catch {
++  } catch (cause) {
++    // npm's own output IS the diagnosis — an unwritable cache, a refused
++    // proxy, a missing platform binary. Swallowing it leaves the author
++    // rerunning the same command by hand just to read the reason.
+     console.warn(
+-      "Could not run npm install — run it in the plugin directory before `bb plugin build`.",
++      `Could not run npm install — run it in the plugin directory before \`bb plugin build\`.${npmFailureDetail(cause)}`,
+     );
+     return false;
+   }
+diff --git a/apps/server/src/services/skills/builtin-skills/bb-plugin-authoring/SKILL.md b/apps/server/src/services/skills/builtin-skills/bb-plugin-authoring/SKILL.md
+index d3aec96948..6092718582 100644
+--- a/apps/server/src/services/skills/builtin-skills/bb-plugin-authoring/SKILL.md
++++ b/apps/server/src/services/skills/builtin-skills/bb-plugin-authoring/SKILL.md
+@@ -686,7 +686,7 @@ Read and edit existing threads with the same area — you do not need a
+ sidebar panel or a spawned thread to reach them:
+ 
+ ```ts
+-const { threads } = await bb.sdk.threads.list({ projectId, limit: 50 });
++const threads = await bb.sdk.threads.list({ projectId, limit: 50 });
+ const thread = await bb.sdk.threads.get({ threadId });
+ const timeline = await bb.sdk.threads.timeline({ threadId });
+ await bb.sdk.threads.update({ threadId, title: "Fix the flaky test" });
+diff --git a/apps/server/test/services/plugins/plugin-authoring-doc-examples.test.ts b/apps/server/test/services/plugins/plugin-authoring-doc-examples.test.ts
+new file mode 100644
+index 0000000000..e8c05ae9be
+--- /dev/null
++++ b/apps/server/test/services/plugins/plugin-authoring-doc-examples.test.ts
+@@ -0,0 +1,167 @@
++import { execFile } from "node:child_process";
++import { mkdtemp, rm, writeFile } from "node:fs/promises";
++import { readFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join, resolve } from "node:path";
++import { fileURLToPath } from "node:url";
++import { promisify } from "node:util";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++
++const execFileAsync = promisify(execFile);
++
++/**
++ * The bb-plugin-authoring skill is the first thing an agent reads before
++ * writing a plugin, and its examples get copied verbatim. A wrong one is worse
++ * than a missing one: the author either ships the bug or burns a debugging
++ * round trip rediscovering the real signature in the 700KB of bundled
++ * declarations.
++ *
++ * plugin-authoring-docs.test.ts already proves the skill *mentions* every API
++ * member. Nothing proved the examples *compile*, which is how
++ * `const { threads } = await bb.sdk.threads.list(...)` survived: `threads.list`
++ * resolves to a plain array, so the documented destructuring silently yields
++ * `undefined` for every reader who copies it.
++ *
++ * This compiles every `bb.sdk.<path>(` the skill shows against the SDK's own
++ * declarations: indexing the type proves the method exists, and where the
++ * skill destructures the awaited result, that shape is checked against what
++ * the method really returns. Arguments are deliberately not reconstructed —
++ * only what the example claims to call and receive is under test, which is
++ * exactly the class of bug that slipped through. The probe is generated from
++ * SKILL.md at run time, so a new example is covered the moment it is written
++ * and no list here can go stale.
++ */
++
++const SKILL_PATH = fileURLToPath(
++  new URL(
++    "../../../src/services/skills/builtin-skills/bb-plugin-authoring/SKILL.md",
++    import.meta.url,
++  ),
++);
++
++const repoRoot = resolve(import.meta.dirname, "..", "..", "..", "..", "..");
++const pluginSdkEntry = join(
++  repoRoot,
++  "packages",
++  "plugin-sdk",
++  "src",
++  "index.ts",
++);
++const tsc = join(repoRoot, "node_modules", ".bin", "tsc");
++
++interface SdkExample {
++  /** Dotted path under `bb.sdk`, e.g. `threads.list`. */
++  path: string;
++  /** The destructuring the skill applies to the result, when it shows one. */
++  pattern: string | null;
++  line: number;
++}
++
++/** Any `bb.sdk.<path>(` the skill shows, with the destructuring in front of it. */
++const SDK_CALL =
++  /(?:const\s*\{([^}]*)\}\s*=\s*await\s+)?bb\.sdk\.([A-Za-z0-9_$]+(?:\.[A-Za-z0-9_$]+)*)\s*\(/g;
++
++function sdkExamples(skill: string): SdkExample[] {
++  const found = new Map<string, SdkExample>();
++  for (const match of skill.matchAll(SDK_CALL)) {
++    const [, pattern, path] = match;
++    if (path === undefined) continue;
++    const line = skill.slice(0, match.index).split("\n").length;
++    // One entry per (path, destructuring): the same method shown twice needs
++    // checking once, but two different destructurings of it need both.
++    found.set(`${path}|${pattern ?? ""}`, {
++      path,
++      pattern: pattern === undefined ? null : pattern.trim(),
++      line,
++    });
++  }
++  return [...found.values()];
++}
++
++/** `threads.list` → `["threads"]["list"]`, for indexing the SDK type. */
++function typeIndex(path: string): string {
++  return path
++    .split(".")
++    .map((segment) => `[${JSON.stringify(segment)}]`)
++    .join("");
++}
++
++function probeSource(examples: readonly SdkExample[]): string {
++  return [
++    `import type { BbPluginApi } from "@get-bb/plugin-sdk";`,
++    ``,
++    `type AwaitedReturn<F> = F extends (...args: never[]) => infer R`,
++    `  ? R extends Promise<infer V>`,
++    `    ? V`,
++    `    : R`,
++    `  : never;`,
++    `type Sdk = BbPluginApi["sdk"];`,
++    ``,
++    ...examples.flatMap((example, index) => [
++      `// SKILL.md:${example.line} — bb.sdk.${example.path}`,
++      // Indexing the SDK type proves the method exists and is callable; a
++      // renamed or invented one fails right here.
++      `declare const result${index}: AwaitedReturn<Sdk${typeIndex(example.path)}>;`,
++      // …and where the skill destructures the result, that shape is checked
++      // against what the method actually returns.
++      example.pattern === null
++        ? `void result${index};`
++        : `const { ${example.pattern} } = result${index};`,
++      ``,
++    ]),
++  ].join("\n");
++}
++
++const PROBE_TSCONFIG = {
++  compilerOptions: {
++    strict: true,
++    target: "ES2022",
++    module: "ESNext",
++    moduleResolution: "bundler",
++    noEmit: true,
++    skipLibCheck: true,
++    noUnusedLocals: false,
++    types: [],
++    paths: { "@get-bb/plugin-sdk": [pluginSdkEntry] },
++  },
++  files: ["probe.ts"],
++};
++
++describe("bb-plugin-authoring skill examples", () => {
++  let workDir: string;
++
++  beforeEach(async () => {
++    workDir = await mkdtemp(join(tmpdir(), "bb-plugin-doc-examples-"));
++  });
++
++  afterEach(async () => {
++    await rm(workDir, { recursive: true, force: true });
++  });
++
++  it("calls and destructures bb.sdk the way the SDK actually declares it", async () => {
++    const skill = readFileSync(SKILL_PATH, "utf8");
++    const examples = sdkExamples(skill);
++    // A skill that stops showing sdk calls at all is a regression of its own:
++    // the SDK area is the half of the API a plugin cannot discover from the
++    // registration surface.
++    expect(examples.length).toBeGreaterThan(0);
++
++    await writeFile(join(workDir, "probe.ts"), probeSource(examples), "utf8");
++    await writeFile(
++      join(workDir, "tsconfig.json"),
++      `${JSON.stringify(PROBE_TSCONFIG, null, 2)}\n`,
++      "utf8",
++    );
++
++    let diagnostics = "";
++    try {
++      await execFileAsync(tsc, ["--project", workDir]);
++    } catch (cause) {
++      diagnostics = `${(cause as { stdout?: string }).stdout ?? ""}${
++        (cause as { stderr?: string }).stderr ?? ""
++      }`.trim();
++    }
++
++    expect(diagnostics).toBe("");
++  }, 60_000);
++});
+diff --git a/packages/templates/src/plugin-scaffold.ts b/packages/templates/src/plugin-scaffold.ts
+index 21dcb0ae21..388aadc067 100644
+--- a/packages/templates/src/plugin-scaffold.ts
++++ b/packages/templates/src/plugin-scaffold.ts
+@@ -1901,8 +1901,10 @@ export async function scaffoldPlugin(args: ScaffoldPluginArgs): Promise<void> {
+         // `bb plugin types` keeps it matched to the bb you run. The rest supply
+         // the real npm types those declarations reference (hono/better-sqlite3
+         // and React) for packages generated source does not import: BB
+-        // provides them at runtime and the bundle never inlines them. An
+-        // author who imports one directly must promote it above.
++        // provides them at runtime and the bundle never inlines them, plus
++        // the optional peers `@get-bb/plugin-sdk/testing` imports so the
++        // documented test harness runs from a fresh scaffold. An author who
++        // imports one directly must promote it above.
+         devDependencies: {
+           "@get-bb/plugin-sdk": PLUGIN_SDK_VERSION,
+           "@types/better-sqlite3": "^7.6.12",
+@@ -1910,6 +1912,17 @@ export async function scaffoldPlugin(args: ScaffoldPluginArgs): Promise<void> {
+           "@types/react": "^19.0.0",
+           "@types/react-dom": "^19.0.0",
+           "better-sqlite3": "^12.0.0",
++          // Every package `@get-bb/plugin-sdk/testing` imports. The SDK
++          // declares them as OPTIONAL peers, so npm installs none of them:
++          // whatever the backend harness reaches for has to be declared here
++          // or an author's first `createFakePluginHost` test dies on an
++          // unresolved import.
++          "cron-parser": "^5.5.0",
++          // Every package `@get-bb/plugin-sdk/testing` imports. The SDK
++          // declares them as OPTIONAL peers, so npm installs none of them:
++          // whatever the backend harness reaches for has to be declared here
++          // or an author's first `createFakePluginHost` test dies on an
++          // unresolved import.
+           hono: "^4.11.9",
+           typescript: "^5.7.0",
+           // Every package BB shims to its own runtime (never bundled), at
