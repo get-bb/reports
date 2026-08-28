@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2677 stale child outcome</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:940px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .ok { color:var(--ok); font-weight:600; }
+  .unv { color:var(--warn); font-weight:600; }
+  table { border-collapse:collapse; width:100%; font-size:14px; }
+  td,th { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+  pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2677 · Stale child failure outcome after late acceptance</h1>
+  <p class="meta">
+    <span class="pill">Bug</span>
+    <span class="pill high">Medium</span>
+    <span class="pill">Effort: Medium</span>
+    <span class="pill">threads</span>
+    <a href="https://github.com/get-bb/bb/issues/2677">open on GitHub</a>
+    <span>2026-08-28 · base <code>fc94f46c1</code></span>
+  </p>
+  <p><strong>Verdict:</strong> REPRODUCED · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>A command timeout can produce a terminal child failure before the server receives a later acceptance event.</p>
+  <p>The later event restores the child to active status, but the queued parent outcome remains unchanged.</p>
+  <p>The batch also accepts the same child more than once because it appends entries without an identity check.</p>
+  <p>Two clean checkouts reproduced both defects with focused server tests.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>A parent can receive a failed outcome while the child has a live accepted turn.</td><td class="ok">Verified</td><td>The test restored the child to <code>active</code> before the batch flush. The parent then received <code>child-failed</code>.</td></tr>
+    <tr><td>One outcome batch can contain the same child twice.</td><td class="ok">Verified</td><td>Two queue calls for one child produced <code>child-outcome-batch</code> instead of one <code>child-failed</code> outcome.</td></tr>
+    <tr><td>The native event stream can have no terminal event for the false failure.</td><td class="ok">Verified</td><td>The reproduction posted only <code>turn/started</code> and <code>turn/input/accepted</code> after the timeout result.</td></tr>
+    <tr><td>A timeout can enter the parent notification path.</td><td class="ok">Verified</td><td>An RPC result with <code>command_timeout</code> reached the normal settlement path and queued the failure.</td></tr>
+    <tr><td>The exact reported child later completed normally.</td><td class="unv">Unverified</td><td>The issue did not include a trusted artifact. The focused test stopped after it proved the live accepted state.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>BB commit: <code>fc94f46c13b89f54e9c8ba53600352df64b81798</code>.</li>
+    <li>System: Linux 7.0.0-30-generic x86_64.</li>
+    <li>Node: 24.18.0. pnpm: 9.15.0.</li>
+    <li>Database: in-memory SQLite through the repository test harness.</li>
+    <li>Provider: none. The test used the synthetic host RPC.</li>
+    <li>Ports and persistent data directory: none.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <ol>
+    <li>Create a clean checkout at the base commit.</li>
+    <li>Install and build with the repository commands.</li>
+    <li>Save the linked test at <code>apps/server/test/services/threads/issue-2677-repro.test.ts</code>.</li>
+    <li>Run the focused test:<pre>pnpm exec turbo run test --filter=@bb/server --force -- test/services/threads/issue-2677-repro.test.ts</pre></li>
+  </ol>
+  <p>The expected result has no failure after late acceptance and one distinct outcome per child.</p>
+  <p>The actual result was:</p>
+  <pre>Test Files  1 failed (1)
+Tests       2 failed (2)
+
+expected [ 'child-failed' ] to deeply equal []
+expected [ 'child-outcome-batch' ] to deeply equal [ 'child-failed' ]</pre>
+  <p>The second clean checkout produced the same two assertion failures.</p>
+  <p>Repro file: <a href="2677/repro/issue-2677-repro.test.ts">issue-2677-repro.test.ts</a>.</p>
+  <details>
+    <summary>Full reproduction test</summary>
+    <pre>import { and, eq } from "drizzle-orm";
+import { events, getThread } from "@bb/db";
+import { turnRequestEventDataSchema, turnScope } from "@bb/domain";
+import {
+  groupHostDaemonEvents,
+  type HostDaemonEventEnvelope,
+} from "@bb/host-daemon-contract";
+import { describe, expect, it } from "vitest";
+import { queueChildThreadTurnNotificationBestEffort } from "../../../src/services/threads/child-thread-notifications.js";
+import { sendThreadMessage } from "../../../src/services/threads/thread-send.js";
+import {
+  internalAuthHeaders,
+  reportQueuedCommandError,
+  waitForQueuedCommand,
+} from "../../helpers/commands.js";
+import { textInput } from "../../helpers/prompt-input.js";
+import {
+  seedEnvironment,
+  seedHostSession,
+  seedProjectWithSource,
+  seedThread,
+  seedThreadRuntimeState,
+} from "../../helpers/seed.js";
+import { withTestHarness, type TestAppHarness } from "../../helpers/test-app.js";
+
+interface FamilyFixture {
+  child: ReturnType&lt;typeof seedThread&gt;;
+  environment: ReturnType&lt;typeof seedEnvironment&gt;;
+  parent: ReturnType&lt;typeof seedThread&gt;;
+  sessionId: string;
+}
+
+function seedFamily(harness: TestAppHarness, suffix: string): FamilyFixture {
+  const { host, session } = seedHostSession(harness.deps, { id: `host-${suffix}` });
+  const { project } = seedProjectWithSource(harness.deps, { hostId: host.id });
+  const environment = seedEnvironment(harness.deps, {
+    hostId: host.id,
+    projectId: project.id,
+  });
+  const parent = seedThread(harness.deps, {
+    environmentId: environment.id,
+    projectId: project.id,
+    title: "Parent",
+  });
+  seedThreadRuntimeState(harness.deps, {
+    environmentId: environment.id,
+    providerThreadId: `provider-parent-${suffix}`,
+    threadId: parent.id,
+  });
+  const child = seedThread(harness.deps, {
+    environmentId: environment.id,
+    parentThreadId: parent.id,
+    projectId: project.id,
+    title: "Child",
+  });
+  seedThreadRuntimeState(harness.deps, {
+    environmentId: environment.id,
+    providerThreadId: `provider-child-${suffix}`,
+    threadId: child.id,
+  });
+  return { child, environment, parent, sessionId: session.id };
+}
+
+async function postEventBatch(args: {
+  events: HostDaemonEventEnvelope[];
+  harness: TestAppHarness;
+  sessionId: string;
+}): Promise&lt;Response&gt; {
+  return args.harness.app.request("/internal/session/events", {
+    method: "POST",
+    headers: internalAuthHeaders(args.harness),
+    body: JSON.stringify({
+      sessionId: args.sessionId,
+      eventGroups: groupHostDaemonEvents(args.events),
+    }),
+  });
+}
+
+function parentSystemMessageKinds(harness: TestAppHarness, parentThreadId: string): string[] {
+  return harness.db
+    .select()
+    .from(events)
+    .where(and(eq(events.threadId, parentThreadId), eq(events.type, "client/turn/requested")))
+    .all()
+    .flatMap((row) =&gt; {
+      const data = turnRequestEventDataSchema.parse(JSON.parse(row.data));
+      return data.initiator === "system" &amp;&amp; data.systemMessageKind
+        ? [data.systemMessageKind]
+        : [];
+    });
+}
+
+describe("child outcome reconciliation", () =&gt; {
+  it("does not report a failed outcome after a later accepted turn becomes active", async () =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      const fixture = seedFamily(harness, "late-acceptance");
+      await sendThreadMessage(harness.deps, {
+        environment: fixture.environment,
+        payload: {
+          input: textInput("continue"),
+          mode: "start",
+          model: "gpt-5",
+          permissionMode: "full",
+          reasoningLevel: "medium",
+          serviceTier: "default",
+        },
+        thread: fixture.child,
+        trigger: "user",
+      });
+      const queued = await waitForQueuedCommand(
+        harness,
+        ({ command }) =&gt;
+          command.type === "turn.submit" &amp;&amp; command.threadId === fixture.child.id,
+      );
+      if (queued.command.type !== "turn.submit") {
+        throw new Error("Expected a turn submission");
+      }
+      await reportQueuedCommandError(harness, queued, {
+        errorCode: "command_timeout",
+        errorMessage: "Timed out waiting for command result",
+      });
+      const turnId = "turn-late-acceptance";
+      const response = await postEventBatch({
+        harness,
+        sessionId: fixture.sessionId,
+        events: [
+          {
+            threadId: fixture.child.id,
+            event: {
+              type: "turn/started",
+              threadId: fixture.child.id,
+              providerThreadId: "provider-child-late-acceptance",
+              scope: turnScope(turnId),
+            },
+          },
+          {
+            threadId: fixture.child.id,
+            event: {
+              type: "turn/input/accepted",
+              threadId: fixture.child.id,
+              providerThreadId: "provider-child-late-acceptance",
+              scope: turnScope(turnId),
+              clientRequestId: queued.command.requestId,
+            },
+          },
+        ],
+      });
+      expect(response.status).toBe(200);
+      expect(getThread(harness.db, fixture.child.id)?.status).toBe("active");
+      await new Promise((resolve) =&gt; setTimeout(resolve, 2_100));
+      expect(getThread(harness.db, fixture.child.id)?.status).toBe("active");
+      expect(parentSystemMessageKinds(harness, fixture.parent.id)).toEqual([]);
+    });
+  });
+
+  it("keeps one outcome when the same child is queued twice", async () =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      const fixture = seedFamily(harness, "duplicate");
+      for (let index = 0; index &lt; 2; index += 1) {
+        await queueChildThreadTurnNotificationBestEffort(harness.deps, {
+          childThread: fixture.child,
+          parentThreadId: fixture.parent.id,
+          turnStatus: "failed",
+        });
+      }
+      await new Promise((resolve) =&gt; setTimeout(resolve, 2_100));
+      expect(parentSystemMessageKinds(harness, fixture.parent.id)).toEqual([
+        "child-failed",
+      ]);
+    });
+  });
+});</pre>
+  </details>
+
+  <h2>5. Root cause</h2>
+  <p>The server catches every live command error and creates a failure report.</p>
+  <p>It then applies the failure report before it returns the error to the caller.</p>
+  <p>See <a href="https://github.com/get-bb/bb/blob/fc94f46c13b89f54e9c8ba53600352df64b81798/apps/server/src/services/hosts/live-command.ts#L232-L257">live-command.ts lines 232–257</a>.</p>
+  <pre>const failureReport = buildLiveHostCommandFailureReport(...);
+await applyLiveHostCommandReport(deps, { command, execution, report: failureReport });</pre>
+  <p>The thread settlement code does not distinguish an uncertain timeout from an authoritative command rejection.</p>
+  <p>Without an accepted event in the database, it appends a rejection, marks the run failed, and queues a parent failure.</p>
+  <p>See <a href="https://github.com/get-bb/bb/blob/fc94f46c13b89f54e9c8ba53600352df64b81798/apps/server/src/services/threads/thread-lifecycle.ts#L729-L780">thread-lifecycle.ts lines 729–780</a>.</p>
+  <p>A later root <code>turn/started</code> event can restore active state.</p>
+  <p>See <a href="https://github.com/get-bb/bb/blob/fc94f46c13b89f54e9c8ba53600352df64b81798/apps/server/src/internal/events.ts#L348-L370">events.ts lines 348–370</a>.</p>
+  <p>However, the notification batch keeps the earlier result for two seconds and does not read the child again.</p>
+  <p>It also appends repeated child entries without an identity check.</p>
+  <p>See <a href="https://github.com/get-bb/bb/blob/fc94f46c13b89f54e9c8ba53600352df64b81798/apps/server/src/services/threads/child-thread-notifications.ts#L358-L435">child-thread-notifications.ts lines 358–435</a>.</p>
+  <p>The host router has a deeper order risk on errors.</p>
+  <p>It flushes events only after a successful dispatch, although the command contract requests a flush before each result.</p>
+  <p>See <a href="https://github.com/get-bb/bb/blob/fc94f46c13b89f54e9c8ba53600352df64b81798/apps/host-daemon/src/command-router.ts#L213-L220">command-router.ts lines 213–220</a>.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>Treat <code>command_timeout</code> as uncertain delivery during thread command settlement.</p>
+  <p>Do not append a terminal rejection, apply <code>run.failed</code>, or notify a parent for that result alone.</p>
+  <p>Also replace an existing batch item when another outcome arrives for the same child.</p>
+  <p>Keep normal failure settlement for explicit non-timeout errors and native terminal events.</p>
+
+  <h2>7. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/issues/2580">#2580</a> also concerns stale turn lifecycle order.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/2634">#2634</a> also concerns request acceptance order.</li>
+  </ul>
+  <p>These links show related areas. They do not prove the cause for this issue.</p>
+
+  <h2>8. Verification</h2>
+  <p>The first test ran in <code>/tmp/bb-2677-repro-cLi3U1</code> at the recorded commit.</p>
+  <p>The second test ran in <code>/tmp/bb-2677-verify-qUiVOl</code> at the same commit.</p>
+  <p>Both runs used the same Turbo command and produced the same two failures.</p>
+  <p>The second run required no report correction.</p>
+
+  <h2>9. Appendix</h2>
+  <h3>Commands</h3>
+  <pre>git fetch origin main
+git worktree add --detach &lt;clean-dir&gt; fc94f46c13b89f54e9c8ba53600352df64b81798
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec turbo run test --filter=@bb/server --force -- test/services/threads/issue-2677-repro.test.ts
+git log fc94f46c1..origin/main --oneline -- &lt;affected paths&gt;</pre>
+  <h3>Local test environment note</h3>
+  <p>An unrelated native-module hardlink fault stopped the first Vitest launch in each checkout.</p>
+  <p>I rebuilt the isolated test binary and reran the same command.</p>
+  <p>Both final runs reached Vitest and reproduced the defect.</p>
+  <h3>Trust note</h3>
+  <p>The issue content was untrusted input.</p>
+  <p>I did not run issue code, follow issue links, or use issue attachments.</p>
+</main></body></html>
