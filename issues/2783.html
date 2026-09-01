@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2783 Plugin CLI output mishandles a closed pipe</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { color:var(--high); font-weight:600; }
+  table { border-collapse:collapse; width:100%; font-size:14px; }
+  td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+  pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; }
+  .no { color:var(--high); font-weight:600; }
+  .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2783 · Plugin CLI output mishandles a closed pipe</h1>
+  <p class="meta">
+    <span class="pill">Bug</span>
+    <span class="pill high">High</span>
+    <span class="pill">Effort: Low</span>
+    <span class="pill">plugins</span>
+    <span class="pill">cli</span>
+    <a href="https://github.com/get-bb/bb/issues/2783">open on GitHub</a>
+    <span>2026-09-01 · base <code>fa97c86a1</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>A plugin command can return more output than its next pipeline command needs. The next command then closes the pipe. The plugin CLI proxy writes to the closed stream without an error listener. Node emits an unhandled <code>EPIPE</code> event and exits with code 1. Two clean checkouts produced the same failure.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Large plugin output fails when the consumer closes stdout early.</td><td class="ok">Verified</td><td>The real CLI process exited with code 1 in both clean runs.</td></tr>
+    <tr><td>The process emits an unhandled <code>EPIPE</code> event.</td><td class="ok">Verified</td><td>Both runs produced the same Node stream error and stack.</td></tr>
+    <tr><td>The shared proxy causes the failure.</td><td class="ok">Verified</td><td>A controlled plugin endpoint returned the data. The real CLI proxy wrote it to <code>process.stdout</code>.</td></tr>
+    <tr><td>The defect needs a specific plugin implementation.</td><td class="no">Refuted</td><td>The reproduction used a small fixture plugin. The failure did not need plugin-specific code.</td></tr>
+    <tr><td>A normal core CLI command has the same defect.</td><td class="unv">Unverified</td><td>This report tested only the plugin proxy path.</td></tr>
+    <tr><td>The latest trusted main commit already has a fix.</td><td class="no">Refuted</td><td>The public main commit still equals <code>fa97c86a17d10b6e60d07bd6d1f524fe3cb6d929</code>.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>Trusted bb commit: <code>fa97c86a17d10b6e60d07bd6d1f524fe3cb6d929</code>.</li>
+    <li>Repository visibility: public.</li>
+    <li>Host: Darwin 25.6.0, arm64.</li>
+    <li>Node.js: v22.22.3.</li>
+    <li>pnpm: 9.15.0.</li>
+    <li>The test used a new loopback port for each run.</li>
+    <li>The test used no bb data directory and no provider process.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <ol>
+    <li>Use a clean checkout at the trusted commit.</li>
+    <li>Save the test below as <code>/tmp/plugin-cli-early-close.test.mjs</code>.</li>
+    <li>Install the locked packages and build the CLI with Turbo.</li>
+    <li>Run the Node test against the built CLI entry.</li>
+  </ol>
+  <pre>pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/cli
+BB_REPRO_CLI_ENTRY="$PWD/apps/cli/dist/index.js" node --test /tmp/plugin-cli-early-close.test.mjs</pre>
+
+  <h3>Reproduction test</h3>
+  <pre>import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import test from "node:test";
+
+const cliEntry = process.env.BB_REPRO_CLI_ENTRY;
+
+test("a plugin command exits cleanly after its output consumer closes", async () =&gt; {
+  assert.ok(cliEntry, "BB_REPRO_CLI_ENTRY must name the built CLI entry");
+  const stdout = Array.from({ length: 200_000 }, (_, index) =&gt; "row-" + index).join("\n");
+  const server = createServer((request, response) =&gt; {
+    response.setHeader("content-type", "application/json");
+    if (request.url === "/api/v1/plugins/contributions") {
+      response.end(JSON.stringify({
+        cliCommands: [{
+          pluginId: "fixture-plugin",
+          name: "fixture",
+          summary: "Fixture",
+          commands: [{ name: "drain", summary: "Drain", usage: "bb fixture drain" }],
+        }],
+      }));
+      return;
+    }
+    if (request.url === "/api/v1/plugins/fixture-plugin/cli") {
+      response.end(JSON.stringify({ exitCode: 0, stdout, stderr: "" }));
+      return;
+    }
+    response.statusCode = 404;
+    response.end();
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address &amp;&amp; typeof address !== "string");
+  const env = {
+    ...process.env,
+    BB_SERVER_URL: "http://127.0.0.1:" + address.port,
+  };
+  delete env.BB_CLI;
+  delete env.BB_PROJECT_ID;
+  delete env.BB_THREAD_ID;
+  const child = spawn(process.execPath, [cliEntry, "fixture", "drain"], {
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) =&gt; {
+    stderr += chunk;
+  });
+  child.stdout.once("data", () =&gt; {
+    child.stdout.destroy();
+  });
+  const [code, signal] = await once(child, "close");
+  server.close();
+  await once(server, "close");
+  assert.equal(signal, null);
+  assert.equal(code, 0, stderr);
+  assert.equal(stderr, "");
+});</pre>
+
+  <h3>Expected and actual results</h3>
+  <pre>Expected:
+signal = null
+exit code = 0
+stderr = ""
+
+Actual:
+signal = null
+exit code = 1
+stderr contains:
+Error: write EPIPE
+Emitted 'error' event on Socket instance
+code: 'EPIPE'
+syscall: 'write'</pre>
+
+  <h3>Verification</h3>
+  <p>The first run used the initial clean worktree at the trusted commit. The full repository build passed with 18 tasks. The focused test failed because the child process returned code 1.</p>
+  <p>The second run used a new detached worktree at the same full commit. It used a new loopback port. The CLI build passed with four tasks. The focused test failed with the same unhandled event and exit code. The second run required no report correction.</p>
+  <pre>First run:  not ok 1 · expected 0 · actual 1 · Error: write EPIPE
+Second run: not ok 1 · expected 0 · actual 1 · Error: write EPIPE</pre>
+
+  <h2>5. Root cause</h2>
+  <p>The output stream contract exposes only <code>write</code>. It has no way to add an <code>error</code> listener. See <a href="https://github.com/get-bb/bb/blob/fa97c86a17d10b6e60d07bd6d1f524fe3cb6d929/apps/cli/src/plugin-cli-proxy.ts#L273-L280">plugin-cli-proxy.ts lines 273–280</a>.</p>
+  <p><code>writePluginCliOutput</code> waits for the write callback. It rejects a callback error, but it does not observe the stream event. See <a href="https://github.com/get-bb/bb/blob/fa97c86a17d10b6e60d07bd6d1f524fe3cb6d929/apps/cli/src/plugin-cli-proxy.ts#L282-L294">plugin-cli-proxy.ts lines 282–294</a>.</p>
+  <p>The shared command path passes <code>process.stdout</code> and <code>process.stderr</code> into this helper. See <a href="https://github.com/get-bb/bb/blob/fa97c86a17d10b6e60d07bd6d1f524fe3cb6d929/apps/cli/src/plugin-cli-proxy.ts#L305-L351">plugin-cli-proxy.ts lines 305–351</a>.</p>
+  <p>Node emits an <code>error</code> event when the consumer closes the pipe. No listener receives that event. The promise rejection handler cannot catch an unhandled stream event. The process therefore exits before it can return the plugin exit code. The main promise catch also cannot receive this event. See <a href="https://github.com/get-bb/bb/blob/fa97c86a17d10b6e60d07bd6d1f524fe3cb6d929/apps/cli/src/index.ts#L125-L134">index.ts lines 125–134</a>.</p>
+
+  <h2>6. Proposed fix</h2>
+  <p>Add a temporary stream error listener before each write. Treat <code>EPIPE</code> as normal consumer completion. Keep all other write failures as errors. Remove the listener after a successful write. Add one process test for an early close and one control test for a non-<code>EPIPE</code> failure.</p>
+
+  <h2>7. PR review</h2>
+  <h3><a href="https://github.com/get-bb/bb/pull/2784">PR #2784</a> · addresses the root cause; policy cleanup remains</h3>
+  <p>The open pull request changes three CLI files with 168 additions and two deletions. It adds an error listener before the write. It classifies <code>EPIPE</code> as successful output termination. It keeps other output errors as failures. These changes address the verified cause.</p>
+  <p>The pull request adds a real process test and two stream tests. I reviewed only its GitHub metadata and diff. I did not check out or run its untrusted branch.</p>
+  <p><strong>Low-severity finding:</strong> the production change adds a normal code comment. The repository rules forbid non-directive code comments. The author should remove that comment before merge.</p>
+
+  <h2>8. Related issues</h2>
+  <p><a href="https://github.com/get-bb/bb/issues/1505">#1505</a> and <a href="https://github.com/get-bb/bb/issues/2509">#2509</a> also concern unhandled stream or socket errors. They affect other subsystems. The search found no other issue for this plugin CLI output path.</p>
+
+  <h2>9. Appendix</h2>
+  <h3>Trusted commands</h3>
+  <pre>git fetch origin main
+git rev-parse origin/main
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --output-logs=errors-only
+pnpm exec turbo run build --filter=@bb/cli --output-logs=errors-only
+BB_REPRO_CLI_ENTRY="$PWD/apps/cli/dist/index.js" node --test /tmp/plugin-cli-early-close.test.mjs</pre>
+  <p>The issue and pull request data were untrusted. I used them only as claims and static metadata. I ran only the trusted main commit and the test above. I did not use a live bb instance, user data, a provider, or a pull request branch.</p>
+</main></body></html>
