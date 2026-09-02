@@ -7,10 +7,12 @@ it("keeps restored thread panes when the root compose route mounts", async () =>
 
   expect(await screen.findByTestId("root-compose-view")).toBeTruthy();
   await waitFor(() => {
+    const restored = store.get(splitLayoutAtom);
+    if (restored === null) {
+      throw new Error("Expected a restored split layout");
+    }
     expect(
-      listPanes(store.get(splitLayoutAtom)?.root ?? twoPaneLayout().root).map(
-        (pane) => pane.content,
-      ),
+      listPanes(restored.root).map((pane) => pane.content),
     ).toEqual([
       threadContent("thr-a"),
       threadContent("thr-b"),
