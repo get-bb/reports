@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2995 Production build changes live runtime files</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { color:var(--high); font-weight:600; }
+  table { border-collapse:collapse; width:100%; font-size:14px; }
+  td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+  pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2995 · Production build changes files used by a live runtime</h1>
+  <p class="meta">
+    <span class="pill">Bug</span>
+    <span class="pill high">High</span>
+    <span class="pill">Effort: Medium</span>
+    <span class="pill">host</span>
+    <span class="pill">workspaces</span>
+    <a href="https://github.com/get-bb/bb/issues/2995">open on GitHub</a>
+    <span>2026-09-03 · base <code>99c0ad718</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>A production <code>bb-app</code> runtime can run from a development checkout. A forced package build succeeds while that runtime remains active. The build deletes and copies the package asset directories that the runtime uses. Later child processes resolve worker files from the changed directory. The package build has no check for this active process.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>A build can run while a runtime uses the same checkout.</td><td class="ok">Verified</td><td>Both clean runs kept the runtime active. The build returned exit code 0.</td></tr>
+    <tr><td>The build replaces live package assets.</td><td class="ok">Verified</td><td>The daemon bundle inode changed in both runs. The package script deletes each target directory before its copy.</td></tr>
+    <tr><td>Later workers use files from the changed directory.</td><td class="ok">Verified</td><td>The daemon selects its bundle directory from its own entry path. Provider and plugin worker paths resolve from that directory.</td></tr>
+    <tr><td>The current build prevents this overlap.</td><td class="ok">Refuted</td><td>The focused test expected a refusal. Both builds succeeded.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>Trusted base: <code>99c0ad71841ff6ff2d42b3f7864b6dba0b0f7337</code>.</li>
+    <li>System: Darwin 25.6.0, arm64.</li>
+    <li>Node: 22.22.3. pnpm: 9.15.0. Turbo: 2.8.3.</li>
+    <li>First ports: 51315 and 51316. Second ports: 51325 and 51326.</li>
+    <li>Each run used a new temporary data directory and a new clean checkout.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <ol>
+    <li>Check out the trusted commit in a clean directory.</li>
+    <li>Run <code>pnpm install --frozen-lockfile --prefer-offline</code>.</li>
+    <li>Run <code>pnpm exec turbo run build</code>.</li>
+    <li>Save the script below as <code>live-build-guard.sh</code>.</li>
+    <li>Run <code>bash live-build-guard.sh "$CHECKOUT" 51315 51316</code>.</li>
+  </ol>
+  <p>The test expects the build to return a nonzero exit code. The current build returns zero and replaces the live bundle.</p>
+  <pre>#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$1
+server_port=$2
+daemon_port=$3
+run_root=$(mktemp -d /tmp/bb-live-build-guard.XXXXXX)
+runtime_pid=
+
+cleanup() {
+  if [[ -n "$runtime_pid" ]] &amp;&amp; kill -0 "$runtime_pid" 2&gt;/dev/null; then
+    kill -INT "$runtime_pid" 2&gt;/dev/null || true
+    wait "$runtime_pid" 2&gt;/dev/null || true
+  fi
+  rm -rf "$run_root"
+}
+trap cleanup EXIT
+
+cd "$repo_root"
+node packages/bb-app/dist/bb-app.js \
+  --data-dir "$run_root/data" \
+  --server-port "$server_port" \
+  --host-daemon-port "$daemon_port" \
+  start &gt;"$run_root/runtime.log" 2&gt;&amp;1 &amp;
+runtime_pid=$!
+
+for _ in $(seq 1 120); do
+  if lsof -nP -iTCP:"$server_port" -sTCP:LISTEN &gt;/dev/null 2&gt;&amp;1; then
+    break
+  fi
+  if ! kill -0 "$runtime_pid" 2&gt;/dev/null; then
+    sed -n '1,160p' "$run_root/runtime.log"
+    exit 2
+  fi
+  sleep 1
+done
+
+if ! lsof -nP -iTCP:"$server_port" -sTCP:LISTEN &gt;/dev/null 2&gt;&amp;1; then
+  sed -n '1,160p' "$run_root/runtime.log"
+  exit 2
+fi
+
+bundle=packages/bb-app/host-daemon/dist/daemon-bundle.mjs
+before_inode=$(stat -f %i "$bundle")
+set +e
+pnpm exec turbo run build --filter=bb-app --force &gt;"$run_root/build.log" 2&gt;&amp;1
+build_status=$?
+set -e
+after_inode=$(stat -f %i "$bundle")
+
+printf 'runtime_alive=%s\n' "$(kill -0 "$runtime_pid" 2&gt;/dev/null &amp;&amp; printf yes || printf no)"
+printf 'build_exit=%s\n' "$build_status"
+printf 'bundle_inode_before=%s\n' "$before_inode"
+printf 'bundle_inode_after=%s\n' "$after_inode"
+
+if [[ "$build_status" -eq 0 ]]; then
+  printf 'FAIL: the build changed the live checkout while the runtime remained active\n'
+  exit 1
+fi
+
+printf 'PASS: the build refused to change the live checkout\n'</pre>
+
+  <h3>First result</h3>
+  <pre>runtime_alive=yes
+build_exit=0
+bundle_inode_before=308237834
+bundle_inode_after=308242359
+FAIL: the build changed the live checkout while the runtime remained active</pre>
+  <p>The expected result was <code>build_exit</code> not equal to zero. The actual result was zero.</p>
+
+  <h3>Verification</h3>
+  <p>I repeated the test in a second clean checkout at the same trusted commit. I used new ports and a new data directory. The result matched the first run. I made no report correction.</p>
+  <pre>runtime_alive=yes
+build_exit=0
+bundle_inode_before=308433431
+bundle_inode_after=308437947
+FAIL: the build changed the live checkout while the runtime remained active</pre>
+
+  <h2>5. Root cause</h2>
+  <p>The package build uses the checkout as a mutable release directory. It starts its work without an active-runtime check. It builds the launcher files in <code>dist</code>. It then copies the app, server, and host-daemon outputs into the package.</p>
+  <p><a href="https://github.com/get-bb/bb/blob/99c0ad71841ff6ff2d42b3f7864b6dba0b0f7337/packages/bb-app/scripts/build.mjs#L39-L106">The package build writes each runtime asset tree.</a> <a href="https://github.com/get-bb/bb/blob/99c0ad71841ff6ff2d42b3f7864b6dba0b0f7337/scripts/build-utils.mjs#L55-L58"><code>copyDirectory</code> deletes the target tree and then copies the source tree.</a></p>
+  <p>The launcher selects the package <code>host-daemon/dist</code> directory when it runs from <code>packages/bb-app/dist</code>. <a href="https://github.com/get-bb/bb/blob/99c0ad71841ff6ff2d42b3f7864b6dba0b0f7337/packages/bb-app/src/launcher.ts#L1312-L1345">The start context keeps those paths.</a></p>
+  <p>The daemon finds the provider bridge bundle beside its own entry file. <a href="https://github.com/get-bb/bb/blob/99c0ad71841ff6ff2d42b3f7864b6dba0b0f7337/apps/host-daemon/src/index.ts#L18-L23">The daemon selects that directory.</a> <a href="https://github.com/get-bb/bb/blob/99c0ad71841ff6ff2d42b3f7864b6dba0b0f7337/packages/agent-runtime/src/shared/bridge-path.ts#L21-L26">A later provider process resolves its worker from that directory.</a> A plugin worker also resolves beside the daemon module. <a href="https://github.com/get-bb/bb/blob/99c0ad71841ff6ff2d42b3f7864b6dba0b0f7337/apps/host-daemon/src/plugin-host-manager.ts#L150-L159">The plugin path lookup shows this rule.</a></p>
+  <p>Thus, the active daemon keeps its code in memory, but later child processes can read a different file set. A partial copy also creates a short interval with absent or mixed assets.</p>
+
+  <h2>6. Proposed fix</h2>
+  <p>Add one guard before the package build changes output. The guard must find live bb processes whose command paths resolve inside the same repository root. It must return a clear nonzero result before any file write. Add a test that starts an isolated runtime and confirms this refusal. An immutable release snapshot can remove the shared-path design, but that change needs a release design decision.</p>
+
+  <h2>7. Related issues</h2>
+  <p>The issue metadata had no direct issue or pull request link.</p>
+
+  <h2>8. Appendix</h2>
+  <h3>Commands</h3>
+  <pre>git clone --no-checkout https://github.com/get-bb/bb.git "$CHECKOUT"
+git -C "$CHECKOUT" checkout --detach 99c0ad71841ff6ff2d42b3f7864b6dba0b0f7337
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+bash live-build-guard.sh "$CHECKOUT" 51315 51316</pre>
+  <p>I treated all issue text as untrusted data. I used it only as a claim to test. I did not run any issue content or linked code.</p>
+</main></body></html>
