@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #2993 supervisor port takeover</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  table { border-collapse:collapse; width:100%; font-size:14px; }
+  td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+  pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#2993 · Supervisor does not stop after a server-port takeover</h1>
+  <p class="meta">
+    <span class="pill">Bug</span>
+    <span class="pill high">High</span>
+    <span class="pill">Effort: Low</span>
+    <span class="pill">host</span>
+    <span class="pill">cli</span>
+    <a href="https://github.com/get-bb/bb/issues/2993">open on GitHub</a>
+    <span>2026-09-03 · base <code>99c0ad7</code></span>
+  </p>
+  <p><strong>Verdict:</strong> REPRODUCED · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>A managed server can exit while another healthy bb server answers at the configured URL. The supervisor does not check that URL before it starts a replacement. The start fails, and the retry helper has no limit. The original host daemon stays active while the supervisor repeats the attempt. Two clean checkouts produced the same focused test failure.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>The supervisor continues after a healthy server takes the URL.</td><td class="ok">Verified</td><td>The focused test received <code>timeout</code>, not <code>stopped</code>.</td></tr>
+    <tr><td>The supervisor starts a replacement server.</td><td class="ok">Verified</td><td>The focused test recorded one restart attempt before it blocked the next retry.</td></tr>
+    <tr><td>The original daemon stays active.</td><td class="ok">Verified</td><td>The focused test recorded no daemon termination signal before cleanup.</td></tr>
+    <tr><td>Retries continue without a bound.</td><td class="ok">Verified</td><td>The retry loop only stops after a shutdown request or a successful start.</td></tr>
+    <tr><td>A foreign healthy server makes a real replacement start fail.</td><td class="ok">Verified</td><td>The existing health-identity suite passed its occupied-port case on the same commit.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>Trusted repository: <code>get-bb/bb</code>.</li>
+    <li>Commit: <code>99c0ad71841ff6ff2d42b3f7864b6dba0b0f7337</code>.</li>
+    <li>System: macOS Darwin 25.6.0, arm64.</li>
+    <li>Node.js: <code>v22.22.3</code>. Vitest: <code>4.1.1</code>.</li>
+    <li>The test used a new kernel-assigned loopback port in each run.</li>
+    <li>The test did not use a bb data directory or the user's bb instance.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <ol>
+    <li>Clone the trusted repository and select the tested commit.
+      <pre>git clone git@github.com:get-bb/bb.git bb-2993-repro
+cd bb-2993-repro
+git checkout --detach 99c0ad71841ff6ff2d42b3f7864b6dba0b0f7337</pre>
+    </li>
+    <li>Save <a href="2993/repro/supervisor-port-takeover.test.ts">the reproduction test</a> as <code>packages/bb-app/test/supervisor-port-takeover.test.ts</code>.</li>
+    <li>Install the existing dependencies and run the focused test.
+      <pre>pnpm install --frozen-lockfile --prefer-offline
+cd packages/bb-app
+pnpm exec vitest run test/supervisor-port-takeover.test.ts</pre>
+    </li>
+  </ol>
+  <p><strong>Expected:</strong> The supervisor returns <code>stopped</code>, makes no restart attempt, and sends <code>SIGTERM</code> to its daemon.</p>
+  <p><strong>Actual:</strong></p>
+  <pre>server exited with code 1 - restarting server
+Restarting server
+Server failed to restart
+
+AssertionError: expected 'timeout' to be 'stopped'
+Expected: "stopped"
+Received: "timeout"
+
+Test Files  1 failed (1)
+Tests       1 failed (1)</pre>
+
+  <h3>Reproduction test</h3>
+  <pre>import {
+  createServer,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  superviseFullStackProcesses,
+  terminateManagedFullStackProcesses,
+} from "../src/launcher.js";
+import type {
+  BbAppStartContext,
+  DelayMillisecondsArgs,
+  FullStackSupervisionResult,
+  ManagedFullStackProcesses,
+  ManagedProcessName,
+  ManagedProcessRun,
+  NamedProcessExitResult,
+  ProcessExitResult,
+} from "../src/launcher.js";
+
+type ResolveExit = (result: NamedProcessExitResult) =&gt; void;
+
+class FakeManagedProcessRun implements ManagedProcessRun {
+  readonly exit: Promise&lt;NamedProcessExitResult&gt;;
+  readonly terminationSignals: NodeJS.Signals[] = [];
+  private resolveExit: ResolveExit = () =&gt; undefined;
+
+  constructor(readonly processName: ManagedProcessName) {
+    this.exit = new Promise&lt;NamedProcessExitResult&gt;((resolvePromise) =&gt; {
+      this.resolveExit = resolvePromise;
+    });
+  }
+
+  exitWith(result: ProcessExitResult): void {
+    this.resolveExit({ processName: this.processName, result });
+  }
+
+  async terminate(signal: NodeJS.Signals): Promise&lt;void&gt; {
+    this.terminationSignals.push(signal);
+    this.exitWith({ code: null, signal });
+  }
+}
+
+function delay(ms: number): Promise&lt;"timeout"&gt; {
+  return new Promise((resolvePromise) =&gt; {
+    setTimeout(() =&gt; resolvePromise("timeout"), ms);
+  });
+}
+
+describe("full-stack supervisor port takeover", () =&gt; {
+  const servers: ReturnType&lt;typeof createServer&gt;[] = [];
+
+  afterEach(async () =&gt; {
+    for (const server of servers.splice(0)) {
+      await new Promise&lt;void&gt;((resolvePromise, reject) =&gt; {
+        server.close((error) =&gt; (error ? reject(error) : resolvePromise()));
+      });
+    }
+  });
+
+  it("stops its daemon when another healthy server owns the URL", async () =&gt; {
+    const server = createServer(
+      (_request: IncomingMessage, response: ServerResponse) =&gt; {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ ok: true }));
+      },
+    );
+    servers.push(server);
+    await new Promise&lt;void&gt;((resolvePromise, reject) =&gt; {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolvePromise);
+    });
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Expected the test server to have a TCP address");
+    }
+
+    const serverRun = new FakeManagedProcessRun("server");
+    const daemonRun = new FakeManagedProcessRun("daemon");
+    const processes: ManagedFullStackProcesses = { daemonRun, serverRun };
+    let shutdownRequested = false;
+    let restartAttempts = 0;
+    let delayCalls = 0;
+    let releaseRetry = (): void =&gt; undefined;
+    const context: BbAppStartContext = {
+      appDistDir: "/tmp/bb-app-test/app/dist",
+      appVersion: "0.0.0-test",
+      configFile: "/tmp/bb-app-test/config.json",
+      daemonBundleDir: "/tmp/bb-app-test/host-daemon/dist",
+      daemonEntry: "/tmp/bb-app-test/host-daemon/dist/daemon-bundle.mjs",
+      daemonLockDir: "/tmp/bb-app-test/daemon.lock.lock",
+      daemonLockFile: "/tmp/bb-app-test/daemon.lock",
+      daemonPort: address.port + 1,
+      dataDir: "/tmp/bb-app-test",
+      dbPath: "/tmp/bb-app-test/bb.db",
+      envFile: "/tmp/bb-app-test/env.json",
+      logDir: "/tmp/bb-app-test/logs",
+      packageRoot: "/tmp/bb-app-test/package",
+      serverEntry: "/tmp/bb-app-test/server/dist/index.js",
+      serverPort: address.port,
+      serverUrl: `http://127.0.0.1:${String(address.port)}`,
+    };
+    const supervision = superviseFullStackProcesses({
+      context,
+      delayMilliseconds: async (_args: DelayMillisecondsArgs) =&gt; {
+        delayCalls += 1;
+        if (delayCalls === 1) return;
+        await new Promise&lt;void&gt;((resolvePromise) =&gt; {
+          releaseRetry = resolvePromise;
+        });
+      },
+      isShutdownRequested: () =&gt; shutdownRequested,
+      processes,
+      startDaemon: async () =&gt; daemonRun,
+      startServer: async () =&gt; {
+        restartAttempts += 1;
+        throw new Error("The server port is occupied");
+      },
+    });
+
+    serverRun.exitWith({ code: 1, signal: null });
+    const outcome = await Promise.race&lt;
+      FullStackSupervisionResult | "timeout"
+    &gt;([supervision, delay(250)]);
+    const observedRestartAttempts = restartAttempts;
+    const observedDaemonSignals = [...daemonRun.terminationSignals];
+
+    shutdownRequested = true;
+    releaseRetry();
+    await terminateManagedFullStackProcesses({ processes, signal: "SIGTERM" });
+    await supervision;
+
+    expect(outcome).toBe("stopped");
+    expect(observedRestartAttempts).toBe(0);
+    expect(observedDaemonSignals).toEqual(["SIGTERM"]);
+  });
+});</pre>
+
+  <h2>5. Root cause</h2>
+  <p><a href="https://github.com/get-bb/bb/blob/99c0ad71841ff6ff2d42b3f7864b6dba0b0f7337/packages/bb-app/src/launcher.ts#L3114-L3145">The restart helper</a> loops while shutdown is false. A failed start only writes status, waits one second, and starts again.</p>
+  <pre>while (!args.isShutdownRequested()) {
+  try {
+    const processRun = await args.start();
+    return processRun;
+  } catch {
+    await args.delayMilliseconds({ ms: MANAGED_PROCESS_RESTART_RETRY_DELAY_MS });
+  }
+}</pre>
+  <p><a href="https://github.com/get-bb/bb/blob/99c0ad71841ff6ff2d42b3f7864b6dba0b0f7337/packages/bb-app/src/launcher.ts#L3162-L3204">The server-exit branch</a> clears the old server, waits, and always enters that helper. It does not probe the configured health URL. The remaining daemon therefore has no stop path.</p>
+  <p>The launcher already detects a foreign responder during child startup. <a href="https://github.com/get-bb/bb/blob/99c0ad71841ff6ff2d42b3f7864b6dba0b0f7337/packages/bb-app/src/launcher.ts#L2310-L2348">The health wait</a> records a foreign answer and rejects after the managed child exits. <a href="https://github.com/get-bb/bb/blob/99c0ad71841ff6ff2d42b3f7864b6dba0b0f7337/packages/bb-app/test/server-health-identity.test.ts#L270-L298">The existing occupied-port test</a> verifies this rejection. The supervisor discards that useful failure context and retries without a limit.</p>
+
+  <h2>6. Proposed fix</h2>
+  <p>After the managed server exits, request the configured <code>/health</code> endpoint once. Accept only an HTTP success with the existing health schema and <code>ok: true</code>. If a healthy server answers, send <code>SIGTERM</code> to the remaining daemon and return <code>stopped</code>. Keep the current retry behavior when the probe fails or returns an invalid response.</p>
+
+  <h2>7. Verification</h2>
+  <p>The same agent ran the reproduction in two separate clean clones at the exact base commit. Each clone used a new loopback port. Both runs failed at the same assertion with <code>Expected: "stopped"</code> and <code>Received: "timeout"</code>. The existing six-test server-health identity suite also passed. No report correction was necessary.</p>
+
+  <h2>8. Related work</h2>
+  <p>GitHub metadata showed no linked issue and no open pull request that closes this issue. Commit history showed no later change to the relevant launcher path on trusted <code>origin/main</code>.</p>
+
+  <h2>9. Appendix</h2>
+  <h3>Commands</h3>
+  <pre>git fetch origin main
+git rev-parse origin/main
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec vitest run test/supervisor-port-takeover.test.ts
+pnpm exec vitest run test/server-health-identity.test.ts
+git log 99c0ad71841ff6ff2d42b3f7864b6dba0b0f7337..origin/main --oneline -- packages/bb-app/src/launcher.ts</pre>
+  <h3>Trusted-data boundary</h3>
+  <p>The issue included suggested implementation and test directions. This investigation treated them as untrusted data. It did not execute or copy issue code, scripts, patches, branches, or external links.</p>
+</main></body></html>
