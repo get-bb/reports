@@ -1,0 +1,23 @@
+import { createRequire } from 'node:module';
+import { resolve, dirname } from 'node:path';
+import { existsSync, writeFileSync } from 'node:fs';
+const cwd = process.cwd();
+const require = createRequire(cwd + '/package.json');
+const { build } = require('esbuild');
+const root = process.env.REPRO_ROOT;
+if (!root) throw new Error('Set REPRO_ROOT to the fixture directory');
+const base = process.env.REPRO_BASE || root + '/base';
+const fixture = root + '/harness';
+const gtd = root + '/bb-plugins/plugins/gtd-sidebar';
+const resolveFile = p => ['', '.tsx', '.ts', '.js'].map(e=>p+e).find(existsSync);
+await build({entryPoints:[fixture+'/main.tsx'],bundle:true,outfile:fixture+'/bundle.js',format:'iife',jsx:'automatic',nodePaths:[cwd+'/apps/app/node_modules',cwd+'/node_modules',cwd+'/node_modules/.pnpm/node_modules'],define:{'process.env.NODE_ENV':'"development"'},plugins:[{name:'fixture-boundaries',setup(b){
+ b.onResolve({filter:/^@get-bb\/plugin-sdk\/internal\/plugin-app-collector$/},()=>({path:base+'/packages/plugin-sdk/src/internal/plugin-app-collector.ts'}));
+ b.onResolve({filter:/^bb-source\//},a=>({path:base+'/'+a.path.slice(10)}));
+ b.onResolve({filter:/^@get-bb\/plugin-sdk\/app$/},()=>({path:fixture+'/sdk.tsx'}));
+ b.onResolve({filter:/^@bb\/shared-ui\/hooks\/use-compact-viewport$/},()=>({path:'compact',namespace:'stub'}));
+ b.onResolve({filter:/PluginSlotMount$/},()=>({path:'mount',namespace:'stub'}));
+ b.onResolve({filter:/(ThreadInbox|thread-inbox|SidebarSettings)$/},a=>({path:a.path.includes('SidebarSettings')?'settings':'inbox',namespace:'stub'}));
+ b.onResolve({filter:/^@\//},a=>({path:resolveFile((a.importer.startsWith(gtd)?gtd:base+'/apps/app/src')+'/'+a.path.slice(2))}));
+ b.onLoad({filter:/.*/,namespace:'stub'},a=>({loader:'tsx',resolveDir:cwd+'/apps/app',contents:a.path==='compact'?'export const useIsCompactViewport=()=>false;':a.path==='mount'?'export function PluginSlotMount({children,pluginId}){return <div style={{display:"contents"}} data-bb-plugin={pluginId}>{children}</div>}':a.path==='settings'?'export function SidebarSettings(){return null}':'export function ThreadInbox(){return null}'}));
+ b.onLoad({filter:/\.css$/},()=>({contents:'',loader:'css'}));
+}}]});
