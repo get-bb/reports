@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #3077 redundant thread-start lifecycle log</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .verdict,.ok { color:var(--ok); font-weight:600; }
+  .unv { color:var(--warn); font-weight:600; }
+  table { border-collapse:collapse; width:100%; font-size:14px; }
+  td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+  pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#3077 · Late thread-start settlement logs a redundant lifecycle transition</h1>
+  <p class="meta">
+    <span class="pill">Bug</span>
+    <span class="pill">Medium</span>
+    <span class="pill">Effort: Medium</span>
+    <span class="pill">threads</span>
+    <span class="pill">provider-acp</span>
+    <a href="https://github.com/get-bb/bb/issues/3077">open on GitHub</a>
+    <span>2026-09-04 · base <code>53b3cbc46</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>A new thread has two independent success signals: a root provider <code>turn/started</code> event and completion of the host's <code>thread.start</code> RPC. When the provider event arrives first, it correctly changes the thread from <code>starting</code> to <code>active</code>. The later RPC settlement tries the same <code>run.started</code> transition again, which the lifecycle table deliberately rejects from <code>active</code> and the server logs at info level. Two clean-checkout runs reproduced the exact log fields; the thread remained active, so the verified defect is misleading noise rather than a broken execution state.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>The server can report an unapplied run-start event while a thread is already active.</td><td class="ok">Verified</td><td>Both focused runs captured one info call with event <code>run.started</code>, reason <code>illegal-transition</code>, and detail <code>no transition for run.started from status active</code>.</td></tr>
+    <tr><td>The behavior can occur during an ACP-backed thread startup.</td><td class="ok">Verified at the shared server boundary</td><td>The deterministic test uses the same provider-neutral daemon event and live-command settlement routes used by ACP. The race does not depend on ACP payload details; provider timing only determines which success signal arrives first.</td></tr>
+    <tr><td>The message means the thread stopped working.</td><td class="unv">Not supported</td><td>After both signals, the persisted thread status remained <code>active</code>. The issue supplied no deterministic functional failure beyond the log message.</td></tr>
+    <tr><td>The trigger is random.</td><td class="ok">Refined</td><td>The trigger is deterministic ordering: provider event first, RPC settlement second. Runtime scheduling makes that ordering appear intermittent.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>Trusted repository: <code>get-bb/bb</code>, commit <code>53b3cbc467db8a9ca65c71cc0d1dda1e1c017d97</code>, fetched from canonical <code>main</code>.</li>
+    <li>macOS Darwin 25.6.0 arm64, Node.js v22.22.3, pnpm 9.15.0.</li>
+    <li>ACP provider plugin in the checkout: 0.1.0. No external provider process, account, or user data was used.</li>
+    <li>Both clean checkouts completed <code>pnpm install --frozen-lockfile --prefer-offline</code> and a full <code>pnpm exec turbo run build</code>. The reproduction used in-memory SQLite through the repository's test harness; no ports or persistent data directory were needed.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <ol>
+    <li>Check out the trusted base commit and complete the frozen install and full Turbo build.</li>
+    <li>Add the focused case below to <code>apps/server/test/threads/thread-live-start-handoff.test.ts</code>, including <code>vi</code> in the Vitest import.</li>
+    <li>Run <code>pnpm exec turbo run test --filter=@bb/server -- --run test/threads/thread-live-start-handoff.test.ts</code>.</li>
+  </ol>
+  <pre><code>it("does not log when a turn start wins the thread start handoff", async () =&gt; {
+  await withTestHarness(async (harness) =&gt; {
+    const info = vi.fn();
+    harness.deps.logger.info = info;
+    const fixture = await startLiveThreadStartRpc({
+      harness,
+      requestIdValue: 8,
+    });
+    const providerThreadId = "provider-turn-before-start-settlement";
+    const sessionId = fixture.startCommand.row.sessionId;
+    if (!sessionId) throw new Error("Queued thread start is missing sessionId");
+
+    const eventResponse = await harness.app.request("/internal/session/events", {
+      method: "POST",
+      headers: internalAuthHeaders(harness),
+      body: JSON.stringify({
+        sessionId,
+        eventGroups: groupHostDaemonEvents([
+          createTestDaemonEventEnvelope({
+            event: {
+              type: "turn/started",
+              threadId: fixture.thread.id,
+              providerThreadId,
+              scope: turnScope("turn-before-start-settlement"),
+            },
+          }),
+        ]),
+      }),
+    });
+    expect(eventResponse.status).toBe(200);
+    expect(getThread(harness.db, fixture.thread.id)?.status).toBe("active");
+
+    await reportQueuedCommandSuccess(harness, fixture.startCommand, {
+      providerThreadId,
+    });
+
+    expect(
+      info.mock.calls.filter(
+        ([, message]) =&gt; message === "Thread lifecycle event not applied",
+      ),
+    ).toEqual([]);
+  });
+});</code></pre>
+  <p><strong>Expected:</strong> the later success settlement recognizes that the same clean thread is already active, emits no lifecycle warning, and the focused suite passes. <strong>Actual in both clean runs:</strong></p>
+  <pre>AssertionError: expected [ [ { …(4) }, …(1) ] ] to deeply equal []
+
+Received:
+{
+  "detail": "no transition for run.started from status active",
+  "event": "run.started",
+  "reason": "illegal-transition",
+  "threadId": "&lt;thread-id&gt;"
+}
+
+Test Files  1 failed (1)
+Tests       1 failed | 7 passed (8)</pre>
+  <p>Artifacts: <a href="3077/repro/thread-live-start-handoff.test.ts">focused regression test in its owning suite</a>, <a href="3077/repro/first-run.txt">first clean run</a>, and <a href="3077/repro/second-run.txt">second clean run</a>.</p>
+
+  <h3>Verification</h3>
+  <p>A second canonical clone was detached at the same full commit, installed and built independently, and received the same focused test. It failed at the same assertion with one matching lifecycle log while the thread remained <code>active</code>. The code permalinks below were checked against the recorded base commit. No report claim required correction after the second run.</p>
+
+  <h2>5. Root cause</h2>
+  <p>The daemon event route treats a root <code>turn/started</code> as the execution-start signal and applies <code>run.started</code> unless the thread is already active (<a href="https://github.com/get-bb/bb/blob/53b3cbc467db8a9ca65c71cc0d1dda1e1c017d97/apps/server/src/internal/events.ts#L355-L381">event effect, lines 355–381</a>). Its <code>hasThreadAlreadyStartedRun</code> helper explicitly recognizes a clean active thread (<a href="https://github.com/get-bb/bb/blob/53b3cbc467db8a9ca65c71cc0d1dda1e1c017d97/apps/server/src/internal/events.ts#L618-L627">inverse-order guard, lines 618–627</a>). This suppresses the redundant event when the <code>thread.start</code> RPC settlement wins the race.</p>
+  <p>The successful <code>thread.start</code> settlement independently computes another <code>run.started</code> event and applies it whenever the activation is not stale, but it has no corresponding already-active guard (<a href="https://github.com/get-bb/bb/blob/53b3cbc467db8a9ca65c71cc0d1dda1e1c017d97/apps/server/src/services/threads/thread-lifecycle.ts#L804-L855">settlement path, lines 804–855</a>). If the provider event won the race, this second application sees <code>active</code>. The lifecycle table intentionally has no <code>active → active</code> cell, so the evaluator returns <code>illegal-transition</code> (<a href="https://github.com/get-bb/bb/blob/53b3cbc467db8a9ca65c71cc0d1dda1e1c017d97/packages/domain/src/thread-lifecycle.ts#L47-L69">transition table, lines 47–69</a>; <a href="https://github.com/get-bb/bb/blob/53b3cbc467db8a9ca65c71cc0d1dda1e1c017d97/packages/domain/src/thread-lifecycle.ts#L90-L109">evaluation, lines 90–109</a>). The logging wrapper then records every unapplied outcome at info level (<a href="https://github.com/get-bb/bb/blob/53b3cbc467db8a9ca65c71cc0d1dda1e1c017d97/apps/server/src/services/threads/lifecycle-outcome.ts#L48-L64">logging, lines 48–64</a>).</p>
+  <p>The deeper defect is asymmetric idempotency across two legitimate startup-success signals: one ordering is explicitly deduplicated, while the other is not.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>In successful <code>thread.start</code> settlement, skip only the redundant <code>run.started</code> application when the same thread is already cleanly <code>active</code>. Preserve stale interruption/completion checks, deleted/archived handling, identity recording for empty forks, title synchronization, and notifications for genuine transitions. This mirrors the existing event-side guard without weakening the lifecycle table or making arbitrary active-to-active transitions legal.</p>
+
+  <h2>7. Related issues</h2>
+  <p>No open pull request links to this issue. A small review of recent <code>threads</code> and <code>provider-acp</code> issues found no duplicate of this exact startup-signal ordering. Repository history contains an earlier change that suppresses the inverse ordering in the event route, which is why the remaining race is asymmetric.</p>
+
+  <h2>8. Appendix</h2>
+  <p>The issue title, body, comments, links, attachments, logs, code blocks, and quoted text were treated as untrusted claims. No issue-supplied command, URL, branch, patch, binary, or test was executed. Executable code came only from canonical <code>get-bb/bb</code> <code>main</code> at the recorded commit or from the focused test written during this investigation.</p>
+  <p>Commands used:</p>
+  <pre><code>git clone https://github.com/get-bb/bb.git
+git checkout --detach 53b3cbc467db8a9ca65c71cc0d1dda1e1c017d97
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec turbo run test --filter=@bb/server -- --run test/threads/thread-live-start-handoff.test.ts
+git log --oneline -- apps/server/src/internal/events.ts apps/server/src/services/threads/thread-lifecycle.ts
+git blame -L 355,381 apps/server/src/internal/events.ts
+git blame -L 804,855 apps/server/src/services/threads/thread-lifecycle.ts</code></pre>
+</main></body></html>
