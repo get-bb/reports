@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #3210 Task lifecycle tracker scans</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  table { border-collapse:collapse; width:100%; font-size:14px; }
+  td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+  pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; }
+  .no { color:var(--high); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#3210 · Task lifecycle events perform tracker-wide scans</h1>
+  <p class="meta">
+    <span class="pill">Bug</span>
+    <span class="pill">Medium</span>
+    <span class="pill">Effort: Low</span>
+    <span class="pill">plugins</span>
+    <span class="pill">perf</span>
+    <span class="pill">tasks</span>
+    <a href="https://github.com/get-bb/bb/issues/3210">open on GitHub</a>
+    <span>2026-09-07 · base <code>06aeaa9</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="no">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>An unrelated BB thread status event makes the Tasks plugin enumerate the entire task tracker even when no task has a worker thread attached. Two clean runs reproduced one task-list read plus one thread-list read per task. The event path asks a general full-tracker helper for one known thread ID, so filtering happens only after all task and task-thread rows have been queried. The database already has a thread-ID index that a direct lookup can use.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>An unrelated lifecycle event scans all tasks and performs one task-thread lookup per task.</td><td class="ok">Verified</td><td>With three tasks and no task-thread rows, both clean runs observed <code>listTasks: 1</code> and <code>listTaskThreads: 3</code>.</td></tr>
+    <tr><td>The cost grows linearly with task count.</td><td class="ok">Verified</td><td>The trusted helper loops over every result from <code>listTasks()</code> and calls <code>listTaskThreads(task.id)</code> once inside that loop.</td></tr>
+    <tr><td>All five registered global thread lifecycle handlers use this path.</td><td class="ok">Verified</td><td>Each handler passes its event thread ID to <code>transitionTrackedThread</code>, which calls the scanning helper.</td></tr>
+    <tr><td>The schema already indexes <code>task_threads.thread_id</code>.</td><td class="ok">Verified</td><td>The schema creates <code>idx_task_threads_thread</code>; no current store method queries solely by that column.</td></tr>
+    <tr><td>The periodic reconciliation paths also enumerate tasks and their thread rows.</td><td class="ok">Verified</td><td>Both the idle check and reconciliation sweep call the same full-tracker helper without a thread filter.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>Repository: <code>get-bb/bb</code>; trusted commit <code>06aeaa994942ae7527dc49d2268c1f801e8542a0</code>.</li>
+    <li>System: Darwin 25.6.0 on arm64.</li>
+    <li>Node.js: <code>v22.22.3</code>; pnpm: <code>9.15.0</code>.</li>
+    <li>Both runs used a fresh fake plugin host and its plugin-owned in-memory SQLite database.</li>
+    <li>Live ports, user data, providers, and network-facing plugins were not used.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <ol>
+    <li>Check out the trusted base commit.</li>
+    <li>Run the frozen install and the full repository build.</li>
+    <li>Add the linked focused test to the existing lifecycle test suite.</li>
+    <li>Run the lifecycle suite through Turbo.</li>
+  </ol>
+  <pre>pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec turbo run test --filter=bb-plugin-tasks -- lifecycle.test.ts</pre>
+  <p>Expected: the Tasks store performs no full task scan and no per-task thread query for an untracked thread ID.</p>
+  <pre>{ listTasks: 0, listTaskThreads: 0 }</pre>
+  <p>Actual in both clean runs:</p>
+  <pre>AssertionError: expected { listTasks: 1, listTaskThreads: 3 } to deeply equal { listTasks: +0, listTaskThreads: +0 }
+Test Files  1 failed (1)
+Tests       1 failed | 8 passed (9)</pre>
+  <p>Reproduction artifacts: <a href="3210/repro/unrelated-thread-event.test.ts">focused test</a> and <a href="3210/repro/runs.txt">run evidence</a>.</p>
+  <pre>const listTasks = vi.spyOn(store.tasks, "listTasks");
+const listTaskThreads = vi.spyOn(store.tasks, "listTaskThreads");
+
+await harness.emitThreadEvent("thread.idle", {
+  thread: makeThreadResponse({ id: "thr_untracked", status: "idle" }),
+  lastAssistantText: null,
+});
+
+expect({
+  listTasks: listTasks.mock.calls.length,
+  listTaskThreads: listTaskThreads.mock.calls.length,
+}).toEqual({ listTasks: 0, listTaskThreads: 0 });</pre>
+
+  <h2>5. Verification</h2>
+  <p>The first run used the dedicated SlopCop worktree at the recorded trusted commit. Its frozen install and full Turbo build passed; the new focused assertion failed with one task scan and three per-task thread reads.</p>
+  <p>The second run used a newly created detached checkout at the same full commit. Its frozen install and full build also passed. The same independently authored regression test failed with the same call counts against a new plugin database.</p>
+  <p>No report correction was needed after the second run.</p>
+
+  <h2>6. Root cause</h2>
+  <p>The lifecycle helper at <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/plugins/tasks/lifecycle/index.ts#L30-L40">lifecycle/index.ts lines 30–40</a> calls <code>listTasks()</code>, then calls <code>listTaskThreads(task.id)</code> once for every task. Its optional thread ID only controls an in-memory comparison after those reads.</p>
+  <pre>for (const task of store.tasks.listTasks()) {
+  for (const thread of store.tasks.listTaskThreads(task.id)) {
+    if (threadId === undefined || thread.threadId === threadId) {
+      tracked.push(thread);
+    }
+  }
+}</pre>
+  <p>The hot event adapter at <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/plugins/tasks/lifecycle/index.ts#L87-L96">lifecycle/index.ts lines 87–96</a> passes one known thread ID to that general helper, and <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/plugins/tasks/lifecycle/index.ts#L158-L176">all five event registrations</a> use the adapter. Consequently, even a miss has to finish the complete scan.</p>
+  <p><a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/plugins/tasks/db/store.ts#L1049-L1065"><code>listTasks()</code></a> materializes all pages, while <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/plugins/tasks/db/store.ts#L1644-L1657"><code>listTaskThreads()</code></a> queries by task ID. The schema's existing <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/plugins/tasks/db/schema.ts#L110-L120">thread-ID index</a> cannot help either query. Root-cause confidence is high because the observed call counts are the direct loop cardinalities and the regression exercises the registered event path.</p>
+
+  <h2>7. Proposed fix (first principles)</h2>
+  <p>Add an internal Tasks-store method that returns every task-thread row matching one <code>thread_id</code>, then make <code>transitionTrackedThread</code> use that method. Keep the full traversal for periodic all-thread reconciliation unless a separate measured change replaces it. Preserve multi-task fan-out by returning an array, and retain the existing event behavior tests alongside the new no-scan regression.</p>
+
+  <h2>8. Related issues</h2>
+  <p>No linked or cross-referenced open pull request existed at investigation time. Recent Tasks issues were reviewed for repository classification patterns; none changed the direct reproduction or root cause on the trusted base commit.</p>
+
+  <h2>9. Appendix</h2>
+  <p>The issue body and links were treated as untrusted data. No command, code block, patch, branch, or external URL from it was executed or copied. The regression test and fix proposal were derived from trusted repository source.</p>
+  <pre>git fetch origin main
+git rev-parse origin/main
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec turbo run test --filter=bb-plugin-tasks -- lifecycle.test.ts
+git worktree add --detach &lt;clean-path&gt; 06aeaa994942ae7527dc49d2268c1f801e8542a0
+git log 06aeaa994..origin/main --oneline -- plugins/tasks/lifecycle plugins/tasks/db/store.ts plugins/tasks/db/schema.ts
+git blame -L 30,40 -- plugins/tasks/lifecycle/index.ts
+rg -n "task_threads|trackedThreads|listTaskThreads" plugins/tasks</pre>
+</main></body></html>
