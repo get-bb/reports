@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #3196 retention sweep event-loop blocking</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { color:var(--high); font-weight:700; }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#3196 · Retention sweep blocks the server event loop</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill high">High</span> <span class="pill">Effort: Medium</span> <span class="pill">host</span> <span class="pill">perf</span>
+    <a href="https://github.com/get-bb/bb/issues/3196">open on GitHub</a>
+    <span>2026-09-06 · base <code>06aeaa994</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>The completed-output retention job performs synchronous SQLite JSON scans and updates for as many as 250 rows of each supported output kind in one event-loop turn. A focused test seeded large completed command outputs, ran the real periodic sweep, and verified that the entire eligible set completed before a <code>setImmediate</code> observer could see any intermediate progress. The same failure occurred in a second clean checkout at the same trusted commit. Because the job is wrapped as asynchronous work, its synchronous database body is also excluded from the stall monitor’s “slowest blocking work” selection. The exact multi-second production delay and downstream request failures were not recreated from private runtime data, but the reported non-yielding mechanism is directly reproduced.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Completed-output retention can process a large batch without yielding.</td><td class="ok">Verified</td><td>The focused test completed all eligible 128 KiB output rows without an intermediate event-loop observation in both clean runs.</td></tr>
+    <tr><td>The retention path uses synchronous SQLite JSON work.</td><td class="ok">Verified</td><td>The database implementation synchronously selects row IDs and runs one JSON extraction/update statement for the selected rows.</td></tr>
+    <tr><td>Stall attribution can omit the retention body.</td><td class="ok">Verified</td><td>The generic periodic runner uses <code>runEventLoopWork</code>, whose frames have <code>blocksEventLoop: false</code>; the retention function does not create a nested synchronous frame.</td></tr>
+    <tr><td>Observed deployments stall for roughly two seconds and local callers fail during those windows.</td><td class="unv">Unverified at exact production scale</td><td>No private database or live user instance was accessed. The deterministic reproduction establishes starvation, not the reporter’s exact duration or HTTP symptom.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>Repository: <code>get-bb/bb</code>, trusted <code>origin/main</code> commit <code>06aeaa994942ae7527dc49d2268c1f801e8542a0</code>.</li>
+    <li>macOS Darwin 25.6.0 arm64; Node.js v22.22.3; pnpm frozen install.</li>
+    <li>Vitest 4.1.1 through the <code>@bb/server</code Turbo task; in-memory migrated SQLite database.</li>
+    <li>No live server, port, user data directory, provider turn, or external issue artifact was used.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <ol>
+    <li>At the trusted base commit, save the test below as <code>apps/server/test/services/completed-output-yield.test.ts</code>.</li>
+    <li>Run <code>pnpm install --frozen-lockfile --prefer-offline</code>.</li>
+    <li>Run <code>pnpm exec turbo run test --filter=@bb/server -- test/services/completed-output-yield.test.ts</code>.</li>
+  </ol>
+  <p><strong>Expected:</strong> the observer sees at least one count above zero and below the final eligible count, proving that other event-loop work can run during retention.</p>
+  <p><strong>Actual:</strong></p>
+  <pre>FAIL  test/services/completed-output-yield.test.ts
+AssertionError: expected false to be true
+Test Files  1 failed (1)
+Tests       1 failed (1)</pre>
+  <p>Repro file: <a href="3196/repro/completed-output-yield.test.ts">completed-output-yield.test.ts</a></p>
+  <pre>import {
+  COMPLETED_EVENT_OUTPUT_RETENTION_MS,
+  DEFAULT_COMPLETED_EVENT_OUTPUT_TRUNCATION_BATCH_SIZE,
+} from "@bb/db";
+import { turnScope } from "@bb/domain";
+import { expect, it, vi } from "vitest";
+import { runPeriodicSweeps } from "../../src/services/system/periodic-sweeps.js";
+import {
+  seedEnvironment,
+  seedEvent,
+  seedHostSession,
+  seedProjectWithSource,
+  seedThread,
+} from "../helpers/seed.js";
+import { testLogger, withTestHarness } from "../helpers/test-app.js";
+
+it("truncates completed event outputs across event-loop turns", async () =&gt; {
+  await withTestHarness(async (harness) =&gt; {
+    const { host } = seedHostSession(harness.deps, {
+      id: "host-output-truncation",
+    });
+    const { project } = seedProjectWithSource(harness.deps, {
+      hostId: host.id,
+    });
+    const environment = seedEnvironment(harness.deps, {
+      hostId: host.id,
+      projectId: project.id,
+    });
+    const thread = seedThread(harness.deps, {
+      environmentId: environment.id,
+      projectId: project.id,
+      status: "idle",
+    });
+    const eventCount = DEFAULT_COMPLETED_EVENT_OUTPUT_TRUNCATION_BATCH_SIZE;
+    const createdAt =
+      Date.now() - COMPLETED_EVENT_OUTPUT_RETENTION_MS - 60_000;
+    const truncationThresholdChars = 32 * 1024;
+    const aggregatedOutput = "x".repeat(truncationThresholdChars * 4);
+    for (let sequence = 1; sequence &lt;= eventCount; sequence += 1) {
+      seedEvent(harness.deps, {
+        createdAt,
+        data: {
+          item: {
+            aggregatedOutput,
+            approvalStatus: null,
+            command: "generate output",
+            cwd: "/tmp/test",
+            exitCode: 0,
+            id: `command-${sequence}`,
+            status: "completed",
+            type: "commandExecution",
+          },
+        },
+        environmentId: environment.id,
+        providerThreadId: "provider-output-truncation",
+        scope: turnScope("turn-output-truncation"),
+        sequence,
+        threadId: thread.id,
+        type: "item/completed",
+      });
+    }
+
+    const countTruncated = () =&gt;
+      harness.db.$client
+        .prepare&lt;[], { count: number }&gt;(
+          "SELECT count(*) AS count FROM events WHERE json_type(data, '$.item.truncation.aggregatedOutput') = 'object'",
+        )
+        .get()?.count ?? 0;
+    const candidateCount =
+      harness.db.$client
+        .prepare&lt;[number, number], { count: number }&gt;(
+          "SELECT count(*) AS count FROM events WHERE type = 'item/completed' AND item_kind = 'commandExecution' AND created_at &lt; ? AND json_type(data, '$.item.aggregatedOutput') = 'text' AND length(json_extract(data, '$.item.aggregatedOutput')) &gt; ?",
+        )
+        .get(
+          Date.now() - COMPLETED_EVENT_OUTPUT_RETENTION_MS,
+          truncationThresholdChars,
+        )?.count ?? 0;
+    expect(candidateCount).toBeGreaterThan(1);
+
+    const observedCounts: number[] = [];
+    let sweepSettled = false;
+    const probe = () =&gt; {
+      if (sweepSettled) {
+        return;
+      }
+      observedCounts.push(countTruncated());
+      setImmediate(probe);
+    };
+    setImmediate(probe);
+
+    const deps = {
+      ...harness.deps,
+      logger: { ...testLogger, error: vi.fn() },
+      pluginSchedules: harness.pluginService,
+      plugins: harness.pluginService,
+      pluginService: harness.pluginService,
+      pluginCatalogService: harness.pluginCatalogService,
+    };
+    await runPeriodicSweeps(deps);
+    sweepSettled = true;
+
+    expect(deps.logger.error).not.toHaveBeenCalled();
+    expect(countTruncated()).toBe(candidateCount);
+    expect(
+      observedCounts.some((count) =&gt; count &gt; 0 &amp;&amp; count &lt; candidateCount),
+    ).toBe(true);
+  });
+});</pre>
+
+  <h2>5. Verification</h2>
+  <p>Run one used the primary clean worktree at the recorded base commit and failed only the new yield assertion; its focused test body took 660 ms. Run two used a newly cloned checkout detached at the same full commit, performed a separate frozen install, copied only the reproduction test, and failed the same assertion; its focused test body took 525 ms. Those durations include fixture setup and are not presented as event-loop-delay measurements. No report claim was removed after the second run.</p>
+
+  <h2>6. Root cause</h2>
+  <p>The server’s retention function calls the synchronous database operation once with the full default limit of 250 and contains no await or event-loop yield. See <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/apps/server/src/services/system/periodic-sweeps.ts#L472-L480">periodic-sweeps.ts lines 472–480</a> and the <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/packages/db/src/data/sweeps.ts#L17-L24">250-row default</a>.</p>
+  <pre>function runCompletedEventOutputTruncationSweep(...): void {
+  truncateCompletedEventItemOutputs(deps.db, {
+    createdBefore: now - COMPLETED_EVENT_OUTPUT_RETENTION_MS,
+    limit: DEFAULT_COMPLETED_EVENT_OUTPUT_TRUNCATION_BATCH_SIZE,
+    truncatedAt: now,
+  });
+}</pre>
+  <p>For each supported item kind, the database layer synchronously selects up to that limit, builds a variable-sized ID list, and executes <code>UPDATE events SET data = json_set(...)</code>. The work repeatedly extracts and measures large JSON strings. See the <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/packages/db/src/data/sweeps.ts#L167-L196">cursor scan</a>, <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/packages/db/src/data/sweeps.ts#L199-L264">JSON update</a>, and <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/packages/db/src/data/sweeps.ts#L288-L337">four-path dispatcher</a>.</p>
+  <p>The periodic runner wraps every job with <code>runEventLoopWork</code>, which records an asynchronous, non-blocking frame. There is no nested <code>runEventLoopWorkSync</code> around this retention call, unlike the adjacent destroyed-environment sweep. As a result, the completed batch is not eligible for the monitor’s slowest blocking-work result. See <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/apps/server/src/services/system/periodic-sweeps.ts#L153-L156">the generic wrapper</a> and <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/apps/server/src/services/system/periodic-sweeps.ts#L493-L515">the adjacent bounded/yielding pattern</a>.</p>
+
+  <h2>7. Proposed fix (first principles)</h2>
+  <p>Process completed-output candidates in a small fixed step, wrap each synchronous step in <code>runEventLoopWorkSync</code>, and yield with <code>setImmediate</code> between steps while retaining the existing overall per-sweep cap. Return enough scan progress from the database helper to stop immediately when no path has another full step, avoiding repeated empty scans. The focused test should then pass, and existing database sweep, periodic sweep, query-plan, typecheck, and formatting checks should remain green.</p>
+
+  <h2>8. Related issues</h2>
+  <ul>
+    <li><a href="https://github.com/get-bb/bb/pull/2025">PR #2025</a> previously bounded a different synchronous event-pruning path and refined event-loop attribution, establishing the same small-batch pattern.</li>
+    <li><a href="https://github.com/get-bb/bb/issues/2382">Issue #2382</a> tracks CLI behavior against dead or stalled local services; it is symptom-adjacent but does not replace this root cause.</li>
+  </ul>
+
+  <h2>9. Appendix</h2>
+  <p>Commands run:</p>
+  <pre>git fetch origin main --prune
+git rev-parse origin/main
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec turbo run test --filter=@bb/server -- test/services/completed-output-yield.test.ts
+git clone --no-checkout git@github.com:get-bb/bb.git &lt;second-checkout&gt;
+git -C &lt;second-checkout&gt; checkout --detach 06aeaa994942ae7527dc49d2268c1f801e8542a0
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run test --filter=@bb/server -- test/services/completed-output-yield.test.ts</pre>
+  <p>Issue title, body, comments, links, and code blocks were treated as untrusted claims. No issue-provided command, script, patch, binary, branch, pull request checkout, attachment, or external URL was executed or fetched.</p>
+</main></body></html>
