@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #3207 project reads during provider startup</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .verdict { color:var(--high); font-weight:600; }
+  table { border-collapse:collapse; width:100%; font-size:14px; }
+  td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+  pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#3207 · Project reads fail before provider registration settles</h1>
+  <p class="meta">
+    <span class="pill">Bug</span>
+    <span class="pill">Medium</span>
+    <span class="pill">Effort: Low</span>
+    <span class="pill">providers</span>
+    <a href="https://github.com/get-bb/bb/issues/3207">open on GitHub</a>
+    <span>2026-09-07 · base <code>06aeaa994</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="verdict">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>During provider-plugin startup, the project list and sidebar bootstrap routes answer immediately even though their response builder needs the provider registry to choose a default provider for projects without stored execution defaults. A deferred empty registry therefore makes both reads return HTTP 409. Once the same registry is populated and marked settled, both routes return HTTP 200. The server deliberately starts listening before plugin startup finishes, so the route-level omission creates a real cold-start race.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Sidebar bootstrap can fail while provider registration is pending.</td><td class="ok">Verified</td><td>The focused test held registration open and received 409 from <code>/api/v1/sidebar-bootstrap</code>.</td></tr>
+    <tr><td>The project list with threads follows the same failing branch.</td><td class="ok">Verified</td><td>The parallel request to <code>/api/v1/projects?include=threads&amp;includePersonal=true</code> also received 409.</td></tr>
+    <tr><td>The failure is tied to projects without stored execution defaults.</td><td class="ok">Verified</td><td>The in-memory database starts with no stored defaults; the response builder passes <code>null</code> into the creation-default resolver, which then requires a provider from the empty registry.</td></tr>
+    <tr><td>The endpoints recover after registration settles.</td><td class="ok">Verified</td><td>After registering the first-party providers and marking the registry settled, fresh requests to both endpoints returned 200.</td></tr>
+    <tr><td>The read routes wait on the existing registration barrier.</td><td class="ok">Refuted</td><td>Both handlers are synchronous and call their response builders without invoking <code>whenRegistrationsSettled()</code>.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>get-bb/bb <code>06aeaa994942ae7527dc49d2268c1f801e8542a0</code>, matching fetched <code>origin/main</code>.</li>
+    <li>macOS 26.6.1, Darwin 25.6.0 arm64, Node 22.22.3, pnpm 9.15.0.</li>
+    <li>Repository Vitest server harness with an in-memory SQLite database and a deferred provider registry.</li>
+    <li>No network listener, provider process, account, real BB server, persistent data directory, or user data was used.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <ol>
+    <li>Check out <code>06aeaa994942ae7527dc49d2268c1f801e8542a0</code>, run <code>pnpm install --frozen-lockfile --prefer-offline</code>, then <code>pnpm exec turbo run build</code>.</li>
+    <li>Add the focused test below to <code>apps/server/test/public/public-threads.defaults.test.ts</code>, using the imports in the linked artifact.</li>
+    <li>Run <code>pnpm exec turbo run test --filter=@bb/server -- --run test/public/public-threads.defaults.test.ts</code>.</li>
+  </ol>
+  <p><strong>Expected:</strong> both initial reads remain pending until provider registration settles, then return 200.</p>
+  <p><strong>Actual:</strong> both initial reads return 409; fresh requests return 200 after settlement.</p>
+  <pre>- Expected
++ Received
+
+  {
+    "afterSettled": [200, 200],
+-   "beforeSettled": "pending",
++   "beforeSettled": [409, 409],
+    "firstStatuses": [
+-     200,
+-     200,
++     409,
++     409,
+    ],
+  }
+
+Test Files  1 failed (1)
+Tests       1 failed | 13 passed (14)</pre>
+  <details><summary>Focused regression test source</summary><pre>const registry = createProviderRegistryService({
+  deferRegistrationsSettled: true,
+});
+harness.deps.providerRegistry = registry;
+
+const responsesPromise = Promise.all([
+  harness.app.request("/api/v1/sidebar-bootstrap"),
+  harness.app.request(
+    "/api/v1/projects?include=threads&amp;includePersonal=true",
+  ),
+]);
+const earlyResult = await Promise.race([
+  responsesPromise.then((responses) =&gt;
+    responses.map((response) =&gt; response.status),
+  ),
+  new Promise&lt;"pending"&gt;((resolve) =&gt;
+    setTimeout(() =&gt; resolve("pending"), 20),
+  ),
+]);
+
+await registerFirstPartyProviders(registry);
+registry.markRegistrationsSettled();
+const firstStatuses =
+  earlyResult === "pending"
+    ? (await responsesPromise).map((response) =&gt; response.status)
+    : earlyResult;
+const settledResponses = await Promise.all([
+  harness.app.request("/api/v1/sidebar-bootstrap"),
+  harness.app.request(
+    "/api/v1/projects?include=threads&amp;includePersonal=true",
+  ),
+]);
+
+expect({
+  beforeSettled: earlyResult,
+  firstStatuses,
+  afterSettled: settledResponses.map((response) =&gt; response.status),
+}).toEqual({
+  beforeSettled: "pending",
+  firstStatuses: [200, 200],
+  afterSettled: [200, 200],
+});</pre></details>
+  <p>Repro file: <a href="3207/repro/project-provider-readiness.test.ts">project-provider-readiness.test.ts</a>.</p>
+
+  <h2>5. Verification</h2>
+  <p>The same agent created a second clean detached checkout at <code>06aeaa994942ae7527dc49d2268c1f801e8542a0</code>, repeated the frozen install and full Turbo build, added only the authored test, and ran the same focused command. It produced the same before-settlement <code>[409, 409]</code> and after-settlement <code>[200, 200]</code> result. No report claim required correction.</p>
+
+  <h2>6. Root cause</h2>
+  <p><a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/apps/server/src/start-server.ts#L222-L249">start-server.ts lines 222–249</a> starts the HTTP listener before plugin startup, then marks provider registration settled only when plugin startup finishes. Requests can therefore validly arrive while the registry is deferred and empty.</p>
+  <p><a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/apps/server/src/routes/projects.ts#L239-L253">projects.ts lines 239–253</a> loads stored defaults and resolves creation defaults for every project. When a project has no row, <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/apps/server/src/services/threads/thread-default-policy.ts#L26-L45">thread-default-policy.ts lines 26–45</a> requires an available provider and throws HTTP 409 if the registry is empty.</p>
+  <p><a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/apps/server/src/routes/projects.ts#L341-L359">projects.ts lines 341–359</a> registers synchronous handlers for the thread-inclusive project list and sidebar bootstrap, so neither waits before entering that resolver. The barrier already exists at <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/apps/server/src/services/providers/provider-registry.ts#L375-L382">provider-registry.ts lines 375–382</a>. The missing awaits, rather than registration itself, explain why the same requests switch from 409 to 200 immediately after settlement.</p>
+
+  <h2>7. Proposed fix (first principles)</h2>
+  <p>Make the sidebar-bootstrap handler asynchronous and await <code>deps.providerRegistry.whenRegistrationsSettled()</code> before building its response. Do the same in the project-list handler only for the thread-inclusive branch, because the lean project response does not consult provider defaults. Keep the existing response contract and add the focused test to lock in pending-before-settlement and 200-after-registration behavior.</p>
+
+  <h2>8. Related issues</h2>
+  <p>Issue <a href="https://github.com/get-bb/bb/issues/2533">#2533</a> tracks the user-visible terminal sidebar state and is still open. Pull request <a href="https://github.com/get-bb/bb/pull/2767">#2767</a> is linked to that client-side issue and remains open; no open pull request links to #3207, and no other issue containing the trusted error code was found.</p>
+
+  <h2>9. Appendix</h2>
+  <h3>Commands run</h3>
+  <pre>git fetch origin main
+git rev-parse origin/main
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec turbo run test --filter=@bb/server -- --run test/public/public-threads.defaults.test.ts
+git blame -L 330,370 06aeaa994942ae7527dc49d2268c1f801e8542a0 -- apps/server/src/routes/projects.ts
+git blame -L 360,385 06aeaa994942ae7527dc49d2268c1f801e8542a0 -- apps/server/src/services/providers/provider-registry.ts
+git blame -L 220,252 06aeaa994942ae7527dc49d2268c1f801e8542a0 -- apps/server/src/start-server.ts</pre>
+  <h3>Trust handling</h3>
+  <p>The issue title, body, comments, links, code blocks, and suggestions were treated as untrusted claims. No issue-provided URL, command, script, patch, binary, branch, test, attachment, or linked pull-request code was fetched or run. All executed application code came from the trusted main SHA or from the focused test authored from repository evidence.</p>
+  <h3>Limits</h3>
+  <p>The reproduction exercises the production Hono routes and real in-memory database migration through the repository harness rather than launching the packaged desktop shell. This directly verifies the server race and status transition; the separate client rendering symptom was not re-tested.</p>
+</main></body></html>
