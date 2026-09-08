@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #3233 Concurrent workspace finalization exposes database constraint text</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  table { border-collapse:collapse; width:100%; font-size:14px; }
+  td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+  pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#3233 · Concurrent workspace finalization exposes database constraint text</h1>
+  <p class="meta">
+    <span class="pill">Bug</span>
+    <span class="pill high">Medium</span>
+    <span class="pill">Effort: Medium</span>
+    <span class="pill">workspaces</span>
+    <span class="pill">host</span>
+    <a href="https://github.com/get-bb/bb/issues/3233">open on GitHub</a>
+    <span>2026-09-07 · base <code>06aeaa9</code></span>
+  </p>
+  <p><strong>Verdict:</strong> <span class="ok">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high</p>
+
+  <h2>1. TL;DR</h2>
+  <p>Two unmanaged thread starts can create separate provisioning environment rows for one project, host, and requested directory because the rows have no stored path yet. When both successful host results later report that directory, the first update succeeds and the second violates the database uniqueness index. The success-settlement exception is then converted into a provisioning failure whose detail uses the exception message verbatim, exposing internal SQLite text to the thread. An isolated regression test reproduced the behavior twice at the trusted base commit without a live host or provider.</p>
+
+  <h2>2. Claims vs findings</h2>
+  <table>
+    <tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+    <tr><td>Two pending unmanaged provisions can target one directory.</td><td class="ok">Verified</td><td>Two back-to-back starts produced distinct environment IDs, both with a null stored path, while their commands carried the same requested path.</td></tr>
+    <tr><td>The later successful result exposes a raw uniqueness error.</td><td class="ok">Verified</td><td>Both clean runs stored a <code>system/error</code> detail equal to SQLite's three-column uniqueness failure instead of the expected stable message.</td></tr>
+    <tr><td>The database is corrupted.</td><td class="ok">Refuted</td><td>The index worked as designed: the first environment retained the path, while the second path update rolled back and its environment transitioned to error.</td></tr>
+    <tr><td>A host disconnect is required to trigger the defect.</td><td>Unverified</td><td>The reported disconnect timing was not repeated. The underlying race reproduced deterministically by holding two host results pending, so connectivity is one possible choreography rather than part of the failing invariant.</td></tr>
+    <tr><td>An agent or provider causes the failure.</td><td class="ok">Refuted</td><td>The test fails during environment-result settlement before any provider start is needed.</td></tr>
+  </table>
+
+  <h2>3. Environment</h2>
+  <ul>
+    <li>Trusted bb commit: <code>06aeaa994942ae7527dc49d2268c1f801e8542a0</code> from <code>origin/main</code>.</li>
+    <li>macOS 26.6.1 (25G76), Apple Silicon; Node.js v22.22.3; pnpm lockfile frozen.</li>
+    <li>Full Turbo build: 20 tasks successful.</li>
+    <li>Isolated in-memory SQLite test harness; no server ports or persistent data directory.</li>
+    <li>No provider used or queried.</li>
+  </ul>
+
+  <h2>4. Minimal reproduction</h2>
+  <ol>
+    <li>At the trusted commit, save the following test as <code>apps/server/test/environments/environment-provisioning-race.test.ts</code>.</li>
+    <li>Run:
+      <pre>pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run test --filter=@bb/server -- test/environments/environment-provisioning-race.test.ts</pre>
+    </li>
+    <li>The test creates two threads before either captured host command settles, verifies both environments are distinct and pathless, then returns the same discovered path for both.</li>
+  </ol>
+  <pre>import { getEnvironment, listEvents } from "@bb/db";
+import { systemErrorEventDataSchema } from "@bb/domain";
+import { describe, expect, it } from "vitest";
+import { createThreadFromRequest } from "../../src/services/threads/thread-create.js";
+import {
+  reportQueuedCommandSuccess,
+  waitForQueuedCommand,
+} from "../helpers/commands.js";
+import { textInput } from "../helpers/prompt-input.js";
+import {
+  seedHostSession,
+  seedProjectWithSource,
+} from "../helpers/seed.js";
+import { withTestHarness } from "../helpers/test-app.js";
+
+describe("concurrent unmanaged environment provisioning", () => {
+  it("reports a stable error when both provisions resolve to the same path", async () => {
+    await withTestHarness(async (harness) => {
+      const { host } = seedHostSession(harness.deps, {
+        id: "host-concurrent-unmanaged-path",
+      });
+      const { project } = seedProjectWithSource(harness.deps, {
+        hostId: host.id,
+        path: "/tmp/concurrent-unmanaged-project",
+      });
+      const createThread = (input: string) =>
+        createThreadFromRequest(harness.deps, {
+          startedOnBehalfOf: null,
+          environment: {
+            type: "host",
+            hostId: host.id,
+            workspace: {
+              type: "unmanaged",
+              path: "/tmp/concurrent-unmanaged-workspace",
+            },
+          },
+          input: textInput(input),
+          origin: "cli",
+          projectId: project.id,
+          providerId: "codex",
+        });
+
+      const firstThread = await createThread("first concurrent provision");
+      const secondThread = await createThread("second concurrent provision");
+      const firstProvision = await waitForQueuedCommand(
+        harness,
+        ({ command }) =>
+          command.type === "environment.provision" &amp;&amp;
+          command.initiator?.threadId === firstThread.id,
+      );
+      const secondProvision = await waitForQueuedCommand(
+        harness,
+        ({ command }) =>
+          command.type === "environment.provision" &amp;&amp;
+          command.initiator?.threadId === secondThread.id,
+      );
+      if (
+        firstProvision.command.type !== "environment.provision" ||
+        secondProvision.command.type !== "environment.provision"
+      ) {
+        throw new Error("Expected environment provision commands");
+      }
+      expect(firstProvision.command.environmentId).not.toBe(
+        secondProvision.command.environmentId,
+      );
+      expect(
+        getEnvironment(harness.db, firstProvision.command.environmentId)?.path,
+      ).toBeNull();
+      expect(
+        getEnvironment(harness.db, secondProvision.command.environmentId)?.path,
+      ).toBeNull();
+
+      const result = {
+        path: "/tmp/concurrent-unmanaged-workspace",
+        isGitRepo: true,
+        isWorktree: false,
+        branchName: "main",
+        defaultBranch: "main",
+        transcript: [],
+      };
+      await reportQueuedCommandSuccess(harness, firstProvision, result);
+      await reportQueuedCommandSuccess(harness, secondProvision, result);
+
+      const secondError = listEvents(harness.db, {
+        threadId: secondThread.id,
+      }).find((event) => event.type === "system/error");
+      expect(secondError).toBeDefined();
+      expect(
+        systemErrorEventDataSchema.parse(JSON.parse(secondError?.data ?? "{}")),
+      ).toMatchObject({
+        code: "thread_provisioning_failed",
+        message: "Provisioning thread failed",
+        detail: "Workspace path is already attached to another environment",
+      });
+    });
+  });
+});</pre>
+  <pre>Expected detail:
+Workspace path is already attached to another environment
+
+Actual detail:
+UNIQUE constraint failed: environments.project_id, environments.host_id, environments.path
+
+Result:
+1 failed (1)</pre>
+  <h3>Verification</h3>
+  <p>The first run used the task worktree at the recorded base commit and failed at the stable-detail assertion. A second clean detached checkout at the same full commit repeated the same command with a fresh in-memory database and failed at the same assertion with the same actual detail. No report claim changed after the second run.</p>
+
+  <h2>5. Root cause</h2>
+  <p>Thread placement only reuses an environment when a concrete project/host/path lookup already finds one; otherwise it creates a direct unmanaged intent. See <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/apps/server/src/services/threads/thread-create.ts#L368-L390">thread-create.ts lines 368–390</a>.</p>
+  <p>The direct unmanaged plan puts the requested path into the host command but omits it from the newly created environment row, leaving the database path null until the host responds. See <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/apps/server/src/services/threads/thread-provisioning-environment.ts#L756-L790">thread-provisioning-environment.ts lines 756–790</a>.</p>
+  <pre>environmentInput: {
+  projectId: args.thread.projectId,
+  hostId: args.intent.hostId,
+  managed: false,
+  workspaceProvisionType: "unmanaged",
+  status: "provisioning",
+}
+...
+path: args.intent.path</pre>
+  <p>SQLite therefore permits both pending rows because null values do not collide in the unique project/host/path index. The index is defined at <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/packages/db/src/schema.ts#L469-L474">schema.ts lines 469–474</a>.</p>
+  <p>On success, settlement writes the discovered path directly through a generic metadata update. Neither layer recognizes this specific index conflict. See <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/apps/server/src/services/environments/environment-provisioning-internal.ts#L588-L605">environment-provisioning-internal.ts lines 588–605</a> and <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/packages/db/src/data/environments.ts#L232-L257">environments.ts lines 232–257</a>.</p>
+  <p>Finally, the live-command wrapper turns the settlement exception into a failure report using <code>error.message</code>, and provisioning failure persistence copies that string into the thread's <code>system/error</code> detail. See <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/apps/server/src/services/hosts/live-command.ts#L136-L148">live-command.ts lines 136–148</a>, <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/apps/server/src/services/hosts/live-command.ts#L207-L246">lines 207–246</a>, and <a href="https://github.com/get-bb/bb/blob/06aeaa994942ae7527dc49d2268c1f801e8542a0/apps/server/src/services/environments/environment-provisioning-internal.ts#L538-L546">environment-provisioning-internal.ts lines 538–546</a>. That unhandled translation boundary is why database implementation text becomes user-visible.</p>
+
+  <h2>6. Proposed fix (first principles)</h2>
+  <p>At environment provisioning settlement, catch only the named project/host/path uniqueness conflict and translate it to an existing server-domain conflict with a stable message. Let the existing failure settlement mark the losing environment and thread as error. This removes database text without changing schema, protocol, or ownership policy. Reattaching the losing thread to the winning environment would require a separate lifecycle decision and is not necessary for the minimal safe fix.</p>
+
+  <h2>7. Related issues</h2>
+  <p>No linked open pull request or matching tracked issue was found. Nearby workspace issues use the same <code>workspaces</code> and <code>host</code> area labels but do not cover this settlement conflict.</p>
+
+  <h2>8. Appendix</h2>
+  <p>Issue content, comments, links, and quoted data were treated as untrusted evidence. No issue-supplied command, URL, branch, script, or artifact was executed.</p>
+  <h3>Commands</h3>
+  <pre>git fetch origin main
+git rev-parse origin/main
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec turbo run test --filter=@bb/server -- test/environments/environment-provisioning.test.ts
+git worktree add --detach &lt;clean-checkout&gt; 06aeaa994942ae7527dc49d2268c1f801e8542a0
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run test --filter=@bb/server -- test/environments/environment-provisioning.test.ts</pre>
+  <h3>Observed test diff</h3>
+  <pre>- "detail": "Workspace path is already attached to another environment"
++ "detail": "UNIQUE constraint failed: environments.project_id, environments.host_id, environments.path"</pre>
+</main></body></html>
