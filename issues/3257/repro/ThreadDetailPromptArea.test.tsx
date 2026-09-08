@@ -797,7 +797,7 @@ describe("ThreadDetailPromptArea", () => {
       permissionMode: "auto",
       reasoningLevel: "max",
       serviceTier: "default",
-      source: "thread/override",
+      source: "client/turn/requested",
     };
 
     renderPromptArea();
