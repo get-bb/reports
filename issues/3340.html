@@ -1,0 +1,177 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>#3340 · Restart and diagnostic failures</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main><h1>#3340 · Unbounded restart retries and non-atomic diagnostics</h1>
+<p class="meta">Bug · High priority · Medium effort · host · cli · 2026-09-09<br>Trusted origin/main: <code>e13605d71e261d863e907801987f7df9d6a6243b</code><br><a href="https://github.com/get-bb/bb/issues/3340">GitHub issue</a></p>
+<p><strong>Verdict: PARTIALLY REPRODUCED</strong> · Root-cause confidence: <strong>high</strong></p>
+<h2>1. TL;DR</h2>
+<p>A managed child that exits after startup can enter a restart loop whose failures have no attempt budget and always request a one-second delay. Diagnostic reports are written directly to their final JSON filenames with no retention or cleanup after a failed write. Two clean-checkout source-function probes each reached our 32-attempt safety stop, retained all 32 successful reports, and left 32 empty JSON files under an injected storage-write failure. A real disk-full incident and Linux systemd behavior were not replayed. The server already preserves its original startup error on stderr when diagnostic writing throws.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Failed managed restarts continue without backoff or a limit</td><td>Verified at source-function level</td><td>32 attempts; every requested delay 1000 ms; only the probe's shutdown flag terminates the loop.</td></tr>
+<tr><td>Storage write failures accumulate empty JSON reports</td><td>Verified with fault injection</td><td>Open/truncate succeeds, then injected ENOSPC throws before content is written: 32 of 32 files remain empty.</td></tr>
+<tr><td>Diagnostic history is unbounded</td><td>Verified</td><td>32 successful writes leave 32 reports; source has no pruning.</td></tr>
+<tr><td>Original startup evidence must survive diagnostic failure</td><td>Already supported by server handler</td><td>Injected diagnostic error still produces original stderr text and exit code 1.</td></tr>
+<tr><td>Any initial startup failure loops inside the launcher</td><td>Not supported on this base</td><td>Initial startServer failure is caught and exits with code 1. A Restart=always service can restart that supervisor externally. The internal unlimited loop is reached after a previously running child exits.</td></tr>
+<tr><td>Incident counts, real ENOSPC, and systemd terminal-state handling</td><td>Unverified</td><td>No Linux service manager or full filesystem was exercised.</td></tr></table>
+<h2>3. Environment</h2>
+<p>Darwin arm64; Node v22.22.3. Two detached, clean worktrees at the exact commit above, named first and second inside a newly created temporary work directory. No provider, database, listening port, imported store, live core, or user runtime data was used. Each probe creates and removes its own new temporary filesystem directory. The probe uses only Node built-ins and unchanged source functions, with TypeScript annotations stripped by Node.</p>
+<p>Full install/build status is recorded in the appendix. These probes do not depend on a successful monorepo build, and no existing-suite pass is claimed.</p>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Fetch trusted main and create two detached worktrees at the recorded commit.</li>
+<li>Save <a href="3340/repro/probe.mjs">probe.mjs</a> outside both checkouts.</li>
+<li>Run the probe in each checkout as below. It exits 1 when the four safety expectations fail. No disk needs to be filled.</li></ol>
+<pre>git fetch origin main
+git worktree add --detach /tmp/bb-3340-first e13605d71e261d863e907801987f7df9d6a6243b
+git worktree add --detach /tmp/bb-3340-second e13605d71e261d863e907801987f7df9d6a6243b
+node --disable-warning=ExperimentalWarning probe.mjs /tmp/bb-3340-first
+node --disable-warning=ExperimentalWarning probe.mjs /tmp/bb-3340-second</pre>
+<p>Expected: a finite retry budget before the probe safety stop, an increasing delay, removal of older reports, and no final JSON after a failed write. The 32-attempt boundary is a test safety limit, not a proposed product policy. Actual output from both runs:</p><pre>{&quot;attempts&quot;:32,&quot;delays&quot;:[1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000],&quot;safetyStop&quot;:true,&quot;result&quot;:null}
+FAIL repeated failures stop before the 32-attempt safety limit: Expected values to be strictly equal:
+
+true !== false
+
+FAIL retry delay increases: The expression evaluated to a falsy value:
+
+  assert.ok(new Set(delays).size &gt; 1)
+
+{&quot;successfulWrites&quot;:32,&quot;retained&quot;:32}
+FAIL retention removes older reports: The expression evaluated to a falsy value:
+
+  assert.ok(retained &lt; 32)
+
+{&quot;stderr&quot;:[&quot;Error: controlled startup failure\n&quot;],&quot;exitCode&quot;:1}
+PASS startup evidence survives diagnostic write failure
+{&quot;failedWrites&quot;:32,&quot;published&quot;:32,&quot;empty&quot;:32}
+FAIL failed writes leave no published JSON files: Expected values to be strictly equal:
+
+32 !== 0
+
+Failed safety assertions: 4
+</pre>
+<p>The probe slices the exact named functions out of trusted source and executes them in a VM. Retry starts, delays, and cosmetic logging are controlled. Diagnostic writes use a real temporary directory; the ENOSPC case deliberately creates a real empty file and then throws at the write boundary. This isolates the cleanup defect without claiming to reproduce kernel-level ENOSPC. Database access is neither used nor mocked.</p>
+<h3>Complete reproduction source</h3><pre>import assert from &#x27;node:assert/strict&#x27;;
+import * as fs from &#x27;node:fs&#x27;;
+import { tmpdir } from &#x27;node:os&#x27;;
+import { join, resolve } from &#x27;node:path&#x27;;
+import { randomUUID } from &#x27;node:crypto&#x27;;
+import { stripTypeScriptTypes } from &#x27;node:module&#x27;;
+import { runInNewContext } from &#x27;node:vm&#x27;;
+
+const root = resolve(process.argv[2] ?? &#x27;.&#x27;);
+const scratch = fs.mkdtempSync(join(tmpdir(), &#x27;bb-3340-probe-&#x27;));
+const launcher = fs.readFileSync(join(root, &#x27;packages/bb-app/src/launcher.ts&#x27;), &#x27;utf8&#x27;);
+const utilities = fs.readFileSync(join(root, &#x27;packages/process-utils/src/index.ts&#x27;), &#x27;utf8&#x27;);
+const restartSource = launcher.slice(launcher.indexOf(&#x27;async function restartManagedProcess(&#x27;), launcher.indexOf(&#x27;export async function terminateManagedFullStackProcesses(&#x27;));
+assert.ok(restartSource.length &gt; 100);
+const retryConstant = launcher.match(/const MANAGED_PROCESS_RESTART_RETRY_DELAY_MS = [\d_]+;/)?.[0];
+assert.ok(retryConstant);
+const restart = runInNewContext(stripTypeScriptTypes(`${retryConstant}\n${restartSource}\nrestartManagedProcess`), {
+  beginStep() {}, endStep() {}, logManagedProcessStartupFailureContext() {},
+  formatManagedProcessLabel: x =&gt; x, formatManagedProcessName: x =&gt; x,
+  green: x =&gt; x, red: x =&gt; x,
+});
+const diagnosticSource = utilities.slice(utilities.indexOf(&#x27;function createCurrentDiagnosticDate(&#x27;), utilities.indexOf(&#x27;export function installSafeProcessDiagnostics(&#x27;)).replace(&#x27;export function &#x27;, &#x27;function &#x27;);
+assert.ok(diagnosticSource.length &gt; 100);
+const constants = utilities.match(/const MAX_DIAGNOSTIC_[A-Z_]+ = \d+;/g).join(&#x27;\n&#x27;);
+function diagnosticWriter(writeFileSync) {
+  return runInNewContext(stripTypeScriptTypes(`${constants}\n${diagnosticSource}\nwriteSafeProcessDiagnosticReport`), {
+    mkdirSync: fs.mkdirSync, writeFileSync, join, randomUUID, process, Error, AggregateError,
+  });
+}
+let failures = 0;
+function check(name, test) {
+  try { test(); console.log(`PASS ${name}`); }
+  catch (error) { failures++; console.log(`FAIL ${name}: ${error.message}`); }
+}
+try {
+  let attempts = 0;
+  let safetyStop = false;
+  const delays = [];
+  const result = await restart({
+    context: {}, processName: &#x27;server&#x27;, isShutdownRequested: () =&gt; safetyStop,
+    start: async () =&gt; { attempts++; throw new Error(&#x27;controlled startup failure&#x27;); },
+    delayMilliseconds: async ({ms}) =&gt; { delays.push(ms); if (attempts === 32) safetyStop = true; },
+  });
+  console.log(JSON.stringify({attempts, delays, safetyStop, result}));
+  check(&#x27;repeated failures stop before the 32-attempt safety limit&#x27;, () =&gt; assert.equal(safetyStop, false));
+  check(&#x27;retry delay increases&#x27;, () =&gt; assert.ok(new Set(delays).size &gt; 1));
+  const normalDir = join(scratch, &#x27;normal&#x27;);
+  const writer = diagnosticWriter(fs.writeFileSync);
+  for (let i = 0; i &lt; 32; i++) writer({ logsDir: normalDir, processName: &#x27;server&#x27;, kind: &#x27;startupFailure&#x27;, error: new Error(&#x27;controlled startup failure&#x27;) });
+  const retained = fs.readdirSync(normalDir).length;
+  console.log(JSON.stringify({successfulWrites: 32, retained}));
+  check(&#x27;retention removes older reports&#x27;, () =&gt; assert.ok(retained &lt; 32));
+  const server = fs.readFileSync(join(root, &#x27;apps/server/src/index.ts&#x27;), &#x27;utf8&#x27;);
+  const startupSource = server.slice(server.indexOf(&#x27;function reportStartupFailure(&#x27;), server.indexOf(&#x27;async function main(&#x27;));
+  const stderr = [];
+  const fakeProcess = {stderr: {write: value =&gt; stderr.push(value)}, exitCode: undefined};
+  const reportFailure = runInNewContext(stripTypeScriptTypes(`${startupSource}\nreportStartupFailure`), {
+    writeSafeProcessDiagnosticReport() { throw new Error(&#x27;controlled diagnostic failure&#x27;); },
+    diagnosticsLogsDir: scratch, process: fakeProcess, Error,
+  });
+  const startupError = new Error(&#x27;controlled startup failure&#x27;);
+  startupError.stack = &#x27;Error: controlled startup failure&#x27;;
+  reportFailure(startupError);
+  console.log(JSON.stringify({stderr, exitCode: fakeProcess.exitCode}));
+  check(&#x27;startup evidence survives diagnostic write failure&#x27;, () =&gt; {
+    assert.deepEqual(stderr, [&#x27;Error: controlled startup failure\n&#x27;]);
+    assert.equal(fakeProcess.exitCode, 1);
+  });
+  const failingDir = join(scratch, &#x27;write-failure&#x27;);
+  const failedWriter = diagnosticWriter((path) =&gt; {
+    fs.closeSync(fs.openSync(path, &#x27;w&#x27;));
+    throw Object.assign(new Error(&#x27;controlled storage write failure&#x27;), {code: &#x27;ENOSPC&#x27;});
+  });
+  for (let i = 0; i &lt; 32; i++) {
+    assert.throws(() =&gt; failedWriter({ logsDir: failingDir, processName: &#x27;server&#x27;, kind: &#x27;startupFailure&#x27;, error: new Error(&#x27;controlled startup failure&#x27;) }), {code: &#x27;ENOSPC&#x27;});
+  }
+  const published = fs.readdirSync(failingDir);
+  const empty = published.filter(name =&gt; fs.statSync(join(failingDir, name)).size === 0).length;
+  console.log(JSON.stringify({failedWrites: 32, published: published.length, empty}));
+  check(&#x27;failed writes leave no published JSON files&#x27;, () =&gt; assert.equal(published.filter(name =&gt; name.endsWith(&#x27;.json&#x27;)).length, 0));
+} finally {
+  fs.rmSync(scratch, {recursive: true, force: true});
+}
+console.log(`Failed safety assertions: ${failures}`);
+process.exitCode = failures ? 1 : 0;
+</pre>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/e13605d71e261d863e907801987f7df9d6a6243b/packages/bb-app/src/launcher.ts#L3122">restartManagedProcess</a> loops only on the shutdown flag. Its catch block neither counts failures nor distinguishes unrecoverable failures; it requests the <a href="https://github.com/get-bb/bb/blob/e13605d71e261d863e907801987f7df9d6a6243b/packages/bb-app/src/launcher.ts#L82">constant 1000 ms delay</a> each time. <a href="https://github.com/get-bb/bb/blob/e13605d71e261d863e907801987f7df9d6a6243b/packages/bb-app/src/launcher.ts#L3222">The supervisor invokes this loop after a server exit</a>. A finite probe cannot prove infinite execution by itself; the unbounded loop condition and absence of a failure budget establish why continued failures keep retrying.</p>
+<pre>while (!args.isShutdownRequested()) {
+  ...
+  await args.delayMilliseconds({
+    ms: MANAGED_PROCESS_RESTART_RETRY_DELAY_MS,
+  });
+}</pre>
+<p><a href="https://github.com/get-bb/bb/blob/e13605d71e261d863e907801987f7df9d6a6243b/packages/process-utils/src/index.ts#L566">writeSafeProcessDiagnosticReport</a> assigns a unique final filename then calls writeFileSync directly at line 596. It has no temporary publication path, failed-write cleanup, or retention. If opening the final file succeeds but writing its contents fails, the empty file remains; the next report uses a new name.</p>
+<p><a href="https://github.com/get-bb/bb/blob/e13605d71e261d863e907801987f7df9d6a6243b/apps/server/src/index.ts#L16">reportStartupFailure</a> catches diagnostic errors and then writes the original exception to stderr. This behavior passed our controlled test. <a href="https://github.com/get-bb/bb/blob/e13605d71e261d863e907801987f7df9d6a6243b/packages/bb-app/src/launcher.ts#L3507">Initial server startup failure</a> sets exit code 1 and shuts down rather than entering the managed restart loop. An external supervisor configured to restart every exit is a separate source of repeated initial-start attempts.</p>
+<h2>6. Proposed fix</h2>
+<p>Track consecutive failed starts per managed child, increase retry delays up to a cap, and terminate with a documented failure state after a finite budget. Reset the budget only after meaningful healthy runtime. Bound diagnostics per process and kind, write to a temporary file, publish by rename, and remove incomplete writes on failure. Preserve original stderr evidence even when storage is unavailable. External service-manager policy must honor the terminal result; an exit code alone does not override Restart=always.</p>
+<h2>7. PR review</h2>
+<p><a href="https://github.com/get-bb/bb/pull/3339">PR #3339</a> is open and explicitly lists #3340 as a closing issue in GitHub metadata. Only its metadata and diff were read, as untrusted data; no branch, test, patch, or build from that PR was executed.</p>
+<p>The diff introduces a finite failure budget, exponential capped delay, a terminal exit code, abortable delays, and diagnostic retention with temporary-file rename and cleanup. These changes address the verified mechanisms by static inspection. Runtime correctness and Linux service-manager integration remain unverified here; the target-repository probes are not tests of that PR. No additional concrete defect was established by this bounded static review. Verdict: relevant existing fix, requires its own runtime validation.</p>
+<p>No new fix PR was created because this open linked PR already covers the issue.</p>
+<h2>8. Related issues</h2>
+<p>The trusted launcher also stops its daemon if another healthy server answers after its child exits. That branch is distinct from repeated failing starts and does not impose a restart budget. Other issues were not reproduced in this investigation.</p>
+<h2>9. Verification</h2>
+<p>The same agent repeated the final probe in the second freshly created detached checkout at the identical base SHA, with a fresh temporary filesystem directory. Both tracked working trees remained unchanged. Both runs produced identical output and exited 1 with four failed safety assertions and one passing stderr assertion. No port was needed. This is a repeat verification by the same agent, not an independent review.</p>
+<p>Report corrections from inspection: initial startup failure exits instead of using the internal retry loop; stderr fallback already exists. The final verdict is limited to source-function reproduction with injected write failure.</p>
+<h2>10. Appendix</h2>
+<p><a href="3340/repro/first.txt">First run output</a> · <a href="3340/repro/second.txt">Second run output</a> · <a href="3340/repro/probe.mjs">Repeatable test</a></p>
+<p>Preparation commands: git fetch origin main; git worktree add --detach at the recorded SHA (twice); pnpm install --frozen-lockfile --prefer-offline; pnpm exec turbo run build. The PATH pnpm entry initially referenced a missing package-manager file; Corepack supplied pinned pnpm 9.15.0. Build outcome: the frozen installs did not finish after package extraction/linking and were stopped. Both explicit build attempts exited 254 with ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL: Command "turbo" not found. No full build or existing-suite success is claimed; the dependency-free probes completed in both clean checkouts.</p>
+<p>Issue text, commands, and linked PR content were treated as untrusted claims. None of their commands or code were executed. No production fix or dependency was added. Probe-created files were removed in finally blocks, and no development service was started.</p>
+</main></body></html>
