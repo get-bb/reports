@@ -1,0 +1,152 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Report · #3407 · Bulk file replies delay daemon heartbeats</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<h1>#3407 · Bulk file replies delay daemon heartbeats</h1>
+<p class="meta">Bug · High priority · Medium effort · host · remote · inline-vis<br>2026-09-10 · Base 1bc80e1d57991fe60a3896e60e0159427194c7bb · <a href="https://github.com/get-bb/bb/issues/3407">GitHub issue</a></p>
+<p><strong>Verdict: PARTIALLY REPRODUCED</strong> · Root-cause confidence: medium (high for the measured transport mechanism; low for attribution of the historical incident).</p>
+<h2>1. TL;DR</h2><p>Two synthetic HTML file responses queued on a bandwidth-limited connection prevented the daemon's application heartbeats from reaching the receiver before its acknowledgement lease expired. The actual main-branch daemon connection logged an acknowledgement timeout and reconnected while megabytes remained queued. The same file transferred successfully on the fast control connection. This reproduces a transport failure mechanism, not the complete production incident: no full preview UI, Tailscale deployment, HTTP 504 response, provider discovery failure, or repeated session replacement cycle was reproduced.</p>
+<h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Preview preparation reads content before its size check.</td><td>Verified statically</td><td>Plugin reads through files.read and then applies its 5 MiB check.</td></tr>
+<tr><td>Bulk replies can delay heartbeats.</td><td>Verified under an imposed bottleneck</td><td>Real WebSocket transport, actual file reader and ServerConnection, two clean checkouts.</td></tr>
+<tr><td>Preview activity caused the reported production outage.</td><td>Unverified</td><td>No incident socket backlog or equivalent production topology available.</td></tr>
+<tr><td>HTTP 504 and other host operations fail together.</td><td>Unverified dynamically</td><td>The server maps RPC timeout to HTTP 504, but this experiment does not run its HTTP or provider services.</td></tr></table>
+<h2>3. Environment</h2><p>Trusted origin/main at the commit above; macOS 26.6.2; Node v22.22.3; repository-pinned pnpm 9.15.0 through Corepack. Both clean worktrees completed frozen dependency installation and Turbo build (20 tasks). No provider, credentials, production data, or real BB instance was used. Each execution allocates fresh loopback ports and a fresh temporary synthetic file directory, then closes all sockets and deletes that directory.</p>
+<h2>4. Minimal reproduction</h2><p>This is a repeatable transport probe, not a full incident reproduction. Download <a href="3407/repro/repro-3407.ts">repro-3407.ts</a> and place it at apps/host-daemon/repro-3407.ts in a clean checkout at the recorded commit.</p>
+<pre>corepack pnpm install --frozen-lockfile --prefer-offline
+corepack pnpm exec turbo run build
+node --conditions=source --import tsx apps/host-daemon/repro-3407.ts</pre>
+<p>Ensure the pnpm executable on PATH works; the initial machine launcher was broken. A temporary Corepack shim fixed the launcher without changing repository dependencies. The probe reads a generated 3,145,743-byte HTML file through readHostFile. It starts the real ServerConnection with a synthetic session registrar and a local WebSocket receiver that acknowledges application heartbeats. After one successful fast transfer and heartbeat, a TCP relay limits daemon-to-receiver traffic to 16 KiB each 250 ms (64 KiB/s) and queues two file replies. The daemon retains its normal 5-second heartbeat interval and 30-second acknowledgement lease.</p>
+<p>Expected resilience: control heartbeats remain responsive while file transfer is slow. Actual: no further heartbeat arrives before acknowledgement timeout, neither slow file reply finishes, and the relay still has approximately 4 MB queued. A subsequent heartbeat can arrive from the replacement connection. The probe exits successfully when this failure mechanism is observed; it is not a passing regression assertion for desired resilience.</p>
+<h3>Probe source</h3><pre>import assert from &#x27;node:assert/strict&#x27;;
+import net from &#x27;node:net&#x27;;
+import { once } from &#x27;node:events&#x27;;
+import { mkdtemp, writeFile, rm } from &#x27;node:fs/promises&#x27;;
+import { tmpdir } from &#x27;node:os&#x27;;
+import path from &#x27;node:path&#x27;;
+import { WebSocketServer } from &#x27;ws&#x27;;
+import { ServerConnection } from &#x27;./src/server-connection.js&#x27;;
+import { readHostFile } from &#x27;./src/command-handlers/host-files.js&#x27;;
+
+const sleep = (ms: number) =&gt; new Promise(resolve =&gt; setTimeout(resolve, ms));
+const dir = await mkdtemp(path.join(tmpdir(), &#x27;bb-3407-data-&#x27;));
+const sockets = new Set&lt;net.Socket&gt;();
+const intervals = new Set&lt;ReturnType&lt;typeof setInterval&gt;&gt;();
+const server = new WebSocketServer({ host: &#x27;127.0.0.1&#x27;, port: 0 });
+await once(server, &#x27;listening&#x27;);
+const address = server.address();
+assert(address &amp;&amp; typeof address !== &#x27;string&#x27;);
+let slow = false;
+let backlog = 0;
+let replies = 0;
+let heartbeats = 0;
+let timeouts = 0;
+let heartbeatsAtTimeout = 0;
+server.on(&#x27;connection&#x27;, ws =&gt; ws.on(&#x27;message&#x27;, data =&gt; {
+  const message = JSON.parse(data.toString());
+  if (message.type === &#x27;heartbeat&#x27;) {
+    heartbeats++;
+    ws.send(JSON.stringify({ type: &#x27;heartbeat-ack&#x27; }));
+  }
+  if (message.type === &#x27;host-rpc.response&#x27;) replies++;
+}));
+const relay = net.createServer(client =&gt; {
+  const upstream = net.connect(address.port, &#x27;127.0.0.1&#x27;);
+  sockets.add(client); sockets.add(upstream);
+  const queue: Buffer[] = [];
+  client.on(&#x27;error&#x27;, () =&gt; {}); upstream.on(&#x27;error&#x27;, () =&gt; {});
+  upstream.pipe(client);
+  client.on(&#x27;data&#x27;, data =&gt; {
+    if (!slow) upstream.write(data);
+    else { queue.push(data); backlog += data.length; }
+  });
+  const timer = setInterval(() =&gt; {
+    let budget = 16384;
+    while (queue.length &amp;&amp; budget &gt; 0) {
+      const chunk = queue[0];
+      const length = Math.min(chunk.length, budget);
+      upstream.write(chunk.subarray(0, length));
+      backlog -= length; budget -= length;
+      if (length === chunk.length) queue.shift();
+      else queue[0] = chunk.subarray(length);
+    }
+  }, 250);
+  intervals.add(timer);
+});
+relay.listen(0, &#x27;127.0.0.1&#x27;);
+await once(relay, &#x27;listening&#x27;);
+const relayAddress = relay.address();
+assert(relayAddress &amp;&amp; typeof relayAddress !== &#x27;string&#x27;);
+const connection = new ServerConnection({
+  serverUrl: `http://127.0.0.1:${relayAddress.port}`, hostKey: &#x27;synthetic-key&#x27;,
+  hostId: &#x27;synthetic-host&#x27;, hostName: &#x27;synthetic-host&#x27;, hostType: &#x27;persistent&#x27;,
+  dataDir: dir, instanceId: &#x27;synthetic-instance&#x27;, localApiPort: null,
+  logger: { debug() {}, info() {}, error() {}, warn(fields, message) {
+    if (message === &#x27;Server heartbeat acknowledgements stopped; reconnecting&#x27;) { timeouts++; heartbeatsAtTimeout = heartbeats; }
+  } },
+  serverClient: {
+    async openSession() { return {
+      heartbeatIntervalMs: 5000, leaseTimeoutMs: 30000, sessionId: &#x27;synthetic-session&#x27;,
+      retiredEnvironmentIds: [], connectShares: { generation: 0, ports: [] },
+      pluginHostGenerations: [], watchSet: { generation: 0, threadStorageTargets: [], workspaceTargets: [] },
+    }; },
+    async fetchProjectAttachment() { throw Error(&#x27;unused&#x27;); },
+    async fetchSkillTree() { throw Error(&#x27;unused&#x27;); },
+    async fetchPluginHostArtifact() { throw Error(&#x27;unused&#x27;); },
+    async postEvents() { throw Error(&#x27;unused&#x27;); },
+    async callTool() { throw Error(&#x27;unused&#x27;); },
+    async registerInteractiveRequest() { throw Error(&#x27;unused&#x27;); },
+    async interruptInteractiveRequests() { throw Error(&#x27;unused&#x27;); },
+  },
+});
+try {
+  const file = path.join(dir, &#x27;synthetic.html&#x27;);
+  await writeFile(file, &#x27;&lt;!doctype html&gt;&#x27; + &#x27;a&#x27;.repeat(3 * 1024 * 1024));
+  const result = await readHostFile({ type: &#x27;host.read_file&#x27;, path: file, rootPath: dir });
+  await connection.start();
+  const send = (requestId: string) =&gt; connection.sendMessage({
+    type: &#x27;host-rpc.response&#x27;, requestId, commandType: &#x27;host.read_file&#x27;, ok: true, result,
+  });
+  assert(send(&#x27;control&#x27;));
+  await sleep(6000);
+  assert.equal(replies, 1); assert(heartbeats &gt;= 1); assert.equal(timeouts, 0);
+  console.log(JSON.stringify({ phase: &#x27;fast-control&#x27;, fileBytes: result.sizeBytes, replies, heartbeats, timeouts }));
+  slow = true;
+  assert(send(&#x27;slow-one&#x27;)); assert(send(&#x27;slow-two&#x27;));
+  const heartbeatBefore = heartbeats;
+  await sleep(35000);
+  console.log(JSON.stringify({ phase: &#x27;64-KiB-per-second&#x27;, backlog, replies, heartbeats, heartbeatsAtTimeout, timeouts }));
+  assert.equal(replies, 1); assert.equal(heartbeatsAtTimeout, heartbeatBefore); assert(timeouts &gt;= 1); assert(backlog &gt; 0);
+} finally {
+  await connection.shutdown();
+  for (const timer of intervals) clearInterval(timer);
+  for (const socket of sockets) socket.destroy();
+  for (const socket of server.clients) socket.terminate();
+  await new Promise&lt;void&gt;(resolve =&gt; relay.close(() =&gt; resolve()));
+  await new Promise&lt;void&gt;(resolve =&gt; server.close(() =&gt; resolve()));
+  await rm(dir, { recursive: true, force: true });
+}
+</pre>
+<h2>5. Root cause</h2><p>The measured mechanism is head-of-line blocking on a shared ordered transport. <a href="https://github.com/get-bb/bb/blob/1bc80e1d57991fe60a3896e60e0159427194c7bb/apps/host-daemon/src/server-connection.ts#L185">apps/host-daemon/src/server-connection.ts:185</a> serializes each message and sends one complete WebSocket message. Its high-water handling covers terminal output, not file RPC replies. <a href="https://github.com/get-bb/bb/blob/1bc80e1d57991fe60a3896e60e0159427194c7bb/apps/host-daemon/src/app.ts#L836">apps/host-daemon/src/app.ts:836</a> routes the file command response through that connection. The receiver cannot observe later application heartbeat messages until earlier file bytes have crossed the constrained connection.</p>
+<p><a href="https://github.com/get-bb/bb/blob/1bc80e1d57991fe60a3896e60e0159427194c7bb/apps/host-daemon/src/server-connection.ts#L714">apps/host-daemon/src/server-connection.ts:714</a> sends application heartbeats and reconnects after acknowledgement silence exceeds the lease. <a href="https://github.com/get-bb/bb/blob/1bc80e1d57991fe60a3896e60e0159427194c7bb/apps/server/src/ws/daemon-protocol.ts#L222">apps/server/src/ws/daemon-protocol.ts:222</a> acknowledges only a received application heartbeat. This explains the constrained probe timeout. It does not establish the initiating cause or bandwidth of the historical incident.</p>
+<p><a href="https://github.com/get-bb/bb/blob/1bc80e1d57991fe60a3896e60e0159427194c7bb/plugins/inline-vis/server.ts#L125">plugins/inline-vis/server.ts:125</a> performs a complete file read before returning only the relative filename. <a href="https://github.com/get-bb/bb/blob/1bc80e1d57991fe60a3896e60e0159427194c7bb/apps/host-daemon/src/command-handlers/file-read.ts#L353">apps/host-daemon/src/command-handlers/file-read.ts:353</a> already enforces a MIME-dependent host file limit before reading, so the host reader is not entirely unbounded. <a href="https://github.com/get-bb/bb/blob/1bc80e1d57991fe60a3896e60e0159427194c7bb/apps/server/src/services/hosts/online-rpc.ts#L178">apps/server/src/services/hosts/online-rpc.ts:178</a> maps a host-command timeout to HTTP 504; that mapping is supporting static evidence only.</p>
+<h2>6. Proposed fix / next experiment</h2><p>Not enough evidence for a safe simple fix. A metadata-only preview preflight could reduce redundant traffic but would not keep the subsequent file transfer from blocking the same control channel. Preserving control responsiveness during arbitrary bulk transfer needs a transport design and compatibility assessment, which is outside this rule's simple-fix boundary. Next run the full preview path through the same bottleneck while measuring small RPC completion, socket backlog, session identities, and receiver acknowledgement latency; compare with the fast control and other transfer rates. Do not treat a larger heartbeat timeout as an established root-cause repair.</p>
+<h2>7. Related issues and PRs</h2><p>GitHub cross-reference metadata and an open-PR search found no linked open pull request for #3407 at investigation time. The issue author's related-incident comparisons were not independently validated.</p>
+<h2>8. Verification</h2><p>The same agent repeated the experiment in a second clean temporary worktree at the identical trusted commit, with a separate frozen install, Turbo build, ephemeral ports, and synthetic data directory. Both runs observed a successful fast control and an acknowledgement timeout with queued file data under the imposed bottleneck. No production fix was applied. The existing server-connection.test.ts suite passed all 13 tests through Turbo.</p>
+<p>Harness correction: the initial assertion counted all heartbeats after reconnection and failed because a replacement connection received an acknowledgement. Both initial runs still recorded the congestion timeout. The corrected probe captures the heartbeat count at timeout; both final runs use that correction. No claim of an independent verifier is made.</p>
+<h2>9. Appendix</h2><p>Final probe outputs: <a href="3407/repro/first.log">first.log</a> and <a href="3407/repro/second.log">second.log</a>. Build and test summary: <a href="3407/repro/checks.txt">checks.txt</a>.</p>
+<p>Issue content was treated as untrusted claims. No linked script, patch, branch, external evidence URL, or incident command was executed. No screenshots are supplied because this experiment tests transport behavior without rendering UI.</p>
+</main></body></html>
