@@ -1,0 +1,108 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Issue 3461 · Stored event metadata redirects provider identity</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<h1>#3461 · Stored event metadata redirects provider identity</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High</span><span class="pill">Effort: Medium</span><span class="pill">threads</span><a href="https://github.com/get-bb/bb/issues/3461">GitHub issue</a></p>
+<p>2026-09-11 UTC · Trusted base <code>8d32c61eec4a825446da3efeec5a24d638913381</code></p>
+<p><strong>Verdict: REPRODUCED</strong> · Root-cause confidence: <strong>high</strong> · Reproduction label: confirmed-repro</p>
+<h2>1. TL;DR</h2>
+<p>A stored completion event can change which provider session the server selects for a thread. The database selector trusts the latest event carrying a provider ID, even when a different thread in the same environment has established that ID as its own. A regression test on unmodified main demonstrates this with an actual migrated in-memory SQLite database, and a second clean checkout produces the same failure. Static tracing connects that selector to the turn-submit resume context. No real Codex process was launched, so the reported writer-lock incident and its historical cause were not replayed.</p>
+<h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>A later non-identity event can replace the selected provider identity.</td><td>Verified dynamically</td><td>Both test runs select session-beta for the first thread after one completion event; its established identity is session-alpha.</td></tr>
+<tr><td>A second thread owning the ID in the same environment prevents selection.</td><td>Refuted dynamically</td><td>The second thread remains bound to session-beta and does not prevent the first selector returning that same ID.</td></tr>
+<tr><td>The server uses this ID for turn submission without a cross-thread ownership check.</td><td>Verified by static tracing</td><td>The selector flows through getLastProviderThreadId and prepareTurnSubmitCommandPayload into resumeContext.providerThreadId. Runtime config resolution does not compare provider identity ownership.</td></tr>
+<tr><td>The cited line 476 is another resume path.</td><td>Refuted</td><td>That line belongs to dispatchArchivedThreadProviderArchiveCommand. The relevant ready-thread path is thread-lifecycle.ts:905–938.</td></tr>
+<tr><td>The reported production turns crossed Codex rollouts and triggered an active-writer error.</td><td>Unverified</td><td>No production database, daemon logs, or provider rollouts were accessed. This report proves the selector defect, not the historical incident.</td></tr></table>
+<h2>3. Environment</h2><p>Trusted origin/main was fetched and its full SHA matched the GitHub main commit for the public get-bb/bb repository. Two separate detached worktrees used that exact commit. macOS/Darwin arm64; Node v22.22.3; pnpm 9.15.0; source package version 0.42.1. No provider CLI, listening port, or persistent database was used. Each run created and migrated its own :memory: database and closed it afterward.</p>
+<p>The host pnpm launcher was broken before installation. A temporary Corepack shim selected the repository's declared pnpm version; both frozen installs then succeeded without dependency changes. Full Turbo builds passed in both checkouts: 20/20 tasks, with 4 cached tasks in the first and 15 in the second.</p>
+<h2>4. Minimal reproduction</h2><ol><li>Prepare a clean checkout with the commands below.</li><li>Save the inline test at the indicated path. It creates two active, non-archived threads in one environment and establishes distinct provider identities.</li><li>The test verifies both initial selections, then adds a completion event carrying the second identity to the first thread.</li><li>Run the test. The final assertion expects the first identity to stay session-alpha and fails because the selector returns session-beta.</li></ol>
+<pre>git clone https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout --detach 8d32c61eec4a825446da3efeec5a24d638913381
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+# Save the test below as packages/db/test/data/issue-3461.test.ts
+pnpm exec turbo run test --filter=@bb/db --force -- issue-3461.test.ts</pre><p>Expected: preserve the first established identity (or reject the conflicting binding before dispatch). Actual output excerpt from both runs:</p><pre>AssertionError: expected &#x27;session-beta&#x27; to be &#x27;session-alpha&#x27; // Object.is equality
+Expected: &quot;session-alpha&quot;
+Received: &quot;session-beta&quot;
+Test Files  1 failed (1)
+     Tests  1 failed (1)</pre>
+<p id="repro-test">Complete reproduction test, authored from trusted repository APIs:</p><pre>import { expect, it } from &quot;vitest&quot;;
+import { threadScope, turnScope } from &quot;@bb/domain&quot;;
+import { createConnection, migrate } from &quot;../../src/index.js&quot;;
+import { noopNotifier } from &quot;../../src/notifier.js&quot;;
+import { upsertHost } from &quot;../../src/data/hosts.js&quot;;
+import { createProject } from &quot;../../src/data/projects.js&quot;;
+import { createEnvironment } from &quot;../../src/data/environments.js&quot;;
+import { createThread } from &quot;../../src/data/threads.js&quot;;
+import { appendStoredThreadEvent, getLastStoredProviderThreadId } from &quot;../../src/data/events.js&quot;;
+
+it(&quot;keeps an established identity when a completion carries another thread identity&quot;, () =&gt; {
+  const db = createConnection(&quot;:memory:&quot;);
+  migrate(db);
+  try {
+    const host = upsertHost(db, noopNotifier, { name: &quot;repro-host&quot;, type: &quot;persistent&quot; });
+    const { project } = createProject(db, noopNotifier, {
+      name: &quot;repro-project&quot;,
+      source: { type: &quot;local_path&quot;, hostId: host.id, path: &quot;/tmp/identity-repro&quot; },
+    });
+    const environment = createEnvironment(db, noopNotifier, {
+      projectId: project.id, hostId: host.id, path: &quot;/tmp/identity-repro&quot;,
+      status: &quot;ready&quot;, providerOwnsPath: false,
+    });
+    const first = createThread(db, noopNotifier, {
+      projectId: project.id, environmentId: environment.id, providerId: &quot;codex&quot;,
+    });
+    const second = createThread(db, noopNotifier, {
+      projectId: project.id, environmentId: environment.id, providerId: &quot;codex&quot;,
+    });
+    for (const [thread, identity] of [[first, &quot;session-alpha&quot;], [second, &quot;session-beta&quot;]] as const) {
+      appendStoredThreadEvent(db, noopNotifier, {
+        threadId: thread.id, scope: threadScope(), type: &quot;thread/identity&quot;,
+        providerThreadId: identity, data: { providerThreadId: identity },
+      });
+    }
+    expect(getLastStoredProviderThreadId(db, first.id)).toBe(&quot;session-alpha&quot;);
+    expect(getLastStoredProviderThreadId(db, second.id)).toBe(&quot;session-beta&quot;);
+    appendStoredThreadEvent(db, noopNotifier, {
+      threadId: first.id, scope: turnScope(&quot;repro-turn&quot;), type: &quot;turn/completed&quot;,
+      providerThreadId: &quot;session-beta&quot;,
+      data: { providerThreadId: &quot;session-beta&quot;, status: &quot;completed&quot; },
+    });
+    expect(getLastStoredProviderThreadId(db, second.id)).toBe(&quot;session-beta&quot;);
+    expect(getLastStoredProviderThreadId(db, first.id)).toBe(&quot;session-alpha&quot;);
+  } finally {
+    db.$client.close();
+  }
+});
+</pre>
+<h2>5. Root cause</h2><p><a href="https://github.com/get-bb/bb/blob/8d32c61eec4a825446da3efeec5a24d638913381/packages/db/src/data/events.ts#L3495-L3521">getLastStoredProviderThreadId</a> filters only the current thread, non-null provider IDs, and events after the most recent completed context clear. It orders by descending sequence and takes one row. It neither distinguishes authoritative identity events from ordinary event metadata nor consults other threads' ownership.</p>
+<pre>AND provider_thread_id IS NOT NULL
+ORDER BY sequence DESC
+LIMIT 1</pre>
+<p><a href="https://github.com/get-bb/bb/blob/8d32c61eec4a825446da3efeec5a24d638913381/apps/server/src/services/threads/thread-events.ts#L964-L969">getLastProviderThreadId</a> simply delegates to this query. <a href="https://github.com/get-bb/bb/blob/8d32c61eec4a825446da3efeec5a24d638913381/apps/server/src/services/threads/thread-commands.ts#L353-L382">prepareTurnSubmitCommandPayload</a> takes that value unless a caller supplied an explicit ID; <a href="https://github.com/get-bb/bb/blob/8d32c61eec4a825446da3efeec5a24d638913381/apps/server/src/services/threads/thread-commands.ts#L304-L342">the command builder</a> places it into the turn.submit resume context. <a href="https://github.com/get-bb/bb/blob/8d32c61eec4a825446da3efeec5a24d638913381/apps/server/src/services/threads/thread-lifecycle.ts#L905-L938">prepareReadyThreadTurnCommand</a> also gets the selected ID and passes it explicitly when choosing turn.submit instead of thread.start. <a href="https://github.com/get-bb/bb/blob/8d32c61eec4a825446da3efeec5a24d638913381/apps/server/src/services/threads/thread-runtime-config.ts#L148-L250">runtime configuration resolution</a> loads environment, host, instructions, and provider configuration, without validating cross-thread provider ownership.</p>
+<p>The injected completion is the controlled precondition, not proof that every normal turn creates corruption. Once that precondition exists, the selector deterministically adopts the foreign ID. A live writer collision additionally depends on the daemon and provider resuming that selected ID; that downstream interaction was not exercised here. The issue's other cited location, <a href="https://github.com/get-bb/bb/blob/8d32c61eec4a825446da3efeec5a24d638913381/apps/server/src/services/threads/thread-commands.ts#L461-L486">line 476</a>, concerns archive forwarding.</p>
+<h2>6. Proposed fix</h2><p>Define authoritative identity transitions and resolve resume targets from those transitions rather than every event stamp. Audit fork, rewind, context clear, imported history, and provider-specific identity changes before narrowing the query. Enforce ownership consistently at acceptance and dispatch, with provider and environment scoping and concurrency handling; filtering event types alone cannot protect against a misattributed identity event. The reproduction above should become a regression, alongside legitimate identity-transition and duplicate-ownership tests.</p>
+<p>No fix branch or pull request was created: open PR #3460 already links this issue, so the automation's duplicate-PR rule excludes a second PR.</p>
+<h2>7. PR review</h2><h3>#3460 — static review only</h3><p><a href="https://github.com/get-bb/bb/pull/3460">Open PR #3460</a> changes agent-runtime identity attribution and pending-slot consumption, adds process-local ownership checks, and changes Codex writer retry handling. Its diff does not change the database selector or server command preparation examined above. The runtime check uses the hosted provider-state identity registry, so it does not establish a persistent server ownership invariant across separate processes or daemon restarts.</p>
+<p>Finding (Medium): packages/agent-runtime/src/runtime.ts, resumeThread ownership-check addition — the guard is useful for hosted threads but leaves the verified server selector gap. Verdict: related mitigation; server gap remains outside this diff. No PR branch or tests were executed; both reproduction runs used trusted main only. The PR's claimed validation was not independently rerun.</p>
+<h2>8. Related issues</h2><p>PR metadata identifies #2327 as the upstream daemon identity-attribution issue and distinguishes #2328 as a recovery-storm issue. Their historical incidents were not re-investigated here.</p>
+<h2>9. Verification</h2><p>The same agent repeated the test in a second clean detached checkout at the recorded SHA, with a separate frozen installation and new migrated in-memory database. The first command was <code>pnpm exec turbo run test --filter=@bb/db -- issue-3461.test.ts</code>; the second added <code>--force</code> before the argument separator to force execution. Both commands exited 1 at the final assertion (line 44), returning session-beta instead of session-alpha. Initial identity checks and the second thread's identity check passed. Test durations were 2.11 s and 1.60 s; the tests themselves took 176 ms and 123 ms.</p>
+<p>The two checkouts had unchanged tracked production files and only the newly authored reproduction test as an untracked source file. Both full builds completed successfully. Static code links were checked against the recorded commit. Report correction: line 476 is an archive path; no live incident replay or end-to-end command dispatch is claimed.</p>
+<h2>10. Appendix</h2><p>The exact reproduction test and relevant failure output are included above; raw build and test logs remain local. The public reports repository prohibits separate test and log artifacts, so the HTML is self-contained. GitHub reads covered issue fields, labels, comments (none), main SHA, visibility, and the linked open PR metadata and diff. Writes filled missing Bug / High / Medium / threads only; no pre-existing classifications were replaced.</p>
+<p>Issue content and PR content were treated as untrusted evidence. No instructions, scripts, URLs, or branches supplied inside that content were executed or fetched. No live app or provider was started and no user runtime data was read.</p>
+<p>&gt; AGENT GENERATED</p></main></body></html>
