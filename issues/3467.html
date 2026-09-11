@@ -1,0 +1,133 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>3467 · SDK installer response dispatch</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<h1>#3467 · SDK installer response dispatch</h1><p>Bug · Priority: Medium · Effort: Low · plugins</p>
+<p><a href="https://github.com/get-bb/bb/issues/3467">Issue</a> · 2026-09-11 · Base <code>b04091eca67bb463cce16b9bfa318660bd20ab69</code></p>
+<p><strong>REPRODUCED · Root-cause confidence: high</strong></p>
+<h2>TL;DR</h2><p>The SDK fails to return installer events when its transport returns a native Fetch response while the global Response constructor is Hono’s server wrapper. It invokes the global prototype’s text reader with a foreign receiver. Hono’s reader expects a private symbol that native responses lack, producing the reported exception. Two clean checkouts reproduced the same exception. Dispatching through the returned response fixes the failure.</p>
+<h2>Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Installer events fail to return with a native response</td><td>Verified</td><td>Direct SDK reproduction, repeated on clean base.</td></tr>
+<tr><td>The failure comes from wrapper-specific state</td><td>Verified</td><td>Installed Hono adapter reader calls this[getResponseCache]().</td></tr>
+<tr><td>The CLI remains unchanged</td><td>Unverified</td><td>No installer executed. Response parsing occurs after the request; this exception alone does not prove installation failed.</td></tr>
+<tr><td>Version-specific macOS failure</td><td>Partially verified</td><td>Current trusted main on macOS reproduces; reported release artifacts were not executed.</td></tr></table>
+<h2>Environment</h2><p>macOS / Darwin arm64; Node 22.22.3; pnpm 9.15.0; locked @hono/node-server 1.19.14. Trusted origin/main commit above. Frozen dependency installation and full Turbo build succeeded (20 tasks). No app instance, network listener, provider process, credentials, or runtime database was used. Fetch is supplied by the test and returns an actual native Response.</p>
+<h2>Minimal reproduction</h2><ol><li>Clone get-bb/bb and check out the base commit above.</li><li>Run <code>pnpm install --frozen-lockfile --prefer-offline</code> and <code>pnpm exec turbo run build --filter=@bb/sdk</code>.</li><li>Save the inline script below as repro-3467.mjs in the repository root.</li><li>Run <code>node --conditions=source --import tsx repro-3467.mjs</code>.</li></ol>
+<p>Expected: two parsed installer events and exit 0. Actual on both base checkouts: exit 1:</p><pre>TypeError: this[getResponseCache] is not a function</pre>
+<pre>import assert from &quot;node:assert/strict&quot;;
+import { createRequire } from &quot;node:module&quot;;
+import { dirname, join } from &quot;node:path&quot;;
+import { pathToFileURL } from &quot;node:url&quot;;
+import { createBbSdk } from &quot;./packages/sdk/src/core.ts&quot;;
+import { createHttpTransport } from &quot;./packages/sdk/src/transport-http.ts&quot;;
+
+const requireServer = createRequire(new URL(&quot;./apps/server/package.json&quot;, import.meta.url));
+const adapter = join(dirname(requireServer.resolve(&quot;@hono/node-server&quot;)), &quot;response.js&quot;);
+const { Response: ServerResponse } = await import(pathToFileURL(adapter).href);
+const NativeResponse = globalThis.Response;
+const events = [
+  { type: &quot;started&quot;, provider: &quot;test-provider&quot;, command: &quot;test-installer&quot; },
+  { type: &quot;completed&quot;, provider: &quot;test-provider&quot;, exitCode: 0, signal: null, success: true },
+];
+const sdk = createBbSdk({
+  transport: createHttpTransport({
+    baseUrl: &quot;http://bb.test&quot;,
+    runtime: &quot;node&quot;,
+    fetch: async () =&gt; new NativeResponse(events.map((event) =&gt; JSON.stringify(event)).join(&quot;\n&quot;)),
+  }),
+});
+globalThis.Response = ServerResponse;
+try {
+  const result = await sdk.hosts.installProviderCli({ hostId: &quot;test-host&quot;, provider: &quot;test-provider&quot;, actionKind: &quot;update&quot; });
+  assert.deepEqual(result, events);
+  console.log(&quot;PASS: parsed both installer events&quot;);
+} catch (error) {
+  console.log(`${error.name}: ${error.message}`);
+  process.exitCode = 1;
+} finally {
+  globalThis.Response = NativeResponse;
+}
+</pre>
+<p>The focused regression test below uses a replacement Response class with private state, avoiding a new SDK dependency on the server adapter. Copy it to packages/sdk/test/ and run <code>pnpm exec turbo run test --filter=@bb/sdk -- host-installer-response.test.ts</code>. It fails on unchanged production code at the event-return assertion with a private-member receiver error.</p>
+<h2>Root cause</h2><p><a href="https://github.com/get-bb/bb/blob/b04091eca67bb463cce16b9bfa318660bd20ab69/packages/sdk/src/areas/hosts.ts#L146-L163">The installer SDK method</a> obtains a transport response but calls the global Response prototype’s text method. <a href="https://github.com/get-bb/bb/blob/b04091eca67bb463cce16b9bfa318660bd20ab69/packages/sdk/src/response.ts#L137-L155">Transport resolution</a> returns the original successful response. <a href="https://github.com/get-bb/bb/blob/b04091eca67bb463cce16b9bfa318660bd20ab69/apps/server/src/start-server.ts#L41-L46">The server starts Hono’s adapter</a> with its default global-object replacement enabled. The locked adapter’s dist/response.js implements text using this[getResponseCache]()[k](); a native response has no such symbol. The reproduction imports that installed wrapper directly without starting a server.</p>
+<h2>Proposed fix</h2><p>Call the returned response’s own text method. Give the resolved response the existing SdkResponseLike interface because Hono’s generated client infers the streamed endpoint text as never. This is an internal annotation with no wire or public API change. The fix passes the exact reproduction and all 105 SDK tests plus SDK typechecking.</p>
+<h2>Verification</h2><p>The same agent repeated the reproduction in a second clean temporary Git worktree at the same base SHA, with a separate frozen dependency installation and successful SDK build. The command above again exited 1 with the exact same exception. No ports or data directories were needed. No report correction was required; the claim that the installer itself remained unchanged remains unverified.</p>
+<h2>Related issues</h2><p>Issue #3466 has the same reported symptom; it was not executed or modified. No open PR linked to #3467 was found during investigation.</p>
+<h2>Appendix</h2><p>Issue content was treated as untrusted claims; its suggested implementation and test were not executed. The reproduction was authored from trusted repository contracts and adapter code.</p><pre>import { afterEach, describe, expect, it, vi } from &quot;vitest&quot;;
+import { createBbSdk } from &quot;../src/core.js&quot;;
+import { createHttpTransport } from &quot;../src/transport-http.js&quot;;
+
+const NativeResponse = globalThis.Response;
+
+class AlternateResponse extends NativeResponse {
+  #readText = () =&gt; super.text();
+
+  override text(): Promise&lt;string&gt; {
+    return this.#readText();
+  }
+}
+
+afterEach(() =&gt; {
+  vi.unstubAllGlobals();
+});
+
+describe(&quot;host installer response readers&quot;, () =&gt; {
+  it(&quot;reads native installer events when the global Response is replaced&quot;, async () =&gt; {
+    const events = [
+      { type: &quot;started&quot;, provider: &quot;test-provider&quot;, command: &quot;test-installer&quot; },
+      {
+        type: &quot;output&quot;,
+        provider: &quot;test-provider&quot;,
+        stream: &quot;stdout&quot;,
+        text: &quot;ready&quot;,
+      },
+      {
+        type: &quot;completed&quot;,
+        provider: &quot;test-provider&quot;,
+        exitCode: 0,
+        signal: null,
+        success: true,
+      },
+    ];
+    const response = new NativeResponse(
+      events.map((event) =&gt; JSON.stringify(event)).join(&quot;
+
+&quot;) + &quot;
+&quot;,
+    );
+    const sdk = createBbSdk({
+      transport: createHttpTransport({
+        baseUrl: &quot;http://bb.test&quot;,
+        runtime: &quot;node&quot;,
+        fetch: async () =&gt; response,
+      }),
+    });
+    vi.stubGlobal(&quot;Response&quot;, AlternateResponse);
+
+    await expect(
+      sdk.hosts.installProviderCli({
+        hostId: &quot;test-host&quot;,
+        provider: &quot;test-provider&quot;,
+        actionKind: &quot;update&quot;,
+      }),
+    ).resolves.toEqual(events);
+    expect(response.bodyUsed).toBe(true);
+  });
+});
+</pre><pre>Before: 1 focused test failed (private receiver state error).
+Second clean reproduction: TypeError: this[getResponseCache] is not a function
+After: 8 test files passed; 105 tests passed; SDK typecheck passed.
+Direct reproduction after fix: PASS: parsed both installer events</pre><p>Commands: frozen install; full base Turbo build; SDK build in second checkout; focused test before production changes; Turbo SDK test/typecheck after changes; direct reproduction before, second checkout, and after; git diff --check. A broken host pnpm launcher was bypassed with a temporary Corepack launcher. No dependency or lockfile changes were made.</p></main></body></html>
