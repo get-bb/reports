@@ -1,0 +1,119 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Issue 3462 · Retained turns survive idle stop</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<h1>#3462 · Retained turns survive idle stop</h1><p class="meta"><span class="pill">Bug</span><span class="pill high">High</span><span class="pill">Effort: Medium</span><span class="pill">threads, host</span><a href="https://github.com/get-bb/bb/issues/3462">GitHub issue</a> · 2026-09-11 · base 66bf09cd2265955118178fa8afcefc0a38aacd1f</p>
+<p><strong>Verdict: REPRODUCED</strong> · Root-cause confidence: high · component-level reproduction</p>
+<h2>1. TL;DR</h2><p>When the server thinks a thread is idle but its daemon retains a turn, stopping it can return success without clearing that turn. The server selects a release command, whose daemon handler deliberately protects active turns. Its response is indistinguishable from a completed release. A deterministic test demonstrates three consecutive no-op releases, followed by an interrupt that clears the fixture's turn.</p>
+<h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr><tr><td>Idle server stop requests release and returns success.</td><td>Verified</td><td>Existing public stop-route suite; server source.</td></tr><tr><td>An active daemon turn survives repeated release requests.</td><td>Verified</td><td>New diagnostic test executes the production dispatcher three times.</td></tr><tr><td>Later sends reject while that turn remains.</td><td>Verified in source</td><td>Runtime admission guard rejects a non-null active-turn ID.</td></tr><tr><td>The original provider failed to report completion.</td><td>Unverified</td><td>No live incident trace; the divergent state is seeded.</td></tr><tr><td>Retry and tell acknowledge delivery before rejection.</td><td>Unverified</td><td>Outside this focused stop reproduction.</td></tr></table>
+<h2>3. Environment</h2><p>Darwin arm64, Node v22.22.3, frozen workspace dependencies. Both checkouts use the recorded trusted main commit. Corepack supplies the pinned pnpm because the machine's normal pnpm shim points to a missing file. No provider account, live BB instance, imported store, or listener was used. The test creates and removes its own temporary workspace; the server harness uses its isolated test database.</p>
+<h2>4. Minimal reproduction</h2><ol><li>Check out trusted main at the recorded commit in a clean directory.</li><li>Install and build:<pre>corepack pnpm install --frozen-lockfile --prefer-offline
+corepack pnpm exec turbo run build</pre></li><li>Append the diagnostic below to apps/host-daemon/src/command-dispatch.test.ts; it uses the existing trusted suite helpers.</li><li>Run:<pre>corepack pnpm exec turbo run test --filter=@bb/host-daemon -- src/command-dispatch.test.ts
+corepack pnpm exec turbo run test --filter=@bb/server -- test/public/public-thread-stop-runtime.test.ts</pre></li></ol>
+<p>Expected product behavior: an explicit stop must either clear the retained work or communicate that it did not stop. Actual dispatcher behavior: the retained-turn release resolves to the same result as an idle release, and all three attempts leave the active-turn ID unchanged. Only the subsequent interrupt calls stop for that thread. This diagnostic asserts the defective behavior, so a passing diagnostic confirms the defect; it is not a red/green fix regression.</p><p>Appended diagnostic test:</p><pre>
+it(&quot;issue 3462: repeated releases hide a retained turn in a success result&quot;, async () =&gt; {
+  const root = await makeTempDir(&quot;bb-3462-&quot;);
+  const runtime = createRuntime();
+  const manager = new RuntimeManager({
+    createRuntime: () =&gt; runtime,
+    provisionWorkspace: async () =&gt; createWorkspace(root),
+  });
+  await manager.ensureEnvironment({ environmentId: &quot;repro&quot;, workspacePath: root });
+  const options = makeDispatchOptions({ runtimeManager: manager, dataDir: root });
+  runtime.setActiveTurn(&quot;retained&quot;, &quot;unfinished&quot;);
+  runtime.setIdle(&quot;idle&quot;);
+  const release = (threadId: string) =&gt; dispatchCommand({
+    type: &quot;thread.stop&quot;, intent: &quot;release&quot;, environmentId: &quot;repro&quot;, threadId,
+  }, options);
+  const idleResult = await release(&quot;idle&quot;);
+  for (let attempt = 0; attempt &lt; 3; attempt++) {
+    expect(await release(&quot;retained&quot;)).toEqual(idleResult);
+    expect(runtime.getActiveTurnId(&quot;retained&quot;)).toBe(&quot;unfinished&quot;);
+  }
+  expect(runtime.stopThread.mock.calls.map(([args]) =&gt; args.threadId)).toEqual([&quot;idle&quot;]);
+  await dispatchCommand({
+    type: &quot;thread.stop&quot;, intent: &quot;interrupt&quot;, environmentId: &quot;repro&quot;, threadId: &quot;retained&quot;,
+  }, options);
+  expect(runtime.getActiveTurnId(&quot;retained&quot;)).toBeNull();
+});
+</pre>
+<h2>5. Root cause</h2><p><a href="https://github.com/get-bb/bb/blob/66bf09cd2265955118178fa8afcefc0a38aacd1f/apps/server/src/services/threads/thread-lifecycle.ts#L1400-L1420">apps/server/src/services/threads/thread-lifecycle.ts:1400-L1420</a> sends release for an idle thread. <a href="https://github.com/get-bb/bb/blob/66bf09cd2265955118178fa8afcefc0a38aacd1f/apps/host-daemon/src/command-dispatch.ts#L347-L390">apps/host-daemon/src/command-dispatch.ts:347-L390</a> returns early when the runtime has an active turn. That branch and a successful stop share the same checkpoint response; <a href="https://github.com/get-bb/bb/blob/66bf09cd2265955118178fa8afcefc0a38aacd1f/packages/host-daemon-contract/src/commands.ts#L1205-L1210">packages/host-daemon-contract/src/commands.ts:1205-L1210</a> has no disposition field and is strict.</p><p><a href="https://github.com/get-bb/bb/blob/66bf09cd2265955118178fa8afcefc0a38aacd1f/apps/server/src/routes/threads/actions.ts#L367-L375">apps/server/src/routes/threads/actions.ts:367-L375</a> returns success after the lifecycle call. <a href="https://github.com/get-bb/bb/blob/66bf09cd2265955118178fa8afcefc0a38aacd1f/apps/cli/src/commands/thread/actions.ts#L522-L533">apps/cli/src/commands/thread/actions.ts:522-L533</a> prints success when the SDK call resolves. <a href="https://github.com/get-bb/bb/blob/66bf09cd2265955118178fa8afcefc0a38aacd1f/packages/agent-runtime/src/runtime.ts#L758-L767">packages/agent-runtime/src/runtime.ts:758-L767</a> refuses new turns while an active ID or pending start exists. The active-turn guard itself protects legitimate races; removing it globally would be unsafe. The deeper origin of server/daemon divergence remains unproven.</p>
+<h2>6. Proposed fix and automation limit</h2><p>Distinguish release outcomes across the daemon/server boundary and define explicit-stop reconciliation while preserving automatic-release race protection. Test protocol compatibility and concurrent stop/start behavior, including deduplicated requests. No automatic PR: this is a cross-subsystem protocol/behavior decision, outside the simple-fix rule. No production change was attempted. No linked open PR was found.</p>
+<h2>7. Related issues</h2><p>Search found <a href="https://github.com/get-bb/bb/issues/2538">#2538</a> with the same admission-error symptom. It was not reproduced here and is not established as the same root cause.</p>
+<h2>8. Verification</h2><p>The same investigator repeated the diagnostic in a second clean temporary checkout at the identical commit with a separate frozen install and a fresh temporary fixture directory. The second checkout ran both suites with <code>--only --force</code> after dependency preparation, avoiding cached test results. Dispatcher: 41/41; server: 8/8, in both checkouts. See the run excerpts below. This is a repeat check by the same agent, not an independent review. No correction to the mechanism was needed. The original provider failure and full live CLI/send sequence remain unverified.</p>
+<h2>9. Appendix</h2><p>Issue content, including its proposed patch, was treated as untrusted evidence. No issue-supplied code or instructions were executed. The test above was authored from trusted repository fixtures and implementation. Build and test logs have local paths and terminal formatting removed. No screenshots apply to this nonvisual dispatcher defect.</p>
+<h3>First dispatcher run</h3><pre>@bb/host-daemon:test: 
+@bb/host-daemon:test: 
+@bb/host-daemon:test:  RUN  v4.1.1 CHECKOUT
+@bb/host-daemon:test: 
+@bb/host-daemon:test:  ✓ |@bb/host-daemon| src/command-dispatch.test.ts (41 tests) 389ms
+@bb/host-daemon:test: 
+@bb/host-daemon:test:  Test Files  1 passed (1)
+@bb/host-daemon:test:       Tests  41 passed (41)
+@bb/host-daemon:test:    Start at  20:34:33
+@bb/host-daemon:test:    Duration  4.58s (transform 3.00s, setup 0ms, import 3.88s, tests 389ms, environment 0ms)
+@bb/host-daemon:test: 
+
+ Tasks:    7 successful, 7 total
+Cached:    0 cached, 7 total
+  Time:    3m19.834s 
+</pre><h3>Second dispatcher run, cache bypassed</h3><pre>@bb/host-daemon:test: 
+@bb/host-daemon:test: 
+@bb/host-daemon:test:  RUN  v4.1.1 CHECKOUT
+@bb/host-daemon:test: 
+@bb/host-daemon:test:  ✓ |@bb/host-daemon| src/command-dispatch.test.ts (41 tests) 353ms
+@bb/host-daemon:test: 
+@bb/host-daemon:test:  Test Files  1 passed (1)
+@bb/host-daemon:test:       Tests  41 passed (41)
+@bb/host-daemon:test:    Start at  20:36:19
+@bb/host-daemon:test:    Duration  3.35s (transform 1.88s, setup 0ms, import 2.69s, tests 353ms, environment 0ms)
+@bb/host-daemon:test: 
+
+ Tasks:    1 successful, 1 total
+Cached:    0 cached, 1 total
+  Time:    5.854s 
+</pre><h3>First server run</h3><pre>@bb/server:test: 
+@bb/server:test: (node:43001) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test:  ✓ |@bb/server| test/public/public-thread-stop-runtime.test.ts (8 tests) 2055ms
+@bb/server:test:      ✓ releases an idle runtime without changing thread state  1267ms
+@bb/server:test: 
+@bb/server:test:  Test Files  1 passed (1)
+@bb/server:test:       Tests  8 passed (8)
+@bb/server:test:    Start at  20:34:57
+@bb/server:test:    Duration  12.97s (transform 7.22s, setup 0ms, import 10.68s, tests 2.06s, environment 0ms)
+@bb/server:test: 
+
+ Tasks:    8 successful, 8 total
+Cached:    0 cached, 8 total
+  Time:    3m32.303s 
+</pre><h3>Second server run, cache bypassed</h3><pre>@bb/server:test: 
+@bb/server:test: (node:43747) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test:  ✓ |@bb/server| test/public/public-thread-stop-runtime.test.ts (8 tests) 2176ms
+@bb/server:test:      ✓ releases an idle runtime without changing thread state  1493ms
+@bb/server:test: 
+@bb/server:test:  Test Files  1 passed (1)
+@bb/server:test:       Tests  8 passed (8)
+@bb/server:test:    Start at  20:36:06
+@bb/server:test:    Duration  13.88s (transform 8.06s, setup 0ms, import 11.47s, tests 2.18s, environment 0ms)
+@bb/server:test: 
+
+ Tasks:    1 successful, 1 total
+Cached:    0 cached, 1 total
+  Time:    17.106s 
+</pre>
+</main></body></html>
