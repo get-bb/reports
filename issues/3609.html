@@ -1,0 +1,131 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>3609 · Path claim contention during checkout attachment</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<h1>#3609 · Path claim contention during checkout attachment</h1>
+<p>Bug · Priority: Medium · Effort: Medium · workspaces</p>
+<p><a href="https://github.com/get-bb/bb/issues/3609">Issue</a> · 2026-09-13 · trusted base <code>cf51227e1135309a3c9c0baf5630be1ca7ba2714</code></p>
+<p><strong>REPRODUCED · Root-cause confidence: high</strong></p>
+<h2>TL;DR</h2><p>Overlapping requests to attach threads to one checkout can fail before either request changes a branch. The checkout provider takes an exclusive database path claim for every attachment and immediately fails when another request holds it. The first request retains its claim until the server finishes binding its thread. A deterministic server integration test reproduces the failure in two clean trusted-base checkouts using real migrated SQLite and the actual checkout provider.</p>
+<h2>Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Branchless attachments contend</td><td>Verified</td><td>Second preparation reaches error while first holds the seeded ready environment; both contexts have empty inputs.</td></tr>
+<tr><td>Failure occurs before host inspection</td><td>Verified</td><td>Provider returns on a refused claim before calling attach.</td></tr>
+<tr><td>Error refers to branch checkout</td><td>Verified in source</td><td>Refused claim returns LIVE_THREAD_MESSAGE unconditionally.</td></tr>
+<tr><td>Reported CLI frequency, provider versions and environment-ID workaround</td><td>Unverified live</td><td>No real agent, CLI spawn loop, or Linux instance was used. This test isolates the underlying server race.</td></tr></table>
+<h2>Environment</h2><p>Darwin 25.6.0 arm64; Node v22.22.3; pnpm 9.15.0 through Corepack. Both worktrees started at the full commit above. Frozen installs and Turbo builds passed. Each test uses the repository server harness with a fresh migrated in-memory SQLite database. Host attach responses are synthetic; the database, provider create function, claim acquisition, path binding, and attachment release are real repository code. No development server, network-facing plugin, provider turn, or live runtime data was used.</p>
+<h2>Minimal reproduction</h2><ol><li>Create a clean checkout of the trusted base commit.</li><li>Install and build with the repository's pinned package manager.</li><li>Save the inline test-only patch as regression.patch, apply it and run the focused test.</li></ol>
+<pre>git checkout cf51227e1135309a3c9c0baf5630be1ca7ba2714
+corepack pnpm install --frozen-lockfile --prefer-offline
+corepack pnpm exec turbo run build
+git apply regression.patch
+corepack pnpm exec turbo run test --filter=@bb/server --force -- provider-orchestration.test.ts -t 'serializes concurrent branchless'</pre>
+<p>The test-only patch is included below. The test seeds one ready environment, starts an actual checkout-provider preparation, waits until its claim has moved to that environment, starts a competitor, waits for its real claim attempt, then completes the first attachment. Expected: the second preparation reaches ready on the same environment ID. Actual on trusted main:</p>
+<pre>AssertionError: expected { status: 'error', …(1) } to match object { status: 'ready' }
+- "status": "ready"
++ "status": "error"</pre>
+<h3>Reproduction test</h3><pre>diff --git a/apps/server/test/services/environments/provider-orchestration.test.ts b/apps/server/test/services/environments/provider-orchestration.test.ts
+index 869a2c3bd..3fae0848c 100644
+--- a/apps/server/test/services/environments/provider-orchestration.test.ts
++++ b/apps/server/test/services/environments/provider-orchestration.test.ts
+@@ -1,3 +1,4 @@
++import checkoutPlugin from &quot;../../../../../plugins/environment-project-checkout/server.js&quot;;
+ import { appendThreadProvisioningEvent } from &quot;../../../src/services/threads/thread-events.js&quot;;
+ import { requestThreadStopForCurrentState } from &quot;../../../src/services/threads/thread-lifecycle.js&quot;;
+ import { prepareProviderEnvironment } from &quot;../../../src/services/threads/thread-environment-placement.js&quot;;
+@@ -1818,3 +1819,68 @@ it(&quot;keeps a shared workspace ready when its preparing owner cancels before attac
+     expect(remove).not.toHaveBeenCalled();
+   });
+ });
++
++
++it(&quot;serializes concurrent branchless checkout attaches until the first thread is bound&quot;, async () =&gt;
++  withTestHarness(async (harness) =&gt; {
++    const fake = createFakePluginHost({
++      pluginId: &quot;environment-project-checkout&quot;,
++      experimental_callHostRpc: (call) =&gt; {
++        if (call.method !== &quot;attach&quot;) throw new Error(&quot;Unexpected host call&quot;);
++        return { status: &quot;attached&quot;, path: &quot;/tmp/project&quot;, branchName: &quot;main&quot; };
++      },
++    });
++    try {
++      await checkoutPlugin(fake.bb);
++      const provider = fake.harness.registrations.environmentProviders.get(&quot;project-checkout&quot;);
++      if (!provider) throw new Error(&quot;Missing checkout provider&quot;);
++      let claimAttempts = 0;
++      let competingClaim = () =&gt; {};
++      const competing = new Promise&lt;void&gt;((resolve) =&gt; { competingClaim = resolve; });
++      const fixture = setup(harness, {
++        id: provider.id,
++        create: (context) =&gt; provider.create({
++          ...context,
++          experimental_claimPath: async (path) =&gt; {
++            const claimed = await context.experimental_claimPath(path);
++            if (++claimAttempts === 2) competingClaim();
++            return claimed;
++          },
++        }),
++        remove: provider.remove,
++        requires: { projectCheckout: true },
++      });
++      fixture.context.projectCheckout = { path: &quot;/tmp/project&quot;, experimental_ownsPath: false };
++      fixture.context.inputs = {};
++      const existing = createEnvironment(harness.db, harness.hub, {
++        projectId: fixture.context.project.id,
++        hostId: fixture.host.id,
++        path: &quot;/tmp/project&quot;,
++        status: &quot;ready&quot;,
++        providerOwnsPath: false,
++      });
++      fixture.ask();
++      await fixture.settled();
++      expect(fixture.row().id).toBe(existing.id);
++      expect(fixture.row().claimPath).toBe(&quot;/tmp/project&quot;);
++      const competitor = seedThread(harness.deps, {
++        projectId: fixture.context.project.id,
++        status: &quot;starting&quot;,
++      });
++      prepareProviderEnvironment(harness.deps, fixture.record, {
++        ...fixture.context,
++        thread: toThreadResponseFromThread(harness.deps, { thread: competitor }),
++      });
++      await competing;
++      fixture.attach();
++      await expect.poll(() =&gt; {
++        const row = getPreparingEnvironment(harness.db, competitor.id);
++        return { status: row?.status, message: row?.statusMessage };
++      }).toMatchObject({ status: &quot;ready&quot; });
++      const second = getPreparingEnvironment(harness.db, competitor.id);
++      expect(second?.id).toBe(existing.id);
++      markProviderEnvironmentAttached(harness.db, competitor.id, existing.id);
++    } finally {
++      await fake.harness.lifecycle.dispose();
++    }
++  }));
+</pre>
+<h2>Root cause</h2><p><a href="https://github.com/get-bb/bb/blob/cf51227e1135309a3c9c0baf5630be1ca7ba2714/plugins/environment-project-checkout/server.ts#L181">Checkout provider create</a> reads an optional branch but claims the path unconditionally. A refused claim immediately returns failed with the branch-checkout error. The later live-thread branch check is conditional; this earlier path check is not.</p>
+<pre>if (!(await context.experimental_claimPath(path))) {
+  return { status: "failed", message: LIVE_THREAD_MESSAGE };
+}</pre>
+<p><a href="https://github.com/get-bb/bb/blob/cf51227e1135309a3c9c0baf5630be1ca7ba2714/packages/db/src/data/environments.ts#L549">claimEnvironmentPath</a> checks the current preparation identity and rejects any competing non-destroyed path claim inside an immediate transaction. <a href="https://github.com/get-bb/bb/blob/cf51227e1135309a3c9c0baf5630be1ca7ba2714/packages/db/src/data/environments.ts#L568">bindEnvironmentPath</a> transfers the claim and owner to an existing ready environment. <a href="https://github.com/get-bb/bb/blob/cf51227e1135309a3c9c0baf5630be1ca7ba2714/apps/server/src/services/environments/environment-engine.ts#L514">markProviderEnvironmentAttached</a> clears that claim only after attachment. These checks are individually consistent, but the provider interprets transient contention as a permanent failure.</p>
+<p>Simply skipping the provider claim would be insufficient: <a href="https://github.com/get-bb/bb/blob/cf51227e1135309a3c9c0baf5630be1ca7ba2714/apps/server/src/services/environments/environment-engine.ts#L390">the engine claims again before binding the produced path</a>. Preserving serialization avoids a second conflict and prevents overlap with branch mutations.</p>
+<h2>Proposed fix</h2><p>Retry refused claims for branchless attachment, preserving the exclusive claim through binding. Bound the wait by the existing 15-minute attachment timeout and honor cancellation. Continue refusing a competing branch mutation immediately. Use a preparation-contention message for refused claims. A local implementation changes 171 text lines across three files, with no dependencies, stored data, protocols, or public API changes.</p>
+<h2>Verification</h2><p>The same agent repeated the reproduction in a second clean detached worktree at cf51227e1135309a3c9c0baf5630be1ca7ba2714, with a separate frozen install, build, and fresh harness database. Turbo caching was explicitly disabled for the second test run. Both runs fail on the same expected-ready/actual-error assertion. This is a deterministic server-level reproduction, not a measurement of live CLI failure rates. No report corrections were required after the second run.</p>
+<p>After the fix, 65 environment orchestration tests and 34 checkout-plugin tests pass. Server and plugin typechecks pass. Added tests cover blocked branch requests, timeout, and cancellation without invoking host attach. The existing branch-mutation exclusion test remains in the suite, with its expected contention message updated.</p>
+<h2>Related issues</h2><p>No open pull request linked to this issue was found through cross-reference metadata or an open-PR search for its numeric ID. Similar workspace issues do not replace this deterministic contention evidence.</p>
+<h2>Appendix</h2><p>Issue content was treated only as untrusted claims. Its suggested commands and implementation instructions were not executed. The reproduction was written from trusted repository code.</p><pre>Before fix, both clean checkouts: 1 failed, 64 skipped.
+After fix, environment orchestration: 65 passed.
+After fix, checkout plugin: 34 passed.
+Server typecheck: passed. Plugin typecheck: passed.</pre></main></body></html>
