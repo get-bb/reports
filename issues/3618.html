@@ -1,0 +1,56 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Issue 3618 reproduction</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main><h1>#3618 · Guest lifetime outlasts the view getter</h1>
+<p>Bug · High · Effort Low · desktop · 2026-09-13</p>
+<p><a href="https://github.com/get-bb/bb/issues/3618">GitHub issue</a> · base <code>d89160eb8c69c1e3ebc2ba2514f1711af8d7c506</code></p>
+<p><strong>REPRODUCED · Root-cause confidence: high</strong></p>
+<h2>TL;DR</h2><p>The browser manager assumes its view always returns a guest object. When that getter becomes unavailable, visibility and cleanup throw before checking whether the guest is destroyed. Three focused unit cases reproduce this on trusted main in two checkouts. The packaged dialog and the precise Electron event timing were not exercised.</p>
+<h2>Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th></tr><tr><td>Visibility can throw with an unavailable guest</td><td>Verified by failing production-manager test.</td></tr><tr><td>Cleanup has the same weakness</td><td>Verified through detach and destroyed-event tests.</td></tr><tr><td>Packaged app shows a recurring dialog</td><td>Unverified; no packaged UI session used.</td></tr><tr><td>Electron clears the getter in this exact race</td><td>Simulated at the object boundary; native timing unverified.</td></tr></table>
+<h2>Environment</h2><p>Trusted origin/main d89160eb8c69c1e3ebc2ba2514f1711af8d7c506; Darwin arm64; Node 22.22.3; pnpm 10.34.4 via Corepack. Electron is mocked by the repository test harness. No provider, app instance, port, or user data directory used. Frozen installs and Turbo desktop builds completed. A broken pnpm launcher was bypassed with a temporary Corepack wrapper.</p>
+<h2>Minimal reproduction</h2><ol><li>Check out the base commit in a clean get-bb/bb checkout.</li><li>Run <code>pnpm install --frozen-lockfile --prefer-offline</code> and <code>pnpm exec turbo run build --filter=@bb/desktop</code>.</li><li>Download <a href="3618/repro/regression.patch">the regression patch</a> and run <code>git apply regression.patch</code>.</li><li>Run <code>pnpm exec turbo run test --filter=@bb/desktop -- desktop-browser-view-manager.test.ts -t 'tolerates a missing guest'</code>.</li></ol>
+<p>Expected: three cases complete without throwing. Actual in both checkouts:</p><pre>Tests  3 failed | 62 skipped (65)
+TypeError: Cannot read properties of undefined (reading 'isDestroyed')</pre>
+<p>Fresh test derived from repository fixtures:</p><pre>  it.each([&quot;visibility&quot;, &quot;destroyed&quot;, &quot;detach&quot;] as const)(
+    &quot;tolerates a missing guest during %s&quot;,
+    (operation) =&gt; {
+      const { manager, hostWindow, view } = createRendererRecoveryFixture(94);
+      const guest = view.webContents;
+      if (operation !== &quot;destroyed&quot;) guest.destroyed = true;
+      Object.defineProperty(view, &quot;webContents&quot;, { get: () =&gt; undefined });
+      expect(() =&gt; {
+        if (operation === &quot;visibility&quot;) {
+          manager.setVisible({
+            hostWindow,
+            request: { tabId: &quot;browser:a&quot;, visible: false },
+          });
+        } else if (operation === &quot;destroyed&quot;) {
+          guest.close();
+        } else {
+          manager.detach({ hostWindow, tabId: &quot;browser:a&quot; });
+        }
+      }).not.toThrow();
+      manager.destroyAll();
+    },
+  );
+
+</pre>
+<h2>Root cause</h2><p><a href="https://github.com/get-bb/bb/blob/d89160eb8c69c1e3ebc2ba2514f1711af8d7c506/apps/desktop/src/desktop-browser-view.ts#L858-L867">withEntry</a> dereferences the view getter before invoking the destroyed check. <a href="https://github.com/get-bb/bb/blob/d89160eb8c69c1e3ebc2ba2514f1711af8d7c506/apps/desktop/src/desktop-browser-view.ts#L832-L842">disposeEntry</a> repeats that assumption, including when called by the <a href="https://github.com/get-bb/bb/blob/d89160eb8c69c1e3ebc2ba2514f1711af8d7c506/apps/desktop/src/desktop-browser-view.ts#L604-L611">destroyed listener</a>. The manager owns a stable tab entry, but repeatedly obtains its guest through a view whose lifetime can differ. These unit tests isolate that mismatch; they do not prove the native timing.</p>
+<h2>Proposed fix</h2><p>Retain the original WebContents on the entry at creation, then use that stable object throughout the manager. Its existing isDestroyed guards can then reject dead guests without calling through an unavailable view getter. The local fix passes 325 desktop tests (one skipped), typecheck, and build; 85 changed text lines across two files.</p>
+<h2>Verification</h2><p>The same agent repeated the test in a second clean temporary worktree at the identical trusted base commit, with a separate frozen dependency install and desktop build. The same Turbo command failed all three cases with the same TypeError. The final test additionally marks the guest destroyed before visibility and detach, matching their intended dead-guest boundary. The first run already failed all three cases before that fixture refinement. No verdict correction was needed. This is a unit reproduction, not independent or packaged-app verification.</p>
+<h2>Related issues and pull requests</h2><p>No linked open pull request found through issue timeline metadata or open-PR search for 3618. No additional related issue was verified.</p>
+<h2>Appendix</h2><p>Issue content and its proposed patch were treated as untrusted evidence; no supplied code was executed. Tests and fix were authored from trusted repository code.</p><ul>
+<li><a href="3618/repro/first-run.log">First failure log</a></li><li><a href="3618/repro/second-run.log">Second failure log</a></li><li><a href="3618/repro/fixed-tests.log">Fixed desktop suite</a></li><li><a href="3618/repro/build-typecheck.log">Build and typecheck</a></li></ul></main></body></html>
