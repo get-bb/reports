@@ -1,0 +1,127 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Report · #3658 Desktop tab cleanup after host destruction</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<h1>#3658 · Desktop tab cleanup after host destruction</h1>
+<p class="meta">Bug · High priority · Low effort · desktop · 2026-09-14 · base <code>846ec714d5487f8ddbe9a3053f9e93b01cb526e3</code> · <a href="https://github.com/get-bb/bb/issues/3658">Issue</a></p>
+<p><strong>Verdict: REPRODUCED (unit-level)</strong> · Root-cause confidence: high</p>
+<h2>1. TL;DR</h2><p>A browser tab can throw during cleanup after its host has been destroyed. The production destruction callback computes a map key by reading the host’s native web contents ID at callback time. The regression harness makes that native access throw after destruction, and all three cleanup paths fail on unchanged main. Capturing the key at registration fixes the failure while retaining entry removal and exactly-once notifications. A packaged macOS quit dialog and its frequency were not reproduced in this investigation.</p>
+<h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>Cleanup reads host identity after destruction</td><td>Verified</td><td>Production callback and failing regression in two clean checkouts.</td></tr>
+<tr><td>Quitting the packaged application shows an exception dialog</td><td>Unverified live</td><td>No packaged app launched; unit test verifies the mechanism, not native teardown timing.</td></tr>
+<tr><td>The window-broker repair left a separate browser-view path</td><td>Verified in current code</td><td>The browser-view callback still computes its key lazily even though releaseWindow accepts a numeric ID.</td></tr>
+<tr><td>No data loss occurs</td><td>Unverified</td><td>This test checks teardown and map cleanup only.</td></tr></table>
+<h2>3. Environment</h2><p>Trusted public get-bb/bb origin/main at the commit above. Darwin arm64; Node v22.22.3; Corepack pnpm 9.15.0; repository-declared Electron 41.7.0 mocked by the existing Vitest harness. Fresh clone plus a second clean detached worktree at the same commit, each with its own frozen dependency install. No providers, live app, ports, user store, or imported data used. The default pnpm launcher was broken; a temporary Corepack shim supplied pnpm to Turbo. Full Turbo build: 56 successful tasks.</p>
+<h2>4. Minimal reproduction</h2><ol><li>Clone the trusted repository and check out the recorded commit.</li><li>Install dependencies with the frozen lockfile and build.</li><li>Apply the supplied regression-only patch, which adds a test to the repository’s existing Electron test harness.</li><li>Run the focused test:</li></ol>
+<pre>git clone https://github.com/get-bb/bb.git bb-3658
+cd bb-3658
+git checkout 846ec714d5487f8ddbe9a3053f9e93b01cb526e3
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+git apply /path/to/regression.patch
+pnpm exec turbo run test --filter=@bb/desktop -- --testNamePattern='cleans up through'</pre>
+<p>Expected: each teardown path finishes without throwing, removes the tab, and notifies once. Actual on unchanged production source in both checkouts:</p><pre>AssertionError: expected [Function] to not throw an error but 'TypeError: Object has been destroyed' was thrown
+Tests  3 failed | 326 skipped (329)</pre>
+<p>The three paths are guest close, releaseWindow, and destroyAll. The test models an invalid native ID getter after host destruction. It runs the real manager callback with the repository’s existing Electron doubles; it is not a native Electron integration reproduction.</p>
+<p>Save the inline regression-only patch in the appendix as regression.patch. The test below uses the existing repository harness.</p><pre>  it.each([&quot;guest&quot;, &quot;releaseWindow&quot;, &quot;destroyAll&quot;] as const)(
+    &quot;cleans up through %s after the host is destroyed&quot;,
+    (operation) =&gt; {
+      const { manager, hostWindow, view } = createRendererRecoveryFixture(91);
+      const onTabsChanged = vi.fn();
+      manager.subscribeAutomationTabs(onTabsChanged);
+      hostWindow.destroyed = true;
+      hostWindow.webContents.destroyed = true;
+      Object.defineProperty(hostWindow.webContents, &quot;id&quot;, {
+        get: () =&gt; {
+          throw new TypeError(&quot;Object has been destroyed&quot;);
+        },
+      });
+
+      expect(() =&gt; {
+        if (operation === &quot;guest&quot;) view.webContents.close();
+        if (operation === &quot;releaseWindow&quot;) manager.releaseWindow(91);
+        if (operation === &quot;destroyAll&quot;) manager.destroyAll();
+      }).not.toThrow();
+      expect(
+        manager.getAutomationTabs({
+          hostWebContentsId: 91,
+          threadId: &quot;thread-1&quot;,
+        }),
+      ).toEqual([]);
+      expect(view.webContents.isDestroyed()).toBe(true);
+      expect(onTabsChanged).toHaveBeenCalledTimes(1);
+      expect(hostWindow.contentView.removedViews).toEqual([]);
+      manager.destroyAll();
+      expect(onTabsChanged).toHaveBeenCalledTimes(1);
+    },
+  );
+
+</pre>
+<h2>5. Root cause</h2><p><a href="https://github.com/get-bb/bb/blob/846ec714d5487f8ddbe9a3053f9e93b01cb526e3/apps/desktop/src/desktop-browser-view.ts#L309-L314">browserViewKey</a> reads <code>hostWindow.webContents.id</code>. <a href="https://github.com/get-bb/bb/blob/846ec714d5487f8ddbe9a3053f9e93b01cb526e3/apps/desktop/src/desktop-browser-view.ts#L600-L613">wireWebContents</a> performs that read from its destroyed callback before checking whether the entry is still registered. <a href="https://github.com/get-bb/bb/blob/846ec714d5487f8ddbe9a3053f9e93b01cb526e3/apps/desktop/src/desktop-browser-view.ts#L829-L861">disposeEntry and destroyEntry</a> already have safe map-removal and host-destruction checks, but execution fails before reaching them. During releaseWindow or destroyAll, disposing a live guest synchronously invokes the same callback even after the entry was removed; its unnecessary key read still throws.</p>
+<h2>6. Proposed fix</h2><p>Compute the key once in wireWebContents before registering the destruction callback. Keep the entry-identity guard so an old guest cannot remove a replacement. This moves one existing statement; no API, protocol, permission, storage, or packaging behavior changes.</p>
+<h2>7. Verification</h2><p>The same agent repeated the regression from a second clean detached checkout named verify at the recorded commit, using a separate frozen dependency install and unchanged production source. The same focused Turbo command failed all three cases there. No ports or data directories were needed. No report correction was required after the second run.</p><p>After the one-statement production fix in the first checkout, <code>pnpm exec turbo run test typecheck --filter=@bb/desktop</code> passed: 42 test files, 328 tests passed, one skipped; typecheck passed. The new cases also verify removal, guest closure, no access to the dead host’s content view, and exactly one change notification after repeated cleanup. Diff whitespace check passed. Total change: 35 text lines (34 additions, one deletion) across two files. No binary files or dependencies changed.</p>
+<h2>8. Related issues</h2><p>Repository issue metadata for <a href="https://github.com/get-bb/bb/issues/3588">#3588</a> and <a href="https://github.com/get-bb/bb/issues/3618">#3618</a> identifies related desktop teardown failures. This report addresses the host-ID access inside the browser-view destruction callback. No open linked pull request was found during investigation.</p>
+<h2>9. Appendix</h2><p>Raw logs and the complete harness are retained locally. The public report includes the repeatable patch and exact test results.</p><pre>First clean run: Tests  3 failed | 326 skipped (329)
+Second clean run: Tests  3 failed | 326 skipped (329)
+After fix: Test Files  42 passed (42)
+Tests  328 passed | 1 skipped (329)
+Turbo test/typecheck: Tasks: 5 successful, 5 total
+Full build: Tasks: 56 successful, 56 total</pre><p>Source inspection used git diff, numbered source reads, and GitHub metadata. Verification commands are listed above. Git diff --check and git diff --numstat origin/main checked the final patch. Issue text was treated only as untrusted claims; its suggested actions were not executed. No linked source, script, patch, or PR code was fetched or run.</p>
+<h3>Regression-only patch</h3><pre>diff --git a/apps/desktop/test/desktop-browser-view-manager.test.ts b/apps/desktop/test/desktop-browser-view-manager.test.ts
+index 31766f9..9bc6725 100644
+--- a/apps/desktop/test/desktop-browser-view-manager.test.ts
++++ b/apps/desktop/test/desktop-browser-view-manager.test.ts
+@@ -2154,6 +2154,39 @@ describe(&quot;DesktopBrowserViewManager&quot;, () =&gt; {
+     },
+   );
+ 
++  it.each([&quot;guest&quot;, &quot;releaseWindow&quot;, &quot;destroyAll&quot;] as const)(
++    &quot;cleans up through %s after the host is destroyed&quot;,
++    (operation) =&gt; {
++      const { manager, hostWindow, view } = createRendererRecoveryFixture(91);
++      const onTabsChanged = vi.fn();
++      manager.subscribeAutomationTabs(onTabsChanged);
++      hostWindow.destroyed = true;
++      hostWindow.webContents.destroyed = true;
++      Object.defineProperty(hostWindow.webContents, &quot;id&quot;, {
++        get: () =&gt; {
++          throw new TypeError(&quot;Object has been destroyed&quot;);
++        },
++      });
++
++      expect(() =&gt; {
++        if (operation === &quot;guest&quot;) view.webContents.close();
++        if (operation === &quot;releaseWindow&quot;) manager.releaseWindow(91);
++        if (operation === &quot;destroyAll&quot;) manager.destroyAll();
++      }).not.toThrow();
++      expect(
++        manager.getAutomationTabs({
++          hostWebContentsId: 91,
++          threadId: &quot;thread-1&quot;,
++        }),
++      ).toEqual([]);
++      expect(view.webContents.isDestroyed()).toBe(true);
++      expect(onTabsChanged).toHaveBeenCalledTimes(1);
++      expect(hostWindow.contentView.removedViews).toEqual([]);
++      manager.destroyAll();
++      expect(onTabsChanged).toHaveBeenCalledTimes(1);
++    },
++  );
++
+   it.each([&quot;detach&quot;, &quot;releaseWindow&quot;, &quot;destroyAll&quot;, &quot;destroyed&quot;] as const)(
+     &quot;notifies once after removing a native target through %s&quot;,
+     (operation) =&gt; {
+</pre></main></body></html>
