@@ -1,0 +1,97 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Issue 3625 investigation</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main><h1>#3625 · Bridge tool retention around compaction</h1>
+<p class="meta">Bug · Priority High · Effort Medium · providers · provider-claude-code · 2026-09-14</p>
+<p><a href="https://github.com/get-bb/bb/issues/3625">GitHub issue</a> · Base <code>d89160eb8c69c1e3ebc2ba2514f1711af8d7c506</code></p>
+<p><strong>NOT REPRODUCED</strong> · Root-cause confidence: <strong>low</strong> · Label: no-repro</p>
+<h2>1. TL;DR</h2><p>The report describes tools becoming undiscoverable during a long-lived Claude session. A focused test on current main found that the BB MCP server still lists its registered tool after a simulated compact event and an unchanged session resume. This exercises the real BB bridge and MCP server, with the Claude SDK query replaced by the repository's controlled test harness. It does not exercise Claude ToolSearch, a real daemon disconnect, or a long-lived authenticated Claude process. The original symptom remains unverified, and the actual root cause is unresolved.</p>
+<h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Ordinary turns do not reattach dynamic tools</td><td>Verified statically</td><td>Host handler passes tools on runtime resume, but not runTurn.</td></tr>
+<tr><td>Compaction makes tools disappear</td><td>Unverified</td><td>Controlled compact event left the MCP tools/list response intact in two runs. Claude deferred indexing was not tested.</td></tr>
+<tr><td>Reconstruction restores discovery</td><td>Unverified</td><td>No production logs or authenticated session accessed.</td></tr>
+<tr><td>Empty attachment input omits the bridge</td><td>Verified statically</td><td>Conditional construction requires a nonempty dynamicTools array; no evidence proves that input occurred in the reported incident.</td></tr></table>
+<h2>3. Environment</h2><p>Darwin 25.6.0 arm64; Node 22.22.3; Corepack pnpm 9.15.0; installed Claude Agent SDK 0.3.245. Both checkouts used the same base commit. No HTTP server, port, runtime data directory, or live Claude session was used. The reported Linux and Claude executable environment was not reproduced.</p>
+<h2>4. Minimal reproduction attempt</h2><ol><li>Create a clean checkout at the base commit.</li><li>Run <code>pnpm install --frozen-lockfile --prefer-offline</code> and <code>pnpm exec turbo run build</code>.</li><li>Apply <a href="3625/repro/bridge-probe.patch">bridge-probe.patch</a> using <code>git apply bridge-probe.patch</code>.</li><li>Run <code>pnpm exec turbo run test --force --filter=bb-plugin-provider-claude-code -- --testNamePattern='issue 3625'</code>.</li></ol>
+<p>The probe starts a bridge with one synthetic tool, connects an in-memory MCP client, lists the tool, injects a compact boundary into the SDK message stream, lists again, resumes with unchanged construction settings, and lists again. Expected healthy behavior: all three lists contain the tool and the SDK query is reused. Actual: all assertions pass. This is a negative boundary probe, not an end-to-end reproduction or a failing regression test.</p><pre>First run:  Tests  1 passed | 354 skipped (355)
+Second run: Tests  1 passed | 354 skipped (355)</pre>
+<h3>Probe patch</h3><pre>diff --git a/plugins/provider-claude-code/src/bridge/__tests__/bridge.test.ts b/plugins/provider-claude-code/src/bridge/__tests__/bridge.test.ts
+index 7a635befa..ec258ebaa 100644
+--- a/plugins/provider-claude-code/src/bridge/__tests__/bridge.test.ts
++++ b/plugins/provider-claude-code/src/bridge/__tests__/bridge.test.ts
+@@ -1,3 +1,5 @@
++import { Client } from &quot;@modelcontextprotocol/sdk/client/index.js&quot;;
++import { InMemoryTransport } from &quot;@modelcontextprotocol/sdk/inMemory.js&quot;;
+ import {
+   chmodSync,
+   mkdirSync,
+@@ -706,6 +708,42 @@ describe(&quot;bridge&quot;, () =&gt; {
+     }
+   });
+ 
++  it(&quot;issue 3625 retains bridge tools across compact and same-session resume&quot;, async () =&gt; {
++    const bridge = createBridgeJsonRpcTestHarness(handleLine);
++    const queries: ControlledClaudeQuery[] = [];
++    queryMock.mockImplementation(() =&gt; {
++      const query = createControlledClaudeQuery();
++      queries.push(query);
++      return query;
++    });
++    const threadId = &quot;test-3625&quot;;
++    const dynamicTools = [{ name: &quot;probe&quot;, description: &quot;Test probe&quot;, inputSchema: { type: &quot;object&quot; } }];
++    const params = { threadId, cwd: &quot;/tmp&quot;, instructionMode: &quot;append&quot;, options: canonicalOptions({}), dynamicTools };
++    const client = new Client({ name: &quot;probe-client&quot;, version: &quot;1.0.0&quot; });
++    try {
++      bridge.sendRequest(1, &quot;thread/start&quot;, params);
++      const response = await bridge.waitForResponse(1);
++      const providerThreadId = getProviderThreadIdFromResult(response);
++      const options = queryMock.mock.calls[0][0].options;
++      expect(options.allowedTools).toContain(&quot;mcp__bb-bridge__probe&quot;);
++      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
++      await options.mcpServers[&quot;bb-bridge&quot;].instance.connect(serverTransport);
++      await client.connect(clientTransport);
++      expect((await client.listTools()).tools.map((tool) =&gt; tool.name)).toEqual([&quot;probe&quot;]);
++      queries[0].emit({ type: &quot;system&quot;, subtype: &quot;compact_boundary&quot;, uuid: &quot;00000000-0000-4000-8000-000000000001&quot;, session_id: providerThreadId, compact_metadata: { trigger: &quot;manual&quot;, pre_tokens: 450, post_tokens: 100 } });
++      await vi.waitFor(() =&gt; expect(queries[0].getContextUsage).toHaveBeenCalled());
++      expect((await client.listTools()).tools.map((tool) =&gt; tool.name)).toEqual([&quot;probe&quot;]);
++      bridge.sendRequest(3, &quot;thread/resume&quot;, { ...params, providerThreadId });
++      await bridge.waitForResponse(3);
++      expect(queryMock).toHaveBeenCalledTimes(1);
++      expect((await client.listTools()).tools.map((tool) =&gt; tool.name)).toEqual([&quot;probe&quot;]);
++    } finally {
++      await client.close();
++      await stopBridgeThread({ bridge, queries, threadId });
++      bridge.restore();
++    }
++  });
++
+   it(&quot;publishes a context snapshot after a turn and invalidates it at compaction&quot;, async () =&gt; {
+     const bridge = createBridgeJsonRpcTestHarness(handleLine);
+     const queries: ControlledClaudeQuery[] = [];
+</pre>
+<h2>5. Root cause</h2><p>Unresolved. The code establishes a construction-time tool set, but that does not by itself explain loss from a previously working Claude catalog.</p>
+<ul><li><a href="https://github.com/get-bb/bb/blob/d89160eb8c69c1e3ebc2ba2514f1711af8d7c506/apps/host-daemon/src/command-handlers/thread.ts#L163">Runtime resume</a> returns early when hasThread is true; otherwise it forwards resumeContext.dynamicTools.</li>
+<li><a href="https://github.com/get-bb/bb/blob/d89160eb8c69c1e3ebc2ba2514f1711af8d7c506/apps/host-daemon/src/command-handlers/thread.ts#L313">Turn submission</a> forwards input, options, contributed environment, and instructions; no dynamicTools refresh occurs.</li>
+<li><a href="https://github.com/get-bb/bb/blob/d89160eb8c69c1e3ebc2ba2514f1711af8d7c506/plugins/provider-claude-code/src/bridge/bridge.ts#L2045">Session attachment</a> builds the bridge only for nonempty tools:<pre>if (params.dynamicTools &amp;&amp; params.dynamicTools.length &gt; 0) {
+  const mcpServer = buildBridgeMcpServer(params.dynamicTools, ...);
+  sessionOptions.mcpServers = { [BB_BRIDGE_MCP_SERVER_NAME]: mcpServer };
+}</pre></li>
+<li><a href="https://github.com/get-bb/bb/blob/d89160eb8c69c1e3ebc2ba2514f1711af8d7c506/plugins/provider-claude-code/src/bridge/bridge.ts#L1350">Compact boundary handling</a> refreshes context usage; the probe found no BB-side removal of tools.</li>
+<li><a href="https://github.com/get-bb/bb/blob/d89160eb8c69c1e3ebc2ba2514f1711af8d7c506/plugins/provider-claude-code/src/bridge/tool-proxy-mcp.ts#L38">MCP list handler</a> maps the supplied tool definitions to the response.</li></ul>
+<h2>6. Proposed next experiment</h2><p>Use a disposable authenticated Claude process to record tool names at attachment, then exercise actual compaction and daemon reconnection separately while checking ToolSearch before and after each event. A BB MCP list response and Claude's deferred catalog are distinct observations. No production fix is justified until a faithful failing test identifies which layer loses the tools.</p>
+<h2>7. Verification</h2><p>The same agent created a second clean detached checkout at the recorded commit, repeated frozen installation and the full build, applied only the probe patch, and reran the exact test command with <code>--force</code>. Both builds completed 56 tasks successfully. The second test ran uncached and passed. This supports the limited boundary result, not the reported live-session symptom. No report correction was needed.</p>
+<h2>8. Related issues and pull requests</h2><p>Repository metadata search returned similarly classified reports, including #3626. These were used only as classification context. Issue timeline metadata contained no linked pull requests, and the open-PR search for 3625 returned none. No pull request was opened because the original failure was not reproduced.</p>
+<h2>9. Appendix</h2><p><a href="3625/repro/test-first.txt">First test output</a> · <a href="3625/repro/test-second.txt">Second test output</a>. The system pnpm shim initially failed with MODULE_NOT_FOUND; a temporary Corepack shim resolved it. The initial full build also hit that shim error; the retry and second build passed. No repository dependency or production source was changed. The patch contains only a test addition.</p><p>Untrusted-data note: issue prose was treated only as claims; embedded instructions and supplied external links were not followed. The investigation did not access the reporter's files or the user's runtime data.</p></main></body></html>
