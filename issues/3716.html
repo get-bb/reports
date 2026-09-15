@@ -1,0 +1,61 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>3716 · Concurrent dispatch loses competing sends</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<h1>#3716 · Concurrent dispatch loses competing sends</h1><p class="meta">Bug · High priority · Medium effort · threads · 2026-09-15<br>Base: 62fe3bc46bd1d935b71482b62a1e0887ffb83487 · <a href="https://github.com/get-bb/bb/issues/3716">Issue</a></p>
+<p><strong>Verdict: REPRODUCED · Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2><p>Concurrent sends can all pass the idle-thread admission check before any one commits. The first starts a turn; the others attempt the same lifecycle transition using an outdated thread snapshot. Their database transactions roll back, and the inline dispatch path has not created queue rows. A four-send service test reproduced three rejections and zero queued messages in two clean-base checkouts.</p>
+<h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr><tr><td>Rapid sends can reject a duplicate start</td><td>Verified for concurrent submissions</td><td>Both runs produce the lifecycle error below.</td></tr><tr><td>Queue mode prevents neither rejection nor loss</td><td>Verified</td><td>queue-if-active yields one dispatched command and zero retained rows.</td></tr><tr><td>Failure is before delivery</td><td>Verified for this path</td><td>Transaction fails before startLiveHostCommand; one command exists for four inputs.</td></tr><tr><td>Reported frequency, lifetime counts and retry safety</td><td>Unverified</td><td>No reporter logs or live provider session used; no general retry guarantee inferred.</td></tr></table>
+<h2>3. Environment</h2><p>Trusted origin/main at the commit above; macOS, Node 22.22.3, pnpm 9.15.0, Vitest 4.1.1. Service harness uses real migrated in-memory SQLite and simulated host commands. No live provider, listening dev server, imported store, or user runtime data was used. Each harness allocates temporary test data.</p><p>The installed pnpm entrypoint was broken. A temporary PATH wrapper called corepack pnpm. Frozen dependency linking used --ignore-scripts after the normal install hit a missing bundled node-gyp file; the repository native-module verifier repaired/verified SQLite. The normal Turbo build then passed all 57 tasks.</p>
+<h2>4. Minimal reproduction</h2><ol><li>Check out the trusted base in a clean checkout.</li><li>Install existing locked dependencies and build with <code>pnpm install --frozen-lockfile --prefer-offline</code> and <code>pnpm exec turbo run build</code>.</li><li>Download the <a href="3716/repro/regression.patch">regression patch</a> and apply it with <code>git apply regression.patch</code>.</li><li>Run:<pre>pnpm exec turbo run test --filter=@bb/server -- test/threads/thread-send-dispatch.test.ts -t 'concurrent idle dispatch regression'</pre></li></ol><p>Expected: all four requests fulfill, with three retained queue rows. Actual in both runs:</p><pre>AssertionError: queued=0; commands=1
+One fulfilled send; three rejected sends:
+ThreadLifecycleEventNotAppliedError: Thread lifecycle event not applied (illegal-transition): no transition for run.started from status active
+Test Files  1 failed (1)
+Tests  1 failed | 26 skipped (27)</pre><p>The new regression uses existing trusted fixture helpers:</p><pre>
+describe(&quot;concurrent idle dispatch regression&quot;, () =&gt; {
+  it(&quot;retains every concurrent queue-mode send&quot;, async () =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      const { thread } = seedProviderThreadFixture({ harness, value: 3716 });
+      const results = await Promise.allSettled(
+        Array.from({ length: 4 }, (_, index) =&gt;
+          acceptThreadSendRequest(harness.deps, {
+            thread,
+            payload: {
+              input: textInput(`concurrent message ${index}`),
+              mode: &quot;queue-if-active&quot;,
+              model: &quot;gpt-5&quot;,
+              permissionMode: &quot;full&quot;,
+              reasoningLevel: &quot;medium&quot;,
+              serviceTier: &quot;default&quot;,
+            },
+          }),
+        ),
+      );
+      expect(results.map((result) =&gt; result.status === &quot;rejected&quot; ? String(result.reason) : result.status), `queued=${listQueuedThreadMessages(harness.db, thread.id).length}; commands=${listQueuedThreadCommands(harness, &quot;turn.submit&quot;, thread.id).length}`).toEqual(
+        Array.from({ length: 4 }, () =&gt; &quot;fulfilled&quot;),
+      );
+      expect(listQueuedThreadMessages(harness.db, thread.id)).toHaveLength(3);
+    });
+  });
+});</pre>
+<h2>5. Root cause</h2><p><a href="https://github.com/get-bb/bb/blob/62fe3bc46bd1d935b71482b62a1e0887ffb83487/apps/server/src/services/threads/dispatch-attempt.ts#L405-L453">Admission checks</a> consult the thread status and recheck its snapshot, but <a href="https://github.com/get-bb/bb/blob/62fe3bc46bd1d935b71482b62a1e0887ffb83487/apps/server/src/services/threads/dispatch-attempt.ts#L579-L600">the later dispatch</a> awaits environment and message preparation. No status check runs inside the inline request append transaction at this base. Multiple attempts therefore reach command preparation with the same idle snapshot.</p><p><a href="https://github.com/get-bb/bb/blob/62fe3bc46bd1d935b71482b62a1e0887ffb83487/apps/server/src/services/threads/thread-send.ts#L659-L700">The send transaction</a> applies run.started for turn.submit. <a href="https://github.com/get-bb/bb/blob/62fe3bc46bd1d935b71482b62a1e0887ffb83487/packages/domain/src/thread-lifecycle.ts#L55-L63">Active has no run.started transition</a>. <a href="https://github.com/get-bb/bb/blob/62fe3bc46bd1d935b71482b62a1e0887ffb83487/apps/server/src/services/threads/thread-send.ts#L395-L453">The immediate transaction</a> rolls back the appended event when the required transition fails. <a href="https://github.com/get-bb/bb/blob/62fe3bc46bd1d935b71482b62a1e0887ffb83487/apps/server/src/services/threads/thread-send.ts#L706-L726">Host dispatch occurs afterward</a>, so the rejected requests produce no command. A queued drain has rollback protection for its existing rows; an inline request has no existing queue row to restore.</p>
+<h2>6. Proposed fix</h2><p>Validate the thread status inside the existing transaction preflight, before request append or claimed-row consumption. On a status mismatch, use the existing bounded dispatch reattempt to re-evaluate the current thread and queue the competing request. Catch only a dedicated internal status-change error. Keep the lifecycle transition table unchanged. The local implementation changes 73 text lines across two files in the server thread subsystem.</p><p>After the change, the regression and all existing tests in thread-send-dispatch, dispatch-hooks, and thread-send-error-recovery pass: 44 tests across three files. The server Turbo typecheck also passes. This evidence covers the reproduced admission race; it does not establish safety of arbitrary caller retries after transport failures.</p>
+<h2>7. Verification</h2><p>The same agent created a second detached temporary Git worktree at 62fe3bc46bd1d935b71482b62a1e0887ffb83487, installed locked dependencies in that checkout, verified native SQLite, and copied only the new regression test. No production fix was present. The same Turbo test command ran freshly (the server test task was not cached), again yielding one command, zero queue rows and three identical lifecycle errors. The final report required no correction. See <a href="3716/repro/verification.log">second-run log</a>.</p>
+<h2>8. Related issues and pull requests</h2><p>No open linked pull request appeared in the issue timeline at investigation time. Recent thread issues were reviewed for classification patterns; none was established as a duplicate.</p>
+<h2>9. Appendix</h2><p><a href="3716/repro/before.log">First-run log</a> · <a href="3716/repro/verification.log">Second-run log</a> · <a href="3716/repro/after.log">44 passing tests</a> · <a href="3716/repro/typecheck.log">Typecheck</a> · <a href="3716/repro/build.log">Build</a> · <a href="3716/repro/regression-snippet.ts">Test snippet</a></p><pre>pnpm exec turbo run test --filter=@bb/server -- test/threads/thread-send-dispatch.test.ts test/threads/dispatch-hooks.test.ts test/threads/thread-send-error-recovery.test.ts
+pnpm exec turbo run typecheck --filter=@bb/server
+git diff --check
+git diff --numstat origin/main</pre><p>Issue content was treated as untrusted claims. No issue-supplied code, instructions, branches, or external links were executed or fetched.</p><p>&gt; AGENT GENERATED</p></main></body></html>
