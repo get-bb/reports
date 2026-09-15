@@ -1,0 +1,123 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Issue 3694 pagination reproduction</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<h1>#3694 · Pagination drops an anchorless group across an ownership boundary</h1>
+<p>Bug · High priority · Medium effort · threads · 2026-09-15</p>
+<p><a href="https://github.com/get-bb/bb/issues/3694">GitHub issue</a> · Base <code>18d20f304ff6bc6328676913126db09b8f325c23</code></p>
+<p><strong>PARTIALLY REPRODUCED · Root-cause confidence: high for the pagination defect</strong></p>
+<h2>1. TL;DR</h2><p>The paginator can discard every supplied row while claiming older history exists without a continuation cursor. A synthetic two-row reproduction demonstrates this on current main. Moving the ownership boundary past the first row causes the failure, even though a later row lies inside the owned range. The live event-selection chain and server performance were not reproduced.</p>
+<h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Projected rows can disappear during pagination</td><td>Verified at function boundary</td><td>Two rows in control; zero after ownership start moves</td></tr>
+<tr><td>Older history can be advertised without a cursor</td><td>Verified</td><td>Both runs fail the continuation invariant</td></tr>
+<tr><td>No user-message anchor alone explains the failure</td><td>Incomplete</td><td>Anchorless groups work when their fallback cursor is owned</td></tr>
+<tr><td>Interleaved production turns trigger this selection window</td><td>Unverified</td><td>No production data accessed</td></tr>
+<tr><td>Repeated polls stall the server</td><td>Unverified</td><td>No live process or performance benchmark</td></tr></table>
+<h2>3. Environment</h2><p>Darwin arm64; Node v22.22.3; trusted get-bb/bb origin/main at 18d20f304ff6bc6328676913126db09b8f325c23. No provider, database, port, or runtime instance used. Frozen install and Turbo build were attempted but the installed pnpm launcher fails with MODULE_NOT_FOUND for its pnpm.cjs executable. The dependency-free test strips TypeScript using Node's built-in API and loads the two trusted pagination modules without changing their logic.</p>
+<h2>4. Minimal reproduction</h2><ol><li>Clone the public repository and check out the recorded commit.</li><li>Download <a href="3694/repro/check.mjs">check.mjs</a>.</li><li>Run <code>node check.mjs /absolute/path/to/checkout</code> with Node 22.22.3.</li></ol>
+<p>Expected: when older history is advertised, a usable continuation cursor exists. Actual: exit 1 with the assertion below. The control returns both rows.</p><pre>(node:68149) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+{
+  &quot;controlRows&quot;: 2,
+  &quot;actual&quot;: {
+    &quot;hasOlderRows&quot;: true,
+    &quot;olderCursor&quot;: null,
+    &quot;olderRowsSourceSeqEnd&quot;: 30,
+    &quot;returnedSegmentCount&quot;: 0,
+    &quot;rows&quot;: []
+  }
+}
+node:internal/modules/run_main:123
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: Older history must have a usable continuation cursor
+    at check.mjs:50:10 {
+  generatedMessage: false,
+  code: &#x27;ERR_ASSERTION&#x27;,
+  actual: false,
+  expected: true,
+  operator: &#x27;==&#x27;,
+  diff: &#x27;simple&#x27;
+}
+
+Node.js v22.22.3
+</pre>
+<details><summary>Full reproduction source</summary><pre>import assert from &quot;node:assert/strict&quot;;
+import { stripTypeScriptTypes } from &quot;node:module&quot;;
+import { readFile, writeFile, mkdtemp, rm } from &quot;node:fs/promises&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { resolve, join } from &quot;node:path&quot;;
+import { pathToFileURL } from &quot;node:url&quot;;
+
+const root = resolve(process.argv[2]);
+const temporary = await mkdtemp(join(tmpdir(), &quot;timeline-check-&quot;));
+try {
+  for (const name of [&quot;timeline-content-pagination&quot;, &quot;timeline-pagination&quot;]) {
+    const source = await readFile(join(root, &quot;apps/server/src/services/threads&quot;, name + &quot;.ts&quot;), &quot;utf8&quot;);
+    const stripped = stripTypeScriptTypes(source).replace(
+      &#x27;&quot;./timeline-content-pagination.js&quot;&#x27;,
+      &#x27;&quot;./timeline-content-pagination.mjs&quot;&#x27;,
+    );
+    await writeFile(join(temporary, name + &quot;.mjs&quot;), stripped);
+  }
+  const { paginateTimelineRows } = await import(pathToFileURL(join(temporary, &quot;timeline-pagination.mjs&quot;)));
+  const operation = (seq) =&gt; ({
+    id: &quot;operation-&quot; + seq,
+    kind: &quot;system&quot;,
+    threadId: &quot;synthetic-thread&quot;,
+    turnId: null,
+    sourceSeqStart: seq,
+    sourceSeqEnd: seq,
+    startedAt: seq,
+    createdAt: seq,
+    systemKind: &quot;operation&quot;,
+    operationKind: &quot;generic&quot;,
+    title: &quot;Synthetic operation&quot;,
+    detail: null,
+    status: &quot;completed&quot;,
+    completedAt: seq,
+  });
+  const rows = [operation(10), operation(30)];
+  const args = {
+    contextBoundarySeq: null,
+    knownHasOlderSegments: true,
+    maxLeaves: 1000,
+    maxBytes: 1000000,
+    ownedSequenceEnd: 40,
+    page: { kind: &quot;latest&quot;, segmentLimit: 8 },
+    rows,
+  };
+  const control = paginateTimelineRows({ ...args, ownedSequenceStart: 10 });
+  assert.equal(control.rows.length, 2);
+  const actual = paginateTimelineRows({ ...args, ownedSequenceStart: 20 });
+  console.log(JSON.stringify({ controlRows: control.rows.length, actual }, null, 2));
+  assert.ok(
+    !actual.hasOlderRows || actual.olderCursor !== null,
+    &quot;Older history must have a usable continuation cursor&quot;,
+  );
+} finally {
+  await rm(temporary, { recursive: true, force: true });
+}
+</pre></details>
+<h2>5. Root cause</h2><p><a href="https://github.com/get-bb/bb/blob/18d20f304ff6bc6328676913126db09b8f325c23/apps/server/src/services/threads/timeline-pagination.ts#L54-L73">Segment construction</a> uses the first row as its cursor when no message anchor exists. <a href="https://github.com/get-bb/bb/blob/18d20f304ff6bc6328676913126db09b8f325c23/apps/server/src/services/threads/timeline-pagination.ts#L147-L164">Ownership filtering and empty return</a> then reject the entire group based on that cursor, without considering that another row belongs to the owned range. The empty return preserves knownHasOlderSegments but hard-codes a null cursor. This explains the synthetic failure precisely; it does not establish how the reported production event window arose.</p>
+<p>Current main also restores missing request context in <a href="https://github.com/get-bb/bb/blob/18d20f304ff6bc6328676913126db09b8f325c23/apps/server/src/services/threads/timeline.ts#L1110-L1188">the event-selection path</a>, so absence of a particular old profiling stage does not prove request restoration was removed.</p>
+<h2>6. Proposed fix</h2><p>First add an event-backed regression covering selection, projection, and a complete older-page walk. Recover ownership of the actual group at window selection, then verify that older cursors make progress. A blanket inclusion of overlapping groups is unsafe: an existing pagination test deliberately excludes older context groups whose source end overlaps the window. Do not synthesize an arbitrary cursor without validating it through the cursor decoder.</p>
+<p>No PR: required installation/build and existing regression suites could not run because the pnpm executable is missing. No production code was changed or pushed.</p>
+<h2>7. Related issues and PRs</h2><p>No open PR referencing this issue was found through PR search or issue cross-reference metadata. Related issue search returned other timeline concerns, but no duplicate was established.</p>
+<h2>8. Verification</h2><p>The same agent repeated the test in a second clean clone checked out at the identical full commit. Command: <code>node check.mjs /absolute/path/to/second-checkout</code>. Both runs returned the same zero-row result and failed the same invariant with exit 1. No correction was needed to the function-level finding. This is a partial reproduction because event-store selection, browser rendering, and polling cost remain untested.</p>
+<h2>9. Appendix</h2><p><a href="3694/repro/run1.txt">First run</a> · <a href="3694/repro/run2.txt">Second run</a> · <a href="3694/repro/check.mjs">Repeatable test</a></p><p>Commands: git clone --depth 1 --branch main; git rev-parse HEAD; pnpm install --frozen-lockfile --prefer-offline; pnpm exec turbo run build; node check.mjs CHECKOUT; git clone --no-hardlinks --no-checkout; git checkout --detach BASE; node check.mjs SECOND_CHECKOUT. No server was started; temporary transpiled modules were removed automatically.</p><p>Issue text and suggested actions were treated as untrusted claims. No issue-supplied code, command, URL, or private runtime data was executed or accessed.</p>
+</main></body></html>
