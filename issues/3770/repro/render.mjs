@@ -1,0 +1,17 @@
+import { readFile, writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+const [root, output] = process.argv.slice(2);
+const theme = await readFile(resolve(root, 'apps/app/src/components/ui/theme.css'), 'utf8');
+const sizing = await readFile(resolve(root, 'packages/shared-ui/src/components/ui/coarse-pointer-sizing.ts'), 'utf8');
+const editor = await readFile(resolve(root, 'apps/app/src/components/promptbox/ComposerEditorSlot.tsx'), 'utf8');
+if (!editor.includes('COARSE_POINTER_TEXT_BASE_CLASS')) throw new Error('Editor no longer uses sizing helper');
+const classes = sizing.match(/COARSE_POINTER_TEXT_BASE_CLASS\s*=\s*"([^"]+)"/)[1];
+const start = theme.indexOf('@theme {\n  --text-sm:');
+const end = theme.indexOf('@layer components', start);
+const rules = theme.slice(start, end);
+const { compile } = await import(pathToFileURL(resolve(root, 'apps/app/node_modules/tailwindcss/dist/lib.mjs')));
+const result = await compile('@theme { --breakpoint-md: 48rem; }\n' + rules + '\n@tailwind utilities;');
+const css = result.build(classes.split(' '));
+await writeFile(output, '<!doctype html><html><meta name="viewport" content="width=device-width, initial-scale=1"><title>3770 reduced CSS reproduction</title><style>' + css + '</style><body><h1>Reduced composer typography test</h1><p>This isolates the trusted sizing helper and theme rules; it is not the full BB app or an iOS zoom reproduction.</p><div class="' + classes + '"><div class="ProseMirror" contenteditable="true">Focus this editable text</div></div><pre id="result"></pre></body></html>');
+console.log(JSON.stringify({classes, output: output.split('/').at(-1)}));
