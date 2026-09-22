@@ -1,0 +1,106 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>#3791 · Native cookie recovery investigation</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<h1>#3791 · Native cookie recovery investigation</h1>
+<p class="meta">Bug · High priority · Medium effort · bug, remote, connect, mobile<br>2026-09-21 · base 3a1178164f8cce6d7986d2627c03ffaedb8a6428<br><a href="https://github.com/get-bb/bb/issues/3791">Issue #3791</a></p>
+<p><strong>PARTIALLY REPRODUCED · Root-cause confidence: medium</strong></p>
+<h2>1. TL;DR</h2>
+<p>The reported incident combines a browser startup failure with native recovery failures. A focused test on current main reproduced one native recovery gap: removing both browser cookies leaves the session scheduler authenticated, and returning to foreground does not restore those cookies while expiry is far away. Explicit session verification does restore both stores in the same test. This supports the native reset concern, but does not reproduce a native HTTP response, failed pairing, Safari cache corruption, or the original transfer interruption.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Cookie deletion can leave native state authenticated</td><td>Verified at scheduler boundary</td><td>Two clean-checkout tests: authenticated state, zero cookie stores, only one session mint after foreground renewal.</td></tr>
+<tr><td>The clear-data action reloads without waiting or renewing</td><td>Verified by source only</td><td>ProfileWebViewScreen invokes two unawaited deletions and immediately changes its reload key.</td></tr>
+<tr><td>Startup asset became truncated and persistently cached</td><td>Unverified in this investigation</td><td>No incident device, damaged cache, or production edge access used. Complete-response encoding tests pass.</td></tr>
+<tr><td>Re-pairing fails, reinstall succeeds, intermittent 503</td><td>Unverified</td><td>No native device run or historical state available to this isolated test.</td></tr></table>
+<h2>3. Environment</h2><p>Trusted get-bb/bb origin/main at the full commit above; macOS Darwin arm64, Node v22.22.3, repository-pinned pnpm 9.15.0, Vitest 4.1.1. Two new detached worktrees named base and verify. Dependencies installed from the frozen lockfile with Corepack because the machine's default pnpm launcher references a missing installation. No providers, production instances, user cookies, or credentials were used. The unit reproduction has no ports or persistent data directory; its cookie store is an in-memory injected dependency. Workerd encoding tests use their existing ephemeral fixture.</p>
+<h2>4. Minimal reproduction</h2><ol><li>Check out the recorded trusted main commit in a new checkout and install with <code>corepack pnpm install --frozen-lockfile --prefer-offline</code>.</li><li>Copy the complete test below and place it at <code>apps/mobile/src/lib/session/issue-3791.test.ts</code>.</li><li>Run <code>pnpm exec turbo run test --filter=@bb/mobile -- issue-3791.test.ts</code>.</li></ol>
+<p>The test starts a real scheduler with a synthetic one-hour session, checks that both cookie stores were populated, removes them, and invokes the same renewal method used on foreground. A control then calls verifySession and confirms restoration before asserting the saved foreground result.</p>
+<pre>Expected: foreground restores 2 cookie stores.
+Actual: {"state":"authenticated","cookieStores":0,"minted":1}
+AssertionError: foreground must restore cleared cookies: expected +0 to be 2 // Object.is equality
+Test Files  1 failed (1)
+Tests       1 failed (1)</pre>
+<p>This is a focused failing regression candidate for a recovery contract, not a full native UI test. The current scheduler has no cookie-deletion notification; the failure belongs to the caller/scheduler coordination. It is not evidence that the expiry check itself should be removed. No screenshot is supplied because no visual reproduction was performed; this report does not claim to reproduce the blank screen.</p><pre>import { expect, it } from &quot;vitest&quot;;
+import { createSessionScheduler } from &quot;./session-scheduler&quot;;
+
+it(&quot;restores removed cookies when a still-valid session returns to foreground&quot;, async () =&gt; {
+  const stores = new Map&lt;boolean, string&gt;();
+  let minted = 0;
+  const scheduler = createSessionScheduler({
+    cookieStore: {
+      async set(_url, cookie, useWebKit) {
+        stores.set(useWebKit, cookie.value);
+      },
+    },
+    async fetchSession() {
+      minted += 1;
+      return {
+        cookie: {
+          name: &quot;test_session&quot;,
+          value: &quot;synthetic-cookie&quot;,
+          domain: &quot;.example.test&quot;,
+          expiresAt: Date.now() + 3_600_000,
+        },
+      };
+    },
+  });
+  try {
+    await scheduler.start({
+      id: &quot;test-profile&quot;,
+      mode: &quot;connect&quot;,
+      serverUrl: &quot;https://phone.example.test&quot;,
+      label: &quot;test&quot;,
+      handle: &quot;phone&quot;,
+      credential: &quot;synthetic-credential&quot;,
+      createdAt: 0,
+    });
+    expect(stores.size).toBe(2);
+    stores.clear();
+    scheduler.renewIfDue();
+    await new Promise((resolve) =&gt; setTimeout(resolve, 0));
+    console.log(JSON.stringify({ state: scheduler.getState().status, cookieStores: stores.size, minted }));
+    const cookiesAfterForeground = stores.size;
+    await scheduler.verifySession();
+    expect(stores.size).toBe(2);
+    expect(minted).toBe(2);
+    expect(cookiesAfterForeground, &quot;foreground must restore cleared cookies&quot;).toBe(2);
+  } finally {
+    scheduler.stop();
+  }
+});
+</pre>
+<h2>5. Root cause</h2><p><a href="https://github.com/get-bb/bb/blob/3a1178164f8cce6d7986d2627c03ffaedb8a6428/apps/mobile/src/screens/webview/ProfileWebViewScreen.tsx#L114">apps/mobile/src/screens/webview/ProfileWebViewScreen.tsx:114</a> clears native and WebKit cookies without awaiting either operation, then immediately reloads:</p><pre>webViewRef.current?.clearCache(true);
+void CookieManager.clearAll(false);
+void CookieManager.clearAll(true);
+...
+setLoad({ kind: "loading" });
+setReloadKey((value) =&gt; value + 1);</pre>
+<p><a href="https://github.com/get-bb/bb/blob/3a1178164f8cce6d7986d2627c03ffaedb8a6428/apps/mobile/src/lib/session/app-state.ts#L5">apps/mobile/src/lib/session/app-state.ts:5</a> calls renewIfDue on foreground. <a href="https://github.com/get-bb/bb/blob/3a1178164f8cce6d7986d2627c03ffaedb8a6428/apps/mobile/src/lib/session/session-scheduler.ts#L156">apps/mobile/src/lib/session/session-scheduler.ts:156</a> renews an authenticated session only near expiry. Cookie removal is therefore invisible to this scheduler. The test establishes the stale state under a synthetic successful mint and completed cookie deletion; it does not establish actual iOS deletion timing or cookie transmission.</p>
+<p><a href="https://github.com/get-bb/bb/blob/3a1178164f8cce6d7986d2627c03ffaedb8a6428/apps/mobile/src/screens/webview/ProfileWebViewScreen.tsx#L182">apps/mobile/src/screens/webview/ProfileWebViewScreen.tsx:182</a> retries by reloading. <a href="https://github.com/get-bb/bb/blob/3a1178164f8cce6d7986d2627c03ffaedb8a6428/apps/mobile/src/screens/webview/ProfileWebViewScreen.tsx#L309">apps/mobile/src/screens/webview/ProfileWebViewScreen.tsx:309</a> records HTTP errors without directly requesting session verification. The separate native client has its own recovery callbacks, so a client auth failure can renew the session; the problematic case is when that client remains healthy.</p>
+<p>For the original transfer, <a href="https://github.com/get-bb/bb/blob/3a1178164f8cce6d7986d2627c03ffaedb8a6428/apps/connect/src/tunnel-do.ts#L398">apps/connect/src/tunnel-do.ts:398</a> requests writer abort on failure; <a href="https://github.com/get-bb/bb/blob/3a1178164f8cce6d7986d2627c03ffaedb8a6428/apps/connect/src/tunnel-do.ts#L530">apps/connect/src/tunnel-do.ts:530</a> closes after body-end. These paths alone do not prove that a dropped connection becomes successful EOF. No initiating truncation root cause is established here.</p>
+<h2>6. Proposed fix and automatic-fix decision</h2><p>Coordinate data reset with session renewal: await cookie deletion, reinstall a valid session, then reload; make HTTP authentication failure invoke bounded recovery. Test deletion races, a missing WebView reference, and mint failures on iOS. For the browser incident, the next discriminating experiment is interrupted compressed immutable delivery through workerd cache miss/hit with slow readers, followed by real Safari cache reuse checks.</p><p>No automatic PR: the reproduced gap concerns authentication/session lifecycle, which is excluded by this rule's simple-fix conditions. The original Safari cache-corruption mechanism was not reproduced on main. No production changes, branch push, or fix test success is claimed.</p>
+<h2>7. Related issues and PRs</h2><p>No open pull request was found by issue-number search or the issue's cross-reference metadata. Similar mobile issue metadata was consulted for classification; no duplicate diagnosis was inferred.</p>
+<h2>8. Verification</h2><p>The same agent repeated the test in a second clean detached checkout at 3a1178164f8cce6d7986d2627c03ffaedb8a6428, with separately installed dependencies and no copied build output. The test task executed live (cache miss) and failed at the same assertion, reporting authenticated state with zero cookies. Explicit verifySession passed its two-store control in both runs. Both runs require no port or persistent data. No report correction was necessary; the verdict remains partial and scoped to the scheduler boundary.</p>
+<p>Both fresh runs executed the test and failed at line 44 with expected 2 / received 0. Existing checks passed: response-encoding.test.ts, 6 tests; session-scheduler.test.ts, 9 tests.</p>
+<h2>9. Appendix and limits</h2><p>Complete-response encoding suite: <code>pnpm exec turbo run test --filter=@bb/connect -- response-encoding.test.ts</code>, six tests passed. These cover valid compressed responses, not interrupted transfers. Existing scheduler suite was run separately with <code>pnpm exec turbo run test --filter=@bb/mobile -- session-scheduler.test.ts</code>; nine tests passed. Full repository build was attempted using <code>pnpm exec turbo run build</code>; final build status is recorded below.</p>
+<p>Issue content included operational suggestions and constraints. They were treated as untrusted claims, not followed as instructions. Only trusted main and the newly authored test ran. No issue-provided URLs were fetched. No live Safari/native UI, old native state, production logs, or production fault injection was used. Missing device evidence limits confidence about the original incident to low; confidence in the reproduced scheduler behavior is high.</p>
+<p>Build status: Full repository build was stopped after the focused evidence completed; it had not finished the app/bundled-plugin build. No successful full-build claim. The focused tests above completed.</p>
+<h3>Verbatim focused test output</h3><pre>@bb/mobile:test: cache miss, executing 58ddbbe82ecdbd69
+@bb/mobile:test: {&quot;state&quot;:&quot;authenticated&quot;,&quot;cookieStores&quot;:0,&quot;minted&quot;:1}
+@bb/mobile:test: AssertionError: foreground must restore cleared cookies: expected +0 to be 2 // Object.is equality
+@bb/mobile:test:  Test Files  1 failed (1)
+@bb/mobile:test:       Tests  1 failed (1)</pre></main></body></html>
