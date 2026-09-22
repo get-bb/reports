@@ -1,0 +1,10 @@
+import { createRequire } from 'node:module';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { resolve } from 'node:path';
+const root = resolve(process.argv[2]);
+const output = resolve(process.argv[3]);
+const require = createRequire(resolve(root,'package.json'));
+const {build} = require('esbuild');
+mkdirSync(output,{recursive:true});
+await build({stdin:{contents:readFileSync(new URL('./fixture.tsx',import.meta.url),'utf8'),resolveDir:resolve(root,'apps/app'),loader:'tsx'},bundle:true,jsx:'automatic',outfile:resolve(output,'fixture.js'),platform:'browser',define:{'process.env.NODE_ENV':'"production"'}});
+writeFileSync(resolve(output,'index.html'),`<!doctype html><meta charset="utf-8"><title>Composer sizing probe</title><style>*{box-sizing:border-box}body{margin:0;font:16px system-ui;background:#fff;color:#222}h1{font-size:18px;margin:12px}body>div>p{margin:12px;font-size:12px}section{width:390px;margin:12px;border:1px solid #999}[data-promptbox-editor-scroll]{overflow-y:auto;padding:12px 56px 4px 16px}.ProseMirror p{margin:0;line-height:1.7}.ProseMirror{outline:none}footer{padding:12px;background:#eee}#boundary{position:absolute;top:400px;width:100%;border-top:2px dashed #b00;pointer-events:none}</style><div id="root"></div><script src="fixture.js"></script>`);
