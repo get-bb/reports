@@ -1,0 +1,153 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>#3956 · Host interruption omits parent delivery</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<h1>#3956 · Host interruption omits parent delivery</h1>
+<p class="meta">Bug · High priority · Medium effort · threads · 2026-09-21</p>
+<p><a href="https://github.com/get-bb/bb/issues/3956">GitHub issue</a> · Base <code>3a1178164f8cce6d7986d2627c03ffaedb8a6428</code></p>
+<p><strong>Verdict: REPRODUCED</strong> · Root-cause confidence: high</p>
+<h2>1. TL;DR</h2><p>A child can enter error after its host disappears without delivering a terminal message to its parent. The bulk interruption path records the child events and lifecycle transition but bypasses the parent notification helper used by normal event processing. A database-backed test reproduces zero parent submissions after host interruption, while direct use of the existing helper successfully submits one parent message. Manual stop remains silent in the same harness.</p>
+<h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Host interruption fails to deliver a child outcome</td><td>Verified</td><td>Expected one parent submission, received zero in both clean-base runs.</td></tr>
+<tr><td>The child itself is terminally interrupted</td><td>Verified</td><td>Child state becomes error; turn/completed and system/thread/interrupted events exist.</td></tr>
+<tr><td>Existing batching can deliver interrupted outcomes</td><td>Verified</td><td>Direct-helper control passes.</td></tr>
+<tr><td>Manual stop stays silent</td><td>Verified</td><td>Negative control passes.</td></tr>
+<tr><td>Structured interruption details are available on parent notices</td><td>Absent in current contract</td><td>Notification arguments and system-message subject contain no reason or cause fields.</td></tr>
+<tr><td>Reported outage counts, waiting duration and competing recovery activity</td><td>Unverified</td><td>No access to reporter runtime; these operational claims are not needed for the focused reproduction.</td></tr></table>
+<h2>3. Environment</h2><p>Public get-bb/bb repository at the full commit above; Darwin arm64, Node 22.22.3, pnpm 9.15.0 through Corepack. Frozen installs and Turbo server builds succeeded. No live provider, user runtime, network-facing core or browser was started. The repository test harness uses migrated in-memory SQLite and a fresh temporary directory for each test, with simulated host RPC capture. No listening ports are required.</p>
+<h2>4. Minimal reproduction</h2><ol><li>Check out the recorded trusted commit in a clean checkout.</li><li>Install with <code>corepack pnpm install --frozen-lockfile --prefer-offline</code> and build with <code>corepack pnpm exec turbo run build --filter=@bb/server</code>.</li><li>Save the <a href="3956/repro/issue-3956-repro.test.ts">test artifact</a> to <code>apps/server/test/public/issue-3956-repro.test.ts</code>.</li><li>Run <code>corepack pnpm exec turbo run test --filter=@bb/server -- test/public/issue-3956-repro.test.ts</code>. For direct investigation after generating prerequisites: from <code>apps/server</code>, run <code>corepack pnpm exec vitest run --config vitest.config.ts --hookTimeout 60000 --testTimeout 60000 test/public/issue-3956-repro.test.ts</code>.</li></ol>
+<p>The parent lives on a different seeded host so interrupting the child does not also interrupt the parent. The test waits 2300ms, longer than the existing 2000ms batch delay. Expected: one parent submission for host interruption and the direct-helper control; none for manual stop. Actual: host interruption produces zero; the controls pass.</p><pre>import { setTimeout as sleep } from &quot;node:timers/promises&quot;;
+import { events, getThread } from &quot;@bb/db&quot;;
+import { turnScope } from &quot;@bb/domain&quot;;
+import { eq } from &quot;drizzle-orm&quot;;
+import { expect, it } from &quot;vitest&quot;;
+import { interruptActiveThreadsForHost } from &quot;../../src/services/threads/thread-lifecycle.js&quot;;
+import { queueChildThreadTurnNotificationBestEffort } from &quot;../../src/services/threads/child-thread-notifications.js&quot;;
+import { listQueuedThreadCommands } from &quot;../helpers/commands.js&quot;;
+import { seedEnvironment, seedEvent, seedHostSession, seedProjectWithSource, seedThread, seedThreadRuntimeState } from &quot;../helpers/seed.js&quot;;
+import { withTestHarness } from &quot;../helpers/test-app.js&quot;;
+
+it.each([&quot;host-daemon-restarted&quot;, &quot;manual-stop&quot;, &quot;control&quot;] as const)(&quot;parent delivery after %s&quot;, async (mode) =&gt; {
+  await withTestHarness(async (harness) =&gt; {
+    const { host } = seedHostSession(harness.deps);
+    const { project } = seedProjectWithSource(harness.deps, { hostId: host.id });
+    const parentEnv = seedEnvironment(harness.deps, { hostId: host.id, projectId: project.id });
+    const childHost = seedHostSession(harness.deps).host;
+    const childEnv = seedEnvironment(harness.deps, { hostId: childHost.id, projectId: project.id });
+    const parent = seedThread(harness.deps, { projectId: project.id, environmentId: parentEnv.id, providerId: &quot;codex&quot;, status: &quot;idle&quot; });
+    seedThreadRuntimeState(harness.deps, { threadId: parent.id, environmentId: parentEnv.id, providerThreadId: &quot;parent-provider&quot; });
+    const child = seedThread(harness.deps, { projectId: project.id, environmentId: childEnv.id, parentThreadId: parent.id, providerId: &quot;codex&quot;, status: &quot;active&quot; });
+    seedEvent(harness.deps, { threadId: child.id, environmentId: childEnv.id, providerThreadId: &quot;child-provider&quot;, sequence: 1, type: &quot;turn/started&quot;, scope: turnScope(&quot;child-turn&quot;), data: { providerThreadId: &quot;child-provider&quot; } });
+    if (mode === &quot;control&quot;) {
+      await queueChildThreadTurnNotificationBestEffort(harness.deps, { childThread: child, parentThreadId: parent.id, turnStatus: &quot;interrupted&quot; });
+    } else {
+      const result = interruptActiveThreadsForHost(harness.deps, { hostId: childHost.id, reason: mode, ...(mode === &quot;host-daemon-restarted&quot; ? { cause: &quot;host-connection-lost&quot; as const } : {}) });
+      expect(result.threads).toHaveLength(1);
+      expect(result.threads[0]?.interruptedTurnId).toBe(&quot;child-turn&quot;);
+      if (mode === &quot;host-daemon-restarted&quot;) expect(getThread(harness.db, child.id)?.status).toBe(&quot;error&quot;);
+      const childEvents = harness.db.select().from(events).where(eq(events.threadId, child.id)).all();
+      expect(childEvents.some((event) =&gt; event.type === &quot;turn/completed&quot;)).toBe(true);
+      expect(childEvents.some((event) =&gt; event.type === &quot;system/thread/interrupted&quot;)).toBe(true);
+    }
+    await sleep(2300);
+    const delivered = listQueuedThreadCommands(harness, &quot;turn.submit&quot;, parent.id);
+    expect(delivered).toHaveLength(mode === &quot;manual-stop&quot; ? 0 : 1);
+  });
+});
+</pre>
+<h2>5. Root cause</h2><p><a href="https://github.com/get-bb/bb/blob/3a1178164f8cce6d7986d2627c03ffaedb8a6428/apps/server/src/services/threads/thread-lifecycle.ts#L1825-L1852">interruptActiveThreadsForHost</a> selects active threads for the affected host and calls the bulk helper. <a href="https://github.com/get-bb/bb/blob/3a1178164f8cce6d7986d2627c03ffaedb8a6428/apps/server/src/services/threads/thread-lifecycle.ts#L1704-L1823">interruptActiveThreads</a> writes turn completion, error and interruption events, applies the lifecycle transition, cancels pending interactions and notifies only each child’s hub channel. It never invokes the parent batching helper.</p>
+<p>By contrast, <a href="https://github.com/get-bb/bb/blob/3a1178164f8cce6d7986d2627c03ffaedb8a6428/apps/server/src/internal/events.ts#L417-L453">normal turn-completion effects</a> schedule parent follow-ups and <a href="https://github.com/get-bb/bb/blob/3a1178164f8cce6d7986d2627c03ffaedb8a6428/apps/server/src/internal/events.ts#L507-L524">follow-up execution</a> invokes the helper. <a href="https://github.com/get-bb/bb/blob/3a1178164f8cce6d7986d2627c03ffaedb8a6428/apps/server/src/services/threads/thread-lifecycle.ts#L858-L867">command failure settlement</a> also schedules it. Inserting events directly does not execute those follow-up paths.</p>
+<p><a href="https://github.com/get-bb/bb/blob/3a1178164f8cce6d7986d2627c03ffaedb8a6428/apps/server/src/services/threads/child-thread-notifications.ts#L24-L65">batch item and queue arguments</a> have no interruption reason/cause fields. <a href="https://github.com/get-bb/bb/blob/3a1178164f8cce6d7986d2627c03ffaedb8a6428/packages/domain/src/system-message.ts#L30-L44">the public system-message subject schema</a> exposes thread identity, batch count or tool-call identity, with no interruption metadata. The queue persists that subject. Existing batching replaces entries by child ID within a live batch; it is not a durable per-turn deduplication mechanism.</p>
+<h2>6. Proposed fix and automatic-fix gate</h2><p>Route non-manual terminal interruptions through the existing parent batching path after the transaction commits, preserving parent eligibility and preventing duplicate delivery when command failure has already handled the turn. Define how structured reason/cause travel through single and batched persisted notices, then extend the regression coverage to the metadata and duplicate-handling paths. Preserve the existing <a href="https://github.com/get-bb/bb/blob/3a1178164f8cce6d7986d2627c03ffaedb8a6428/apps/server/src/services/threads/thread-lifecycle.ts#L2110-L2127">restart-revival suppression</a>.</p><p>No automatic fix PR: structured interruption metadata needs a contract/schema decision across persisted parent notices. The rule explicitly excludes public schema or stored-data changes. A delivery-only patch would leave that part unresolved. Production code was not changed, and no fix branch was pushed.</p>
+<h2>7. Verification</h2><p>The same agent repeated the test in a second clean temporary Git worktree at the identical base, with its own frozen install and successful server build. Each test gets a new isolated database and temporary directory. Both final runs show the same missing delivery and passing controls. An initial test-only assertion incorrectly expected the bulk manual-stop helper to settle a directly seeded active thread to idle; that assertion was removed because stop.settled requires the stopping lifecycle state. The final negative control checks silence without asserting unrelated lifecycle behavior. This is a direct code-path reproduction, not a physical host-disconnect experiment. It does not test reporter-specific timing, automatic retry, or command-failure duplicate suppression.</p>
+<h2>8. Related issues</h2><p>Repository search identified #3614 (parent unblock visibility), #2677 (premature child failure notification), and #3143 (runtime survival across daemon loss). They concern adjacent notification and transport behavior; none establishes a fix for this missing interruption delivery. No open PR linking #3956 was found in cross-reference metadata or an open-PR search.</p>
+<h2>9. Appendix</h2><p>Issue content was treated as untrusted claims. Instructions embedded in it were not executed; the test was authored from trusted repository helpers and implementation evidence. Local setup needed a PATH-local pnpm wrapper invoking Corepack because the machine’s pnpm launcher referenced a missing installation. Turbo test orchestration was attempted; direct Vitest investigation was also used to bypass the unrelated SDK declaration-build wait. The overloaded host also caused the default 10-second harness startup hook to time out; the final commands raise only runner hook/test timeouts to 60 seconds. Logs below are path-sanitized.</p>
+<h3>First run</h3><pre>
+ RUN  v4.1.1 &lt;checkout&gt;/apps/server
+
+(node:29038) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ❯ |@bb/server| test/public/issue-3956-repro.test.ts (3 tests | 1 failed) 19301ms
+   × parent delivery after host-daemon-restarted 2841ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |@bb/server| test/public/issue-3956-repro.test.ts &gt; parent delivery after host-daemon-restarted
+AssertionError: expected [] to have a length of 1 but got +0
+
+- Expected
++ Received
+
+- 1
++ 0
+
+ ❯ test/public/issue-3956-repro.test.ts:36:23
+     34|     await sleep(2300);
+     35|     const delivered = listQueuedThreadCommands(harness, &quot;turn.submit&quot;,…
+     36|     expect(delivered).toHaveLength(mode === &quot;manual-stop&quot; ? 0 : 1);
+       |                       ^
+     37|   });
+     38| });
+ ❯ withTestHarness test/helpers/test-app.ts:341:12
+ ❯ test/public/issue-3956-repro.test.ts:13:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 2 passed (3)
+   Start at  17:10:26
+   Duration  79.95s (transform 45.11s, setup 11.75s, import 47.08s, tests 19.30s, environment 0ms)
+
+</pre><h3>Second clean run</h3><pre>
+ RUN  v4.1.1 &lt;second-checkout&gt;/apps/server
+
+(node:28797) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ❯ |@bb/server| test/public/issue-3956-repro.test.ts (3 tests | 1 failed) 18434ms
+   × parent delivery after host-daemon-restarted 3284ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |@bb/server| test/public/issue-3956-repro.test.ts &gt; parent delivery after host-daemon-restarted
+AssertionError: expected [] to have a length of 1 but got +0
+
+- Expected
++ Received
+
+- 1
++ 0
+
+ ❯ test/public/issue-3956-repro.test.ts:36:23
+     34|     await sleep(2300);
+     35|     const delivered = listQueuedThreadCommands(harness, &quot;turn.submit&quot;,…
+     36|     expect(delivered).toHaveLength(mode === &quot;manual-stop&quot; ? 0 : 1);
+       |                       ^
+     37|   });
+     38| });
+ ❯ withTestHarness test/helpers/test-app.ts:341:12
+ ❯ test/public/issue-3956-repro.test.ts:13:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 2 passed (3)
+   Start at  17:10:14
+   Duration  76.07s (transform 42.65s, setup 12.77s, import 42.16s, tests 18.43s, environment 0ms)
+
+</pre>
+</main></body></html>
