@@ -1,0 +1,120 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Issue 3987: active-thread admission before host readiness</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<h1>#3987 · Active-thread admission before host readiness</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Low</span><span class="pill">threads</span><a href="https://github.com/get-bb/bb/issues/3987">GitHub issue</a></p>
+<p>2026-09-21 · trusted main <code>b8866c6e1dbb1e9b043df3d4474178459a5b4f9a</code></p>
+<p><strong>Verdict: REPRODUCED · Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2><p>A request to start another turn on an active thread can incorrectly succeed as a queued message when its host is suspended. The server checks host readiness before rejecting an active-thread start, and refreshes a stale thread snapshot even later. Both a stale idle snapshot and a fresh active snapshot reproduce the wrong result. A queued follow-up legitimately retains its host wait.</p>
+<h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr><tr><td>A stale idle snapshot can bypass the active-thread conflict.</td><td>Verified</td><td>Start rejection assertion failed in both clean checkouts; returned delivery queued with host-offline.</td></tr><tr><td>Queue-if-active should retain host waiting.</td><td>Verified</td><td>Control passed in both runs, including a host-readiness request.</td></tr><tr><td>The fault requires a stale snapshot.</td><td>Broader finding</td><td>The fresh active snapshot also failed; host-wait precedence is independently wrong.</td></tr><tr><td>A particular external patch fixes the defect.</td><td>Unverified</td><td>No external patch or fork was fetched or executed.</td></tr></table>
+<h2>3. Environment</h2><p>Public get-bb/bb repository, macOS 26.6.2 arm64, Node 22.22.3, repository-pinned pnpm 9.15.0, Vitest 4.1.1. Both checkouts use the same full commit above. Frozen installs and server builds completed. The system pnpm launcher was unavailable; Corepack supplied the pinned version. Tests use the repository harness with a migrated in-memory SQLite database and a fresh temporary data directory per test. No real provider, development instance, live account, or listening port is required. Host readiness is spied on to prevent external wake work; the database and dispatch implementation are real.</p>
+<h2>4. Minimal reproduction</h2><ol><li>Download <a href="3987/repro/regression.patch">the independently authored regression patch</a>.</li><li>Prepare trusted source and run:<pre>git clone https://github.com/get-bb/bb.git bb-3987
+cd bb-3987
+git checkout --detach b8866c6e1dbb1e9b043df3d4474178459a5b4f9a
+corepack pnpm install --frozen-lockfile --prefer-offline
+corepack pnpm exec turbo run build --filter=@bb/server
+git apply /path/to/regression.patch
+corepack pnpm exec turbo run test --filter=@bb/server -- test/threads/thread-send-dispatch.test.ts -t &#x27;active thread admission before host readiness&#x27; </pre></li><li>The fixture creates an idle provider-backed thread, suspends its host, and records a lifecycle event that makes the persisted thread active. It submits using the saved idle snapshot or a fresh active snapshot.</li><li>Expected: an API error with status 409, code thread_not_writable, reason already_active; no queued message or host wake. Actual verbatim assertion:<pre>AssertionError: promise resolved "{ ok: true, delivery: 'queued', …(1) }" instead of rejecting
+Tests  2 failed | 1 passed | 31 skipped (34)</pre>The returned queued message has <code>waitingOn.kind = "host-offline"</code>.</li></ol>
+<p>New tests (the patch also adds two imports and uses the existing fixture):</p><pre>describe(&quot;active thread admission before host readiness&quot;, () =&gt; {
+  it.each([&quot;stale&quot;, &quot;fresh&quot;] as const)(
+    &quot;rejects a start with a %s snapshot without waking a suspended host&quot;,
+    async (snapshot) =&gt; {
+      await withTestHarness(async (harness) =&gt; {
+        const { environment, thread } = seedProviderThreadFixture({
+          harness,
+          value: 3987,
+        });
+        updateHost(harness.db, harness.hub, environment.hostId, {
+          phase: &quot;suspended&quot;,
+          suspendedAt: Date.now(),
+        });
+        applyLoggedThreadLifecycleEvent(harness.deps, {
+          event: { type: &quot;run.started&quot; },
+          threadId: thread.id,
+        });
+        const current = getThread(harness.db, thread.id);
+        expect(current?.status).toBe(&quot;active&quot;);
+        if (current === null) throw new Error(&quot;Missing seeded thread&quot;);
+        const readiness = vi
+          .spyOn(queuedDispatch, &quot;requestQueuedMachineReadiness&quot;)
+          .mockImplementation(() =&gt; {});
+
+        await expect(
+          acceptThreadSendRequest(harness.deps, {
+            thread: snapshot === &quot;stale&quot; ? thread : current,
+            payload: { input: textInput(&quot;begin another turn&quot;), mode: &quot;start&quot; },
+          }),
+        ).rejects.toMatchObject({
+          status: 409,
+          body: {
+            code: &quot;thread_not_writable&quot;,
+            details: { reason: &quot;already_active&quot; },
+          },
+        });
+        expect(listQueuedThreadMessages(harness.db, thread.id)).toEqual([]);
+        expect(readiness).not.toHaveBeenCalled();
+      });
+    },
+  );
+
+  it(&quot;keeps the host wait for queue-if-active after a stale idle snapshot&quot;, async () =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      const { environment, thread } = seedProviderThreadFixture({
+        harness,
+        value: 3988,
+      });
+      updateHost(harness.db, harness.hub, environment.hostId, {
+        phase: &quot;suspended&quot;,
+        suspendedAt: Date.now(),
+      });
+      applyLoggedThreadLifecycleEvent(harness.deps, {
+        event: { type: &quot;run.started&quot; },
+        threadId: thread.id,
+      });
+      const readiness = vi
+        .spyOn(queuedDispatch, &quot;requestQueuedMachineReadiness&quot;)
+        .mockImplementation(() =&gt; {});
+
+      await expect(
+        acceptThreadSendRequest(harness.deps, {
+          thread,
+          payload: { input: textInput(&quot;follow up later&quot;), mode: &quot;queue-if-active&quot; },
+        }),
+      ).resolves.toMatchObject({
+        delivery: &quot;queued&quot;,
+        queuedMessage: { waitingOn: { kind: &quot;host-offline&quot; } },
+      });
+      expect(listQueuedThreadMessages(harness.db, thread.id)).toHaveLength(1);
+      expect(readiness).toHaveBeenCalledWith(harness.deps, environment.hostId);
+    });
+  });
+});
+
+</pre>
+<h2>5. Root cause</h2><p>In <a href="https://github.com/get-bb/bb/blob/b8866c6e1dbb1e9b043df3d4474178459a5b4f9a/apps/server/src/services/threads/dispatch-attempt.ts#L407-L432">the core wait callback</a>, a suspended host causes an immediate queue result and readiness request before the active-thread check. The <a href="https://github.com/get-bb/bb/blob/b8866c6e1dbb1e9b043df3d4474178459a5b4f9a/apps/server/src/services/threads/dispatch-attempt.ts#L450-L461">database refresh</a> is later still. Thus a stale idle snapshot never causes a retry with current state, while even fresh active state loses to host waiting. The <a href="https://github.com/get-bb/bb/blob/b8866c6e1dbb1e9b043df3d4474178459a5b4f9a/apps/server/src/services/lib/lifecycle-api-errors.ts#L121-L128">existing error helper</a> supplies the expected 409 conflict.</p>
+<pre>host waiting → queue host-offline and return
+active start → reject (unreachable for suspended host)
+refresh persisted thread → retry if changed (also unreachable)</pre>
+<h2>6. Proposed fix</h2><p>Move the existing database freshness check before host handling and reject explicit starts on an active thread at that point. Keep non-start busy-thread queueing after host readiness, preserving queue-if-active behavior. Use the existing retry mechanism for changed state. This remains within server thread dispatch and requires no schema, dependency, or public contract changes.</p>
+<h2>7. Verification</h2><p>The same agent repeated the test in a second clean checkout named <code>second</code> at the recorded commit. Only the regression patch was added; production source was unchanged. A separate frozen install and server build passed. The same test command ran with a fresh in-memory database and temporary data directory, again yielding two failed start assertions and one passing queue control. No report correction was needed. This is a repeat run by the same agent, not independent verification.</p>
+<p><strong>Fix validation:</strong> the local fix passed all 118 tests across thread-send-dispatch, dispatch-hooks, requested-queue-drain, and queue-drain-failure, including all three new cases. Server typecheck and git diff --check passed. Two text files changed: 101 additions plus 19 deletions = 120 lines. The first post-fix test attempt failed during prerequisite process startup with exit -35, before tests ran; rerunning with Turbo concurrency 2 and Vitest maxWorkers 2 passed.</p><pre>corepack pnpm exec turbo run test --concurrency=2 --filter=@bb/server -- test/threads/thread-send-dispatch.test.ts test/threads/dispatch-hooks.test.ts test/threads/requested-queue-drain.test.ts test/threads/queue-drain-failure.test.ts --maxWorkers=2
+corepack pnpm exec turbo run typecheck --filter=@bb/server
+git diff --check
+git diff --numstat origin/main</pre><p><a href="3987/repro/after-tests-retry.log">Post-fix tests</a> · <a href="3987/repro/typecheck.log">Typecheck</a></p><h2>8. Related issues and PRs</h2><p>Issue timeline metadata and an open-PR search for 3987 returned no linked open pull request before the fix assessment. Nearby dispatch issues reviewed during triage did not establish a duplicate.</p>
+<h2>9. Appendix</h2><ul><li><a href="3987/repro/before-first.log">First reproduction log</a></li><li><a href="3987/repro/before-second.log">Second reproduction log</a></li><li><a href="3987/repro/build-first.log">First server build</a></li><li><a href="3987/repro/build-second.log">Second server build</a></li><li><a href="3987/repro/regression-tests.txt">Added test source</a></li></ul><p>Issue prose and links were treated as untrusted claims. No issue-supplied commands, tests, patches, branches, or external URLs were executed or fetched. Local filesystem prefixes in logs are normalized.</p>
+</main></body></html>
