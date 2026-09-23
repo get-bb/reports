@@ -1,0 +1,11 @@
+import { readFileSync } from 'node:fs';
+import assert from 'node:assert/strict';
+import { resolve } from 'node:path';
+const root = process.argv[2];
+const source = readFileSync(resolve(root, 'apps/app/src/lib/bb-desktop.ts'), 'utf8');
+const offset = Number(source.match(/MACOS_TRAFFIC_LIGHT_RESERVE_OFFSET_CLASS = "left-\[(\d+)px\]"/)[1]);
+const reserve = Number(source.match(/MACOS_COLLAPSED_TOP_LEFT_RESERVE_CLASS = "pl-\[(\d+)px\]"/)[1]);
+const native = readFileSync(resolve(root, 'apps/desktop/src/desktop-window-factory.ts'), 'utf8');
+const inset = Number(native.match(/MACOS_TRAFFIC_LIGHT_DIAGONAL_INSET = (\d+)/)[1]);
+assert.equal(offset + 28 + 8, 16 + reserve);
+console.log(JSON.stringify({toggleLeft:offset, collapsedContentStart:16+reserve, nativeInset:inset, relativeAlignment:'PASS', nativeObstruction:'UNVERIFIED'}, null, 2));
