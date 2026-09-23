@@ -1,0 +1,124 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Issue 4158: unresolved hooks repeatedly reschedule removal</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<h1>#4158 · Unresolved hooks repeatedly reschedule removal</h1>
+<p class="meta">Bug · Priority: Medium · Effort: High · workspaces · confirmed-repro<br>2026-09-23 · Base: 94d77da09568d7f0f7cdb23b84686e743acfb0ad<br><a href="https://github.com/get-bb/bb/issues/4158">GitHub issue</a></p>
+<p><strong>Verdict: REPRODUCED</strong> · Root-cause confidence: high</p>
+<h2>1. TL;DR</h2><p>When a host loses its record of a teardown hook, the server correctly refuses to remove a workspace whose hook might still be running. However, it treats this durable uncertainty as an ordinary temporary removal failure. Every eligible sweep retries the same unfinished hook and schedules another attempt 60 seconds later, without resolving the uncertainty. A focused regression on unchanged production code reproduced four such cycles in two clean checkouts, with zero provider removal calls.</p>
+<h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Unknown cancellation leaves a pending operation and prevents removal</td><td>Verified</td><td>Real migrated SQLite harness; four attempts, unfinished hook, zero remove calls.</td></tr>
+<tr><td>Retries continue at a fixed one-minute interval without a cap</td><td>Verified mechanism</td><td>Four deadlines exactly 60,000 ms apart; source has an unconditional increment and constant retry delay. No multi-day soak was performed.</td></tr>
+<tr><td>Each RPC costs six seconds</td><td>Qualified</td><td>Six seconds is the cancellation timeout, not a mandatory duration. The test receives immediate unknown responses. Each attempt dispatches both run and cancel.</td></tr>
+<tr><td>No filtering is available</td><td>Qualified</td><td>There is no teardown-specific filter, but list supports --status error and --json.</td></tr>
+<tr><td>No explicit recovery command</td><td>Verified in inspected CLI/routes</td><td>The CLI offers deletion, which requests the existing removal lifecycle; no recovery verb is registered.</td></tr>
+<tr><td>Reported fleet counts, disk usage, and already-missing paths</td><td>Unverified</td><td>No reporter machine or runtime data was accessed; no filesystem reclamation or physical daemon restart was tested here.</td></tr></table>
+<h2>3. Environment</h2><p>Public get-bb/bb origin/main at the full commit above; macOS Darwin arm64, Node 22.22.3, pnpm 9.15.0 through Corepack, Vitest 4.1.1. Two detached clean source worktrees, named base and verify. Each run used the repository harness with its own temporary data directory and migrated in-memory SQLite database. No HTTP listeners, real provider accounts, or user runtime data were used. The injected provider records removal calls; the RPC responder represents a daemon that has lost the hook operation.</p>
+<p>Frozen installs succeeded and both full Turbo builds passed (60 tasks). A broken system pnpm launcher initially failed; a temporary wrapper invoking corepack pnpm restored normal tooling without changing dependencies.</p>
+<h2>4. Minimal reproduction</h2><ol><li>Check out the recorded commit in a clean worktree.</li><li>Run <code>pnpm install --frozen-lockfile --prefer-offline</code> and <code>pnpm exec turbo run build</code>.</li><li>Save the complete patch below as regression.patch and apply it with <code>git apply regression.patch</code>. It adds imports and one test to the existing provider orchestration test, reusing its trusted setup helper.</li><li>Run <code>pnpm exec turbo run test --filter=@bb/server -- test/services/environments/provider-orchestration.test.ts -t 'issue 4158'</code>.</li></ol>
+<p>The test seeds an unfinished hook, makes resume fail and cancellation report unknown, then drives four lifecycle sweeps using the deadlines written by the real server. Only Date.now is controlled; asynchronous timers remain real. Its regression assertion requires automatic cancellation probes to stop after the first unknown outcome. The assertion intentionally fails on the base; it is a candidate requirement, not an implemented recovery policy.</p>
+<pre>diff --git a/apps/server/test/services/environments/provider-orchestration.test.ts b/apps/server/test/services/environments/provider-orchestration.test.ts
+index c78d15ec7..1e36dcbf6 100644
+--- a/apps/server/test/services/environments/provider-orchestration.test.ts
++++ b/apps/server/test/services/environments/provider-orchestration.test.ts
+@@ -1,3 +1,5 @@
++import { environmentHookOperations } from &quot;@bb/db&quot;;
++import { registerHostRpcResponder } from &quot;../../helpers/host-rpc.js&quot;;
+ import { appendThreadProvisioningEvent } from &quot;../../../src/services/threads/thread-events.js&quot;;
+ import { requestThreadStopForCurrentState } from &quot;../../../src/services/threads/thread-lifecycle.js&quot;;
+ import {
+@@ -2177,3 +2179,61 @@ describe(&quot;worktree adoption cleanup&quot;, () =&gt; {
+       }),
+   );
+ });
++
++
++it(&quot;issue 4158: unknown hook outcomes stop automatic retry&quot;, async () =&gt; {
++  await withTestHarness(async (harness) =&gt; {
++    const remove = vi.fn(async () =&gt; ({ status: &quot;removed&quot; as const }));
++    const fixture = setup(harness, { policy: { retireGraceMs: 0 }, remove });
++    registerTestHostRpcCapture(harness.deps, {
++      hostId: fixture.host.id,
++      sessionId: fixture.session.id,
++    });
++    fixture.ask();
++    await fixture.settled();
++    const environmentId = fixture.attach();
++    const operationId = `environment:${environmentId}:${fixture.row().environmentProviderInstanceKey}:teardown`;
++    harness.db.insert(environmentHookOperations).values({
++      id: operationId,
++      operationId,
++      hostId: fixture.host.id,
++      path: fixture.row().path!,
++      kind: &quot;teardown&quot;,
++      startedAt: Date.now() - 1000,
++    }).run();
++    const rpc = registerHostRpcResponder(harness, {
++      hostId: fixture.host.id,
++      sessionId: fixture.session.id,
++      handle: async ({ command }) =&gt; {
++        if (command.type === &quot;environment.hook.run&quot;) {
++          expect(command.resumeOnly).toBe(true);
++          return { ok: false, errorCode: &quot;test_lost_operation&quot;, errorMessage: &quot;Lost operation&quot; };
++        }
++        if (command.type === &quot;environment.hook.cancel&quot;)
++          return { ok: true, result: { status: &quot;unknown&quot; } };
++        throw new Error(`Unexpected command: ${command.type}`);
++      },
++    });
++    const clock = vi.spyOn(Date, &quot;now&quot;);
++    let now = Date.now();
++    const observations = [];
++    try {
++      for (let cycle = 0; cycle &lt; 4; cycle++) {
++        clock.mockReturnValue(now);
++        await sweepProviderEnvironment(harness.deps, environmentId);
++        const row = getEnvironment(harness.db, environmentId)!;
++        observations.push({ attempt: row.teardownAttempt, status: row.teardownStatus, retryDelay: row.retireAt === null ? null : row.retireAt - now });
++        now = row.retireAt ?? now + 60000;
++      }
++      const operation = harness.db.select().from(environmentHookOperations).where(eq(environmentHookOperations.id, operationId)).get();
++      const cancels = rpc.requests.filter(({command}) =&gt; command.type === &quot;environment.hook.cancel&quot;).length;
++      console.log(JSON.stringify({ observations, cancels, providerRemoveCalls: remove.mock.calls.length, hookFinishedAt: operation?.finishedAt }));
++      expect(remove).not.toHaveBeenCalled();
++      expect(operation?.finishedAt).toBeNull();
++      expect(cancels).toBe(1);
++    } finally {
++      clock.mockRestore();
++      rpc.unregister();
++    }
++  });
++});
+</pre>
+<h3>Expected versus actual</h3><p>Expected: one cancellation probe while uncertainty stays unresolved; provider removal remains blocked. Actual, verbatim in both runs:</p><pre>{&quot;observations&quot;:[{&quot;attempt&quot;:1,&quot;status&quot;:&quot;failed&quot;,&quot;retryDelay&quot;:60000},{&quot;attempt&quot;:2,&quot;status&quot;:&quot;failed&quot;,&quot;retryDelay&quot;:60000},{&quot;attempt&quot;:3,&quot;status&quot;:&quot;failed&quot;,&quot;retryDelay&quot;:60000},{&quot;attempt&quot;:4,&quot;status&quot;:&quot;failed&quot;,&quot;retryDelay&quot;:60000}],&quot;cancels&quot;:4,&quot;providerRemoveCalls&quot;:0,&quot;hookFinishedAt&quot;:null}
+AssertionError: expected 4 to be 1 // Object.is equality
+Test Files  1 failed (1)
+Tests  1 failed | 57 skipped (58)</pre>
+<h2>5. Root cause</h2><p><a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/apps/host-daemon/src/command-handlers/environment-hook.ts#L15-L29">Daemon operation tracking</a> is held only in memory. <a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/apps/host-daemon/src/command-handlers/environment-hook.ts#L45-L46">Resume after loss</a> rejects unknown IDs, and <a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/apps/host-daemon/src/command-handlers/environment-hook.ts#L88-L99">cancellation of an unknown ID</a> reports unknown. The existing daemon test also verifies memory loss without rerunning the shell.</p>
+<p><a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/apps/server/src/services/environments/environment-hooks.ts#L137-L151">The server catch path</a> awaits cancellation before continuing removal. <a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/apps/server/src/services/environments/environment-hooks.ts#L160-L190">Cancellation throws before finishing the row</a> when the result is unknown. Thus the provider remove call is never reached. <a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/apps/server/src/services/environments/environment-engine.ts#L699-L705">The removal catch</a> sets failed teardown and retireAt = Date.now() + REMOVE_RETRY_MS, where <a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/apps/server/src/services/environments/environment-engine.ts#L294">REMOVE_RETRY_MS</a> is 60,000. <a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/apps/server/src/services/environments/environment-engine.ts#L793-L825">The next sweep</a> increments the attempt and runs removal again without a retry ceiling or a special unresolved state.</p>
+<pre>if (result.status === "unknown")
+  throw new Error(...);
+
+teardownStatus: "failed",
+retireAt: Date.now() + REMOVE_RETRY_MS</pre>
+<p>The retry loop is the defect; the unknown-outcome safety guard is intentional. <a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/packages/templates/src/templates/bb-guide-environments.md#L39-L64">The guide</a> documents this safety requirement. Marking an unknown hook completed automatically would discard it without proof that the process stopped. <a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/apps/cli/src/commands/environment.ts#L393-L460">The CLI list/delete commands</a> show the broad error filter and existing deletion path; <a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/apps/server/src/routes/environments.ts#L300-L328">the delete route</a> requests normal removal.</p>
+<h2>6. Proposed fix and simple-fix decision</h2><p>Define an explicit inspect-and-recover transition for unresolved hooks, retaining the removal guard until safe recovery is acknowledged. Stop or back off automatic retries while unresolved, and make the blocked condition discoverable. This requires choosing recovery semantics and likely an exposed lifecycle/API change, which fails the autopilot rule's no-product-decision and no-public-schema-change limits. No production fix, branch push, or PR was attempted. A retry-only patch would leave recovery unsolved. No open PR linked to this issue was found through timeline metadata or PR search.</p>
+<h2>7. Verification</h2><p>The same agent created a second clean detached checkout at 94d77da09568d7f0f7cdb23b84686e743acfb0ad, performed a fresh frozen install and full Turbo build, applied only the same regression patch, and repeated the exact server test command. The second test really executed (not a test-cache replay): it failed at the same assertion with identical four-attempt observations. First test duration: 3.88 s; second: 4.32 s. Both used fresh harness databases and temporary directories; no ports were needed.</p>
+<p>Additional unchanged-code check: <code>pnpm exec turbo run test --filter=@bb/host-daemon -- test/command/environment-hook.test.ts</code>: 9 passed, including the memory-loss behavior. This validates the responder's premise separately; it is not a physical daemon restart. No correction was required after the second run.</p>
+<h2>8. Related issues</h2><p><a href="https://github.com/get-bb/bb/issues/2477">#2477</a> concerns the teardown-hook feature; <a href="https://github.com/get-bb/bb/issues/1647">#1647</a> concerns process cleanup on environment removal. These provide context, not proof of this defect.</p>
+<h2>9. Appendix and trust boundary</h2><p>The issue body was treated solely as untrusted claims. Its proposed instructions and external links were not executed or fetched. Tests were authored from trusted source. No dependencies were added and production code was unchanged. The complete regression patch and exact relevant output are embedded above; raw local logs are not published. CLI and code-link findings were checked against the pinned source.</p>
+<p>Other checks: GitHub repository visibility, issue properties, labels, comments and cross-reference metadata; git fetch origin main; git diff --check (passed); git diff --numstat (60 additions, zero deletions, one test file). No full server suite was claimed because no production fix was made. All harness resources were cleaned up by the tests.</p>
+</main></body></html>
