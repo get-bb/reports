@@ -1,0 +1,209 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>4159 · Mutable plugin ESM generations remain retained</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<h1>#4159 · Mutable plugin ESM generations remain retained</h1>
+<p class="meta">Bug · High priority · High effort · plugins, perf · 2026-09-23 · <a href="https://github.com/get-bb/bb/issues/4159">GitHub issue</a></p>
+<p>Trusted base: <code>94d77da09568d7f0f7cdb23b84686e743acfb0ad</code>. Verdict: <strong>PARTIALLY REPRODUCED</strong>. Root-cause confidence: <strong>high</strong> for native ESM retention.</p>
+<h2>1. TL;DR</h2><p>Reloading a mutable native ESM graph leaves earlier module state reachable after garbage collection. An isolated reproduction using the current repository’s resolve-hook and generation functions retains eight distinct module states across eight loads, even after root deregistration. The control retains only one state. The reported large TypeScript graph, Electron crash, and 73 MB rate were not reproduced; a tiny TypeScript graph under Node 22 does not show the same retention. No fix PR is proposed because changing module reuse or execution isolation needs a lifecycle design decision.</p>
+<h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Fresh module URLs accumulate retained graphs</td><td>Verified for native ESM</td><td>Two runs: 16.36 MiB heap growth after eight loads, eight distinct retained arrays; control about 2.2 MiB and one array.</td></tr>
+<tr><td>TypeScript loads retain about 73 MB each in newer runtimes</td><td>Unverified</td><td>Node 22 tiny TypeScript fixture retains zero exported arrays; no external plugin downloaded and no Node 24/26 run.</td></tr>
+<tr><td>Disable/enable takes the same loading path</td><td>Verified statically</td><td>Both enable and reload call loadOne. Full HTTP/service cycles were not exercised.</td></tr>
+<tr><td>Path sources select source entry even with a built artifact</td><td>Verified statically</td><td>resolveServerEntry returns manifest.serverEntry for path sources.</td></tr>
+<tr><td>Production server crashes after many reloads</td><td>Unverified</td><td>No crash was induced and no production data accessed.</td></tr></table>
+<h2>3. Environment</h2><p>macOS arm64, Node v22.22.3, repository-locked jiti 2.7.0. Initial checkout at trusted origin/main, followed by a separate detached clean worktree at the same commit. Frozen dependency installations succeeded with Corepack. Full Turbo build succeeded (60 tasks); the second checkout’s server build also succeeded. The first launcher attempt failed because the local pnpm launcher referenced a missing installation; a temporary wrapper invoking Corepack resolved it. No server, provider, port, real account, or persistent application data was used. Each invocation creates and removes its own temporary fixture directory.</p>
+<h2>4. Minimal reproduction</h2><p>Save <a href="4159/repro/retention.mjs">retention.mjs</a> outside a trusted clone and run the following from that clone. The harness extracts the actual hook and generation functions directly from source, strips their TypeScript annotations, and imports through the repository’s jiti with moduleCache disabled. It does not import the whole service. The fixture has no SDK imports, so no SDK alias is needed.</p>
+<pre>git checkout 94d77da09568d7f0f7cdb23b84686e743acfb0ad
+corepack pnpm install --frozen-lockfile --prefer-offline
+corepack pnpm exec turbo run build --filter=@bb/server
+node --expose-gc /path/to/retention.mjs "$PWD" generation
+node --expose-gc /path/to/retention.mjs "$PWD" control
+node --expose-gc /path/to/retention.mjs "$PWD" generation --typescript
+node --expose-gc /path/to/retention.mjs "$PWD" generation --assert-reclaimed</pre>
+<p>Each module exports a 262144-element array. The harness keeps only WeakRefs between loads, performs eight GCs across event-loop turns per sample, then deregisters the root and collects again. Expected bounded behavior: obsolete arrays can be collected. Actual ESM behavior: all eight arrays survive. The final command fails with <code>8 !== 1</code>, providing an explicit desired-behavior regression assertion; it is a focused loader test, not an end-to-end plugin-service regression test. Its default mode asserts the observed current behavior and exits successfully.</p><pre>import { readFileSync, writeFileSync, mkdtempSync, rmSync } from &#x27;node:fs&#x27;;
+import { tmpdir } from &#x27;node:os&#x27;;
+import { join, resolve } from &#x27;node:path&#x27;;
+import { createRequire, stripTypeScriptTypes } from &#x27;node:module&#x27;;
+import { pathToFileURL } from &#x27;node:url&#x27;;
+import assert from &#x27;node:assert/strict&#x27;;
+
+const checkout = resolve(process.argv[2]);
+const mode = process.argv[3] ?? &#x27;generation&#x27;;
+const typescript = process.argv.includes(&#x27;--typescript&#x27;);
+const extension = typescript ? &#x27;ts&#x27; : &#x27;js&#x27;;
+const source = readFileSync(join(checkout, &#x27;apps/server/src/services/plugins/plugin-runtime.ts&#x27;), &#x27;utf8&#x27;);
+const first = source.slice(source.indexOf(&#x27;interface MutableRoot {&#x27;), source.indexOf(&#x27;const PROVIDER_ICON_CONTENT_TYPES&#x27;));
+const second = source.slice(source.indexOf(&#x27;function mutableRootDir(&#x27;), source.indexOf(&#x27;type PluginDevBuildKind&#x27;));
+const scratch = mkdtempSync(join(tmpdir(), &#x27;bb-retention-&#x27;));
+const loader = join(scratch, &#x27;loader.mjs&#x27;);
+writeFileSync(loader, stripTypeScriptTypes(`import { realpathSync } from &#x27;node:fs&#x27;;\nimport { join } from &#x27;node:path&#x27;;\nimport { pathToFileURL } from &#x27;node:url&#x27;;\nimport { createRequire, registerHooks } from &#x27;node:module&#x27;;\n${first}\n${second}\nexport { bumpMutableRootGeneration };`, { mode: &#x27;strip&#x27; }));
+const { bumpMutableRootGeneration, forgetMutableRoot } = await import(pathToFileURL(loader).href);
+const require = createRequire(join(checkout, &#x27;apps/server/package.json&#x27;));
+const { createJiti } = require(&#x27;jiti&#x27;);
+const root = join(scratch, &#x27;fixture&#x27;);
+const { mkdirSync } = await import(&#x27;node:fs&#x27;);
+mkdirSync(root);
+writeFileSync(join(root, &#x27;package.json&#x27;), JSON.stringify({ type: &#x27;module&#x27; }));
+writeFileSync(join(root, `state.${extension}`), `export const state${typescript ? &#x27;: number[]&#x27; : &#x27;&#x27;} = Array.from({length: 262144}, (_, i) =&gt; i);\n`);
+writeFileSync(join(root, `server.${extension}`), `import { state } from &quot;./state.${extension}&quot;;\nexport default function plugin() { return state; }\n`);
+const refs = [];
+async function gc() {
+  for (let i = 0; i &lt; 8; i++) {
+    await new Promise(resolve =&gt; setImmediate(resolve));
+    global.gc();
+  }
+}
+async function load() {
+  if (mode === &#x27;generation&#x27;) bumpMutableRootGeneration(root);
+  const jiti = createJiti(pathToFileURL(join(checkout, &#x27;apps/server/src/services/plugins/plugin-runtime.ts&#x27;)).href, { moduleCache: false });
+  const mod = await jiti.import(join(root, `server.${extension}`));
+  const state = mod.default();
+  refs.push(new WeakRef(state));
+}
+try {
+  console.log(JSON.stringify({ node: process.version, platform: process.platform, arch: process.arch, mode, typescript }));
+  await gc();
+  const baseline = process.memoryUsage().heapUsed;
+  for (let i = 0; i &lt; 8; i++) {
+    await load();
+    await gc();
+    console.log(JSON.stringify({ load: i + 1, heapGrowthMiB: Number(((process.memoryUsage().heapUsed - baseline) / 1048576).toFixed(2)) }));
+  }
+  forgetMutableRoot(root);
+  await gc();
+  const live = refs.map(ref =&gt; ref.deref()).filter(Boolean);
+  const unique = new Set(live).size;
+  console.log(JSON.stringify({ afterForget: true, liveReferences: live.length, uniqueRetainedStates: unique }));
+  assert.equal(unique, typescript ? 0 : mode === &#x27;generation&#x27; ? 8 : 1);
+  if (process.argv.includes(&#x27;--assert-reclaimed&#x27;)) assert.equal(unique, 1, &#x27;Disposed generations should not retain all prior module states&#x27;);
+} finally {
+  forgetMutableRoot(root);
+  rmSync(scratch, { recursive: true, force: true });
+}
+</pre>
+<h2>5. Root cause</h2><p><a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/apps/server/src/services/plugins/plugin-runtime.ts#L164-L209">The resolver</a> attaches a root ID and monotonically increasing generation to file URLs. <a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/apps/server/src/services/plugins/plugin-runtime.ts#L254-L290">Generation management</a> evicts CommonJS cache entries but produces a fresh URL namespace on every load. <a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/apps/server/src/services/plugins/plugin-runtime.ts#L1625-L1650">loadOne</a> advances mutable generations and imports using jiti. Native ESM loading consequently creates new module records rather than reusing prior ones. Deregistering the resolve hook stops future rewriting but does not undo already imported ESM modules; the WeakRef experiment demonstrates their state remains alive.</p>
+<p><a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/apps/server/src/services/plugins/plugin-runtime.ts#L1759-L1833">Disposal</a> tears down plugin resources and removes loaded handles; it has no ESM-registry eviction operation. <a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/apps/server/src/services/plugins/plugin-service.ts#L1588-L1633">Enable and reload</a> both reach the same loadOne path. <a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/apps/server/src/services/plugins/plugin-runtime.ts#L1047-L1068">Entry selection</a> directly selects the manifest entry for path installations.</p>
+<pre>epoch: nextMutableRootEpoch++
+url: `${resolved.url}${separator}bbPluginLoad=${match.id}.${epoch}`
+const jiti = createJiti(import.meta.url, { moduleCache: false, ... });
+const mod = await jiti.import(serverEntry);</pre>
+<h2>6. Proposed fix and simple-fix gate</h2><p>Investigate terminating a dedicated execution context to release a server plugin’s entire module graph. That requires deciding how existing in-process SDK functions, services, callbacks, and registrations cross the boundary. Content-based reuse would need explicit module-state semantics and transitive dependency invalidation: an unchanged importer can otherwise keep its old imported dependency. A built artifact can reduce retained size but cannot release old native ESM generations. No safe local change was identified that both fixes the root cause and avoids architecture or public-boundary decisions. No production files were changed, no fix branch was pushed, and no PR was opened. GitHub cross-references and an open-PR search returned no linked open PR.</p>
+<h2>7. Verification</h2><p>The same agent created a second clean detached checkout at the recorded SHA, installed frozen dependencies, built the server, and ran the three generation/control/TypeScript commands above in fresh processes. The second ESM run grew from 2.10 to 16.36 MiB and retained eight distinct arrays; the control grew from 2.09 to 2.22 MiB and retained one. The TypeScript run grew from 8.58 to 8.81 MiB and retained zero arrays. The report’s scope was narrowed after the initial TypeScript experiment: this is a partial reproduction of the issue, not verification of its newer-runtime TypeScript amplification or crash. This is repeat verification by the same agent, not independent review.</p>
+<h2>8. Related issues</h2><p>A repository search for memory/reload did not identify a duplicate of this loader retention mechanism.</p>
+<h2>9. Appendix</h2><p>Issue material was treated only as untrusted claims. No linked external code or scripts were fetched or executed. All executable fixture code was authored from trusted repository evidence. Logs below are direct process output; the expected-failure stack path is redacted. No screenshots are appropriate for this nonvisual loader test.</p><h3>expected-failure.log</h3><pre>{&quot;node&quot;:&quot;v22.22.3&quot;,&quot;platform&quot;:&quot;darwin&quot;,&quot;arch&quot;:&quot;arm64&quot;,&quot;mode&quot;:&quot;generation&quot;,&quot;typescript&quot;:false}
+(node:17929) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+{&quot;load&quot;:1,&quot;heapGrowthMiB&quot;:2.1}
+{&quot;load&quot;:2,&quot;heapGrowthMiB&quot;:4.13}
+{&quot;load&quot;:3,&quot;heapGrowthMiB&quot;:6.17}
+{&quot;load&quot;:4,&quot;heapGrowthMiB&quot;:8.21}
+{&quot;load&quot;:5,&quot;heapGrowthMiB&quot;:10.24}
+{&quot;load&quot;:6,&quot;heapGrowthMiB&quot;:12.28}
+{&quot;load&quot;:7,&quot;heapGrowthMiB&quot;:14.31}
+{&quot;load&quot;:8,&quot;heapGrowthMiB&quot;:16.36}
+{&quot;afterForget&quot;:true,&quot;liveReferences&quot;:8,&quot;uniqueRetainedStates&quot;:8}
+node:internal/modules/run_main:123
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: Disposed generations should not retain all prior module states
+
+8 !== 1
+
+    at file:///REPORT/retention.mjs:56:59 {
+  generatedMessage: false,
+  code: &#x27;ERR_ASSERTION&#x27;,
+  actual: 8,
+  expected: 1,
+  operator: &#x27;strictEqual&#x27;,
+  diff: &#x27;simple&#x27;
+}
+
+Node.js v22.22.3
+</pre><h3>first-control.log</h3><pre>{&quot;node&quot;:&quot;v22.22.3&quot;,&quot;platform&quot;:&quot;darwin&quot;,&quot;arch&quot;:&quot;arm64&quot;,&quot;mode&quot;:&quot;control&quot;}
+(node:16594) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+{&quot;load&quot;:1,&quot;heapGrowthMiB&quot;:2.09}
+{&quot;load&quot;:2,&quot;heapGrowthMiB&quot;:2.1}
+{&quot;load&quot;:3,&quot;heapGrowthMiB&quot;:2.11}
+{&quot;load&quot;:4,&quot;heapGrowthMiB&quot;:2.12}
+{&quot;load&quot;:5,&quot;heapGrowthMiB&quot;:2.14}
+{&quot;load&quot;:6,&quot;heapGrowthMiB&quot;:2.15}
+{&quot;load&quot;:7,&quot;heapGrowthMiB&quot;:2.16}
+{&quot;load&quot;:8,&quot;heapGrowthMiB&quot;:2.21}
+{&quot;afterForget&quot;:true,&quot;liveReferences&quot;:8,&quot;uniqueRetainedStates&quot;:1}
+</pre><h3>first-generation.log</h3><pre>{&quot;node&quot;:&quot;v22.22.3&quot;,&quot;platform&quot;:&quot;darwin&quot;,&quot;arch&quot;:&quot;arm64&quot;,&quot;mode&quot;:&quot;generation&quot;}
+(node:16577) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+{&quot;load&quot;:1,&quot;heapGrowthMiB&quot;:2.1}
+{&quot;load&quot;:2,&quot;heapGrowthMiB&quot;:4.13}
+{&quot;load&quot;:3,&quot;heapGrowthMiB&quot;:6.17}
+{&quot;load&quot;:4,&quot;heapGrowthMiB&quot;:8.21}
+{&quot;load&quot;:5,&quot;heapGrowthMiB&quot;:10.24}
+{&quot;load&quot;:6,&quot;heapGrowthMiB&quot;:12.28}
+{&quot;load&quot;:7,&quot;heapGrowthMiB&quot;:14.31}
+{&quot;load&quot;:8,&quot;heapGrowthMiB&quot;:16.36}
+{&quot;afterForget&quot;:true,&quot;liveReferences&quot;:8,&quot;uniqueRetainedStates&quot;:8}
+</pre><h3>first-typescript.log</h3><pre>{&quot;node&quot;:&quot;v22.22.3&quot;,&quot;platform&quot;:&quot;darwin&quot;,&quot;arch&quot;:&quot;arm64&quot;,&quot;mode&quot;:&quot;generation&quot;,&quot;typescript&quot;:true}
+(node:17927) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+{&quot;load&quot;:1,&quot;heapGrowthMiB&quot;:8.59}
+{&quot;load&quot;:2,&quot;heapGrowthMiB&quot;:8.61}
+{&quot;load&quot;:3,&quot;heapGrowthMiB&quot;:8.66}
+{&quot;load&quot;:4,&quot;heapGrowthMiB&quot;:8.66}
+{&quot;load&quot;:5,&quot;heapGrowthMiB&quot;:8.72}
+{&quot;load&quot;:6,&quot;heapGrowthMiB&quot;:8.73}
+{&quot;load&quot;:7,&quot;heapGrowthMiB&quot;:8.77}
+{&quot;load&quot;:8,&quot;heapGrowthMiB&quot;:8.83}
+{&quot;afterForget&quot;:true,&quot;liveReferences&quot;:0,&quot;uniqueRetainedStates&quot;:0}
+</pre><h3>second-control.log</h3><pre>{&quot;node&quot;:&quot;v22.22.3&quot;,&quot;platform&quot;:&quot;darwin&quot;,&quot;arch&quot;:&quot;arm64&quot;,&quot;mode&quot;:&quot;control&quot;,&quot;typescript&quot;:false}
+(node:18093) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+{&quot;load&quot;:1,&quot;heapGrowthMiB&quot;:2.09}
+{&quot;load&quot;:2,&quot;heapGrowthMiB&quot;:2.1}
+{&quot;load&quot;:3,&quot;heapGrowthMiB&quot;:2.11}
+{&quot;load&quot;:4,&quot;heapGrowthMiB&quot;:2.12}
+{&quot;load&quot;:5,&quot;heapGrowthMiB&quot;:2.14}
+{&quot;load&quot;:6,&quot;heapGrowthMiB&quot;:2.15}
+{&quot;load&quot;:7,&quot;heapGrowthMiB&quot;:2.17}
+{&quot;load&quot;:8,&quot;heapGrowthMiB&quot;:2.22}
+{&quot;afterForget&quot;:true,&quot;liveReferences&quot;:8,&quot;uniqueRetainedStates&quot;:1}
+</pre><h3>second-generation.log</h3><pre>{&quot;node&quot;:&quot;v22.22.3&quot;,&quot;platform&quot;:&quot;darwin&quot;,&quot;arch&quot;:&quot;arm64&quot;,&quot;mode&quot;:&quot;generation&quot;,&quot;typescript&quot;:false}
+(node:18092) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+{&quot;load&quot;:1,&quot;heapGrowthMiB&quot;:2.1}
+{&quot;load&quot;:2,&quot;heapGrowthMiB&quot;:4.13}
+{&quot;load&quot;:3,&quot;heapGrowthMiB&quot;:6.18}
+{&quot;load&quot;:4,&quot;heapGrowthMiB&quot;:8.22}
+{&quot;load&quot;:5,&quot;heapGrowthMiB&quot;:10.25}
+{&quot;load&quot;:6,&quot;heapGrowthMiB&quot;:12.28}
+{&quot;load&quot;:7,&quot;heapGrowthMiB&quot;:14.31}
+{&quot;load&quot;:8,&quot;heapGrowthMiB&quot;:16.36}
+{&quot;afterForget&quot;:true,&quot;liveReferences&quot;:8,&quot;uniqueRetainedStates&quot;:8}
+</pre><h3>second-typescript.log</h3><pre>{&quot;node&quot;:&quot;v22.22.3&quot;,&quot;platform&quot;:&quot;darwin&quot;,&quot;arch&quot;:&quot;arm64&quot;,&quot;mode&quot;:&quot;generation&quot;,&quot;typescript&quot;:true}
+(node:18094) ExperimentalWarning: stripTypeScriptTypes is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+{&quot;load&quot;:1,&quot;heapGrowthMiB&quot;:8.58}
+{&quot;load&quot;:2,&quot;heapGrowthMiB&quot;:8.61}
+{&quot;load&quot;:3,&quot;heapGrowthMiB&quot;:8.66}
+{&quot;load&quot;:4,&quot;heapGrowthMiB&quot;:8.66}
+{&quot;load&quot;:5,&quot;heapGrowthMiB&quot;:8.72}
+{&quot;load&quot;:6,&quot;heapGrowthMiB&quot;:8.73}
+{&quot;load&quot;:7,&quot;heapGrowthMiB&quot;:8.77}
+{&quot;load&quot;:8,&quot;heapGrowthMiB&quot;:8.81}
+{&quot;afterForget&quot;:true,&quot;liveReferences&quot;:0,&quot;uniqueRetainedStates&quot;:0}
+</pre><p>&gt; AGENT GENERATED</p></main></body></html>
