@@ -1,0 +1,16 @@
+import { readFileSync } from 'node:fs';
+import { stripTypeScriptTypes } from 'node:module';
+import { runInNewContext } from 'node:vm';
+import assert from 'node:assert/strict';
+import { join } from 'node:path';
+const source = readFileSync(join(process.argv[2], 'plugins/provider-claude-code/src/sdk-extraction.ts'), 'utf8');
+const constants = source.match(/const DEFAULT_CLAUDE_CONTEXT_WINDOW[\s\S]*?\n\]\);/)[0];
+const fn = source.match(/export function resolveClaudeModelContextWindowHint\([\s\S]*?\n\}/)[0];
+const resolve = runInNewContext(stripTypeScriptTypes(constants + '\n' + fn.replace('export ', '') + '\nresolveClaudeModelContextWindowHint;'));
+const tests = readFileSync(join(process.argv[2], 'plugins/provider-claude-code/src/model-list.test.ts'), 'utf8');
+const extended = tests.match(/resolvedModel: "(claude-opus-[^"]+\[1m\])"/)[1];
+const plain = extended.replace('[1m]', '');
+console.log(JSON.stringify({ plain: resolve(plain), extended: resolve(extended), default: resolve('default') }));
+assert.equal(resolve(extended), 1000000);
+assert.equal(resolve('default'), null);
+assert.equal(resolve(plain), 1000000, 'plain Opus hint should equal the extended hint under the reported entitlement');
