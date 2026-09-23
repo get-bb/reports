@@ -1,0 +1,233 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>#4160 · Pruning loses storage cleanup ownership</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">Reports</a></p><h1>#4160 · Pruning loses storage cleanup ownership</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: High</span><span class="pill">threads, workspaces</span><a href="https://github.com/get-bb/bb/issues/4160">Issue</a><span>2026-09-23</span></p>
+<p><strong>REPRODUCED · Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2><p>Deleting a thread after its destroyed environment is pruned removes the database record without requesting storage cleanup from its host. The environment foreign key is cleared during pruning, and deletion treats this missing reference as proof that storage is already gone. A route-level regression test reproduces the lost cleanup request and premature hard deletion on main. A control with the same destroyed environment still present correctly retains a tombstone and sends a cleanup request. The same agent repeated the test in a second clean checkout with identical results.</p>
+<h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Environment pruning clears a surviving thread's environment reference.</td><td>Verified</td><td>Real SQLite pruning deletes one environment; the test asserts a null thread reference.</td></tr>
+<tr><td>Deleting that thread skips host cleanup and loses the row.</td><td>Verified</td><td>HTTP 200, row absent, zero cleanup commands in both runs. Control: row present, one command.</td></tr>
+<tr><td>Host storage deletion removes the thread directory.</td><td>Verified by source inspection</td><td>Host handler removes the contained per-thread path recursively. A live host was not launched.</td></tr>
+<tr><td>Thousands of historical directories and several GB are affected on the reporter's machine.</td><td>Unverified</td><td>No access to the reporter's runtime data; scale and installed release were not tested.</td></tr>
+<tr><td>The null-reference path emits no missing-environment warning.</td><td>Verified by source inspection</td><td>The early return precedes the warning branch; logger output was not separately asserted.</td></tr></table>
+<h2>3. Environment</h2><p>Trusted public get-bb/bb main at <code>94d77da09568d7f0f7cdb23b84686e743acfb0ad</code>, workspace package version 0.43.4; Darwin arm64, Node v22.22.3, pnpm 9.15.0, Vitest 4.1.1. Both checkouts completed the frozen install and Turbo build (60 successful tasks each). The broken global pnpm launcher was bypassed with <code>npm exec --yes --package=pnpm@9.15.0 -- pnpm</code>; no repository dependencies changed.</p>
+<p>The harness uses a migrated in-memory SQLite database, a fresh temporary server data directory, and captured host RPCs. Requests run through Hono in process; no listening ports or live provider sessions are needed. Sentinel directories use a new <code>mkdtemp</code> root on each case and are removed in a finally block. The sentinel demonstrates the absence of cleanup, not a live daemon end-to-end filesystem test.</p>
+<h2>4. Minimal reproduction</h2><ol><li>Check out the recorded trusted commit and build it.</li><li>Save the regression test embedded below at the path below.</li><li>Run the focused test. Expected failure is the pruned case's tombstone assertion; the unpruned control passes.</li></ol><pre>git clone https://github.com/get-bb/bb.git bb-4160
+cd bb-4160
+git checkout --detach 94d77da09568d7f0f7cdb23b84686e743acfb0ad
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+# Save the linked test as apps/server/test/threads/issue-4160.test.ts
+pnpm exec turbo run test --filter=@bb/server -- test/threads/issue-4160.test.ts</pre>
+<p>The fixture archives an idle thread, marks its environment destroyed and removed with an expired timestamp, then invokes the real prune function before the real DELETE route. This isolates the post-teardown state without spawning a worktree or waiting seven days.</p>
+<p><strong>Expected:</strong> both cases retain deletion work and dispatch one storage command until the host acknowledges cleanup. <strong>Actual, both clean runs:</strong></p><pre>{&quot;prune&quot;:false,&quot;httpStatus&quot;:200,&quot;rowPresent&quot;:true,&quot;deleteCommands&quot;:1,&quot;sentinel&quot;:&quot;storage awaits host cleanup&quot;}
+{&quot;prune&quot;:true,&quot;httpStatus&quot;:200,&quot;rowPresent&quot;:false,&quot;deleteCommands&quot;:0,&quot;sentinel&quot;:&quot;storage awaits host cleanup&quot;}
+
+AssertionError: retain the tombstone until a host confirms cleanup: expected null not to be null
+Tests  1 failed | 1 passed (2)</pre>
+<p>Raw logs and the standalone test are retained in the local investigation backup; the complete test and decisive output are embedded here so this report is self-contained.</p><details><summary>Complete regression test</summary><pre>import { mkdtemp, mkdir, writeFile, readFile, rm } from &quot;node:fs/promises&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import {
+  environments,
+  threads,
+  getThread,
+  pruneDestroyedEnvironments,
+  DEFAULT_DESTROYED_ENVIRONMENT_EVENT_DETACH_BATCH_SIZE,
+  DEFAULT_DESTROYED_ENVIRONMENT_PRUNE_BATCH_SIZE,
+  DESTROYED_ENVIRONMENT_TTL_MS,
+} from &quot;@bb/db&quot;;
+import { eq } from &quot;drizzle-orm&quot;;
+import { expect, it } from &quot;vitest&quot;;
+import { seedHostSession, seedProjectWithSource, seedEnvironment, seedThread } from &quot;../helpers/seed.js&quot;;
+import { withTestHarness } from &quot;../helpers/test-app.js&quot;;
+import { listQueuedThreadCommands } from &quot;../helpers/commands.js&quot;;
+
+it.each([false, true])(&quot;retains deletion work until host cleanup, prune=%s&quot;, async (prune) =&gt; {
+  const storageRoot = await mkdtemp(join(tmpdir(), &quot;bb-4160-storage-&quot;));
+  try {
+    await withTestHarness(async (harness) =&gt; {
+      const { host } = seedHostSession(harness.deps);
+      const { project } = seedProjectWithSource(harness.deps, { hostId: host.id });
+      const environment = seedEnvironment(harness.deps, {
+        hostId: host.id,
+        projectId: project.id,
+        environmentProviderId: &quot;personal-workspace&quot;,
+        isGitRepo: false,
+      });
+      const thread = seedThread(harness.deps, {
+        projectId: project.id,
+        environmentId: environment.id,
+        status: &quot;idle&quot;,
+      });
+      harness.db.update(threads).set({ archivedAt: Date.now() - 100_000 })
+        .where(eq(threads.id, thread.id)).run();
+      harness.db.update(environments).set({
+        status: &quot;destroyed&quot;,
+        teardownStatus: &quot;removed&quot;,
+        updatedAt: Date.now() - DESTROYED_ENVIRONMENT_TTL_MS - 100_000,
+      }).where(eq(environments.id, environment.id)).run();
+      const storage = join(storageRoot, thread.id);
+      await mkdir(storage);
+      await writeFile(join(storage, &quot;sentinel.txt&quot;), &quot;storage awaits host cleanup&quot;);
+      if (prune) {
+        expect(pruneDestroyedEnvironments(harness.db, harness.hub, {
+          updatedBefore: Date.now() - DESTROYED_ENVIRONMENT_TTL_MS,
+          eventBatchSize: DEFAULT_DESTROYED_ENVIRONMENT_EVENT_DETACH_BATCH_SIZE,
+          limit: DEFAULT_DESTROYED_ENVIRONMENT_PRUNE_BATCH_SIZE,
+        }).deleted).toBe(1);
+        expect(getThread(harness.db, thread.id)?.environmentId).toBeNull();
+      }
+      const response = await harness.app.request(&quot;/api/v1/threads/&quot; + thread.id, {
+        method: &quot;DELETE&quot;,
+        headers: { &quot;content-type&quot;: &quot;application/json&quot; },
+        body: JSON.stringify({ childThreadsConfirmed: false }),
+      });
+      expect(response.status).toBe(200);
+      const remaining = getThread(harness.db, thread.id);
+      const commands = listQueuedThreadCommands(harness, &quot;thread.storage.delete&quot;, thread.id);
+      const sentinel = await readFile(join(storage, &quot;sentinel.txt&quot;), &quot;utf8&quot;);
+      process.stdout.write(JSON.stringify({
+        prune,
+        httpStatus: response.status,
+        rowPresent: remaining !== null,
+        deleteCommands: commands.length,
+        sentinel,
+      }) + &quot;\n&quot;);
+      expect(sentinel).toBe(&quot;storage awaits host cleanup&quot;);
+      expect(remaining, &quot;retain the tombstone until a host confirms cleanup&quot;).not.toBeNull();
+      expect(remaining?.storageDeletedAt).toBeNull();
+      expect(commands).toHaveLength(1);
+    });
+  } finally {
+    await rm(storageRoot, { recursive: true, force: true });
+  }
+});
+</pre></details>
+<h2>5. Root cause</h2><p>Pruning selects old destroyed environments whose provider teardown is complete; it does not preserve them for surviving thread storage. Deleting the environment clears the thread reference through the database foreign key:</p>
+<p><a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/packages/db/src/data/sweeps.ts#L739-L750">packages/db/src/data/sweeps.ts:739–750</a></p><pre>  const staleEnvironmentIds = db
+    .select({ id: environments.id })
+    .from(environments)
+    .where(
+      and(
+        eq(environments.status, &quot;destroyed&quot;),
+        sql`(${environments.environmentProviderId} is null or ${environments.teardownStatus} = &#x27;removed&#x27;)`,
+        lt(environments.updatedAt, args.updatedBefore),
+      ),
+    )
+    .orderBy(asc(environments.updatedAt), asc(environments.id))
+    .limit(args.limit)</pre>
+<p><a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/packages/db/src/data/sweeps.ts#L793-L797">packages/db/src/data/sweeps.ts:793–797</a></p><pre>        const deleteResult = tx
+          .delete(environments)
+          .where(eq(environments.id, environmentId))
+          .run();
+        return { deleted: deleteResult.changes, detachedEvents: 0 };</pre>
+<p><a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/packages/db/src/schema.ts#L584-L586">packages/db/src/schema.ts:584–586</a></p><pre>    environmentId: text(&quot;environment_id&quot;).references(() =&gt; environments.id, {
+      onDelete: &quot;set null&quot;,
+    }),</pre>
+<p>The DELETE route marks the thread deleted and calls storage cleanup using that now-null environment reference:</p>
+<p><a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/apps/server/src/routes/threads/base.ts#L464-L490">apps/server/src/routes/threads/base.ts:464–490</a></p><pre>  del(routes.delete, async (context, payload) =&gt; {
+    const thread = requirePublicThread(deps.db, context.req.param(&quot;id&quot;));
+    requireChildThreadsConfirmation({
+      action: &quot;delete&quot;,
+      confirmed: payload.childThreadsConfirmed,
+      deps,
+      thread,
+    });
+    const dependents = listLifecycleThreadTree(deps.db, thread.id);
+    markThreadDeleted(deps.db, deps.hub, { threadId: thread.id });
+    for (const dependent of dependents) {
+      const deleted = getThread(deps.db, dependent.id);
+      if (!deleted) continue;
+      emitPluginThreadDeleted(deleted);
+      cancelAbandonedProviderCreations(deps, deleted.id);
+      deps.terminalSessions.closeDeletedThreadTerminals({
+        threadId: deleted.id,
+      });
+      requestThreadStorageDeletion(
+        deps,
+        deleted,
+        deleted.environmentId === null
+          ? null
+          : getEnvironment(deps.db, deleted.environmentId),
+      );
+    }
+    return context.json({ ok: true });</pre>
+<p>The null-reference branch marks storage deleted and finalizes immediately. It cannot tell a thread that never had storage from one whose environment was pruned:</p>
+<p><a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/apps/server/src/services/threads/thread-lifecycle.ts#L1083-L1115">apps/server/src/services/threads/thread-lifecycle.ts:1083–1115</a></p><pre>export function requestThreadStorageDeletion(
+  deps: CommandResultSideEffectsDeps,
+  thread: Pick&lt;Thread, &quot;environmentId&quot; | &quot;id&quot;&gt;,
+  environment: { hostId: string; id: string } | null,
+): void {
+  deps.pendingInteractions.interruptPendingInteractionsForThreadIds({
+    threadIds: [thread.id],
+    reason: &quot;thread-deleted&quot;,
+  });
+  abortPluginToolCallsForThreads([thread.id], &quot;thread-deleted&quot;);
+  if (thread.environmentId === null) {
+    markThreadStorageDeleted(deps.db, { threadId: thread.id });
+    finalizeStoppedThread(deps, { threadId: thread.id });
+    return;
+  }
+  if (environment === null) {
+    deps.logger.warn(
+      { environmentId: thread.environmentId, threadId: thread.id },
+      &quot;Thread storage deletion environment is unavailable&quot;,
+    );
+    return;
+  }
+  if (!inFlightThreadRpcGuard.claim(thread.id, &quot;thread.storage.delete&quot;)) {
+    return;
+  }
+  void runLiveHostCommand(deps, {
+    command: buildThreadStorageDeleteCommand({
+      environmentId: environment.id,
+      threadId: thread.id,
+    }),
+    hostId: environment.hostId,
+    timeoutMs: LIVE_DAEMON_COMMAND_TIMEOUT_MS,
+  })</pre>
+<p>Finalization only waits for a storage acknowledgement when the environment reference is non-null, permitting hard deletion in this case:</p>
+<p><a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/apps/server/src/services/threads/thread-lifecycle.ts#L1962-L1971">apps/server/src/services/threads/thread-lifecycle.ts:1962–1971</a></p><pre>    clearThreadProvisionSchedule(finalizedThread.id);
+    if (
+      finalizedThread.environmentId !== null &amp;&amp;
+      finalizedThread.storageDeletedAt === null
+    )
+      return;
+    if (providerEnvironmentHasPendingWork(deps.db, finalizedThread.id)) return;
+    deleteThread(deps.db, deps.hub, finalizedThread.id);
+    if (finalizedThread.environmentId !== null)
+      refreshProviderRetirement(deps, finalizedThread.environmentId);</pre>
+<p>The host-side operation itself needs the thread ID and its host-local storage root:</p>
+<p><a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/apps/host-daemon/src/command-handlers/thread.ts#L54-L64">apps/host-daemon/src/command-handlers/thread.ts:54–64</a></p><pre>export async function deleteThreadStorage(
+  command: CommandOf&lt;&quot;thread.storage.delete&quot;&gt;,
+  options: CommandDispatchOptions,
+): Promise&lt;void&gt; {
+  const storagePath = requireContainedPath(
+    options.threadStorageRootPath,
+    path.join(options.threadStorageRootPath, command.threadId),
+    &quot;Thread storage path escapes the storage root&quot;,
+  );
+  await fs.rm(storagePath, { recursive: true, force: true });
+}</pre>
+<p>Once the thread row is gone, the normal deleted-thread lifecycle sweep cannot retry it. <a href="https://github.com/get-bb/bb/blob/94d77da09568d7f0f7cdb23b84686e743acfb0ad/apps/server/src/services/system/periodic-sweeps.ts#L356-L374">The sweep selects existing deleted rows</a>.</p>
+<h2>6. Proposed fix and simple-fix assessment</h2><p>Persist storage ownership independently of the environment lifetime, retain a deletion tombstone until the owning host confirms cleanup, and retry offline hosts. The already-orphaned population requires a separate recovery policy because the authoritative relationship has been lost. An alternative is retaining environments until dependent storage is reclaimed, but that changes retention behavior and cannot restore ownership already discarded.</p><p>No PR opened. A complete correction needs a stored-data/ownership or retention design decision, outside this automation's simple-fix constraints. No production code was changed or pushed. No open linked PR appeared in issue timeline metadata or the open-PR search. Reporting directory sizes is a separate feature and was not implemented.</p>
+<h2>7. Verification</h2><p>The same agent created two detached clean worktrees at the recorded commit, named <code>first</code> and <code>second</code> under a unique temporary root. Each received only the new test, its own frozen dependency install, and its own build. The focused Turbo command above executed freshly in each checkout; both logged a test cache miss and distinct runner process IDs. Both produced one passing control and one failing pruned case, with the exact observations above. Each harness created fresh database and temporary filesystem state; no ports were bound.</p><p>An initial test draft omitted the required DELETE JSON body and received HTTP 400 in both checkouts. That harness error was corrected using the repository's request contract before collecting the final evidence. No root-cause claim relies on those initial failures.</p>
+<h2>8. Related issues</h2><p><a href="https://github.com/get-bb/bb/issues/1924">#1924</a> addressed archiving after environment pruning. Its existing archive test covers a different operation; allowing archive does not restore storage cleanup ownership. This report does not assess the separate pruning-performance issue.</p>
+<h2>9. Appendix</h2><p>The adjacent archive and thread-stop retry suites passed all 9 tests across 2 files. Both builds completed 60 tasks. All source links were checked against the recorded commit. Production files remained unchanged. Issue content was treated as untrusted claims; no external issue link, proposed patch, or issue-provided command was executed.</p><p>Preparation used <code>git fetch origin main</code> and two <code>git worktree add --detach</code> calls at the recorded SHA. The origin's old repository name resolves through GitHub to public get-bb/bb. Verification commands were the frozen install, Turbo build, focused test above, and <code>pnpm exec turbo run test --filter=@bb/server -- test/threads/archive-pruned-environment.test.ts test/threads/thread-stop-retry.test.ts</code>. Repository reads used git, rg, and GitHub metadata queries. No user runtime or secrets were accessed.</p>
+<p>AGENT GENERATED</p></main></body></html>
