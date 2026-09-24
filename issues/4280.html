@@ -1,0 +1,74 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>#4280 · Host network crash investigation</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<h1>#4280 · Host network crash investigation</h1><p class="meta">Bug · High priority · Medium effort · host · 2026-09-24</p><p><a href="https://github.com/get-bb/bb/issues/4280">GitHub issue</a> · Base <code>b200b04606751ac10274d9dddcdfa55bbc483843</code></p><p><strong>NOT REPRODUCED · Root-cause confidence: low · no-repro</strong></p>
+<h2>1. TL;DR</h2><p>The reporter describes repeated host and server exits during networking. The current source uses the runtime's global fetch and allows fatal uncaught exceptions to terminate the process. The actual host client completed ordinary requests and handled socket resets as rejected promises in two clean checkouts. This machine has a different OS and Node version and lacks the socket method in the reported stack. The platform-specific trigger remains unresolved; this report does not refute the user's crashes or establish a fixed version.</p>
+<h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr><tr><td>Host uses global fetch</td><td>Verified in source and exercised</td><td>createServerClient defaults to fetch; probe supplies no fetch override.</td></tr><tr><td>Uncaught errors can terminate host/server</td><td>Supported by static source</td><td>Host installs an exception monitor; server explicitly exits for exceptions not attributed to a plugin.</td></tr><tr><td>Node socket TOS operation raises EINVAL during normal use</td><td>Unverified</td><td>Available runtime has no Socket.setTypeOfService; no such failure observed.</td></tr><tr><td>Crash frequency, reconnect delay, lost turns, and CLI correlation</td><td>Unverified</td><td>No private logs or live user instance accessed.</td></tr></table>
+<h2>3. Environment</h2><p>Darwin 25.6.0 arm64; Node v22.22.3; bundled Undici 6.24.1. Two detached worktrees of the base commit, named base and verify, with separate dependency installs. No BB instance, real credentials, provider sessions, or persistent data directory. Each probe binds fresh OS-assigned ephemeral ports on IPv4 and IPv6 loopback, closes all servers in finally blocks, and exits normally.</p><p>The standard pnpm launcher was broken (MODULE_NOT_FOUND). Corepack provided the repository-pinned pnpm 9.15.0; a temporary PATH shim made Turbo's pnpm subprocesses use that launcher. Frozen installs and normal Turbo builds were attempted in both checkouts; final build status is recorded in the appendix.</p>
+<h2>4. Minimal reproduction attempt</h2><ol><li>Create a clean checkout of the base commit shown above.</li><li>Run <code>pnpm install --frozen-lockfile --prefer-offline</code> and <code>pnpm exec turbo run build</code> using a functional pnpm launcher.</li><li>Save <a href="4280/repro/probe-4280.mjs">probe-4280.mjs</a> at the checkout root.</li><li>Run <code>node --conditions=source --import tsx probe-4280.mjs</code>.</li></ol><p>The probe imports the unchanged production createServerClient. It posts empty event batches to a temporary HTTP server, forces fresh connections, destroys sockets for ten requests per family, and checks recovery. It does not inject a TOS exception or start the daemon. Expected healthy behavior: requests succeed, resets reject, recovery succeeds. A reproduction of the report would require the natural uncaught socket exception. Actual output:</p><pre>{&quot;node&quot;:&quot;v22.22.3&quot;,&quot;platform&quot;:&quot;darwin&quot;,&quot;arch&quot;:&quot;arm64&quot;,&quot;undici&quot;:&quot;6.24.1&quot;,&quot;socketTosAvailable&quot;:false}
+127.0.0.1: 100 POSTs passed; 10 socket resets rejected; recovery POST passed; requests=111
+::1: 100 POSTs passed; 10 socket resets rejected; recovery POST passed; requests=111
+No uncaught exception observed; reported platform-specific crash NOT REPRODUCED.
+</pre><p>Probe source:</p><pre>import assert from &quot;node:assert/strict&quot;;
+import { createServer } from &quot;node:http&quot;;
+import { Socket } from &quot;node:net&quot;;
+import { createServerClient } from &quot;./apps/host-daemon/src/server-client.ts&quot;;
+
+console.log(JSON.stringify({ node: process.version, platform: process.platform, arch: process.arch, undici: process.versions.undici, socketTosAvailable: typeof Socket.prototype.setTypeOfService === &quot;function&quot; }));
+for (const host of [&quot;127.0.0.1&quot;, &quot;::1&quot;]) {
+  let mode = &quot;ok&quot;;
+  let requests = 0;
+  const server = createServer((req, res) =&gt; {
+    requests++;
+    req.resume();
+    if (mode === &quot;reset&quot;) { req.socket.destroy(); return; }
+    res.setHeader(&quot;content-type&quot;, &quot;application/json&quot;);
+    res.setHeader(&quot;connection&quot;, &quot;close&quot;);
+    res.end(JSON.stringify({ acceptedEvents: [], rejectedEvents: [] }));
+  });
+  await new Promise((resolve, reject) =&gt; {
+    server.once(&quot;error&quot;, reject);
+    server.listen(0, host, resolve);
+  });
+  const address = server.address();
+  assert(address &amp;&amp; typeof address !== &quot;string&quot;);
+  const client = createServerClient({
+    serverUrl: `http://${host === &quot;::1&quot; ? &quot;[::1]&quot; : host}:${address.port}`,
+    hostKey: &quot;local-probe-only&quot;,
+    getSessionId: () =&gt; &quot;local-probe-session&quot;,
+    logger: { debug() {}, error() {}, info() {}, warn() {} },
+  });
+  try {
+    for (let i = 0; i &lt; 100; i++) {
+      assert.deepEqual(await client.postEvents([]), { acceptedEvents: [], rejectedEvents: [] });
+    }
+    mode = &quot;reset&quot;;
+    for (let i = 0; i &lt; 10; i++) await assert.rejects(client.postEvents([]), TypeError);
+    mode = &quot;ok&quot;;
+    await client.postEvents([]);
+    console.log(`${host}: 100 POSTs passed; 10 socket resets rejected; recovery POST passed; requests=${requests}`);
+  } finally {
+    await new Promise(resolve =&gt; server.close(resolve));
+  }
+}
+console.log(&quot;No uncaught exception observed; reported platform-specific crash NOT REPRODUCED.&quot;);
+</pre>
+<h2>5. Root cause</h2><p>The underlying TOS failure is not established. The host's <a href="https://github.com/get-bb/bb/blob/b200b04606751ac10274d9dddcdfa55bbc483843/apps/host-daemon/src/server-client.ts#L408">global fetch default</a> is used by <a href="https://github.com/get-bb/bb/blob/b200b04606751ac10274d9dddcdfa55bbc483843/apps/host-daemon/src/server-client.ts#L558-L586">postEvents</a>. The host entrypoint <a href="https://github.com/get-bb/bb/blob/b200b04606751ac10274d9dddcdfa55bbc483843/apps/host-daemon/src/index.ts#L76-L86">installs diagnostics</a>; the <a href="https://github.com/get-bb/bb/blob/b200b04606751ac10274d9dddcdfa55bbc483843/packages/process-utils/src/index.ts#L623-L643">diagnostic monitor</a> observes uncaught exceptions without converting them to request rejections. The server's <a href="https://github.com/get-bb/bb/blob/b200b04606751ac10274d9dddcdfa55bbc483843/apps/server/src/start-server.ts#L428-L434">uncaught-exception handler</a> exits with code 1 unless a plugin handler claims the error. These paths explain termination if a runtime callback throws outside a handled promise; they do not prove which request or socket condition caused the reported exceptions.</p>
+<h2>6. Proposed next test and fix decision</h2><p>Repeat the same bounded probe on the affected OS and bundled runtime, then exercise the actual failing request operation after collecting sanitized operation/socket metadata. Determine whether the runtime callback escapes promise rejection before choosing a runtime update or localized containment. Do not suppress arbitrary uncaught exceptions or add retries without establishing delivery semantics. No fix PR: the reported bug was not reproduced on trusted main, so the simple-fix gate is unmet. No linked open PR was found in the issue timeline or issue-number search.</p>
+<h2>7. Related issues</h2><p>The similar-issue search returned other host-lifecycle reports, but no equivalence to this socket failure was established.</p>
+<h2>8. Verification</h2><p>The same agent repeated the unchanged probe in a second clean detached checkout at the identical base commit, with separate dependencies and new ephemeral ports. Both runs produced identical results: 200 normal POSTs, 20 rejected reset requests, and 2 recovery POSTs. See <a href="4280/repro/base.txt">first run</a> and <a href="4280/repro/verify.txt">second run</a>. Source permalinks were checked against the base files. No screenshot is relevant. The second run supports the limited NOT REPRODUCED verdict; it does not verify the affected runtime. No report correction was necessary.</p>
+<h2>9. Appendix</h2><p>Investigation commands: fetch origin main; record git rev-parse origin/main; create two detached worktrees; frozen install; Turbo build; inspect server-client.ts, index.ts, process-utils/src/index.ts, and start-server.ts; run the probe once per checkout. GitHub reads checked repository visibility, issue fields, comments, similar issues, and linked PR metadata. The repository is public. Issue suggestions were treated as untrusted data and were not executed. No production source files changed.</p><p>Both frozen installs completed successfully with the temporary Corepack launcher. Both normal Turbo builds passed: 60/60 tasks in each checkout. No focused regression test fails on this platform; the probe is negative evidence, not a demonstrated fix test.</p><p>&gt; AGENT GENERATED</p></main></body></html>
