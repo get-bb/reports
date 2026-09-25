@@ -1,0 +1,177 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>#4363 · Watchdog leaves a pending runtime turn</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<h1>#4363 · Watchdog leaves a pending runtime turn</h1><p>Bug · High · Effort: Medium · providers · threads · provider-claude-code</p><p><a href="https://github.com/get-bb/bb/issues/4363">Issue</a> · 2026-09-25 · Base <code>c6b24edede5a9bff3192055e5526497d633bc67b</code></p><p><strong>PARTIALLY REPRODUCED · Root-cause confidence: medium overall; high for runtime retention.</strong></p>
+<h2>TL;DR</h2><p>When a provider acknowledges a request but never announces a started turn, the runtime warns once and continues reserving the turn slot. A subsequent runtime turn request is rejected as competing. Two executions at the same trusted main commit demonstrate the absence of a terminal event after the warning. This isolates the stalled runtime behavior; it does not establish why the real Claude bridge stalled, reproduce the prior account failure, or exercise the live UI and database queue.</p>
+<h2>Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr><tr><td>Timeout leaves request unresolved</td><td>Verified at runtime boundary</td><td>Both runs fail the terminal-event expectation after observing one watchdog error.</td></tr><tr><td>Later input cannot run</td><td>Verified for direct runtime dispatch</td><td>Both runs pass the competing-turn rejection assertion.</td></tr><tr><td>Queued message waits while UI shows working</td><td>Code-supported; not executed end to end</td><td>Server parks input when thread is active without an active turn ID.</td></tr><tr><td>Earlier account failure causes Claude stall</td><td>Unverified</td><td>No real Claude session or account used.</td></tr></table>
+<h2>Environment</h2><p>Linux x86_64, Node v26.8.1, repository main at the commit above. Frozen install and full Turbo build succeeded in both checkouts. Existing scripted echo bridge uses swallowTurnStart=true; watchdog threshold is shortened to 120ms and interval to 25ms. No live server, ports, credentials, or user runtime data. Harness creates and removes fresh temporary workspace directories per test.</p>
+<h2>Minimal reproduction</h2><ol><li>Check out the recorded trusted commit in a clean repository.</li><li>Replace <code>packages/agent-runtime/src/runtime.turn-start-watchdog.test.ts</code> with the <a href="4363/repro/runtime.turn-start-watchdog.test.ts">attached reproduction test</a>.</li><li>Run:<pre>pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec turbo run test --force --filter=@bb/agent-runtime -- src/runtime.turn-start-watchdog.test.ts</pre></li><li>The scripted provider acknowledges the request without emitting turn/started. Wait for the warning and another 120ms. Attempt another turn. Check for a terminal event.</li></ol><p>Expected: a safe resolved failure boundary after timeout, preserving explicit retry semantics. Actual: the additional request rejects as competing and no terminal event appears.</p><pre>AssertionError: watchdog must resolve the accepted turn with a terminal event: expected false to be true
+Tests  1 failed | 1 passed (2)</pre><p>This is an expected-failure diagnostic, not a passing regression test for a completed fix. The normal-start control passes.</p><details><summary>Complete reproduction test</summary><pre>import { mkdtempSync, rmSync } from &quot;node:fs&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { afterEach, beforeEach, describe, expect, it } from &quot;vitest&quot;;
+import type { ThreadEvent } from &quot;@bb/domain&quot;;
+import {
+  createScriptedEchoRuntime,
+  fullRuntimeOptions,
+  wait,
+  type LaunchBoundAgentRuntime,
+} from &quot;./test/runtime-test-harness.js&quot;;
+import { promptTextInput } from &quot;./test/prompt-input.js&quot;;
+
+describe(&quot;turn-start watchdog&quot;, () =&gt; {
+  let tmpDir: string;
+  let runtime: LaunchBoundAgentRuntime | null = null;
+
+  beforeEach(() =&gt; {
+    tmpDir = mkdtempSync(join(tmpdir(), &quot;bb-runtime-watchdog-&quot;));
+  });
+
+  afterEach(async () =&gt; {
+    await runtime?.shutdown();
+    runtime = null;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  async function waitFor&lt;T&gt;(
+    resolve: () =&gt; T | undefined,
+    timeoutMs = 3_000,
+  ): Promise&lt;T&gt; {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const value = resolve();
+      if (value !== undefined) {
+        return value;
+      }
+      if (Date.now() &gt; deadline) {
+        throw new Error(&quot;timed out waiting&quot;);
+      }
+      await wait(15);
+    }
+  }
+
+  it(&quot;surfaces a visible error when an accepted turn never starts&quot;, async () =&gt; {
+    const events: ThreadEvent[] = [];
+    runtime = createScriptedEchoRuntime({
+      runtime: {
+        workspacePath: tmpDir,
+        onEvent: (event) =&gt; events.push(event),
+        turnStartWatchdog: { thresholdMs: 120, intervalMs: 25 },
+      },
+      launch: { scripted: { swallowTurnStart: true } },
+    });
+
+    await runtime.startThread({
+      environmentId: &quot;env-1&quot;,
+      threadId: &quot;t1&quot;,
+      projectId: &quot;p1&quot;,
+      providerId: &quot;fake&quot;,
+      options: fullRuntimeOptions,
+    });
+    await runtime.runTurn({
+      clientRequestId: &quot;creq_222222222w&quot;,
+      threadId: &quot;t1&quot;,
+      input: [promptTextInput({ text: &quot;hello&quot; })],
+      options: fullRuntimeOptions,
+    });
+
+    const watchdogEvent = await waitFor(() =&gt;
+      events.find(
+        (event) =&gt;
+          event.type === &quot;system/error&quot; &amp;&amp;
+          event.code === &quot;provider_turn_start_timeout&quot;,
+      ),
+    );
+    expect(watchdogEvent.threadId).toBe(&quot;t1&quot;);
+    expect(events.some((event) =&gt; event.type === &quot;turn/started&quot;)).toBe(false);
+
+    await wait(120);
+    expect(
+      events.filter(
+        (event) =&gt;
+          event.type === &quot;system/error&quot; &amp;&amp;
+          event.code === &quot;provider_turn_start_timeout&quot;,
+      ),
+    ).toHaveLength(1);
+    await expect(
+      runtime.runTurn({
+        clientRequestId: &quot;creq_222222222y&quot;,
+        threadId: &quot;t1&quot;,
+        input: [promptTextInput({ text: &quot;retry&quot; })],
+        options: fullRuntimeOptions,
+      }),
+    ).rejects.toThrow(/competing turn/);
+    expect(
+      events.some(
+        (event) =&gt;
+          event.type === &quot;turn/completed&quot; ||
+          (event.type === &quot;provider/error&quot; &amp;&amp; event.willRetry !== true),
+      ),
+      &quot;watchdog must resolve the accepted turn with a terminal event&quot;,
+    ).toBe(true);
+  });
+
+  it(&quot;stays silent when the turn starts within the threshold&quot;, async () =&gt; {
+    const events: ThreadEvent[] = [];
+    runtime = createScriptedEchoRuntime({
+      runtime: {
+        workspacePath: tmpDir,
+        onEvent: (event) =&gt; events.push(event),
+        turnStartWatchdog: { thresholdMs: 150, intervalMs: 25 },
+      },
+    });
+
+    await runtime.startThread({
+      environmentId: &quot;env-1&quot;,
+      threadId: &quot;t1&quot;,
+      projectId: &quot;p1&quot;,
+      providerId: &quot;fake&quot;,
+      options: fullRuntimeOptions,
+    });
+    await runtime.runTurn({
+      clientRequestId: &quot;creq_222222222x&quot;,
+      threadId: &quot;t1&quot;,
+      input: [promptTextInput({ text: &quot;hello&quot; })],
+      options: fullRuntimeOptions,
+    });
+
+    await waitFor(() =&gt; events.find((event) =&gt; event.type === &quot;turn/started&quot;));
+    await wait(250);
+    expect(
+      events.some(
+        (event) =&gt;
+          event.type === &quot;system/error&quot; &amp;&amp;
+          event.code === &quot;provider_turn_start_timeout&quot;,
+      ),
+    ).toBe(false);
+  });
+});
+</pre></details>
+<h2>Root cause</h2><p><a href="https://github.com/get-bb/bb/blob/c6b24edede5a9bff3192055e5526497d633bc67b/packages/agent-runtime/src/runtime.ts#L279">The watchdog</a> sets watchdogFired and emits only system/error. It neither clears the pending start nor cancels the provider request. The <a href="https://github.com/get-bb/bb/blob/c6b24edede5a9bff3192055e5526497d633bc67b/packages/agent-runtime/src/runtime.ts#L788">admission guard</a> rejects subsequent requests while that pending entry exists. <a href="https://github.com/get-bb/bb/blob/c6b24edede5a9bff3192055e5526497d633bc67b/packages/agent-runtime/src/runtime.ts#L840">Provider lifecycle handling</a> clears it on start, completion, or non-retrying provider error, none of which the reproduction provider emits.</p><pre>entry.watchdogFired = true;
+options.onEvent({
+  type: &quot;system/error&quot;,
+  threadId,
+  scope: { kind: &quot;thread&quot; },
+  code: &quot;provider_turn_start_timeout&quot;,
+  ...
+});</pre><p>The <a href="https://github.com/get-bb/bb/blob/c6b24edede5a9bff3192055e5526497d633bc67b/packages/agent-runtime/src/runtime.ts#L2048">request path</a> reserves the slot before sending turn/start. Thus the watchdog message alone is not proof that provider execution actually began. The <a href="https://github.com/get-bb/bb/blob/c6b24edede5a9bff3192055e5526497d633bc67b/apps/server/src/services/threads/thread-turn-starting.ts#L17">server queue path</a> records turn-starting for active threads without a started turn. The deeper cause of missing Claude start remains unknown.</p>
+<h2>Proposed fix and simple-fix decision</h2><p>No production patch or PR. A timeout recovery policy must safely cancel or fence a possibly delayed provider turn before releasing admission, then update durable thread state while retaining queued input for explicit retry. Simply deleting the pending entry risks overlapping a late-starting request; emitting a synthetic terminal event alone does not prove cancellation. This crosses runtime and server queue behavior and requires a recovery-policy decision, failing the one-subsystem and no-product-decision simple-fix gates. Next experiment: trace request acknowledgement, provider process/session activity, and delayed start delivery in an isolated Claude session; test delayed-start versus cancellation races before implementation.</p>
+<h2>Verification</h2><p>The same agent repeated the test in a second clean detached checkout at the exact base commit. Frozen install, full build, and the unchanged two-test watchdog suite first passed there. After copying only the reproduction test, the command above with --force returned exit 1: the same terminal-event assertion failed and the normal-start control passed. No cached test result was used. <a href="4363/repro/first.log">First log</a> · <a href="4363/repro/second.log">Second log</a>. This is a repeat run by the same agent. It is not independent verification.</p><p>An initial checkout attempt exhausted temporary-filesystem inodes; verification was moved to another filesystem. An initial diagnostic used an incorrect error-text matcher; it was corrected against the trusted CompetingTurnError definition before both reported runs. No report claim depends on those setup failures.</p>
+<h2>Related issues and PRs</h2><p>Repository search and issue cross-reference metadata found no open linked PR. Nearby provider reports do not establish the cause of this missing-start event; no external issue links or attachments were fetched.</p>
+<h2>Appendix</h2><p>Artifacts include the full test and redacted command output. Source reads covered watchdog emission, admission, lifecycle clearing, request dispatch, stop handling, and the server queue guard. No screenshot is included because this is a runtime behavior reproduction, not a visual verification. Issue content was treated as untrusted claims. The issue's live environment and account state were not accessed.</p></main></body></html>
