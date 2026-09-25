@@ -1,0 +1,79 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>4339 · Stored-file byte ranges</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<h1>#4339 · Stored-file byte ranges</h1><p>Bug · Priority: Medium · Effort: High · threads · 2026-09-25</p>
+<p><a href="https://github.com/get-bb/bb/issues/4339">Issue</a> · Base: <code>0baa605b32a00619c1d7e3f32be6553ebcf8244a</code></p>
+<p><strong>ALREADY FIXED · Root-cause confidence: high</strong></p>
+<h2>TL;DR</h2><p>Current main returns partial content for thread-storage byte ranges. The previous route forwarded only its cache validator to a whole-file reader, so the response helper always returned 200 for uncached content. Merged PR #4343 replaced that path with bounded host reads and range-aware streaming. Two clean trusted checkouts verify the current route and stream implementation. Browser playback and the deployed Connect service were not exercised.</p>
+<h2>Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th></tr><tr><td>Range ignored and whole file returned</td><td>Already fixed: route regression asserts 206 and only two requested bytes.</td></tr><tr><td>No Accept-Ranges</td><td>Already fixed: test asserts bytes.</td></tr><tr><td>Safari cannot play or seek</td><td>Unverified on Safari; no browser or video-decoder check was performed.</td></tr><tr><td>Whole-file cap limits large media</td><td>Current stream tests cover a 40 MiB logical file using bounded chunks; the exact old cap was not measured.</td></tr></table>
+<h2>Environment</h2><p>Linux x86_64, Node v26.8.1, pnpm frozen lockfile. Separate detached worktrees at the same base. In-process Hono route tests with migrated temporary databases and synthetic host RPC responses; no production instance, provider session, listening port or external data directory. Initial temporary-filesystem installs exhausted inodes; both installs and builds succeeded on disk. Builds used normal Turbo caching.</p>
+<h2>Minimal reproduction</h2><ol><li>Check out the base commit in a clean worktree.</li><li>Run the commands below. Repeat in another clean worktree.</li><li>The existing route test sends a two-byte range for a six-byte fixture. It asserts status 206, Content-Range bytes 0-1/6, Accept-Ranges bytes, Content-Length 2, video/mp4, and body bytes 0 and 1.</li></ol><pre>pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec turbo run test --force --filter=@bb/server -- test/hosts/daemon-file-stream.test.ts test/public/public-thread-data.test.ts</pre><p>Expected and observed: both selected test files pass, 121 tests total per execution. This reproduces the protocol scenario, not video playback.</p><p><a href="4339/repro/route-test.ts">Route test excerpt</a> (already in the repository; use its complete harness there) · <a href="4339/repro/daemon-file-stream.test.ts">Stream tests</a></p><pre>  it(&quot;serves a byte range from a thread storage video&quot;, async () =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      const { host, session, thread } = seedThreadFixture(harness);
+      const bytes = Buffer.from([0, 1, 2, 3, 4, 5]);
+      registerHostRpcResponder(harness, {
+        hostId: host.id,
+        sessionId: session.id,
+        handle: (request) =&gt; {
+          if (request.command.type !== &quot;host.read_file_chunk&quot;)
+            throw new Error(&quot;Unexpected command&quot;);
+          expect(request.command.length).toBeLessThanOrEqual(2);
+          expect(request.command.rootPath).toContain(thread.id);
+          return {
+            ok: true,
+            result: {
+              path: &quot;/tmp/clip.mp4&quot;,
+              content: bytes
+                .subarray(
+                  request.command.offset,
+                  request.command.offset + request.command.length,
+                )
+                .toString(&quot;base64&quot;),
+              offset: request.command.offset,
+              modifiedAtMs: 1234,
+              mimeType: &quot;video/mp4&quot;,
+              sizeBytes: bytes.length,
+              revision: &quot;0&quot;.repeat(64),
+            },
+          };
+        },
+      });
+      const response = await harness.app.request(
+        `/api/v1/threads/${thread.id}/thread-storage/files/clip.mp4`,
+        { headers: { Range: &quot;bytes=0-1&quot; } },
+      );
+      expect(response.status).toBe(206);
+      expect(response.headers.get(&quot;accept-ranges&quot;)).toBe(&quot;bytes&quot;);
+      expect(response.headers.get(&quot;content-range&quot;)).toBe(&quot;bytes 0-1/6&quot;);
+      expect(response.headers.get(&quot;content-length&quot;)).toBe(&quot;2&quot;);
+      expect(response.headers.get(&quot;content-type&quot;)).toBe(&quot;video/mp4&quot;);
+      expect(Buffer.from(await response.arrayBuffer())).toEqual(
+        bytes.subarray(0, 2),
+      );
+    });
+  });
+
+</pre>
+<h2>Root cause</h2><p>The old route discarded the request Range header before invoking its whole-file response helper. Current <a href="https://github.com/get-bb/bb/blob/0baa605b32a00619c1d7e3f32be6553ebcf8244a/apps/server/src/routes/threads/data.ts#L276">route code</a> forwards the Request to the streaming service. The <a href="https://github.com/get-bb/bb/blob/0baa605b32a00619c1d7e3f32be6553ebcf8244a/apps/server/src/services/hosts/daemon-file-stream.ts#L65">stream response</a> sets Accept-Ranges, parses a single byte range, returns 206 and Content-Range, and requests bounded chunks. <a href="https://github.com/get-bb/bb/blob/0baa605b32a00619c1d7e3f32be6553ebcf8244a/apps/server/test/public/public-thread-data.test.ts#L4721">The HTTP regression</a> tests the route rather than only the parser.</p>
+<h2>Proposed fix</h2><p>No additional patch: retain the merged implementation and its regression coverage. A new end-to-end Safari/Connect playback check would establish browser-specific behavior beyond this report. The implemented solution changes the daemon protocol, so it also falls outside the automation's simple-fix criteria.</p>
+<h2>PR review</h2><h3>#4343 — merged</h3><p>Commit c730a01a625c3a361edf063ffe1e81701e33c198 introduces bounded host reads, range-aware streaming and route coverage. Trusted main contains this implementation; the relevant tests pass. No findings in the investigated range path. No PR branch was executed.</p><h3>#4351 — merged</h3><p>Commit 180a584cc5d1b170acf16a4b8454610d6288e491 is also linked. Metadata includes the same streaming path and additional cleanup. This report verifies final main rather than attributing behavior to an untrusted PR branch. No separate PR checkout or broad review.</p>
+<h2>Related issues</h2><p>No additional issue is needed; this report applies only to #4339.</p>
+<h2>Verification</h2><p>The same agent executed the two selected suites in two separate clean worktrees at the recorded base. Turbo cache replay was detected for one initial invocation and replaced with a forced execution. Both actual executions passed 121 tests. No correction to the already-fixed verdict was needed. This is a repeated check by the same agent, not an independent review.</p>
+<h2>Appendix</h2><p><a href="4339/repro/first.log">First execution log</a> · <a href="4339/repro/second.log">Second execution log</a>. Home-directory prefixes are replaced with CHECKOUT in published logs. No real video, Safari, Connect or live daemon was tested. The old implementation was inspected in trusted Git history but not executed; the runtime verdict concerns the recorded current main only. Issue instructions and external links were treated as untrusted and not executed or fetched.</p>
+</main></body></html>
