@@ -1,0 +1,72 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Issue 4352 report</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main><h1>#4352 · Disabled plugin routes return transient errors</h1>
+<p>Bug · Priority: Medium · Effort: Medium · providers, provider-claude-code, plugins</p>
+<p>2026-09-25 · Base 0baa605b32a00619c1d7e3f32be6553ebcf8244a · <a href="https://github.com/get-bb/bb/issues/4352">Issue</a></p>
+<p><strong>PARTIALLY REPRODUCED · Root-cause confidence: high for the HTTP failure; OAuth cause unverified.</strong></p>
+<h2>1. TL;DR</h2><p>A request to a working plugin HTTP route returns 503 after the plugin is deliberately disabled. A real plugin service and in-memory migrated database reproduce this on trusted main in two clean checkouts. The route treats this permanent user-selected state like a temporary outage. No Claude process or real account was used, so the reported retry duration and local OAuth invalidation are not reproduced.</p>
+<h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr><tr><td>Disabling a plugin leaves its HTTP endpoint returning 503</td><td>Verified</td><td>Both runs: HTTP 200 before disable, disabled service lookup, then HTTP 503</td></tr><tr><td>Active Claude turns retry for minutes</td><td>Unverified end to end</td><td>The 503 trigger is reproduced; no Claude process was started</td></tr><tr><td>Pool refresh invalidates the local login</td><td>Unverified</td><td>Adapter copies imported refresh tokens and saves refreshed values to the pool, but upstream rotation and the affected machine's account provenance were not tested</td></tr></table>
+<h2>3. Environment</h2><p>Linux x86_64; Node v26.8.1; trusted main at the commit above. Frozen pnpm installs and Turbo builds succeeded in both checkouts (60 tasks each). No installed Claude version was used. Requests use Hono in-process, with no listening ports; each test creates a fresh temporary directory and migrated SQLite :memory: database and removes its plugin directory afterward. No production instance or credentials were accessed.</p>
+<h2>4. Minimal reproduction</h2><ol><li>Create a clean checkout of the base commit.</li><li>Run <code>pnpm install --frozen-lockfile --prefer-offline</code> and <code>pnpm exec turbo run build</code>.</li><li>Download <a href="4352/repro/repro.patch">the authored regression patch</a> and run <code>git apply repro.patch</code>.</li><li>Run <code>pnpm exec turbo run test --filter=@bb/server -- --testNamePattern='issue 4352'</code>.</li></ol><p>The test adds a plugin that serves one unauthenticated fixture route, proves it works, disables it through the real service, then expects a non-server-error response. The final assertion deliberately fails on unchanged production code.</p><pre>disabled response 503 {"ok":false,"error":"plugin \"disabled-route\" is not running (status: disabled)"}
+AssertionError: expected 503 to be less than 500
+Tests  1 failed | 3279 skipped (3280)</pre><p>Test additions in their existing repository harness:</p><pre>diff --git i/apps/server/test/services/plugins/plugin-service.test.ts w/apps/server/test/services/plugins/plugin-service.test.ts
+index f13b15187..c87d5e942 100644
+--- i/apps/server/test/services/plugins/plugin-service.test.ts
++++ w/apps/server/test/services/plugins/plugin-service.test.ts
+@@ -1,3 +1,5 @@
++import { Hono } from &quot;hono&quot;;
++import { registerPluginRoutes } from &quot;../../../src/routes/plugins.js&quot;;
+ import {
+   cp,
+   mkdtemp,
+@@ -165,6 +167,25 @@ describe(&quot;plugin service&quot;, () =&gt; {
+     }
+   });
+ 
++  it(&quot;issue 4352 disabled route must not advertise transient failure&quot;, async () =&gt; {
++    const rootDir = await writePlugin(workDir, {
++      name: &quot;bb-plugin-disabled-route&quot;,
++      serverSource: `export default function plugin(bb) {
++        bb.http.route(&quot;POST&quot;, &quot;/v1/messages&quot;, (context) =&gt; context.json({ ok: true }), { auth: &quot;none&quot; });
++      }`,
++    });
++    expect((await service.installPath(rootDir)).status).toBe(&quot;running&quot;);
++    const app = new Hono().basePath(&quot;/api/v1&quot;);
++    registerPluginRoutes(app, { config: { serverPort: 49163 }, db }, service);
++    const request = () =&gt; app.request(&quot;http://localhost/api/v1/plugins/disabled-route/http/v1/messages&quot;, { method: &quot;POST&quot; });
++    expect((await request()).status).toBe(200);
++    await service.setEnabled(&quot;disabled-route&quot;, false);
++    expect(service.getHttpRoute(&quot;disabled-route&quot;, &quot;POST&quot;, &quot;/v1/messages&quot;)).toMatchObject({ outcome: &quot;not-running&quot;, status: &quot;disabled&quot; });
++    const response = await request();
++    console.log(&quot;disabled response&quot;, response.status, await response.text());
++    expect(response.status).toBeLessThan(500);
++  });
++
+   it(&quot;installs a path plugin, runs its factory, and reports running&quot;, async () =&gt; {
+     const rootDir = await writePlugin(workDir, {
+       name: &quot;bb-plugin-greeter&quot;,
+</pre>
+<h2>5. Root cause</h2><p><a href="https://github.com/get-bb/bb/blob/0baa605b32a00619c1d7e3f32be6553ebcf8244a/apps/server/src/routes/plugins.ts#L850-L863">apps/server/src/routes/plugins.ts:850-L863</a> returns 503 for every not-running lookup, including disabled. It does not distinguish intentional disablement from startup or temporary failure.</p><pre>if (lookup.outcome === "not-running") {
+  return context.json(
+    { ok: false, error: notRunningError(id, lookup) },
+    503,
+  );
+}</pre><p><a href="https://github.com/get-bb/bb/blob/0baa605b32a00619c1d7e3f32be6553ebcf8244a/plugins/account-pool/src/server.ts#L284-L306">plugins/account-pool/src/server.ts:284-L306</a> contributes a server-path base URL to Claude. <a href="https://github.com/get-bb/bb/blob/0baa605b32a00619c1d7e3f32be6553ebcf8244a/apps/server/src/services/threads/thread-runtime-config.ts#L197-L210">apps/server/src/services/threads/thread-runtime-config.ts:197-L210</a> resolves provider environment at turn preparation. <a href="https://github.com/get-bb/bb/blob/0baa605b32a00619c1d7e3f32be6553ebcf8244a/plugins/provider-claude-code/src/bridge/bridge.ts#L1515-L1539">plugins/provider-claude-code/src/bridge/bridge.ts:1515-L1539</a> marks a resident session for rebuilding before the next turn when that environment changes. These paths explain why an already configured process can keep targeting the disabled route; this report does not execute the full process lifecycle.</p><p><a href="https://github.com/get-bb/bb/blob/0baa605b32a00619c1d7e3f32be6553ebcf8244a/plugins/account-pool/src/claude-adapter.ts#L65-L77">plugins/account-pool/src/claude-adapter.ts:65-L77</a> copies imported OAuth credentials; <a href="https://github.com/get-bb/bb/blob/0baa605b32a00619c1d7e3f32be6553ebcf8244a/plugins/account-pool/src/claude-adapter.ts#L106-L131">plugins/account-pool/src/claude-adapter.ts:106-L131</a> writes refreshed tokens through the pool account store. This supports a possible divergence mechanism, but does not prove refresh-token invalidation or explain a specific machine's authentication failure.</p>
+<h2>6. Proposed fix</h2><p>Choose explicit behavior for intentional disablement: fail affected requests promptly with an accurate terminal reason, or coordinate provider-session shutdown. Preserve transient handling for startup/reload. Separately test refresh-token rotation with a controlled account before choosing credential ownership or synchronization. No PR: changing the HTTP response contract or authentication ownership and selecting shutdown policy exceeds the automation's simple-fix constraints.</p>
+<h2>7. Verification</h2><p>The same agent repeated the authored test in a second clean detached checkout at the same commit, with its own frozen install/build and new temporary plugin directory/database. Both runs reached the intended assertion and failed with 503. These are two direct runs, not independent reviews. An initial harness used a URL without the API prefix and failed its precondition with 404; correcting the Hono base path produced the recorded results. No production correction was made.</p>
+<h2>8. Related issues</h2><p>No open linked pull request was found through issue timeline metadata and an open-PR search. Other account-pool reports were not reproduced or treated as evidence here.</p>
+<h2>9. Appendix</h2><p><a href="4352/repro/repro-first.log">First run log</a> · <a href="4352/repro/repro-second.log">Second run log</a>. Temporary checkout creation initially exhausted /tmp file slots; successful runs used /var/tmp. Investigation commands: git fetch origin main; git worktree add --detach for each checkout; frozen install; Turbo build; git apply; Turbo focused test; git diff --check. GitHub metadata reads established public visibility and preserved classification. Issue content was treated only as untrusted claims; its proposed actions were not executed.</p></main></body></html>
