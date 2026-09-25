@@ -1,0 +1,84 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>4364 · Heartbeat loss and turn interruption</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<h1>#4364 · Heartbeat loss and turn interruption</h1><p>Bug · High · Effort: Medium · threads, host · 2026-09-25</p><p><a href="https://github.com/get-bb/bb/issues/4364">GitHub issue</a> · Base <code>c6b24edede5a9bff3192055e5526497d633bc67b</code></p>
+<p><strong>PARTIALLY REPRODUCED</strong> · Root-cause confidence: low for the initiating failure; high for the downstream interruption mechanism.</p>
+<h2>1. TL;DR</h2><p>Withholding server heartbeat acknowledgements makes the daemon reconnect. Keeping the host disconnected then makes the server interrupt active work and emit the reported connection-lost message. Both mechanisms were exercised with existing trusted-main tests in two clean checkouts. The tests inject the missing acknowledgements and disconnect; they do not reproduce why the real deployment lost acknowledgements, a seven-hour Claude session, or the reported delayed question completion. No safe automatic repair follows from this evidence.</p>
+<h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr><tr><td>Missing acknowledgements cause a reconnect</td><td>Verified under injection</td><td>Host connection suite: 17 tests pass in each checkout.</td></tr><tr><td>Prolonged host absence emits interrupted completion, error, then interruption event</td><td>Verified under injection</td><td>Server reconciliation suite: 12 tests pass in each checkout.</td></tr><tr><td>A brief reconnect necessarily loses a turn</td><td>Not supported as a general claim</td><td>Same-instance reconnect with active thread preserves the turn in the server test.</td></tr><tr><td>Real heartbeat failure and seven-hour question lifecycle</td><td>Unverified</td><td>No incident host, network capture, matching macOS instance, or real provider session used.</td></tr></table>
+<h2>3. Environment</h2><p>Trusted origin/main at the full commit above; Linux, Node v26.8.1, pnpm 9.15.0. Both checkouts used frozen installs and normal Turbo builds. No live app, provider, production data, or network listener was started; harnesses use temporary data and in-memory databases. The first temporary checkout attempt exhausted /tmp inodes; two successful checkouts were then created on a filesystem with capacity.</p>
+<h2>4. Minimal reproduction</h2><ol><li>Clone get-bb/bb and check out the recorded commit in a fresh directory.</li><li>Run the artifact below from its root.</li><li>Repeat in a second fresh checkout at the same commit.</li></ol><pre>set -eu
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec turbo run test --force --filter=@bb/host-daemon -- src/server-connection.test.ts
+pnpm exec turbo run test --force --filter=@bb/server -- test/internal/background-task-reconciliation.test.ts
+</pre><p><a href="4364/repro/run.sh">Command artifact</a>. Expected and actual for both runs:</p><pre>Host: Test Files 1 passed (1); Tests 17 passed (17)
+Server: Test Files 1 passed (1); Tests 12 passed (12)</pre>
+<p>The host test “reconnects when server heartbeat acknowledgements stop” acknowledges at 25 seconds, verifies no reconnect after 30 more seconds, then advances five seconds and asserts code 1013 and the timeout reason. The server test “records a lost host connection after the live event window elapses without a reconnect” invokes the real disconnect handler, verifies activity survives the short grace, then advances the active-work grace and asserts the three timeline events and error state. These are passing characterization tests, not a failing regression for a proven root defect.</p>
+<p>Exact trusted test sources: <a href="4364/repro/server-connection.test.ts">host suite</a> and <a href="4364/repro/background-task-reconciliation.test.ts">server suite</a>. The following is the key server test, unchanged:</p><pre>  it(&quot;records a lost host connection after the live event window elapses without a reconnect&quot;, async () =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      const { session, thread } = seedActiveTurnThread(harness);
+
+      vi.useFakeTimers();
+      handleDaemonSocketClosed(harness.deps, { sessionId: session.id });
+
+      await vi.advanceTimersByTimeAsync(DAEMON_DISCONNECT_GRACE_MS + 1);
+      expect(getThread(harness.deps.db, thread.id)?.status).toBe(&quot;active&quot;);
+      expect(
+        listEvents(harness.deps.db, { threadId: thread.id })
+          .filter((row) =&gt; row.type !== &quot;turn/started&quot;)
+          .map((row) =&gt; row.type),
+      ).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(
+        DAEMON_ACTIVE_WORK_DISCONNECT_GRACE_MS - DAEMON_DISCONNECT_GRACE_MS,
+      );
+      expect(getThread(harness.deps.db, thread.id)?.status).toBe(&quot;error&quot;);
+      expect(
+        listEvents(harness.deps.db, { threadId: thread.id })
+          .filter((row) =&gt; row.type !== &quot;turn/started&quot;)
+          .map((row) =&gt; ({
+            data: JSON.parse(row.data),
+            type: row.type,
+          })),
+      ).toEqual([
+        expect.objectContaining({
+          type: &quot;turn/completed&quot;,
+        }),
+        expect.objectContaining({
+          data: expect.objectContaining({
+            code: &quot;thread_command_failed&quot;,
+            message:
+              &quot;Thread interrupted because the connection to the host was lost&quot;,
+            detail: &quot;Please retry the thread to continue.&quot;,
+          }),
+          type: &quot;system/error&quot;,
+        }),
+        expect.objectContaining({
+          data: {
+            reason: &quot;host-daemon-restarted&quot;,
+            cause: &quot;host-connection-lost&quot;,
+          },
+          type: &quot;system/thread/interrupted&quot;,
+        }),
+      ]);
+    });
+  });</pre>
+<h2>5. Root cause</h2><p><a href="https://github.com/get-bb/bb/blob/c6b24edede5a9bff3192055e5526497d633bc67b/apps/host-daemon/src/server-connection.ts#L828">apps/host-daemon/src/server-connection.ts:828</a> compares the last acknowledged timestamp against the lease, logs the timeout, clears the heartbeat timer and reconnects. <a href="https://github.com/get-bb/bb/blob/c6b24edede5a9bff3192055e5526497d633bc67b/apps/server/src/ws/daemon-protocol.ts#L282">apps/server/src/ws/daemon-protocol.ts:282</a> sends an acknowledgement upon receiving a heartbeat. Neither fact identifies whether the incident lost delivery, stalled processing, or encountered another runtime condition.</p><p><a href="https://github.com/get-bb/bb/blob/c6b24edede5a9bff3192055e5526497d633bc67b/apps/server/src/constants.ts#L1">apps/server/src/constants.ts:1</a> sets a 5-second pending-interaction grace and a 30-second active-work grace. <a href="https://github.com/get-bb/bb/blob/c6b24edede5a9bff3192055e5526497d633bc67b/apps/server/src/internal/session-owner-side-effects.ts#L148">apps/server/src/internal/session-owner-side-effects.ts:148</a> schedules both on disconnect. The short grace interrupts pending interactions; <a href="https://github.com/get-bb/bb/blob/c6b24edede5a9bff3192055e5526497d633bc67b/apps/server/src/internal/session-owner-side-effects.ts#L267">apps/server/src/internal/session-owner-side-effects.ts:267</a> interrupts active threads after the long grace when no daemon is registered, using host-daemon-restarted with cause host-connection-lost. <a href="https://github.com/get-bb/bb/blob/c6b24edede5a9bff3192055e5526497d633bc67b/apps/server/src/services/threads/thread-lifecycle.ts#L413">apps/server/src/services/threads/thread-lifecycle.ts:413</a> maps the cause to the connection-lost error and retry detail. That explains the visible symptom but is not a diagnosis of the initiating transport failure.</p>
+<h2>6. Proposed next experiment</h2><p>Capture synchronized daemon heartbeat-send/ack-receive timing and server receive/ack-send timing alongside event-loop delays and connection transitions in an isolated deployment. Exercise a pending question across disconnect and same-instance reconnect, checking both pending-interaction and tool-item terminal states. Do not automatically retry a possibly mutating turn. Extending a timeout without identifying the cause would hide the symptom. No PR: the initiating bug is not reproduced and no failing regression justifies a contained repair.</p>
+<h2>7. Verification</h2><p>The same agent repeated frozen install, build, and both suites in a second clean checkout at the exact commit. Turbo --force prevented test cache replay. Both suites passed again: 29 tests total. No report correction was needed; the verdict remains partial. This is a repeat verification by the same agent, not an independent review.</p>
+<h2>8. Related issues</h2><p>#3407 also discusses heartbeat timeouts, but no shared initiating cause was established. No open PR referencing #4364 was found in the issue timeline or open-PR search at investigation time.</p>
+<h2>9. Appendix</h2><p>All issue text and comments were treated as untrusted claims. No linked attachment, script, or PR code was executed. Source evidence comes exclusively from trusted main. No source fix or new test was added.</p><ul><li><a href="4364/repro/host-first.txt">host-first execution log</a></li><li><a href="4364/repro/server-first.txt">server-first execution log</a></li><li><a href="4364/repro/host-second.txt">host-second execution log</a></li><li><a href="4364/repro/server-second.txt">server-second execution log</a></li></ul></main></body></html>
