@@ -1,0 +1,91 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>#4368 · Cleanup uses stale worker eligibility</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<h1>#4368 · Cleanup uses stale worker eligibility</h1><p>Bug · Medium priority · Low effort · plugins · workflows</p><p>2026-09-25 · Base <code>0baa605b32a00619c1d7e3f32be6553ebcf8244a</code> · <a href="https://github.com/get-bb/bb/issues/4368">Issue</a></p><p><strong>REPRODUCED · Root-cause confidence: high</strong></p>
+<h2>TL;DR</h2><p>A worker can become attached and running while cleanup is waiting for a different worker to stop. Cleanup then stops and archives that live worker using an outdated retirement decision. A new regression test demonstrates this with the actual workflow service and migrated in-memory database. Both trusted checkouts failed the same assertion.</p>
+<h2>Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th></tr><tr><td>Cleanup can archive a newly attached worker</td><td>Verified twice: archive records contain worker-z after attachment and running status were confirmed.</td></tr><tr><td>A delayed earlier stop enables the race</td><td>Verified by holding the stop promise for worker-a, attaching worker-z, then releasing the promise.</td></tr><tr><td>Reported desktop/provider incident and corrective-turn behavior</td><td>Unverified: no real provider or macOS session was run.</td></tr></table>
+<h2>Environment</h2><p>Linux x86_64, Node v26.8.1, frozen repository dependencies, trusted origin/main commit above. SDK thread operations use the existing fake host; storage is a real migrated SQLite database. No app server, provider, ports, or runtime data directories were used. The first temporary location hit inode exhaustion; verification ran from fresh thread storage instead.</p>
+<h2>Minimal reproduction</h2><p>Use a clean trusted checkout at the base commit. Download <a href="4368/repro/regression.diff">the independently authored regression patch</a> as regression.diff, then run:</p><pre>git checkout 0baa605b32a00619c1d7e3f32be6553ebcf8244a
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+# Apply the attached regression.diff to this trusted checkout.
+git apply regression.diff
+pnpm exec turbo run test --filter=bb-plugin-workflows -- --testNamePattern=&#x27;preserves an attached worker&#x27;</pre><p>The patch uses the existing service test harness. It waits for discovery, adds an orphan worker sorting first, holds that worker's stop, releases the spawn response, confirms the call is running and attached, and releases cleanup.</p><p>Expected: worker-z is absent from the archive list. Actual in both runs:</p><pre>AssertionError: expected [ 'worker-a', 'worker-z' ] to not include 'worker-z'
+Test Files  1 failed | 13 skipped (14)
+Tests  1 failed | 248 skipped (249)</pre><p><a href="4368/repro/service-policy.test.ts">Complete test file</a></p><pre>  it(&quot;preserves an attached worker after an earlier cleanup awaits stop&quot;, async () =&gt; {
+    const test = setup();
+    harnesses.push(test.harness);
+    let finishSpawn = () =&gt; {};
+    let finishStop = () =&gt; {};
+    const spawnGate = new Promise&lt;void&gt;((resolve) =&gt; { finishSpawn = resolve; });
+    const stopGate = new Promise&lt;void&gt;((resolve) =&gt; { finishStop = resolve; });
+    let metadata: NonNullable&lt;Parameters&lt;typeof test.bb.sdk.threads.spawn&gt;[0][&quot;pluginMetadata&quot;]&gt; = {};
+    let stopping = false;
+    test.harness.sdk.stub(&quot;threads.spawn&quot;, async (args: Parameters&lt;typeof test.bb.sdk.threads.spawn&gt;[0]) =&gt; {
+      metadata = args.pluginMetadata!;
+      await spawnGate;
+      return { id: &quot;worker-z&quot; } as never;
+    });
+    test.harness.sdk.stub(&quot;threads.list&quot;, async () =&gt; metadata.workflowWorker ? ([{ id: &quot;worker-z&quot; }] as never) : []);
+    test.harness.sdk.stub(&quot;threads.getPluginMetadata&quot;, async () =&gt; metadata);
+    test.harness.sdk.stub(&quot;threads.stop&quot;, async ({ threadId }: { threadId: string }) =&gt; {
+      if (threadId === &quot;worker-a&quot;) {
+        stopping = true;
+        await stopGate;
+      }
+      return { ok: true };
+    });
+    const run = await test.start(source(`return await agent(&quot;work&quot;);`));
+    const controller = new AbortController();
+    const running = test.service.runWorker(controller.signal);
+    try {
+      await eventually(() =&gt; expect(test.db.prepare(&quot;SELECT thread_id FROM workflow_workers WHERE thread_id = &#x27;worker-z&#x27;&quot;).get()).toBeDefined());
+      ownWorker(test.db, &quot;worker-a&quot;, run.id, &quot;missing-call&quot;, &quot;origin&quot;);
+      await eventually(() =&gt; expect(stopping).toBe(true));
+      finishSpawn();
+      await eventually(() =&gt; expect(getCall(test.db, run.id, 0)?.childThreadId).toBe(&quot;worker-z&quot;));
+      expect(getCall(test.db, run.id, 0)?.status).toBe(&quot;running&quot;);
+      finishStop();
+      await eventually(() =&gt; expect(test.archived).toContain(&quot;worker-a&quot;));
+      await new Promise((resolve) =&gt; setTimeout(resolve, 100));
+      expect(test.archived).not.toContain(&quot;worker-z&quot;);
+    } finally {
+      finishSpawn();
+      finishStop();
+      controller.abort();
+      await running;
+    }
+  });
+
+</pre>
+<h2>Root cause</h2><p><a href="https://github.com/get-bb/bb/blob/0baa605b32a00619c1d7e3f32be6553ebcf8244a/plugins/workflows/src/data.ts#L901">retiredWorkers</a> includes a worker whose call does not yet reference its thread. <a href="https://github.com/get-bb/bb/blob/0baa605b32a00619c1d7e3f32be6553ebcf8244a/plugins/workflows/src/service.ts#L487">Discovery</a> can record that ownership before spawn returns. <a href="https://github.com/get-bb/bb/blob/0baa605b32a00619c1d7e3f32be6553ebcf8244a/plugins/workflows/src/service.ts#L524">cleanupWorkers</a> reads the candidates once and awaits each archive in order:</p><pre>(): Promise&lt;void&gt; {
+    for (const worker of retiredWorkers(db, Date.now())) {
+      if (spawningCalls.has(worker.callId)) continue;
+      recordWorkerCleanup(
+        db,
+        worker.threadId,
+        await archiveRetiredWorker(worker.threadId),
+      );
+    }
+  }
+
+</pre><p>During the earlier await, <a href="https://github.com/get-bb/bb/blob/0baa605b32a00619c1d7e3f32be6553ebcf8244a/plugins/workflows/src/service.ts#L950">spawn completion</a> attaches the later worker and removes its spawning guard. The stale candidate remains in the loop. <a href="https://github.com/get-bb/bb/blob/0baa605b32a00619c1d7e3f32be6553ebcf8244a/plugins/workflows/src/service.ts#L1564">archiveRetiredWorker</a> then stops and archives it without validating current ownership. The guards are evaluated at different times and neither proves retirement at the point of stopping.</p>
+<h2>Proposed fix</h2><p>Recheck current retirement using a targeted database query immediately before stopping each candidate, retaining the spawning guard. Reuse the retirement predicate to avoid divergence between discovery cleanup and the recheck. Preserve cleanup of orphaned and cancelled workers.</p>
+<h2>PR review</h2><p><a href="https://github.com/get-bb/bb/pull/4369">PR #4369</a> is open and GitHub closing metadata links it to this issue. Static diff review shows it shares the retirement predicate and checks current retirement in cleanup before stopping. This addresses the verified window; no blocking finding in that narrow static review. Its code and tests were not checked out or executed. No duplicate fix PR was opened.</p>
+<h2>Related issues</h2><p>A repository search for archived workflow workers returned only this issue. Issue #2284 concerns idle provider cleanup, a different symptom.</p>
+<h2>Verification</h2><p>The same agent repeated the test in a second clean detached checkout of 0baa605b32a00619c1d7e3f32be6553ebcf8244a, with a fresh frozen install and build. Only the independently authored regression test was copied. The second test task executed rather than using a cached result and failed the identical assertion. No report correction was necessary. This is repeated verification, not independent verification.</p>
+<h2>Appendix</h2><p><a href="4368/repro/first.log">First run</a> · <a href="4368/repro/second.log">Second run</a>. Both builds passed. Git diff --check passed. Issue instructions, external branches, and supplied tests were treated as untrusted and were not executed. The reproduced outcome is an erroneous archive request at the actual service path; the full provider failure message and reported historical timeline were not re-created.</p></main></body></html>
