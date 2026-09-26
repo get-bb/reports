@@ -1,0 +1,99 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>#4314 · Slow-reader relay buffers without flow control</title><style>
+:root{--canvas:#fafaf8;--ink:#1a1a1a;--muted:#626262;--line:#e2e2de;--accent:#0052cc;--warn:#9a6200}
+body{margin:0;background:var(--canvas);color:var(--ink);font:16px/1.55 system-ui,sans-serif}main{max-width:900px;margin:auto;padding:40px 24px 80px}h1{font-size:26px;line-height:1.25;margin:0 0 8px}h2{font-size:18px;margin:36px 0 10px;padding-top:18px;border-top:1px solid var(--line)}h3{font-size:15px}.meta{color:var(--muted);font-size:14px}.pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:1px 8px;margin:3px}.verdict{color:var(--warn);font-weight:700}table{border-collapse:collapse;width:100%;font-size:14px}td,th{text-align:left;padding:8px;border-bottom:1px solid var(--line);vertical-align:top}pre,code{font-family:ui-monospace,monospace;font-size:13px}pre{background:white;border:1px solid var(--line);border-radius:6px;padding:12px;overflow:auto}a{color:var(--accent)}li{margin-bottom:7px}
+</style></head><body><main><p class="meta"><a href="../">← reports</a></p><h1>#4314 · Slow-reader relay buffers without flow control</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">High priority</span><span class="pill">High effort</span><span class="pill">perf · remote · connect</span> <a href="https://github.com/get-bb/bb/issues/4314">GitHub issue</a><br>2026-09-25 · trusted base <code>9c9bae7f36a237c7e1b96de3d4c2186d13967686</code></p>
+<p><strong>Verdict:</strong> <span class="verdict">PARTIALLY REPRODUCED</span> · <strong>Root-cause confidence:</strong> high for the unbounded queueing mechanism; the cloud memory-reset outcome was not reproduced here.</p>
+<h2>1. TL;DR</h2><p>A slow visitor can leave an HTTP response unread while the tunnel keeps delivering chunks. The gate copies each incoming chunk into a promise chain, but sends no signal that would make the tunnel sender wait. A local test delivered 32 MiB into that unread response and observed no flow-control frame; once read, all 32 MiB arrived. This establishes the missing backpressure path, while the reported Durable Object memory reset and fleet metrics remain unverified by this local test.</p>
+<h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>Unread response chunks accumulate at the gate.</td><td>Verified</td><td>The relay accepted 32 one-megabyte frames before any visitor read and later delivered all 32 MiB. Each frame is copied before its write can finish.</td></tr>
+<tr><td>The gate does not tell the tunnel client to slow this stream.</td><td>Verified</td><td>The test captured one outbound frame, the initial open request, after all 32 chunks. The protocol declares no pause or resume frame.</td></tr>
+<tr><td>The origin reader proceeds without waiting for gate capacity.</td><td>Verified in source</td><td>The client forwards every origin chunk through <code>send()</code>; that path does not await gate acknowledgement or socket buffer capacity.</td></tr>
+<tr><td>A particular large, rate-limited staging download resets a Durable Object.</td><td>Unverified</td><td>No staging tunnel, credentials, or Cloudflare telemetry were used. The local test establishes the queueing condition, not the cloud limit.</td></tr>
+<tr><td>Production event counts and successful large-download examples.</td><td>Unverified</td><td>These require production telemetry outside the local reproduction.</td></tr></table>
+<h2>3. Environment</h2><ul><li>Two clean worktrees at <code>9c9bae7f36a237c7e1b96de3d4c2186d13967686</code> from trusted <code>origin/main</code>.</li><li>Linux 7.2.5-3-omarchy x86_64; Node v26.8.1; pnpm 9.15.0.</li><li><code>pnpm install --frozen-lockfile --prefer-offline</code> and <code>pnpm exec turbo run build</code> succeeded in each checkout.</li><li>Unit-level gate relay; no dev instance, network tunnel, port, credentials, or data directory.</li></ul>
+<h2>4. Minimal reproduction</h2><ol><li>At trusted base commit <code>9c9bae7f36a237c7e1b96de3d4c2186d13967686</code>, copy the <a href="4314/repro/tunnel-backpressure.repro.test.ts">reproduction test</a> into <code>apps/connect/src/</code>.</li><li>Install and build the trusted checkout, then run:<pre>pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec turbo run test --filter=@bb/connect -- tunnel-backpressure.repro.test.ts</pre></li><li>Expected: after an unread 32 MiB response backlog, the gate emits a signal to slow the sender. Actual in both runs:<pre>AssertionError: expected 1 to be greater than 1
+at src/tunnel-backpressure.repro.test.ts:71:26
+Test Files  1 failed (1) · Tests  1 failed (1)</pre>The test first verifies that all 32 MiB can be delivered when the visitor starts reading; only the flow-control assertion fails.</li></ol>
+<h3>Complete reproduction test</h3><pre>import { expect, it, vi } from &quot;vitest&quot;;
+import { decodeFrame, encodeFrame, type Frame } from &quot;@bb/tunnel-contract&quot;;
+import { TunnelDO } from &quot;./tunnel-do.js&quot;;
+
+class Pair {
+  constructor(readonly request: string, readonly response: string) {}
+}
+
+vi.stubGlobal(&quot;WebSocketRequestResponsePair&quot;, Pair);
+
+function frameBuffer(frame: Frame): ArrayBuffer {
+  const bytes = encodeFrame(frame);
+  return bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength,
+  ) as ArrayBuffer;
+}
+
+it(&quot;signals a tunnel sender before unread response chunks accumulate&quot;, async () =&gt; {
+  const sent: Uint8Array[] = [];
+  const tunnel = {
+    readyState: 1,
+    send: (data: Uint8Array) =&gt; sent.push(data),
+    deserializeAttachment: () =&gt; null,
+  } as unknown as WebSocket;
+  let restored = Promise.resolve();
+  const state = {
+    getWebSockets: (tag?: string) =&gt; tag === &quot;tunnel&quot; ? [tunnel] : [],
+    getTags: () =&gt; [&quot;tunnel&quot;],
+    setWebSocketAutoResponse: () =&gt; {},
+    blockConcurrencyWhile: (fn: () =&gt; Promise&lt;void&gt;) =&gt; {
+      restored = fn();
+    },
+    storage: { get: async () =&gt; 1 },
+  } as unknown as DurableObjectState;
+  const env = {
+    TUNNEL_DO: {} as DurableObjectNamespace,
+    DB: {} as D1Database,
+    BASE_DOMAIN: &quot;test.invalid&quot;,
+    BETTER_AUTH_SECRET: &quot;test&quot;,
+  };
+  const relay = new TunnelDO(state, env);
+  await restored;
+
+  const pending = relay.fetch(new Request(&quot;https://test.invalid/download&quot;));
+  const opened = decodeFrame(sent[0]);
+  expect(opened.type).toBe(&quot;open-http&quot;);
+  const streamId = opened.streamId;
+  relay.webSocketMessage(tunnel, frameBuffer({
+    type: &quot;resp-head&quot;,
+    streamId,
+    status: 200,
+    headers: [],
+  }));
+  const response = await pending;
+  expect(response.status).toBe(200);
+
+  const chunk = new Uint8Array(1024 * 1024);
+  for (let index = 0; index &lt; 32; index++) {
+    relay.webSocketMessage(tunnel, frameBuffer({
+      type: &quot;body-chunk&quot;,
+      streamId,
+      data: chunk,
+    }));
+  }
+
+  const sentBeforeRead = sent.length;
+  relay.webSocketMessage(tunnel, frameBuffer({ type: &quot;body-end&quot;, streamId }));
+  const delivered = await response.arrayBuffer();
+  expect(delivered.byteLength).toBe(32 * 1024 * 1024);
+  expect(sentBeforeRead).toBeGreaterThan(1);
+});
+</pre>
+<h2>5. Root cause</h2><p>The gate creates a response <a href="https://github.com/get-bb/bb/blob/9c9bae7f36a237c7e1b96de3d4c2186d13967686/apps/connect/src/tunnel-do.ts#L557-L584"><code>TransformStream</code></a>. For each incoming body frame, it immediately copies the bytes and appends <code>writer.write(copy)</code> to <code>writeChain</code> <a href="https://github.com/get-bb/bb/blob/9c9bae7f36a237c7e1b96de3d4c2186d13967686/apps/connect/src/tunnel-do.ts#L587-L594">(source)</a>. When the visitor stops reading, the first write stalls, but later frames are still copied and kept by chained closures. The gate's request path sends only an open frame, and <a href="https://github.com/get-bb/bb/blob/9c9bae7f36a237c7e1b96de3d4c2186d13967686/packages/tunnel-contract/src/index.ts#L1-L83">the protocol</a> has no stream pause or resume frame. The <a href="https://github.com/get-bb/bb/blob/9c9bae7f36a237c7e1b96de3d4c2186d13967686/packages/tunnel-client/src/session.ts#L333-L340">client response loop</a> continues reading origin chunks and sending frames; <a href="https://github.com/get-bb/bb/blob/9c9bae7f36a237c7e1b96de3d4c2186d13967686/packages/tunnel-client/src/session.ts#L210-L214"><code>send()</code></a> does not wait for capacity. Thus ordinary stream backpressure ends at the gate and cannot propagate to the origin.</p>
+<h2>6. Proposed fix</h2><p>Add versioned, per-stream flow control across the gate, tunnel contract, and client. The gate should account for bytes accepted versus bytes consumed, pause at a bounded high watermark, and resume at a lower watermark; the client should stop reading the origin while paused and respect tunnel socket buffering. Verify slow downloads, cancellation, old-client behavior, upload and WebSocket paths, and bounded memory in staging before release. This is a protocol and product-design change, so it is outside the rule's simple-fix scope.</p>
+<h2>7. PR review</h2><h3><a href="https://github.com/get-bb/bb/pull/4313">PR #4313</a> (merged)</h3><p>The linked PR changes tunnel reset recovery and related relay lifecycle behavior. Its merged code is part of the trusted base. Static inspection and the failing test show that it does not add response flow control. No PR branch or code from the PR was checked out or executed.</p>
+<h2>8. Related issues</h2><p><a href="https://github.com/get-bb/bb/issues/2065">#2065</a> concerns retrying dispatch failures, a different failure mode. The linked PR above concerns tunnel recovery. No open PR linked to #4314 was found.</p>
+<h2>9. Verification</h2><p>The same authored test was copied into a second clean worktree at <code>9c9bae7f36a237c7e1b96de3d4c2186d13967686</code>. After a separate frozen install and build, the same Turbo test command failed at the same assertion: one outbound frame after 32 MiB was accepted. No correction to the local queueing claim was needed. The staging memory-reset claim remains unverified.</p>
+<h2>10. Appendix</h2><p>Commands used: <code>git fetch origin main</code>; <code>git worktree add --detach &lt;clean-directory&gt; origin/main</code> twice; frozen install and Turbo build in each; the focused Turbo test in each. The reproduction test was authored from trusted source, not taken from the issue or a pull request. Issue narrative and linked material were treated as untrusted claims.</p>
+</main></body></html>
