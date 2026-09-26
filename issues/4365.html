@@ -1,0 +1,172 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>#4365 · Pending turn survives start watchdog</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<h1>#4365 · Pending turn survives start watchdog</h1><p>Bug · High priority · Medium effort · threads · 2026-09-25</p><p><a href="https://github.com/get-bb/bb/issues/4365">GitHub issue</a> · Base <code>9c9bae7f36a237c7e1b96de3d4c2186d13967686</code></p>
+<p><strong>PARTIALLY REPRODUCED · Root-cause confidence: high for runtime stall; medium for complete incident</strong></p>
+<h2>1. TL;DR</h2><p>An accepted provider request that never emits a start event remains pending after the watchdog warns. A subsequent runtime turn request still fails with CompetingTurnError. This was reproduced twice using the repository's scripted provider bridge, without changing production code. Server source explains how active threads without a turn ID park input until a start arrives. The reported reconnect incident, actual Claude behavior, persisted queue and Working display were not reproduced end to end.</p>
+<h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr><tr><td>Start timeout does not settle pending runtime work</td><td>Verified</td><td>Two failing recovery tests; zero starts/completions and one warning</td></tr><tr><td>Active thread without turn ID parks input</td><td>Verified by source only</td><td>Transactional queue guard and turn-start dispatch</td></tr><tr><td>Reconnect revives interrupted thread</td><td>Unverified incident; plausible source path</td><td>Reconciliation maps errored threads reported active to run.started</td></tr><tr><td>UI Working and durable stranded queue</td><td>Unverified dynamically</td><td>No real UI or database incident reproduction performed</td></tr></table>
+<h2>3. Environment</h2><p>Linux 7.2.5-3-omarchy x86_64; Node v26.8.1; pnpm frozen install; Turbo build: 60 successful tasks in each checkout. Repository scripted echo bridge with swallowTurnStart enabled. No real provider CLI, user data, network service ports or live BB instance used. Each test allocates and removes a fresh temporary workspace. Watchdog threshold 120 ms and polling interval 25 ms replace the production 120-second and 15-second defaults.</p>
+<h2>4. Minimal reproduction</h2><p>In a clean checkout apply the linked test-only diff and run:</p><pre>git checkout --detach 9c9bae7f36a237c7e1b96de3d4c2186d13967686
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+git apply /path/to/reproduction.diff
+pnpm exec turbo run test --filter=@bb/agent-runtime --force -- src/runtime.turn-start-watchdog.test.ts</pre><p>The fixture accepts a turn request but intentionally suppresses its start notification. After the warning, wait another 240 ms and attempt another runTurn. Expected under automatic recovery: retry is accepted. Actual:</p><pre>timeout recovery {"warnings":1,"starts":0,"completions":0}
+AssertionError: promise rejected "CompetingTurnError: Refusing to start a c…" instead of resolving
+CompetingTurnError: Refusing to start a competing turn for thread "t1" while another turn is active or starting
+Tests  1 failed | 1 passed (2)</pre><p>This assertion tests the proposed recovery behavior, not an existing guarantee that a timeout proves the provider stopped. It demonstrates the blocked state; it does not justify clearing the pending flag alone.</p>
+<p><a href="4365/repro/reproduction.diff">Test diff</a> · <a href="4365/repro/runtime.turn-start-watchdog.test.ts">Complete test</a> · <a href="4365/repro/first.log">First log</a> · <a href="4365/repro/second.log">Second log</a></p><details><summary>Complete reproduction test</summary><pre>import { mkdtempSync, rmSync } from &quot;node:fs&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { afterEach, beforeEach, describe, expect, it } from &quot;vitest&quot;;
+import type { ThreadEvent } from &quot;@bb/domain&quot;;
+import {
+  createScriptedEchoRuntime,
+  fullRuntimeOptions,
+  wait,
+  type LaunchBoundAgentRuntime,
+} from &quot;./test/runtime-test-harness.js&quot;;
+import { promptTextInput } from &quot;./test/prompt-input.js&quot;;
+
+describe(&quot;turn-start watchdog&quot;, () =&gt; {
+  let tmpDir: string;
+  let runtime: LaunchBoundAgentRuntime | null = null;
+
+  beforeEach(() =&gt; {
+    tmpDir = mkdtempSync(join(tmpdir(), &quot;bb-runtime-watchdog-&quot;));
+  });
+
+  afterEach(async () =&gt; {
+    await runtime?.shutdown();
+    runtime = null;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  async function waitFor&lt;T&gt;(
+    resolve: () =&gt; T | undefined,
+    timeoutMs = 3_000,
+  ): Promise&lt;T&gt; {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const value = resolve();
+      if (value !== undefined) {
+        return value;
+      }
+      if (Date.now() &gt; deadline) {
+        throw new Error(&quot;timed out waiting&quot;);
+      }
+      await wait(15);
+    }
+  }
+
+  it(&quot;surfaces a visible error when an accepted turn never starts&quot;, async () =&gt; {
+    const events: ThreadEvent[] = [];
+    runtime = createScriptedEchoRuntime({
+      runtime: {
+        workspacePath: tmpDir,
+        onEvent: (event) =&gt; events.push(event),
+        turnStartWatchdog: { thresholdMs: 120, intervalMs: 25 },
+      },
+      launch: { scripted: { swallowTurnStart: true } },
+    });
+
+    await runtime.startThread({
+      environmentId: &quot;env-1&quot;,
+      threadId: &quot;t1&quot;,
+      projectId: &quot;p1&quot;,
+      providerId: &quot;fake&quot;,
+      options: fullRuntimeOptions,
+    });
+    await runtime.runTurn({
+      clientRequestId: &quot;creq_222222222w&quot;,
+      threadId: &quot;t1&quot;,
+      input: [promptTextInput({ text: &quot;hello&quot; })],
+      options: fullRuntimeOptions,
+    });
+
+    const watchdogEvent = await waitFor(() =&gt;
+      events.find(
+        (event) =&gt;
+          event.type === &quot;system/error&quot; &amp;&amp;
+          event.code === &quot;provider_turn_start_timeout&quot;,
+      ),
+    );
+    expect(watchdogEvent.threadId).toBe(&quot;t1&quot;);
+    await wait(240);
+    console.log(&quot;timeout recovery&quot;, JSON.stringify({
+      warnings: events.filter(event =&gt; event.type === &quot;system/error&quot; &amp;&amp; event.code === &quot;provider_turn_start_timeout&quot;).length,
+      starts: events.filter(event =&gt; event.type === &quot;turn/started&quot;).length,
+      completions: events.filter(event =&gt; event.type === &quot;turn/completed&quot;).length,
+    }));
+    await expect(runtime.runTurn({
+      clientRequestId: &quot;creq_222222222y&quot;,
+      threadId: &quot;t1&quot;,
+      input: [promptTextInput({ text: &quot;retry&quot; })],
+      options: fullRuntimeOptions,
+    })).resolves.toBeUndefined();
+    expect(events.some((event) =&gt; event.type === &quot;turn/started&quot;)).toBe(false);
+
+    await wait(120);
+    expect(
+      events.filter(
+        (event) =&gt;
+          event.type === &quot;system/error&quot; &amp;&amp;
+          event.code === &quot;provider_turn_start_timeout&quot;,
+      ),
+    ).toHaveLength(1);
+  });
+
+  it(&quot;stays silent when the turn starts within the threshold&quot;, async () =&gt; {
+    const events: ThreadEvent[] = [];
+    runtime = createScriptedEchoRuntime({
+      runtime: {
+        workspacePath: tmpDir,
+        onEvent: (event) =&gt; events.push(event),
+        turnStartWatchdog: { thresholdMs: 150, intervalMs: 25 },
+      },
+    });
+
+    await runtime.startThread({
+      environmentId: &quot;env-1&quot;,
+      threadId: &quot;t1&quot;,
+      projectId: &quot;p1&quot;,
+      providerId: &quot;fake&quot;,
+      options: fullRuntimeOptions,
+    });
+    await runtime.runTurn({
+      clientRequestId: &quot;creq_222222222x&quot;,
+      threadId: &quot;t1&quot;,
+      input: [promptTextInput({ text: &quot;hello&quot; })],
+      options: fullRuntimeOptions,
+    });
+
+    await waitFor(() =&gt; events.find((event) =&gt; event.type === &quot;turn/started&quot;));
+    await wait(250);
+    expect(
+      events.some(
+        (event) =&gt;
+          event.type === &quot;system/error&quot; &amp;&amp;
+          event.code === &quot;provider_turn_start_timeout&quot;,
+      ),
+    ).toBe(false);
+  });
+});
+</pre></details>
+<h2>5. Root cause</h2><p><a href="https://github.com/get-bb/bb/blob/9c9bae7f36a237c7e1b96de3d4c2186d13967686/packages/agent-runtime/src/runtime.ts#L279">packages/agent-runtime/src/runtime.ts:279</a> keeps pending starts in a map. The watchdog only marks watchdogFired and emits system/error; it does not settle or cancel the request. <a href="https://github.com/get-bb/bb/blob/9c9bae7f36a237c7e1b96de3d4c2186d13967686/packages/agent-runtime/src/runtime.ts#L788">packages/agent-runtime/src/runtime.ts:788</a> rejects competing requests whenever that map still contains the thread. <a href="https://github.com/get-bb/bb/blob/9c9bae7f36a237c7e1b96de3d4c2186d13967686/packages/agent-runtime/src/runtime.ts#L840">packages/agent-runtime/src/runtime.ts:840</a> clears pending starts on lifecycle events, which the stalled fixture never sends.</p><p><a href="https://github.com/get-bb/bb/blob/9c9bae7f36a237c7e1b96de3d4c2186d13967686/apps/server/src/services/threads/thread-turn-starting.ts#L29">apps/server/src/services/threads/thread-turn-starting.ts:29</a> parks input when durable status is active and the active turn ID is null. <a href="https://github.com/get-bb/bb/blob/9c9bae7f36a237c7e1b96de3d4c2186d13967686/apps/server/src/services/threads/queued-message-dispatch.ts#L298">apps/server/src/services/threads/queued-message-dispatch.ts:298</a> retries those waits on a start event. Idle recovery at line 511 visits idle threads, so an active thread does not qualify. These source findings support the reported queue mechanism but are not an integrated server reproduction.</p><p><a href="https://github.com/get-bb/bb/blob/9c9bae7f36a237c7e1b96de3d4c2186d13967686/apps/server/src/services/threads/thread-lifecycle.ts#L2087">apps/server/src/services/threads/thread-lifecycle.ts:2087</a> reconciles errored threads reported active by the host with run.started. Whether the original host report was stale is unknown.</p>
+<h2>6. Proposed fix</h2><p>Define a timeout recovery policy that safely cancels or fences the accepted provider request before accepting another turn, reconciles durable server status, and preserves queued input in an actionable state. Test delayed start after timeout, late completion, reconnect and manual stop. Simply deleting pendingTurnStarts risks concurrent provider turns. No automated PR: the full incident is only partially reproduced and recovery requires a policy decision across runtime and server subsystems.</p>
+<h2>7. Related issues</h2><p>The issue identifies adjacent timeout and connection-loss reports. Their incident claims were not used as executable evidence. GitHub metadata and an open-PR search found no PR linked to #4365 during this investigation.</p>
+<h2>8. Verification</h2><p>The same agent created a second clean detached checkout at the full base commit above, performed a separate frozen install and build, copied only the test change and ran the same Turbo test with --force. It again failed at the retry assertion with CompetingTurnError, while the normal-start control passed. Both runs showed one warning, zero starts and zero completions. No report correction was needed. This is repeated verification, not independent verification.</p>
+<h2>9. Appendix</h2><p>Initial setup encountered /tmp inode exhaustion; that failed setup was excluded from evidence. The report clone and second checkout were moved to /var/tmp. The first successful run and fresh second run are linked above; absolute local paths are sanitized. No UI screenshot is supplied because only a nonvisual runtime mechanism was reproduced. No production code, dependency or persistent data was changed.</p><p>Issue content and comments were treated as untrusted claims. No linked external content, issue scripts or pull-request code was executed.</p><p>AGENT GENERATED</p></main></body></html>
