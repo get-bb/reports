@@ -1,0 +1,84 @@
+  it.each([
+    {
+      name: "a user ask rule",
+      metadata: {
+        matchedAskRule: {
+          source: "userSettings",
+          toolName: "Bash",
+          ruleContent: "Bash(npm publish*)",
+        },
+      },
+    },
+    { name: "a metadata-free permission request", metadata: {} },
+  ])("forwards $name to bb", async ({ metadata }) => {
+    const bridge = createBridgeJsonRpcTestHarness(handleLine);
+    const queries: ControlledClaudeQuery[] = [];
+    queryMock.mockImplementation(() => {
+      const query = createControlledClaudeQuery();
+      queries.push(query);
+      return query;
+    });
+
+    try {
+      const threadId = "thread-user-ask-rule";
+      const toolUseID = "tool-user-ask-rule";
+      bridge.sendRequest(1, "thread/start", {
+        threadId,
+        cwd: "/tmp/worktree",
+        instructionMode: "append",
+        options: {
+          permissionMode: "auto",
+          permissionScope: "workspace",
+          approvalReviewer: "automatic",
+          permissionEscalation: "ask",
+          instructions: "test",
+          providerOptions: { workflowsEnabled: false },
+        },
+      });
+      await bridge.waitForResponse(1);
+
+      const decision = getLastCanUseTool()(
+        "Bash",
+        { command: "npm publish" },
+        {
+          ...metadata,
+          requestId: "control-request",
+          signal: new AbortController().signal,
+          toolUseID,
+        },
+      );
+      await bridge.flushWork();
+
+      const permissionRequest = bridge.messages.find((message) =>
+        isApprovalInteraction(message),
+      );
+      if (permissionRequest?.id === undefined) {
+        throw new Error(
+          `Expected forwarded permission request; received ${JSON.stringify(await decision)}`,
+        );
+      }
+      expect(permissionRequest.params).toMatchObject({
+        threadId,
+        payload: {
+          kind: "approval",
+          subject: expect.objectContaining({ itemId: toolUseID }),
+        },
+      });
+
+      handleLine(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: permissionRequest.id,
+          result: { decision: "deny", grantedPermissions: null },
+        }),
+      );
+      await expect(decision).resolves.toMatchObject({
+        behavior: "deny",
+        toolUseID,
+      });
+
+      await stopBridgeThread({ bridge, queries, threadId });
+    } finally {
+      bridge.restore();
+    }
+  });
