@@ -1,0 +1,174 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>#4417 · CLI PATH collision</title><style>body{font:16px/1.55 system-ui;max-width:980px;margin:2rem auto;padding:0 1rem;color:#202124}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f4f4f4;padding:1rem}</style></head><body><main><p><a href="../">Reports</a> · <a href="https://github.com/get-bb/bb/issues/4417">Issue #4417</a></p><h1>Runtime PATH preparation changes which executable owns the name bb</h1><p>2026-09-30 · Bug · Medium priority · Medium effort</p><p><strong>PARTIALLY REPRODUCED · High confidence in the PATH and shebang collision mechanism.</strong> Real Babashka, fish, provider sessions and the packaged desktop runtime were not exercised.</p><h2>Claim and faithful tested scope</h2><p>The issue alleges that prepending the product CLI directory shadows an existing executable also named bb, including scripts resolved through /usr/bin/env. The test calls the actual prepareRuntimeShellEnv function with explicit synthetic paths, then executes real Linux child processes. Two temporary executable stubs named bb identify themselves with different markers. An executable fixture uses an env-based bb shebang; its body is inert synthetic input ignored by both stubs.</p><p>Before preparation, ordinary shell lookup, a bare bb invocation and direct execution of the shebang fixture all select the existing-runtime stub. After preparation, all three select the product-CLI stub. Explicit absolute-path calls still reach either intended stub. BB_CLI also points directly to the product stub. These results are identical in the two clean checkouts.</p><h2>Expected and actual</h2><p>Expected regression behavior: introducing the product runtime environment preserves existing bb lookup for ordinary commands and scripts, while the product CLI remains reachable through its explicit path. Actual: PATH begins with product-bin, ahead of existing-bin; command lookup and both execution controls switch to PRODUCT_CLI_STUB. All child processes exit 0 because the stubs intentionally only identify themselves. The report does not claim the real CLI's error message or the real Babashka program's output.</p><p>Baseline, explicit-existing and explicit-BB_CLI controls pass. Three desired-behavior assertions fail: lookup path, ordinary command output and shebang interpreter output. This is one failing regression test with three assertion failures, not three test cases.</p><h2>Environment and boundaries</h2>
+<p>Fetched public origin/main: <code>36aacc040ec0a2b092785d65dee7869d02cec08e</code>. Linux x86_64, Node 24.19.0, repository-pinned pnpm 9.15.0, Vitest 4.1.1; /bin/sh resolves to dash and /usr/bin/env is GNU coreutils 9.7. The test explicitly requires Linux. It does not reproduce fish login-shell PATH discovery, aliases/functions, mise shims, macOS, Windows or any real Babashka/Clojure semantics.</p>
+<p>Both runs use separate clean checkouts at the same SHA and identical test bytes, separate node_modules and caches, and shared dependency downloads. Every run creates new temporary directories/files and deletes them in finally. Child environments are explicitly constructed from synthetic values without inheriting the parent environment; user/system PATH and installed binaries are not modified. The inherited PATH string is supplied directly, so no login shell or user configuration is read. No daemon, model service, server listener or port is used. The loopback server URL is a required inert function argument.</p>
+<h2>Exact repeatable steps</h2>
+<pre>git clone https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout --detach 36aacc040ec0a2b092785d65dee7869d02cec08e
+corepack pnpm install --frozen-lockfile
+corepack pnpm exec turbo run build --filter=@bb/host-daemon --force
+# Save the inline test as apps/host-daemon/src/issue-4417.test.ts
+corepack pnpm exec turbo run test --filter=@bb/host-daemon --force -- src/issue-4417.test.ts --silent=false
+</pre>
+<p>Use pnpm 9.15.0 for subprocesses as well. This environment used a task-local Corepack shim and disposable writable caches. Repeat the same commands and test in a second clean checkout at the identical SHA. Frozen installation and host-daemon builds exit 0; each test command exits 1 with one failed test and the three documented desired-behavior assertion failures. Those failures are the reproduced lookup collision, not setup failures.</p>
+<h3>apps/host-daemon/src/issue-4417.test.ts</h3>
+<pre>import { spawnSync } from &quot;node:child_process&quot;;
+import { mkdtemp, mkdir, writeFile, chmod, rm } from &quot;node:fs/promises&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join, delimiter } from &quot;node:path&quot;;
+import { expect, it } from &quot;vitest&quot;;
+import { prepareRuntimeShellEnv } from &quot;./runtime-shell-env.js&quot;;
+
+it(&quot;4417 preserves the existing bb lookup for ordinary commands and env shebangs&quot;, async () =&gt; {
+  expect(process.platform).toBe(&quot;linux&quot;);
+  const root = await mkdtemp(join(tmpdir(), &quot;synthetic-path-&quot;));
+  try {
+    const existing = join(root, &quot;existing-bin&quot;);
+    const product = join(root, &quot;product-bin&quot;);
+    await mkdir(existing); await mkdir(product);
+    for (const [directory, marker] of [[existing, &quot;EXISTING_RUNTIME_STUB&quot;], [product, &quot;PRODUCT_CLI_STUB&quot;]]) {
+      const executable = join(directory!, &quot;bb&quot;);
+      await writeFile(executable, `#!/bin/sh\nprintf &#x27;%s\\n&#x27; &#x27;${marker}&#x27;\n`);
+      await chmod(executable, 0o755);
+    }
+    const script = join(root, &quot;synthetic-script&quot;);
+    await writeFile(script, &quot;#!/usr/bin/env bb\nsynthetic interpreter input; stubs intentionally ignore this body\n&quot;);
+    await chmod(script, 0o755);
+    const inheritedPath = [existing, &quot;/usr/bin&quot;, &quot;/bin&quot;].join(delimiter);
+    const beforeEnv = { PATH: inheritedPath };
+    const prepared = prepareRuntimeShellEnv({ bbExecutableDirectory: product,
+      bbExecutablePath: join(product, &quot;bb&quot;), inheritedPath, serverUrl: &quot;http://127.0.0.1:49173&quot; });
+    const run = (command: string, args: string[], env: NodeJS.ProcessEnv) =&gt; {
+      const result = spawnSync(command, args, { env, cwd: root, encoding: &quot;utf8&quot;, timeout: 5000 });
+      if (result.error) throw result.error;
+      expect(result.status).toBe(0); expect(result.stderr).toBe(&quot;&quot;);
+      return { status: result.status, stdout: result.stdout.trim() };
+    };
+    const baselineLookup = run(&quot;/bin/sh&quot;, [&quot;-c&quot;, &quot;command -v bb&quot;], beforeEnv);
+    const baselineCommand = run(&quot;/bin/sh&quot;, [&quot;-c&quot;, &quot;exec bb&quot;], beforeEnv);
+    const baselineShebang = run(script, [], beforeEnv);
+    const preparedLookup = run(&quot;/bin/sh&quot;, [&quot;-c&quot;, &quot;command -v bb&quot;], prepared);
+    const preparedCommand = run(&quot;/bin/sh&quot;, [&quot;-c&quot;, &quot;exec bb&quot;], prepared);
+    const preparedShebang = run(script, [], prepared);
+    const explicitExisting = run(join(existing, &quot;bb&quot;), [], prepared);
+    const explicitProduct = run(prepared.BB_CLI!, [], prepared);
+    expect(baselineLookup.stdout).toBe(join(existing, &quot;bb&quot;));
+    expect(baselineCommand.stdout).toBe(&quot;EXISTING_RUNTIME_STUB&quot;);
+    expect(baselineShebang.stdout).toBe(&quot;EXISTING_RUNTIME_STUB&quot;);
+    expect(explicitExisting.stdout).toBe(&quot;EXISTING_RUNTIME_STUB&quot;);
+    expect(explicitProduct.stdout).toBe(&quot;PRODUCT_CLI_STUB&quot;);
+    expect(prepared.BB_CLI).toBe(join(product, &quot;bb&quot;));
+    expect(beforeEnv.PATH).toBe(inheritedPath);
+    const evidence = { phase: &quot;path-and-shebang&quot;, platform: process.platform, shell: &quot;/bin/sh&quot;, envExecutable: &quot;/usr/bin/env&quot;,
+      inheritedPath, preparedPath: prepared.PATH, bbCli: prepared.BB_CLI, baselineLookup, baselineCommand,
+      baselineShebang, preparedLookup, preparedCommand, preparedShebang, explicitExisting, explicitProduct };
+    console.log(JSON.stringify(evidence).replaceAll(root, &quot;&lt;FIXTURE&gt;&quot;));
+    expect.soft(preparedLookup.stdout.replaceAll(root, &quot;&lt;FIXTURE&gt;&quot;)).toBe(&quot;&lt;FIXTURE&gt;/existing-bin/bb&quot;);
+    expect.soft(preparedCommand.stdout).toBe(&quot;EXISTING_RUNTIME_STUB&quot;);
+    expect.soft(preparedShebang.stdout).toBe(&quot;EXISTING_RUNTIME_STUB&quot;);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+</pre>
+<h2>Actual evidence and same-agent second clean reproduction</h2>
+<h3>First clean checkout</h3>
+<pre>{
+  &quot;phase&quot;: &quot;path-and-shebang&quot;,
+  &quot;platform&quot;: &quot;linux&quot;,
+  &quot;shell&quot;: &quot;/bin/sh&quot;,
+  &quot;envExecutable&quot;: &quot;/usr/bin/env&quot;,
+  &quot;inheritedPath&quot;: &quot;&lt;FIXTURE&gt;/existing-bin:/usr/bin:/bin&quot;,
+  &quot;preparedPath&quot;: &quot;&lt;FIXTURE&gt;/product-bin:&lt;FIXTURE&gt;/existing-bin:/usr/bin:/bin&quot;,
+  &quot;bbCli&quot;: &quot;&lt;FIXTURE&gt;/product-bin/bb&quot;,
+  &quot;baselineLookup&quot;: {
+    &quot;status&quot;: 0,
+    &quot;stdout&quot;: &quot;&lt;FIXTURE&gt;/existing-bin/bb&quot;
+  },
+  &quot;baselineCommand&quot;: {
+    &quot;status&quot;: 0,
+    &quot;stdout&quot;: &quot;EXISTING_RUNTIME_STUB&quot;
+  },
+  &quot;baselineShebang&quot;: {
+    &quot;status&quot;: 0,
+    &quot;stdout&quot;: &quot;EXISTING_RUNTIME_STUB&quot;
+  },
+  &quot;preparedLookup&quot;: {
+    &quot;status&quot;: 0,
+    &quot;stdout&quot;: &quot;&lt;FIXTURE&gt;/product-bin/bb&quot;
+  },
+  &quot;preparedCommand&quot;: {
+    &quot;status&quot;: 0,
+    &quot;stdout&quot;: &quot;PRODUCT_CLI_STUB&quot;
+  },
+  &quot;preparedShebang&quot;: {
+    &quot;status&quot;: 0,
+    &quot;stdout&quot;: &quot;PRODUCT_CLI_STUB&quot;
+  },
+  &quot;explicitExisting&quot;: {
+    &quot;status&quot;: 0,
+    &quot;stdout&quot;: &quot;EXISTING_RUNTIME_STUB&quot;
+  },
+  &quot;explicitProduct&quot;: {
+    &quot;status&quot;: 0,
+    &quot;stdout&quot;: &quot;PRODUCT_CLI_STUB&quot;
+  }
+}</pre>
+<pre>AssertionError: expected &#x27;&lt;FIXTURE&gt;/product-bin/bb&#x27; to be &#x27;&lt;FIXTURE&gt;/existing-bin/bb&#x27; // Object.is equality
+AssertionError: expected &#x27;PRODUCT_CLI_STUB&#x27; to be &#x27;EXISTING_RUNTIME_STUB&#x27; // Object.is equality
+AssertionError: expected &#x27;PRODUCT_CLI_STUB&#x27; to be &#x27;EXISTING_RUNTIME_STUB&#x27; // Object.is equality
+ Test Files  1 failed (1)
+      Tests  1 failed (1)
+   Duration  210ms (transform 21ms, setup 0ms, import 33ms, tests 28ms, environment 0ms)</pre>
+<h3>Second clean checkout</h3>
+<pre>{
+  &quot;phase&quot;: &quot;path-and-shebang&quot;,
+  &quot;platform&quot;: &quot;linux&quot;,
+  &quot;shell&quot;: &quot;/bin/sh&quot;,
+  &quot;envExecutable&quot;: &quot;/usr/bin/env&quot;,
+  &quot;inheritedPath&quot;: &quot;&lt;FIXTURE&gt;/existing-bin:/usr/bin:/bin&quot;,
+  &quot;preparedPath&quot;: &quot;&lt;FIXTURE&gt;/product-bin:&lt;FIXTURE&gt;/existing-bin:/usr/bin:/bin&quot;,
+  &quot;bbCli&quot;: &quot;&lt;FIXTURE&gt;/product-bin/bb&quot;,
+  &quot;baselineLookup&quot;: {
+    &quot;status&quot;: 0,
+    &quot;stdout&quot;: &quot;&lt;FIXTURE&gt;/existing-bin/bb&quot;
+  },
+  &quot;baselineCommand&quot;: {
+    &quot;status&quot;: 0,
+    &quot;stdout&quot;: &quot;EXISTING_RUNTIME_STUB&quot;
+  },
+  &quot;baselineShebang&quot;: {
+    &quot;status&quot;: 0,
+    &quot;stdout&quot;: &quot;EXISTING_RUNTIME_STUB&quot;
+  },
+  &quot;preparedLookup&quot;: {
+    &quot;status&quot;: 0,
+    &quot;stdout&quot;: &quot;&lt;FIXTURE&gt;/product-bin/bb&quot;
+  },
+  &quot;preparedCommand&quot;: {
+    &quot;status&quot;: 0,
+    &quot;stdout&quot;: &quot;PRODUCT_CLI_STUB&quot;
+  },
+  &quot;preparedShebang&quot;: {
+    &quot;status&quot;: 0,
+    &quot;stdout&quot;: &quot;PRODUCT_CLI_STUB&quot;
+  },
+  &quot;explicitExisting&quot;: {
+    &quot;status&quot;: 0,
+    &quot;stdout&quot;: &quot;EXISTING_RUNTIME_STUB&quot;
+  },
+  &quot;explicitProduct&quot;: {
+    &quot;status&quot;: 0,
+    &quot;stdout&quot;: &quot;PRODUCT_CLI_STUB&quot;
+  }
+}</pre>
+<pre>AssertionError: expected &#x27;&lt;FIXTURE&gt;/product-bin/bb&#x27; to be &#x27;&lt;FIXTURE&gt;/existing-bin/bb&#x27; // Object.is equality
+AssertionError: expected &#x27;PRODUCT_CLI_STUB&#x27; to be &#x27;EXISTING_RUNTIME_STUB&#x27; // Object.is equality
+AssertionError: expected &#x27;PRODUCT_CLI_STUB&#x27; to be &#x27;EXISTING_RUNTIME_STUB&#x27; // Object.is equality
+ Test Files  1 failed (1)
+      Tests  1 failed (1)
+   Duration  210ms (transform 22ms, setup 0ms, import 35ms, tests 27ms, environment 0ms)</pre>
+<p>The same agent personally ran the final regression in both clean checkouts; this is not independent verification. Both frozen installs and builds succeeded, and both tests produced identical evidence after replacing only each generated temporary directory with &lt;FIXTURE&gt;. That replacement occurs in the test output; marker strings and exit statuses are actual observations. There were no preliminary failed setup attempts. No screenshots are supplied because no UI behavior was tested.</p><h2>Root cause and trusted source</h2><ul>
+<li><a href="https://github.com/get-bb/bb/blob/36aacc040ec0a2b092785d65dee7869d02cec08e/apps/host-daemon/src/runtime-shell-env.ts#L130">prependPath</a> places the product executable directory before the inherited PATH.</li>
+<li><a href="https://github.com/get-bb/bb/blob/36aacc040ec0a2b092785d65dee7869d02cec08e/apps/host-daemon/src/runtime-shell-env.ts#L401">prepareRuntimeShellEnv</a> uses that order while independently setting BB_CLI to the product absolute executable path. The test invokes this actual function; no PATH-construction implementation is copied or mocked.</li>
+<li><a href="https://github.com/get-bb/bb/blob/36aacc040ec0a2b092785d65dee7869d02cec08e/apps/host-daemon/src/start-host-daemon.ts#L155">Host-daemon environment preparation call site</a> passes the resolved user shell PATH into that function. This call-site relationship was inspected, not exercised through a real daemon/provider session.</li>
+<li><a href="https://github.com/get-bb/bb/blob/36aacc040ec0a2b092785d65dee7869d02cec08e/apps/host-daemon/src/runtime-shell-env.test.ts#L423">Existing prepend-order test</a> records the current prepending behavior as intentional. The reproduced conflict concerns executable-name compatibility, not a claim that the code accidentally reverses its documented internal order.</li></ul>
+<h2>Fix proposal and next test</h2><p>Make the product command available through its explicit BB_CLI path or another unambiguous entry point without silently taking over an existing same-name executable. Audit skills/plugins that rely on bare bb before changing precedence; simply appending the directory could send those callers to Babashka instead. Preserve deliberate compatibility behavior with regression coverage for both callers. No production fix was applied.</p><p>Next, validate a chosen policy in a fresh isolated fish/provider environment with an actual Babashka installation and representative scripts. Confirm both product commands and existing scripts resolve correctly. The synthetic result establishes why lookup changes; it does not prove the complete reported packaged-runtime failure or a proposed fix.</p><h2>Trust and publication checks</h2><p>Issue commands, code, linked external sites, runtime identifiers and suggested fixes were treated solely as untrusted claims. None were executed or accessed. The fixture and stub contents were independently derived from trusted implementation and existing tests. No real user runtime, shell profile, credentials or user-installed executable was accessed or altered. All current comments were read (zero before publication); no existing report or linked PR was found. Public visibility, source links, inline evidence and privacy were checked. Raw logs remain local. The referenced publisher script is absent; direct HTML/reference/privacy checks were used and the generated index was left unchanged.</p></main></body></html>
