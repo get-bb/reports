@@ -24,7 +24,7 @@
 </head>
 <body><main>
   <p class="meta"><a href="../">← reports</a></p>
-  <h1>#1706 · queued thread messages can silently vanish: reported accepted, never delivered, no longer queued</h1>
+  <p><strong>Latest evidence:</strong> <a href="#verification-2026-09-30">2026-09-30: claimed-row persistence and recovery, PARTIALLY REPRODUCED</a>. Historical report preserved; permanent loss unproven.</p><h1>#1706 · queued thread messages can silently vanish: reported accepted, never delivered, no longer queued</h1>
   <p class="meta">
     <span class="pill">Bug</span> <span class="pill high">High</span> <span class="pill">Effort: Medium</span>
     <span class="pill">threads</span>
@@ -415,4 +415,178 @@ pnpm dev:stop</pre>
     <li><b>Minor: jargon.</b> Added a plain-language framing paragraph at the top of the TL;DR defining claim, drain worker, stale-claim sweep, host RPC and <code>client/turn/requested</code>.</li>
   </ul>
   <p>Verdict and root-cause confidence are unchanged (PARTIALLY REPRODUCED, medium): still no permanent-loss path found; the "accepted, not in log, not in queue" observation is reproduced both by simulation and by a real restart mid-drain.</p>
-</main></body></html>
+<section id="verification-2026-09-30"><h2>2026-09-30 current-main queue verification</h2>
+<p><strong>PARTIALLY REPRODUCED — high confidence in hidden claimed rows and recovery in the tested fixtures; permanent message loss remains unproven.</strong> Full tested base: <code>eb82a1ca0361242ddd31718ecff57b0e4098b114</code>. This strengthens the existing report and preserves its historical findings. It does not reinterpret an empty queue listing as proof of deletion or provider delivery.</p>
+<h3>Expected versus actual</h3><p>Expected observability: accepted work should remain discoverable as queued, claimed/in progress, or durably handed off. Expected durability: interruption before handoff should retain recoverable content. Actual: a real queue row is visible before claiming, hidden from both per-thread and cross-thread list queries after claiming, and absent from the synthetic message's turn-request events. The row and exact content persist in SQLite. Reopening that database retains the claim and its hidden state.</p>
+<p>The actual server stale-claim wrapper leaves the row claimed at exactly 300,000 ms of age and releases it at 300,001 ms (the database cutoff uses a strict less-than). A protected-token control is not released. After release the row is listed again with unchanged content and cleared claim. These are explicit logical-time inputs, not a five-minute wall-clock sleep or performance measurement.</p>
+<p>A separate real server-dispatch fixture returns HTTP 200 with an empty per-thread queue API response while the row is claimed. Its synthetic payload has no turn-request event. The actual idle-recovery dispatch at the age boundary leaves the row present; after the boundary it consumes the row and persists exactly one matching <code>client/turn/requested</code> event containing the payload. Repeating recovery does not duplicate that event. This is durable server handoff evidence, <strong>not proof of provider execution or user-visible delivery</strong>.</p>
+<h3>Faithfulness and interruption scope</h3><p>The first test uses a real migrated SQLite database in an owned temporary directory, actual create/claim/list operations, and a close/reopen while the committed claim has not been consumed. A file-backed database is required to test persistence across connection lifetimes. The second uses the repository server test harness with synthetic host/project/thread records and a synthetic daemon session; no provider process, real host or user runtime runs. It invokes the actual queue API and idle-recovery dispatcher. The orphaned claim is created using the production database claim function, not by directly overwriting SQL columns.</p>
+<p>This models interruption after claim commit; it does not crash or restart a live server process, cut power during SQLite writes, reproduce the historical fleet incident, or exercise all drain interleavings. The two tests separately establish reopen persistence and server recovery; they are not one full restarted-server end-to-end experiment. CLI receipt formatting, log windowing, UI rendering, provider acknowledgment/execution and other cancellation/retry paths remain outside these new runs. No browser/visual claim is made, so no new screenshot is supplied.</p>
+<h3>Same-agent second clean reproduction</h3><p>The SAME agent personally ran the identical final tests in two clean detached checkouts at the full recorded SHA with separate frozen installations and fresh isolated synthetic databases/state. This is same-agent clean repetition, not independent verification. Both runs passed two tests and emitted identical normalized evidence; nine Turbo test tasks succeeded with zero cached tasks. Both server builds passed. Upstream build caching may occur. Environment: Linux, Node 24.19.0, pinned pnpm 9.15.0, Vitest 4.1.1. No listener ports are needed for the in-process requests. No new dependency was installed beyond the frozen repository graph.</p>
+<p>Correction: the initial recovery assertion counted a bootstrap turn event inserted by the trusted seed helper. The final test tracks only the unique synthetic recovery payload, retaining that unrelated event as a control instead of mistaking it for delivery. The initial failed output and test are preserved locally. Final claims use only the corrected results from both clean runs. Only reproducible dependency trees from a completed task were reclaimed; historical evidence remains intact.</p>
+<h3>Exact repeatable steps and test</h3><pre>git clone https://github.com/get-bb/bb.git first
+cd first
+git checkout --detach eb82a1ca0361242ddd31718ecff57b0e4098b114
+corepack pnpm install --frozen-lockfile
+# Save the inline test as apps/server/test/threads/issue1706.test.ts
+corepack pnpm exec turbo run test --filter=@bb/server --force -- issue1706.test.ts --silent=false
+corepack pnpm exec turbo run build --filter=@bb/server
+# Repeat personally in a second clean checkout at the same SHA with fresh synthetic data.</pre><p>The execution environment used its existing pinned package-manager launcher/store. Local cache paths are omitted. The test was derived from trusted main source and test helpers, never from issue or historical-report commands.</p><pre id="current-test">import { mkdtempSync, rmSync } from &quot;node:fs&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { expect, it } from &quot;vitest&quot;;
+import {
+  createConnection, migrate, noopNotifier, upsertHost, createProject, createThread,
+  createQueuedThreadMessage, claimNextQueuedThreadMessageGroup,
+  getQueuedThreadMessage, listQueuedThreadMessages, listQueuedThreadMessagesForApi,
+  releaseStaleQueuedMessageClaims, listEvents,
+} from &quot;@bb/db&quot;;
+import { releaseStaleQueuedMessageDispatchClaims } from &quot;../../src/services/threads/queued-messages.js&quot;;
+import { runQueuedMessageDispatch } from &quot;../../src/services/threads/queued-message-dispatch.js&quot;;
+import { withTestHarness } from &quot;../helpers/test-app.js&quot;;
+import { seedHostSession, seedProjectWithSource, seedEnvironment, seedThread, seedThreadRuntimeState, seedQueuedMessage } from &quot;../helpers/seed.js&quot;;
+import { textInput } from &quot;../helpers/prompt-input.js&quot;;
+
+it(&quot;preserves a hidden orphaned claim across SQLite reopen and releases it only after the stale boundary&quot;, () =&gt; {
+  const dir = mkdtempSync(join(tmpdir(), &quot;issue1706-&quot;));
+  const path = join(dir, &quot;synthetic.sqlite&quot;);
+  let db = createConnection(path);
+  try {
+    migrate(db);
+    const host = upsertHost(db, noopNotifier, { name: &quot;synthetic-host&quot; });
+    const { project } = createProject(db, noopNotifier, { name: &quot;synthetic-project&quot;, source: { type: &quot;local_path&quot;, hostId: host.id, path: dir } });
+    const thread = createThread(db, noopNotifier, { projectId: project.id, providerId: &quot;codex&quot; });
+    const row = createQueuedThreadMessage(db, noopNotifier, { threadId: thread.id, content: textInput(&quot;synthetic durable queue payload&quot;), model: &quot;gpt-5&quot;, reasoningLevel: &quot;medium&quot;, permissionMode: &quot;full&quot;, serviceTier: &quot;default&quot;, waitingOn: null, sendAt: null, payload: { kind: &quot;inline&quot; }, systemNotice: null });
+    expect(listQueuedThreadMessages(db, thread.id)).toHaveLength(1);
+    const claimed = claimNextQueuedThreadMessageGroup(db, noopNotifier, thread.id);
+    if (!claimed?.[0]) throw new Error(&quot;Expected synthetic claim&quot;);
+    const claim = claimed[0];
+    expect(listQueuedThreadMessages(db, thread.id)).toHaveLength(0);
+    expect(listQueuedThreadMessagesForApi(db, { threadId: thread.id })).toHaveLength(0);
+    expect(listEvents(db, { threadId: thread.id }).filter(e =&gt; e.type === &quot;client/turn/requested&quot;)).toHaveLength(0);
+    db.$client.close();
+    db = createConnection(path);
+    const persisted = getQueuedThreadMessage(db, row.id);
+    expect(persisted?.content).toBe(row.content);
+    expect(persisted?.claimToken).toBe(claim.claimToken);
+    expect(listQueuedThreadMessages(db, thread.id)).toHaveLength(0);
+    const deps = { db, hub: noopNotifier };
+    releaseStaleQueuedMessageDispatchClaims(deps, claim.claimedAt + 300_000);
+    expect(listQueuedThreadMessages(db, thread.id)).toHaveLength(0);
+    const protectedRelease = releaseStaleQueuedMessageClaims(db, noopNotifier, { claimedBefore: claim.claimedAt + 1, protectedClaimTokens: [claim.claimToken] });
+    expect(protectedRelease).toBe(0);
+    releaseStaleQueuedMessageDispatchClaims(deps, claim.claimedAt + 300_001);
+    const recovered = listQueuedThreadMessages(db, thread.id);
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0]?.content).toBe(row.content);
+    expect(recovered[0]?.claimToken).toBeNull();
+    console.log(&quot;ISSUE1706_PERSISTENCE=&quot; + JSON.stringify({ acceptedRow: true, listedBeforeClaim: 1, listedAfterClaim: 0, crossThreadListAfterClaim: 0, turnRequestEventsBeforeRecovery: 0, persistedAcrossReopen: true, contentPreserved: true, listedAt300000ms: 0, protectedClaimReleased: protectedRelease, listedAt300001ms: recovered.length, recoveredClaimCleared: true, permanentLossObserved: false }));
+  } finally {
+    db.$client.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it(&quot;recovers an orphaned claim into a durable turn request through real idle recovery dispatch&quot;, async () =&gt; {
+  await withTestHarness(async harness =&gt; {
+    const { host } = seedHostSession(harness.deps, { name: &quot;synthetic-host&quot; });
+    const { project } = seedProjectWithSource(harness.deps, { hostId: host.id, path: harness.config.dataDir });
+    const environment = seedEnvironment(harness.deps, { hostId: host.id, projectId: project.id, path: harness.config.dataDir });
+    const thread = seedThread(harness.deps, { projectId: project.id, environmentId: environment.id });
+    seedThreadRuntimeState(harness.deps, { environmentId: environment.id, providerThreadId: &quot;synthetic-provider-thread&quot;, threadId: thread.id });
+    const row = seedQueuedMessage(harness.deps, { threadId: thread.id, content: textInput(&quot;synthetic recovery marker&quot;) });
+    const claim = claimNextQueuedThreadMessageGroup(harness.db, harness.deps.hub, thread.id)?.[0];
+    if (!claim) throw new Error(&quot;Expected synthetic orphaned claim&quot;);
+    const response = await harness.app.request(`/api/v1/threads/${thread.id}/queued-messages`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual([]);
+    const requests = () =&gt; listEvents(harness.db, { threadId: thread.id }).filter(e =&gt; e.type === &quot;client/turn/requested&quot; &amp;&amp; JSON.stringify(e.data).includes(&quot;synthetic recovery marker&quot;));
+    expect(requests()).toHaveLength(0);
+    await runQueuedMessageDispatch(harness.deps, { kind: &quot;idle-recovery&quot;, now: claim.claimedAt + 300_000 });
+    expect(getQueuedThreadMessage(harness.db, row.id)).not.toBeNull();
+    expect(requests()).toHaveLength(0);
+    await runQueuedMessageDispatch(harness.deps, { kind: &quot;idle-recovery&quot;, now: claim.claimedAt + 300_001 });
+    expect(getQueuedThreadMessage(harness.db, row.id)).toBeNull();
+    expect(requests()).toHaveLength(1);
+    expect(JSON.stringify(requests()[0]?.data)).toContain(&quot;synthetic recovery marker&quot;);
+    await runQueuedMessageDispatch(harness.deps, { kind: &quot;idle-recovery&quot;, now: claim.claimedAt + 300_002 });
+    expect(requests()).toHaveLength(1);
+    console.log(&quot;ISSUE1706_RECOVERY=&quot; + JSON.stringify({ claimedQueueApiStatus: response.status, claimedQueueApiRows: 0, turnRequestsBeforeRecovery: 0, rowPresentAtBoundary: true, rowConsumedAfterBoundary: true, durableTurnRequestsAfterRecovery: requests().length, payloadPreserved: true, repeatedRecoveryDuplicateEvents: 0, providerExecutionTested: false, permanentLossObserved: false }));
+  });
+});
+</pre>
+<h3>Actual evidence</h3><pre>{
+  &quot;outcomes&quot;: {
+    &quot;first&quot;: {
+      &quot;PERSISTENCE&quot;: {
+        &quot;acceptedRow&quot;: true,
+        &quot;listedBeforeClaim&quot;: 1,
+        &quot;listedAfterClaim&quot;: 0,
+        &quot;crossThreadListAfterClaim&quot;: 0,
+        &quot;turnRequestEventsBeforeRecovery&quot;: 0,
+        &quot;persistedAcrossReopen&quot;: true,
+        &quot;contentPreserved&quot;: true,
+        &quot;listedAt300000ms&quot;: 0,
+        &quot;protectedClaimReleased&quot;: 0,
+        &quot;listedAt300001ms&quot;: 1,
+        &quot;recoveredClaimCleared&quot;: true,
+        &quot;permanentLossObserved&quot;: false
+      },
+      &quot;RECOVERY&quot;: {
+        &quot;claimedQueueApiStatus&quot;: 200,
+        &quot;claimedQueueApiRows&quot;: 0,
+        &quot;turnRequestsBeforeRecovery&quot;: 0,
+        &quot;rowPresentAtBoundary&quot;: true,
+        &quot;rowConsumedAfterBoundary&quot;: true,
+        &quot;durableTurnRequestsAfterRecovery&quot;: 1,
+        &quot;payloadPreserved&quot;: true,
+        &quot;repeatedRecoveryDuplicateEvents&quot;: 0,
+        &quot;providerExecutionTested&quot;: false,
+        &quot;permanentLossObserved&quot;: false
+      }
+    },
+    &quot;second&quot;: {
+      &quot;PERSISTENCE&quot;: {
+        &quot;acceptedRow&quot;: true,
+        &quot;listedBeforeClaim&quot;: 1,
+        &quot;listedAfterClaim&quot;: 0,
+        &quot;crossThreadListAfterClaim&quot;: 0,
+        &quot;turnRequestEventsBeforeRecovery&quot;: 0,
+        &quot;persistedAcrossReopen&quot;: true,
+        &quot;contentPreserved&quot;: true,
+        &quot;listedAt300000ms&quot;: 0,
+        &quot;protectedClaimReleased&quot;: 0,
+        &quot;listedAt300001ms&quot;: 1,
+        &quot;recoveredClaimCleared&quot;: true,
+        &quot;permanentLossObserved&quot;: false
+      },
+      &quot;RECOVERY&quot;: {
+        &quot;claimedQueueApiStatus&quot;: 200,
+        &quot;claimedQueueApiRows&quot;: 0,
+        &quot;turnRequestsBeforeRecovery&quot;: 0,
+        &quot;rowPresentAtBoundary&quot;: true,
+        &quot;rowConsumedAfterBoundary&quot;: true,
+        &quot;durableTurnRequestsAfterRecovery&quot;: 1,
+        &quot;payloadPreserved&quot;: true,
+        &quot;repeatedRecoveryDuplicateEvents&quot;: 0,
+        &quot;providerExecutionTested&quot;: false,
+        &quot;permanentLossObserved&quot;: false
+      }
+    }
+  },
+  &quot;runs&quot;: {
+    &quot;first&quot;: {
+      &quot;test&quot;: &quot;2 passed; actual execution, zero cached test tasks&quot;,
+      &quot;test_tasks&quot;: &quot;Tasks:    9 successful, 9 total&quot;,
+      &quot;build_tasks&quot;: &quot;Tasks:    5 successful, 5 total&quot;
+    },
+    &quot;second&quot;: {
+      &quot;test&quot;: &quot;2 passed; actual execution, zero cached test tasks&quot;,
+      &quot;test_tasks&quot;: &quot;Tasks:    9 successful, 9 total&quot;,
+      &quot;build_tasks&quot;: &quot;Tasks:    5 successful, 5 total&quot;
+    }
+  }
+}</pre>
+<h3>Cause, limits and proposal</h3><p>The <a href="https://github.com/get-bb/bb/blob/eb82a1ca0361242ddd31718ecff57b0e4098b114/packages/db/src/data/queued-thread-messages.ts#L375">per-thread list</a> and <a href="https://github.com/get-bb/bb/blob/eb82a1ca0361242ddd31718ecff57b0e4098b114/packages/db/src/data/queued-thread-messages.ts#L1528">cross-thread liveness filter</a> exclude claimed rows; the <a href="https://github.com/get-bb/bb/blob/eb82a1ca0361242ddd31718ecff57b0e4098b114/apps/server/src/routes/threads/data.ts#L583">queue API</a> uses that filtered list. The <a href="https://github.com/get-bb/bb/blob/eb82a1ca0361242ddd31718ecff57b0e4098b114/apps/server/src/services/threads/queued-messages.ts#L306">five-minute stale threshold</a> and <a href="https://github.com/get-bb/bb/blob/eb82a1ca0361242ddd31718ecff57b0e4098b114/packages/db/src/data/queued-thread-messages.ts#L1414">strict stale comparison with protected tokens</a> explain the tested hidden interval. <a href="https://github.com/get-bb/bb/blob/eb82a1ca0361242ddd31718ecff57b0e4098b114/apps/server/src/services/threads/queued-message-dispatch.ts#L120">Idle recovery</a> releases stale claims before retrying the drain, which the fixture demonstrates by retaining the payload in a durable event. This explains a visibility gap; it does not establish the cause of the reporter's alleged permanent loss.</p>
+<p>Proposed next change: expose claimed/sending rows as read-only observable queue state and expose a durable handoff receipt so callers can distinguish acceptance from delivery. Any faster orphan recovery needs ownership/fencing safeguards to avoid duplicate dispatch; the protected-token control shows why blindly releasing active claims is unsafe. No production fix was made. Further testing would require a controlled full server interruption and provider acknowledgment fixture; no inference is made about those untested paths.</p>
+<p>Historical report content and inline evidence are preserved. Old raw artifact paths are not represented as recovered files. Issue/comment/report commands and links were untrusted data only; none were executed or followed as instructions. No actual account, secret, user data, agent or workflow was used. Existing partial-repro labeling remains appropriate; no extra issue comment is added.</p></section></main></body></html>
