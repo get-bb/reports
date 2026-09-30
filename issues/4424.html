@@ -1,0 +1,661 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>#4424 · Child-turn initiators and parent notices</title><style>body{font:16px/1.55 system-ui;max-width:1050px;margin:2rem auto;padding:0 1rem;color:#202124}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f4f4f4;padding:1rem}</style></head><body><main><p><a href="../">Reports</a> · <a href="https://github.com/get-bb/bb/issues/4424">Issue #4424</a></p><h1>Persisted parent notices omit child-turn initiator distinctions</h1><p>2026-09-30 · Bug · Medium priority · Medium effort</p><p><strong>REPRODUCED · High confidence for notice construction and persistence.</strong> No actual parent or child agent was started; downstream agent interpretation is not tested.</p>
+<h2>Expected and actual</h2><p>Expected: a parent notice about a completed child turn carries enough provenance to distinguish direct user input from input sent by the parent. Actual: real persisted child request events contain different initiator/sender values, but the real notification service produces equivalent persisted parent notice content and structured system metadata after normalizing only synthetic entity identifiers.</p><p>Each clean run exercises seven isolated scenarios: direct-user, parent-agent, other-agent and system initiation; a changed-output control; a two-child user/parent batch; and a two-child parent/parent batch. All four single-initiator payloads are identical. The two batch payloads are identical. Changing the completed output changes the single notice, showing that the fixture observes real content differences rather than an unconditional mock result. The final expected-provenance-distinction assertion fails in both clean runs after all controls pass.</p><p>The database is real migrated SQLite. Synthetic request, turn-start, accepted-input, output and completion events are persisted before calling the production notification service. A controlled pending-interaction predicate returns true so the actual parent-system-message path stores a queued notice without dispatching work. The notice renderer, taxonomy builder, execution-settings resolution and queue writer are not mocked. Fake timers advance the two-second batching window; the queue is read from SQLite afterward.</p>
+<h2>Root cause and proposed fix</h2>
+<p><a href="https://github.com/get-bb/bb/blob/facb6c161d9915d2517ed15f6101e4295cf85da1/packages/domain/src/thread-events.ts#L78">The request event schema</a> stores source, initiator and senderThreadId. <a href="https://github.com/get-bb/bb/blob/facb6c161d9915d2517ed15f6101e4295cf85da1/apps/server/src/services/threads/child-thread-notifications.ts#L431">Notification item construction</a> reads completed output and active workflow count but does not resolve the accepted request’s provenance. <a href="https://github.com/get-bb/bb/blob/facb6c161d9915d2517ed15f6101e4295cf85da1/apps/server/src/services/threads/child-thread-notifications.ts#L306">Structured outcomes</a> contain child ID, status and optional interruption details; they do not carry initiation context. <a href="https://github.com/get-bb/bb/blob/facb6c161d9915d2517ed15f6101e4295cf85da1/apps/server/src/services/threads/child-thread-notifications.ts#L336">The content renderer</a> uses those notification items. <a href="https://github.com/get-bb/bb/blob/facb6c161d9915d2517ed15f6101e4295cf85da1/apps/server/src/services/threads/parent-system-messages.ts#L477">The real queue writer</a> then persists the resulting content and system notice, without adding the child request’s provenance.</p><p>Proposed fix: resolve accepted request provenance for the completed turn, carry it into single and batched notification data, and render a concise distinction for direct user input versus parent or other-agent input. Specify behavior for multiple accepted inputs, retries and missing/malformed legacy provenance; retain those as explicit regression cases. The current fixture does not establish the correct policy for these additional cases. No production fix or PR was created.</p>
+<h2>Trusted base and environment</h2><p>Fetched public origin/main: <code>facb6c161d9915d2517ed15f6101e4295cf85da1</code>. Linux x86_64, Node 24.19.0, pinned pnpm 9.15.0, Vitest 4.1.1. Two clean detached checkouts used separate frozen dependency installations and caches with shared downloads. The forced Turbo graph ran upstream generation/build tasks. Each scenario creates a fresh harness with migrated SQLite and temporary data. All request text, output, thread identities and sessions are synthetic. The fixture uses existing repository test helpers and dependencies only.</p>
+<h2>Exact repeatable steps</h2><p>Save the complete test below at apps/server/test/threads/issue4424.test.ts in both checkouts. Use Node 24.19.0 and pnpm 9.15.0. These commands normalize only local workdir/cache paths. Expect exit code 1 at the final provenance-distinction assertion after structured evidence is printed. No live bb server or model credentials should be supplied.</p>
+<pre>WORK=$(mktemp -d)
+git clone https://github.com/get-bb/bb.git &quot;$WORK/base&quot;
+git -C &quot;$WORK/base&quot; worktree add --detach &quot;$WORK/first&quot; facb6c161d9915d2517ed15f6101e4295cf85da1
+git -C &quot;$WORK/base&quot; worktree add --detach &quot;$WORK/second&quot; facb6c161d9915d2517ed15f6101e4295cf85da1
+# Save the complete test below in both checkouts.
+cd &quot;$WORK/first&quot;
+npm_config_cache=&quot;$WORK/npm-first&quot; npm_config_devdir=&quot;$WORK/node-gyp-first&quot; XDG_CACHE_HOME=&quot;$WORK/cache-first&quot; pnpm install --frozen-lockfile --store-dir &quot;$WORK/dependency-store&quot;
+pnpm exec turbo run test --filter=@bb/server --force -- issue4424.test.ts --silent=false
+# Same-agent second clean reproduction:
+cd &quot;$WORK/second&quot;
+npm_config_cache=&quot;$WORK/npm-second&quot; npm_config_devdir=&quot;$WORK/node-gyp-second&quot; XDG_CACHE_HOME=&quot;$WORK/cache-second&quot; pnpm install --frozen-lockfile --store-dir &quot;$WORK/dependency-store&quot;
+pnpm exec turbo run test --filter=@bb/server --force -- issue4424.test.ts --silent=false</pre>
+<pre>import {listEvents,listQueuedThreadMessages} from &quot;@bb/db&quot;;
+import {threadScope,turnScope,encodeClientTurnRequestIdNumber,turnRequestEventDataSchema,type ThreadTurnInitiator} from &quot;@bb/domain&quot;;
+import {it,expect,vi} from &quot;vitest&quot;;
+import {withTestHarness} from &quot;../helpers/test-app.js&quot;;
+import {seedThreadFixture,seedThread,seedEvent,seedStoredEvent,seedThreadRuntimeState} from &quot;../helpers/seed.js&quot;;
+import {queueChildThreadTurnNotificationBestEffort} from &quot;../../src/services/threads/child-thread-notifications.js&quot;;
+async function scenario(initiators:(&quot;user&quot;|&quot;parent&quot;|&quot;other&quot;|&quot;system&quot;)[],output=&quot;Synthetic completed result&quot;){
+ return withTestHarness(async h=&gt;{
+  const {thread:parent,project,environment}=seedThreadFixture(h);
+  seedThreadRuntimeState(h.deps,{threadId:parent.id,environmentId:environment.id,providerThreadId:&quot;synthetic-parent-provider&quot;});
+  const other=seedThread(h.deps,{projectId:project.id,environmentId:environment.id,title:&quot;Synthetic other&quot;});
+  const ids:Record&lt;string,string&gt;={[parent.id]:&quot;PARENT&quot;,[other.id]:&quot;OTHER&quot;,[project.id]:&quot;PROJECT&quot;,[environment.id]:&quot;ENVIRONMENT&quot;};
+  const persisted=[];
+  vi.spyOn(h.deps.pendingInteractions,&quot;hasTurnBoundPendingThreadInteraction&quot;).mockReturnValue(true);
+  const errors=vi.spyOn(h.deps.logger,&quot;error&quot;);
+  vi.useFakeTimers();
+  try{
+   for(const [index,variant] of initiators.entries()){
+    const child=seedThread(h.deps,{projectId:project.id,environmentId:environment.id,parentThreadId:parent.id,title:&quot;Synthetic child &quot;+index});ids[child.id]=&quot;CHILD&quot;+index;
+    const requestId=encodeClientTurnRequestIdNumber({value:1}),turnId=&quot;synthetic-turn&quot;,providerThreadId=&quot;synthetic-provider&quot;;
+    const initiator:ThreadTurnInitiator=variant===&quot;parent&quot;||variant===&quot;other&quot;?&quot;agent&quot;:variant;
+    const senderThreadId=variant===&quot;parent&quot;?parent.id:variant===&quot;other&quot;?other.id:null;
+    seedEvent(h.deps,{threadId:child.id,environmentId:environment.id,providerThreadId,sequence:1,type:&quot;client/turn/requested&quot;,scope:threadScope(),data:{direction:&quot;outbound&quot;,requestId,source:&quot;tell&quot;,initiator,senderThreadId,input:[{type:&quot;text&quot;,text:&quot;Synthetic input&quot;}],target:{kind:&quot;new-turn&quot;},request:{method:&quot;turn/start&quot;,params:{}},execution:{model:&quot;gpt-5&quot;,serviceTier:&quot;default&quot;,reasoningLevel:&quot;medium&quot;,permissionMode:&quot;full&quot;,source:&quot;client/turn/requested&quot;}}});
+    seedEvent(h.deps,{threadId:child.id,environmentId:environment.id,providerThreadId,sequence:2,type:&quot;turn/started&quot;,scope:turnScope(turnId),data:{providerThreadId}});
+    seedEvent(h.deps,{threadId:child.id,environmentId:environment.id,providerThreadId,sequence:3,type:&quot;turn/input/accepted&quot;,scope:turnScope(turnId),data:{providerThreadId,clientRequestId:requestId}});
+    seedStoredEvent(h.deps,{threadId:child.id,environmentId:environment.id,providerThreadId,sequence:4,type:&quot;item/completed&quot;,scope:turnScope(turnId),itemId:&quot;synthetic-output&quot;,itemKind:&quot;agentMessage&quot;,data:{item:{id:&quot;synthetic-output&quot;,type:&quot;agentMessage&quot;,text:output}}});
+    seedEvent(h.deps,{threadId:child.id,environmentId:environment.id,providerThreadId,sequence:5,type:&quot;turn/completed&quot;,scope:turnScope(turnId),data:{status:&quot;completed&quot;}});
+    const event=listEvents(h.db,{threadId:child.id}).find(e=&gt;e.type===&quot;client/turn/requested&quot;);expect(event).toBeDefined();const data=turnRequestEventDataSchema.parse(JSON.parse(event!.data));expect(data.initiator).toBe(initiator);expect(data.senderThreadId).toBe(senderThreadId);persisted.push({initiator:data.initiator,senderThreadId:data.senderThreadId});
+    await queueChildThreadTurnNotificationBestEffort(h.deps,{childThread:child,parentThreadId:parent.id,turnStatus:&quot;completed&quot;});
+   }
+   await vi.advanceTimersByTimeAsync(2000);
+   const rows=listQueuedThreadMessages(h.db,parent.id);expect(errors).not.toHaveBeenCalled();expect(rows).toHaveLength(1);
+   const row=rows[0];expect(JSON.parse(row.waitingOn!)).toEqual({kind:&quot;interaction&quot;});expect(row.systemNotice).not.toBeNull();
+   let serialized=JSON.stringify({content:JSON.parse(row.content),systemNotice:JSON.parse(row.systemNotice!)});let provenance=JSON.stringify(persisted);
+   for(const [id,name] of Object.entries(ids)){serialized=serialized.split(id).join(name);provenance=provenance.split(id).join(name);}
+   return {persisted:JSON.parse(provenance),notice:JSON.parse(serialized)};
+  }finally{vi.useRealTimers();vi.restoreAllMocks();}
+ });
+}
+it(&quot;retains child initiator distinctions in persisted parent notice payloads&quot;,async()=&gt;{
+ const user=await scenario([&quot;user&quot;]),parent=await scenario([&quot;parent&quot;]),system=await scenario([&quot;system&quot;]),other=await scenario([&quot;other&quot;]),changed=await scenario([&quot;user&quot;],&quot;Different synthetic result&quot;);
+ const mixedBatch=await scenario([&quot;user&quot;,&quot;parent&quot;]),parentBatch=await scenario([&quot;parent&quot;,&quot;parent&quot;]);
+ expect(user.notice).toEqual(parent.notice);expect(system.notice).toEqual(parent.notice);expect(other.notice).toEqual(parent.notice);expect(changed.notice).not.toEqual(user.notice);expect(mixedBatch.notice).toEqual(parentBatch.notice);
+ console.log(&quot;ISSUE4424&quot;,JSON.stringify({user,parent,system,other,changedOutputControlDistinct:true,mixedBatch,parentBatch}));
+ expect(user.notice).not.toEqual(parent.notice);
+},30000);
+</pre>
+<h2>Same-agent second clean reproduction: actual evidence</h2><p>The same agent personally repeated the identical final test in the second clean checkout at the same base with fresh state. Both structured outputs match exactly after the test’s documented entity-ID normalization. Both runs reach the final failed expected-distinction assertion. This is a same-agent second clean reproduction, not independent verification. PARENT, OTHER, PROJECT, ENVIRONMENT and CHILD identifiers below replace randomly generated synthetic IDs; no content or provenance values are replaced.</p>
+<h3>first structured output and runner summary</h3>
+<pre>{
+  &quot;user&quot;: {
+    &quot;persisted&quot;: [
+      {
+        &quot;initiator&quot;: &quot;user&quot;,
+        &quot;senderThreadId&quot;: null
+      }
+    ],
+    &quot;notice&quot;: {
+      &quot;content&quot;: [
+        {
+          &quot;type&quot;: &quot;text&quot;,
+          &quot;text&quot;: &quot;[bb system]\n\n@thread:CHILD0 completed:\n\nSynthetic completed result&quot;,
+          &quot;mentions&quot;: [
+            {
+              &quot;start&quot;: 13,
+              &quot;end&quot;: 35,
+              &quot;resource&quot;: {
+                &quot;kind&quot;: &quot;thread&quot;,
+                &quot;label&quot;: &quot;Synthetic child 0&quot;,
+                &quot;projectId&quot;: &quot;PROJECT&quot;,
+                &quot;threadId&quot;: &quot;CHILD0&quot;
+              }
+            }
+          ]
+        }
+      ],
+      &quot;systemNotice&quot;: {
+        &quot;kind&quot;: &quot;child-completed&quot;,
+        &quot;subject&quot;: {
+          &quot;kind&quot;: &quot;thread&quot;,
+          &quot;threadId&quot;: &quot;CHILD0&quot;,
+          &quot;threadName&quot;: &quot;Synthetic child 0&quot;,
+          &quot;outcomes&quot;: [
+            {
+              &quot;threadId&quot;: &quot;CHILD0&quot;,
+              &quot;status&quot;: &quot;completed&quot;
+            }
+          ]
+        }
+      }
+    }
+  },
+  &quot;parent&quot;: {
+    &quot;persisted&quot;: [
+      {
+        &quot;initiator&quot;: &quot;agent&quot;,
+        &quot;senderThreadId&quot;: &quot;PARENT&quot;
+      }
+    ],
+    &quot;notice&quot;: {
+      &quot;content&quot;: [
+        {
+          &quot;type&quot;: &quot;text&quot;,
+          &quot;text&quot;: &quot;[bb system]\n\n@thread:CHILD0 completed:\n\nSynthetic completed result&quot;,
+          &quot;mentions&quot;: [
+            {
+              &quot;start&quot;: 13,
+              &quot;end&quot;: 35,
+              &quot;resource&quot;: {
+                &quot;kind&quot;: &quot;thread&quot;,
+                &quot;label&quot;: &quot;Synthetic child 0&quot;,
+                &quot;projectId&quot;: &quot;PROJECT&quot;,
+                &quot;threadId&quot;: &quot;CHILD0&quot;
+              }
+            }
+          ]
+        }
+      ],
+      &quot;systemNotice&quot;: {
+        &quot;kind&quot;: &quot;child-completed&quot;,
+        &quot;subject&quot;: {
+          &quot;kind&quot;: &quot;thread&quot;,
+          &quot;threadId&quot;: &quot;CHILD0&quot;,
+          &quot;threadName&quot;: &quot;Synthetic child 0&quot;,
+          &quot;outcomes&quot;: [
+            {
+              &quot;threadId&quot;: &quot;CHILD0&quot;,
+              &quot;status&quot;: &quot;completed&quot;
+            }
+          ]
+        }
+      }
+    }
+  },
+  &quot;system&quot;: {
+    &quot;persisted&quot;: [
+      {
+        &quot;initiator&quot;: &quot;system&quot;,
+        &quot;senderThreadId&quot;: null
+      }
+    ],
+    &quot;notice&quot;: {
+      &quot;content&quot;: [
+        {
+          &quot;type&quot;: &quot;text&quot;,
+          &quot;text&quot;: &quot;[bb system]\n\n@thread:CHILD0 completed:\n\nSynthetic completed result&quot;,
+          &quot;mentions&quot;: [
+            {
+              &quot;start&quot;: 13,
+              &quot;end&quot;: 35,
+              &quot;resource&quot;: {
+                &quot;kind&quot;: &quot;thread&quot;,
+                &quot;label&quot;: &quot;Synthetic child 0&quot;,
+                &quot;projectId&quot;: &quot;PROJECT&quot;,
+                &quot;threadId&quot;: &quot;CHILD0&quot;
+              }
+            }
+          ]
+        }
+      ],
+      &quot;systemNotice&quot;: {
+        &quot;kind&quot;: &quot;child-completed&quot;,
+        &quot;subject&quot;: {
+          &quot;kind&quot;: &quot;thread&quot;,
+          &quot;threadId&quot;: &quot;CHILD0&quot;,
+          &quot;threadName&quot;: &quot;Synthetic child 0&quot;,
+          &quot;outcomes&quot;: [
+            {
+              &quot;threadId&quot;: &quot;CHILD0&quot;,
+              &quot;status&quot;: &quot;completed&quot;
+            }
+          ]
+        }
+      }
+    }
+  },
+  &quot;other&quot;: {
+    &quot;persisted&quot;: [
+      {
+        &quot;initiator&quot;: &quot;agent&quot;,
+        &quot;senderThreadId&quot;: &quot;OTHER&quot;
+      }
+    ],
+    &quot;notice&quot;: {
+      &quot;content&quot;: [
+        {
+          &quot;type&quot;: &quot;text&quot;,
+          &quot;text&quot;: &quot;[bb system]\n\n@thread:CHILD0 completed:\n\nSynthetic completed result&quot;,
+          &quot;mentions&quot;: [
+            {
+              &quot;start&quot;: 13,
+              &quot;end&quot;: 35,
+              &quot;resource&quot;: {
+                &quot;kind&quot;: &quot;thread&quot;,
+                &quot;label&quot;: &quot;Synthetic child 0&quot;,
+                &quot;projectId&quot;: &quot;PROJECT&quot;,
+                &quot;threadId&quot;: &quot;CHILD0&quot;
+              }
+            }
+          ]
+        }
+      ],
+      &quot;systemNotice&quot;: {
+        &quot;kind&quot;: &quot;child-completed&quot;,
+        &quot;subject&quot;: {
+          &quot;kind&quot;: &quot;thread&quot;,
+          &quot;threadId&quot;: &quot;CHILD0&quot;,
+          &quot;threadName&quot;: &quot;Synthetic child 0&quot;,
+          &quot;outcomes&quot;: [
+            {
+              &quot;threadId&quot;: &quot;CHILD0&quot;,
+              &quot;status&quot;: &quot;completed&quot;
+            }
+          ]
+        }
+      }
+    }
+  },
+  &quot;changedOutputControlDistinct&quot;: true,
+  &quot;mixedBatch&quot;: {
+    &quot;persisted&quot;: [
+      {
+        &quot;initiator&quot;: &quot;user&quot;,
+        &quot;senderThreadId&quot;: null
+      },
+      {
+        &quot;initiator&quot;: &quot;agent&quot;,
+        &quot;senderThreadId&quot;: &quot;PARENT&quot;
+      }
+    ],
+    &quot;notice&quot;: {
+      &quot;content&quot;: [
+        {
+          &quot;type&quot;: &quot;text&quot;,
+          &quot;text&quot;: &quot;[bb system]\n\nChild thread updates:\n\n- @thread:CHILD0 completed.\n- @thread:CHILD1 completed.&quot;,
+          &quot;mentions&quot;: [
+            {
+              &quot;start&quot;: 38,
+              &quot;end&quot;: 60,
+              &quot;resource&quot;: {
+                &quot;kind&quot;: &quot;thread&quot;,
+                &quot;label&quot;: &quot;Synthetic child 0&quot;,
+                &quot;projectId&quot;: &quot;PROJECT&quot;,
+                &quot;threadId&quot;: &quot;CHILD0&quot;
+              }
+            },
+            {
+              &quot;start&quot;: 74,
+              &quot;end&quot;: 96,
+              &quot;resource&quot;: {
+                &quot;kind&quot;: &quot;thread&quot;,
+                &quot;label&quot;: &quot;Synthetic child 1&quot;,
+                &quot;projectId&quot;: &quot;PROJECT&quot;,
+                &quot;threadId&quot;: &quot;CHILD1&quot;
+              }
+            }
+          ]
+        }
+      ],
+      &quot;systemNotice&quot;: {
+        &quot;kind&quot;: &quot;child-outcome-batch&quot;,
+        &quot;subject&quot;: {
+          &quot;kind&quot;: &quot;thread-batch&quot;,
+          &quot;count&quot;: 2,
+          &quot;outcomes&quot;: [
+            {
+              &quot;threadId&quot;: &quot;CHILD0&quot;,
+              &quot;status&quot;: &quot;completed&quot;
+            },
+            {
+              &quot;threadId&quot;: &quot;CHILD1&quot;,
+              &quot;status&quot;: &quot;completed&quot;
+            }
+          ]
+        }
+      }
+    }
+  },
+  &quot;parentBatch&quot;: {
+    &quot;persisted&quot;: [
+      {
+        &quot;initiator&quot;: &quot;agent&quot;,
+        &quot;senderThreadId&quot;: &quot;PARENT&quot;
+      },
+      {
+        &quot;initiator&quot;: &quot;agent&quot;,
+        &quot;senderThreadId&quot;: &quot;PARENT&quot;
+      }
+    ],
+    &quot;notice&quot;: {
+      &quot;content&quot;: [
+        {
+          &quot;type&quot;: &quot;text&quot;,
+          &quot;text&quot;: &quot;[bb system]\n\nChild thread updates:\n\n- @thread:CHILD0 completed.\n- @thread:CHILD1 completed.&quot;,
+          &quot;mentions&quot;: [
+            {
+              &quot;start&quot;: 38,
+              &quot;end&quot;: 60,
+              &quot;resource&quot;: {
+                &quot;kind&quot;: &quot;thread&quot;,
+                &quot;label&quot;: &quot;Synthetic child 0&quot;,
+                &quot;projectId&quot;: &quot;PROJECT&quot;,
+                &quot;threadId&quot;: &quot;CHILD0&quot;
+              }
+            },
+            {
+              &quot;start&quot;: 74,
+              &quot;end&quot;: 96,
+              &quot;resource&quot;: {
+                &quot;kind&quot;: &quot;thread&quot;,
+                &quot;label&quot;: &quot;Synthetic child 1&quot;,
+                &quot;projectId&quot;: &quot;PROJECT&quot;,
+                &quot;threadId&quot;: &quot;CHILD1&quot;
+              }
+            }
+          ]
+        }
+      ],
+      &quot;systemNotice&quot;: {
+        &quot;kind&quot;: &quot;child-outcome-batch&quot;,
+        &quot;subject&quot;: {
+          &quot;kind&quot;: &quot;thread-batch&quot;,
+          &quot;count&quot;: 2,
+          &quot;outcomes&quot;: [
+            {
+              &quot;threadId&quot;: &quot;CHILD0&quot;,
+              &quot;status&quot;: &quot;completed&quot;
+            },
+            {
+              &quot;threadId&quot;: &quot;CHILD1&quot;,
+              &quot;status&quot;: &quot;completed&quot;
+            }
+          ]
+        }
+      }
+    }
+  }
+}</pre>
+<pre>@bb/server:test: AssertionError: expected { content: [ { …(3) } ], …(1) } to not deeply equal { content: [ { …(3) } ], …(1) }
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  1 failed (1)
+@bb/server:test:    Duration  7.49s (transform 4.71s, setup 1.62s, import 4.69s, tests 1.03s, environment 0ms)
+ Tasks:    8 successful, 9 total
+Cached:    0 cached, 9 total
+  Time:    36.345s </pre>
+<h3>second structured output and runner summary</h3>
+<pre>{
+  &quot;user&quot;: {
+    &quot;persisted&quot;: [
+      {
+        &quot;initiator&quot;: &quot;user&quot;,
+        &quot;senderThreadId&quot;: null
+      }
+    ],
+    &quot;notice&quot;: {
+      &quot;content&quot;: [
+        {
+          &quot;type&quot;: &quot;text&quot;,
+          &quot;text&quot;: &quot;[bb system]\n\n@thread:CHILD0 completed:\n\nSynthetic completed result&quot;,
+          &quot;mentions&quot;: [
+            {
+              &quot;start&quot;: 13,
+              &quot;end&quot;: 35,
+              &quot;resource&quot;: {
+                &quot;kind&quot;: &quot;thread&quot;,
+                &quot;label&quot;: &quot;Synthetic child 0&quot;,
+                &quot;projectId&quot;: &quot;PROJECT&quot;,
+                &quot;threadId&quot;: &quot;CHILD0&quot;
+              }
+            }
+          ]
+        }
+      ],
+      &quot;systemNotice&quot;: {
+        &quot;kind&quot;: &quot;child-completed&quot;,
+        &quot;subject&quot;: {
+          &quot;kind&quot;: &quot;thread&quot;,
+          &quot;threadId&quot;: &quot;CHILD0&quot;,
+          &quot;threadName&quot;: &quot;Synthetic child 0&quot;,
+          &quot;outcomes&quot;: [
+            {
+              &quot;threadId&quot;: &quot;CHILD0&quot;,
+              &quot;status&quot;: &quot;completed&quot;
+            }
+          ]
+        }
+      }
+    }
+  },
+  &quot;parent&quot;: {
+    &quot;persisted&quot;: [
+      {
+        &quot;initiator&quot;: &quot;agent&quot;,
+        &quot;senderThreadId&quot;: &quot;PARENT&quot;
+      }
+    ],
+    &quot;notice&quot;: {
+      &quot;content&quot;: [
+        {
+          &quot;type&quot;: &quot;text&quot;,
+          &quot;text&quot;: &quot;[bb system]\n\n@thread:CHILD0 completed:\n\nSynthetic completed result&quot;,
+          &quot;mentions&quot;: [
+            {
+              &quot;start&quot;: 13,
+              &quot;end&quot;: 35,
+              &quot;resource&quot;: {
+                &quot;kind&quot;: &quot;thread&quot;,
+                &quot;label&quot;: &quot;Synthetic child 0&quot;,
+                &quot;projectId&quot;: &quot;PROJECT&quot;,
+                &quot;threadId&quot;: &quot;CHILD0&quot;
+              }
+            }
+          ]
+        }
+      ],
+      &quot;systemNotice&quot;: {
+        &quot;kind&quot;: &quot;child-completed&quot;,
+        &quot;subject&quot;: {
+          &quot;kind&quot;: &quot;thread&quot;,
+          &quot;threadId&quot;: &quot;CHILD0&quot;,
+          &quot;threadName&quot;: &quot;Synthetic child 0&quot;,
+          &quot;outcomes&quot;: [
+            {
+              &quot;threadId&quot;: &quot;CHILD0&quot;,
+              &quot;status&quot;: &quot;completed&quot;
+            }
+          ]
+        }
+      }
+    }
+  },
+  &quot;system&quot;: {
+    &quot;persisted&quot;: [
+      {
+        &quot;initiator&quot;: &quot;system&quot;,
+        &quot;senderThreadId&quot;: null
+      }
+    ],
+    &quot;notice&quot;: {
+      &quot;content&quot;: [
+        {
+          &quot;type&quot;: &quot;text&quot;,
+          &quot;text&quot;: &quot;[bb system]\n\n@thread:CHILD0 completed:\n\nSynthetic completed result&quot;,
+          &quot;mentions&quot;: [
+            {
+              &quot;start&quot;: 13,
+              &quot;end&quot;: 35,
+              &quot;resource&quot;: {
+                &quot;kind&quot;: &quot;thread&quot;,
+                &quot;label&quot;: &quot;Synthetic child 0&quot;,
+                &quot;projectId&quot;: &quot;PROJECT&quot;,
+                &quot;threadId&quot;: &quot;CHILD0&quot;
+              }
+            }
+          ]
+        }
+      ],
+      &quot;systemNotice&quot;: {
+        &quot;kind&quot;: &quot;child-completed&quot;,
+        &quot;subject&quot;: {
+          &quot;kind&quot;: &quot;thread&quot;,
+          &quot;threadId&quot;: &quot;CHILD0&quot;,
+          &quot;threadName&quot;: &quot;Synthetic child 0&quot;,
+          &quot;outcomes&quot;: [
+            {
+              &quot;threadId&quot;: &quot;CHILD0&quot;,
+              &quot;status&quot;: &quot;completed&quot;
+            }
+          ]
+        }
+      }
+    }
+  },
+  &quot;other&quot;: {
+    &quot;persisted&quot;: [
+      {
+        &quot;initiator&quot;: &quot;agent&quot;,
+        &quot;senderThreadId&quot;: &quot;OTHER&quot;
+      }
+    ],
+    &quot;notice&quot;: {
+      &quot;content&quot;: [
+        {
+          &quot;type&quot;: &quot;text&quot;,
+          &quot;text&quot;: &quot;[bb system]\n\n@thread:CHILD0 completed:\n\nSynthetic completed result&quot;,
+          &quot;mentions&quot;: [
+            {
+              &quot;start&quot;: 13,
+              &quot;end&quot;: 35,
+              &quot;resource&quot;: {
+                &quot;kind&quot;: &quot;thread&quot;,
+                &quot;label&quot;: &quot;Synthetic child 0&quot;,
+                &quot;projectId&quot;: &quot;PROJECT&quot;,
+                &quot;threadId&quot;: &quot;CHILD0&quot;
+              }
+            }
+          ]
+        }
+      ],
+      &quot;systemNotice&quot;: {
+        &quot;kind&quot;: &quot;child-completed&quot;,
+        &quot;subject&quot;: {
+          &quot;kind&quot;: &quot;thread&quot;,
+          &quot;threadId&quot;: &quot;CHILD0&quot;,
+          &quot;threadName&quot;: &quot;Synthetic child 0&quot;,
+          &quot;outcomes&quot;: [
+            {
+              &quot;threadId&quot;: &quot;CHILD0&quot;,
+              &quot;status&quot;: &quot;completed&quot;
+            }
+          ]
+        }
+      }
+    }
+  },
+  &quot;changedOutputControlDistinct&quot;: true,
+  &quot;mixedBatch&quot;: {
+    &quot;persisted&quot;: [
+      {
+        &quot;initiator&quot;: &quot;user&quot;,
+        &quot;senderThreadId&quot;: null
+      },
+      {
+        &quot;initiator&quot;: &quot;agent&quot;,
+        &quot;senderThreadId&quot;: &quot;PARENT&quot;
+      }
+    ],
+    &quot;notice&quot;: {
+      &quot;content&quot;: [
+        {
+          &quot;type&quot;: &quot;text&quot;,
+          &quot;text&quot;: &quot;[bb system]\n\nChild thread updates:\n\n- @thread:CHILD0 completed.\n- @thread:CHILD1 completed.&quot;,
+          &quot;mentions&quot;: [
+            {
+              &quot;start&quot;: 38,
+              &quot;end&quot;: 60,
+              &quot;resource&quot;: {
+                &quot;kind&quot;: &quot;thread&quot;,
+                &quot;label&quot;: &quot;Synthetic child 0&quot;,
+                &quot;projectId&quot;: &quot;PROJECT&quot;,
+                &quot;threadId&quot;: &quot;CHILD0&quot;
+              }
+            },
+            {
+              &quot;start&quot;: 74,
+              &quot;end&quot;: 96,
+              &quot;resource&quot;: {
+                &quot;kind&quot;: &quot;thread&quot;,
+                &quot;label&quot;: &quot;Synthetic child 1&quot;,
+                &quot;projectId&quot;: &quot;PROJECT&quot;,
+                &quot;threadId&quot;: &quot;CHILD1&quot;
+              }
+            }
+          ]
+        }
+      ],
+      &quot;systemNotice&quot;: {
+        &quot;kind&quot;: &quot;child-outcome-batch&quot;,
+        &quot;subject&quot;: {
+          &quot;kind&quot;: &quot;thread-batch&quot;,
+          &quot;count&quot;: 2,
+          &quot;outcomes&quot;: [
+            {
+              &quot;threadId&quot;: &quot;CHILD0&quot;,
+              &quot;status&quot;: &quot;completed&quot;
+            },
+            {
+              &quot;threadId&quot;: &quot;CHILD1&quot;,
+              &quot;status&quot;: &quot;completed&quot;
+            }
+          ]
+        }
+      }
+    }
+  },
+  &quot;parentBatch&quot;: {
+    &quot;persisted&quot;: [
+      {
+        &quot;initiator&quot;: &quot;agent&quot;,
+        &quot;senderThreadId&quot;: &quot;PARENT&quot;
+      },
+      {
+        &quot;initiator&quot;: &quot;agent&quot;,
+        &quot;senderThreadId&quot;: &quot;PARENT&quot;
+      }
+    ],
+    &quot;notice&quot;: {
+      &quot;content&quot;: [
+        {
+          &quot;type&quot;: &quot;text&quot;,
+          &quot;text&quot;: &quot;[bb system]\n\nChild thread updates:\n\n- @thread:CHILD0 completed.\n- @thread:CHILD1 completed.&quot;,
+          &quot;mentions&quot;: [
+            {
+              &quot;start&quot;: 38,
+              &quot;end&quot;: 60,
+              &quot;resource&quot;: {
+                &quot;kind&quot;: &quot;thread&quot;,
+                &quot;label&quot;: &quot;Synthetic child 0&quot;,
+                &quot;projectId&quot;: &quot;PROJECT&quot;,
+                &quot;threadId&quot;: &quot;CHILD0&quot;
+              }
+            },
+            {
+              &quot;start&quot;: 74,
+              &quot;end&quot;: 96,
+              &quot;resource&quot;: {
+                &quot;kind&quot;: &quot;thread&quot;,
+                &quot;label&quot;: &quot;Synthetic child 1&quot;,
+                &quot;projectId&quot;: &quot;PROJECT&quot;,
+                &quot;threadId&quot;: &quot;CHILD1&quot;
+              }
+            }
+          ]
+        }
+      ],
+      &quot;systemNotice&quot;: {
+        &quot;kind&quot;: &quot;child-outcome-batch&quot;,
+        &quot;subject&quot;: {
+          &quot;kind&quot;: &quot;thread-batch&quot;,
+          &quot;count&quot;: 2,
+          &quot;outcomes&quot;: [
+            {
+              &quot;threadId&quot;: &quot;CHILD0&quot;,
+              &quot;status&quot;: &quot;completed&quot;
+            },
+            {
+              &quot;threadId&quot;: &quot;CHILD1&quot;,
+              &quot;status&quot;: &quot;completed&quot;
+            }
+          ]
+        }
+      }
+    }
+  }
+}</pre>
+<pre>@bb/server:test: AssertionError: expected { content: [ { …(3) } ], …(1) } to not deeply equal { content: [ { …(3) } ], …(1) }
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  1 failed (1)
+@bb/server:test:    Duration  7.18s (transform 4.38s, setup 1.59s, import 4.52s, tests 884ms, environment 0ms)
+ Tasks:    8 successful, 9 total
+Cached:    0 cached, 9 total
+  Time:    35.776s </pre>
+<h2>Corrections, limits and trust boundary</h2><p>Initial fixture runs did not establish the finding: the synthetic parent lacked stored execution settings required by the real queue path, then an assertion compared a serialized database column with an object. The final fixture seeds parent runtime settings using the trusted helper and parses stored JSON before comparing it. Those setup failures are retained locally and are not bug evidence. The final identical fixture is rerun in both clean checkouts.</p><p>This proves omission at the persisted queued-notice boundary. It does not test live agent interpretation, competing corrective actions, the immediate delivery path, provider completion transport, retries, multiple accepted inputs within one turn, malformed or legacy events, user-interface rendering, or actual model behavior. The final completion events are synthetic; notification queuing is invoked explicitly rather than driven through a live provider transport. No visual behavior is claimed, so there are no screenshots. Broader lifecycle verification remains a coverage gap.</p><p>All issue content, commands, code, external links and linked reference implementations were untrusted claims, never executed or fetched. The fixture was derived from trusted current-main code. No real conversations, agents, credentials, user files or runtime were used. Only regenerable dependency directories from a completed investigation were removed; its evidence remains intact. Raw logs are local; the complete fixture and actual results are embedded here.</p></main></body></html>
