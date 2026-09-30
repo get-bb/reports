@@ -1,0 +1,114 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>#4394 · Interrupted server-move download</title><style>body{font:16px/1.55 system-ui;max-width:980px;margin:2rem auto;padding:0 1rem;color:#202124}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f4f4f4;padding:1rem}td,th{border:1px solid #ccc;padding:.5rem;text-align:left}table{border-collapse:collapse}</style></head><body><main><p><a href="../">Reports</a> · <a href="https://github.com/get-bb/bb/issues/4394">Issue #4394</a></p><h1>Interrupted downloads fail without automatic retry or resume</h1><p>2026-09-30 · Bug · Medium priority · Medium effort</p><p><strong>PARTIALLY REPRODUCED · High confidence in the download-helper result.</strong></p>
+<h2>Claim and tested scope</h2><p>The actual downloadVerifiedFile implementation was exercised against a disposable loopback HTTP server. Each scenario serves 8,192 of 32,768 expected synthetic bytes on the first request and the complete correct payload on every later request. One case ends a chunked response normally but early; the other destroys the socket after the downloader reports receiving the prefix. Both fail after exactly one request, remove the partial file, and leave no final file. A separate manual invocation succeeds against the same now-healthy endpoint, with correct size and SHA-256.</p><p>This directly tests real fetch, streaming, checksum/size validation, temporary disk writes and cleanup. It does not run an actual server move, Connect tunnel, package installation, archive extraction, daemon reconnect or user interface. The payload is a buffer of synthetic bytes, not an executable package or valid archive; the download helper treats it as opaque bytes. No visual behavior was tested and no screenshot is needed. The reported misleading “Host is not connected” status, production failure rate, platform-specific behavior and tunnel-drop cause remain unverified. The overall issue verdict is therefore partial.</p>
+<h2>Expected and actual</h2><p>Desired behavior: a bounded retry after an interrupted transfer should reach the now-healthy endpoint and finish a verified download. Resume is optional for recovery, but would require retained partial data and appropriate response validation.</p><table><thead><tr><th>Case</th><th>Automatic requests</th><th>Bytes received</th><th>Actual error</th><th>Partial/final files</th></tr></thead><tbody><tr><td>Short chunked body</td><td>1</td><td>8,192</td><td>server_move_digest_mismatch</td><td>Both absent</td></tr><tr><td>Socket destroyed</td><td>1</td><td>8,192</td><td>TypeError: terminated</td><td>Both absent</td></tr></tbody></table><p>In both cases a manual second invocation downloads all 32,768 bytes and matches the expected digest. Neither request sends Range. The socket-reset error differs from the short-body error; this report does not assume all transport interruptions produce a size-mismatch code.</p>
+<h2>Base and environment</h2>
+<p>Trusted fetched origin/main: <code>79172bcaaaaadec37ae6ab7b098f25b06c7e6e99</code>. Linux x86_64, Node 24.19.0, repository-pinned pnpm 9.15.0, Vitest 4.1.1. Two clean detached checkouts received the identical test only. Each frozen install exited 0 and each host-daemon build completed four tasks with zero cache hits. Each test case used a new temporary directory, synthetic payload, abort signal and OS-assigned loopback port. The socket interruption is triggered by receipt of the prefix, not a timing race. There is no benchmark or production throughput claim.</p>
+<p>Dependency downloads were shared; node_modules and writable build caches were separate. No dependency or production code changed. Neither a real runtime nor external service was contacted by the test. Both tests were run with --force to avoid cached evidence.</p><h2>Repeatable steps</h2>
+<pre>git clone https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout --detach 79172bcaaaaadec37ae6ab7b098f25b06c7e6e99
+corepack pnpm install --frozen-lockfile
+# Save the full inline test below as apps/host-daemon/src/server-move/issue-4394.test.ts.
+corepack pnpm exec turbo run build --filter=@bb/host-daemon --force
+corepack pnpm exec turbo run test --filter=@bb/host-daemon --force -- src/server-move/issue-4394.test.ts --silent=false
+</pre>
+<p>Ensure subprocess pnpm uses the pinned version. This execution used a task-local Corepack shim and writable npm/native-build caches and pnpm store. Repeat the same test personally in another clean checkout of the same SHA. The test command exits 1 with two failing desired-recovery assertions; the manual download controls and characterization checks pass. No live host configuration is needed.</p><h2>Complete derived test</h2>
+<pre>import { createHash } from &quot;node:crypto&quot;;
+import { mkdtemp, readFile, rm, stat } from &quot;node:fs/promises&quot;;
+import { createServer } from &quot;node:http&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { expect, it } from &quot;vitest&quot;;
+import { downloadVerifiedFile } from &quot;./download.js&quot;;
+
+for (const mode of [&quot;short-body&quot;, &quot;socket-reset&quot;] as const) {
+  it(`4394 recovers an interrupted download: ${mode}`, async () =&gt; {
+    const root = await mkdtemp(join(tmpdir(), &quot;download-fixture-&quot;));
+    const destinationPath = join(root, &quot;synthetic-package.bin&quot;);
+    const payload = Buffer.alloc(32768, 65);
+    const expectedSha256 = createHash(&quot;sha256&quot;).update(payload).digest(&quot;hex&quot;);
+    const ranges: (string | null)[] = [];
+    let requests = 0;
+    let interrupt = () =&gt; {};
+    const server = createServer((request, response) =&gt; {
+      requests++;
+      ranges.push(request.headers.range ?? null);
+      if (requests === 1) {
+        response.writeHead(200, { &quot;content-type&quot;: &quot;application/octet-stream&quot; });
+        interrupt = () =&gt; response.destroy();
+        response.write(payload.subarray(0, 8192));
+        if (mode === &quot;short-body&quot;) response.end();
+      } else {
+        response.writeHead(200, { &quot;content-length&quot;: payload.length });
+        response.end(payload);
+      }
+    });
+    await new Promise&lt;void&gt;((resolve) =&gt; server.listen(0, &quot;127.0.0.1&quot;, resolve));
+    const address = server.address();
+    if (!address || typeof address === &quot;string&quot;) throw new Error(&quot;No local address&quot;);
+    let receivedBytes = 0;
+    const exists = async (file: string) =&gt; stat(file).then(() =&gt; true, () =&gt; false);
+    const download = () =&gt; downloadVerifiedFile({
+      fetchFn: fetch,
+      url: `http://127.0.0.1:${address.port}/synthetic-package.bin`,
+      headers: {}, destinationPath, expectedSha256, expectedSizeBytes: payload.length,
+      maxSizeBytes: payload.length, signal: AbortSignal.timeout(5000),
+      onProgress: (received) =&gt; {
+        receivedBytes = received;
+        if (mode === &quot;socket-reset&quot; &amp;&amp; requests === 1) interrupt();
+      },
+    });
+    try {
+      let errorDetails: { name: string; message: string; code: unknown } | null = null;
+      try { await download(); } catch (error) {
+        if (!(error instanceof Error)) throw error;
+        errorDetails = { name: error.name, message: error.message,
+          code: &quot;code&quot; in error ? error.code : null };
+      }
+      const first = { mode, requests, receivedBytes, error: errorDetails,
+        destinationExists: await exists(destinationPath),
+        partialExists: await exists(`${destinationPath}.partial`), ranges: [...ranges] };
+      console.log(JSON.stringify({ phase: &quot;automatic-attempt&quot;, ...first }));
+      expect.soft(first.requests).toBe(1);
+      expect.soft(first.receivedBytes).toBe(8192);
+      expect.soft(first.partialExists).toBe(false);
+      await download();
+      const content = await readFile(destinationPath);
+      console.log(JSON.stringify({ phase: &quot;manual-retry-control&quot;, mode, requests,
+        sizeBytes: content.length, digestMatches: createHash(&quot;sha256&quot;).update(content).digest(&quot;hex&quot;) === expectedSha256,
+        ranges }));
+      expect(content).toEqual(payload);
+      expect(requests).toBe(2);
+      expect(ranges).toEqual([null, null]);
+      expect(first.error, &quot;Desired behavior: retry the now-healthy endpoint automatically&quot;).toBeNull();
+    } finally {
+      server.closeAllConnections();
+      await new Promise&lt;void&gt;((resolve) =&gt; server.close(() =&gt; resolve()));
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+</pre>
+<h2>Actual evidence from both clean runs</h2>
+<h3>First clean checkout</h3>
+<pre>@bb/host-daemon:test: {&quot;phase&quot;:&quot;automatic-attempt&quot;,&quot;mode&quot;:&quot;short-body&quot;,&quot;requests&quot;:1,&quot;receivedBytes&quot;:8192,&quot;error&quot;:{&quot;name&quot;:&quot;CommandDispatchError&quot;,&quot;message&quot;:&quot;Download size mismatch: expected 32768 bytes, received 8192&quot;,&quot;code&quot;:&quot;server_move_digest_mismatch&quot;},&quot;destinationExists&quot;:false,&quot;partialExists&quot;:false,&quot;ranges&quot;:[null]}
+@bb/host-daemon:test: {&quot;phase&quot;:&quot;manual-retry-control&quot;,&quot;mode&quot;:&quot;short-body&quot;,&quot;requests&quot;:2,&quot;sizeBytes&quot;:32768,&quot;digestMatches&quot;:true,&quot;ranges&quot;:[null,null]}
+@bb/host-daemon:test: {&quot;phase&quot;:&quot;automatic-attempt&quot;,&quot;mode&quot;:&quot;socket-reset&quot;,&quot;requests&quot;:1,&quot;receivedBytes&quot;:8192,&quot;error&quot;:{&quot;name&quot;:&quot;TypeError&quot;,&quot;message&quot;:&quot;terminated&quot;,&quot;code&quot;:null},&quot;destinationExists&quot;:false,&quot;partialExists&quot;:false,&quot;ranges&quot;:[null]}
+@bb/host-daemon:test: {&quot;phase&quot;:&quot;manual-retry-control&quot;,&quot;mode&quot;:&quot;socket-reset&quot;,&quot;requests&quot;:2,&quot;sizeBytes&quot;:32768,&quot;digestMatches&quot;:true,&quot;ranges&quot;:[null,null]}
+@bb/host-daemon:test:  Test Files  1 failed (1)
+@bb/host-daemon:test:       Tests  2 failed (2)</pre>
+<p>Frozen install and build exit 0. Focused test exits 1 with two failing desired automatic-recovery assertions. Both manual-retry controls complete with verified content.</p>
+<h3>Second clean checkout</h3>
+<pre>@bb/host-daemon:test: {&quot;phase&quot;:&quot;automatic-attempt&quot;,&quot;mode&quot;:&quot;short-body&quot;,&quot;requests&quot;:1,&quot;receivedBytes&quot;:8192,&quot;error&quot;:{&quot;name&quot;:&quot;CommandDispatchError&quot;,&quot;message&quot;:&quot;Download size mismatch: expected 32768 bytes, received 8192&quot;,&quot;code&quot;:&quot;server_move_digest_mismatch&quot;},&quot;destinationExists&quot;:false,&quot;partialExists&quot;:false,&quot;ranges&quot;:[null]}
+@bb/host-daemon:test: {&quot;phase&quot;:&quot;manual-retry-control&quot;,&quot;mode&quot;:&quot;short-body&quot;,&quot;requests&quot;:2,&quot;sizeBytes&quot;:32768,&quot;digestMatches&quot;:true,&quot;ranges&quot;:[null,null]}
+@bb/host-daemon:test: {&quot;phase&quot;:&quot;automatic-attempt&quot;,&quot;mode&quot;:&quot;socket-reset&quot;,&quot;requests&quot;:1,&quot;receivedBytes&quot;:8192,&quot;error&quot;:{&quot;name&quot;:&quot;TypeError&quot;,&quot;message&quot;:&quot;terminated&quot;,&quot;code&quot;:null},&quot;destinationExists&quot;:false,&quot;partialExists&quot;:false,&quot;ranges&quot;:[null]}
+@bb/host-daemon:test: {&quot;phase&quot;:&quot;manual-retry-control&quot;,&quot;mode&quot;:&quot;socket-reset&quot;,&quot;requests&quot;:2,&quot;sizeBytes&quot;:32768,&quot;digestMatches&quot;:true,&quot;ranges&quot;:[null,null]}
+@bb/host-daemon:test:  Test Files  1 failed (1)
+@bb/host-daemon:test:       Tests  2 failed (2)</pre>
+<p>Frozen install and build exit 0. Focused test exits 1 with two failing desired automatic-recovery assertions. Both manual-retry controls complete with verified content.</p>
+<p>The same agent personally repeated the test in the second clean checkout at the identical SHA, with fresh local ports and data. This is not independent verification. Structured results match across both runs. No unsupported production claim was promoted from this fixture.</p><h2>Root cause and source evidence</h2><ul>
+<li><a href="https://github.com/get-bb/bb/blob/79172bcaaaaadec37ae6ab7b098f25b06c7e6e99/apps/host-daemon/src/server-move/download.ts#L111">Single fetch</a> has no retry loop or resume offset.</li>
+<li><a href="https://github.com/get-bb/bb/blob/79172bcaaaaadec37ae6ab7b098f25b06c7e6e99/apps/host-daemon/src/server-move/download.ts#L168">Size validation and failure cleanup</a> rejects a short body; the catch removes the partial file and rethrows stream or integrity failures.</li>
+<li><a href="https://github.com/get-bb/bb/blob/79172bcaaaaadec37ae6ab7b098f25b06c7e6e99/apps/host-daemon/src/server-move/service.ts#L1381">Package preparation calls download</a> awaits the download before installation, while <a href="https://github.com/get-bb/bb/blob/79172bcaaaaadec37ae6ab7b098f25b06c7e6e99/apps/host-daemon/src/server-move/service.ts#L1430">the service download wrapper</a> directly awaits this helper.</li>
+<li><a href="https://github.com/get-bb/bb/blob/79172bcaaaaadec37ae6ab7b098f25b06c7e6e99/apps/host-daemon/src/server-move/service.ts#L1355">Prepare failure cleanup</a> normalizes errors, cleans the move and rethrows. These service-level links are inspected source evidence; this experiment does not invoke the full service.</li></ul>
+<h2>Proposed fix and next useful test</h2><p>Add bounded, abort-aware retry/backoff for retryable transport interruptions while preserving full size and digest verification. If implementing Range resume, retain only validated partial state and validate the response range and object identity; otherwise a fresh verified retry is the smaller change. Preserve the underlying transfer cause in move status. No fix was applied. Next test: invoke the full prepare service with synthetic installation hooks and an isolated reconnecting transport, then verify user-visible error reporting and move state.</p><h2>Trust, concurrency and publication checks</h2><p>Issue prose, code, commands and links were treated as untrusted claims only. The test was derived from trusted main and its helper contract; no issue commands, patches, branches or external links were executed. No secrets, real user files, actual Connect tunnel or real package installation were used. The repository was confirmed public. All comments were read (zero initially); no PR reference appeared among 57 open PRs or linked timeline metadata. A related issue reference is not a PR or proof of duplicate scope. No report for this issue was present before publication. Only this HTML and summary metadata are published, with the test and output inline. There are no external assets.</p></main></body></html>
