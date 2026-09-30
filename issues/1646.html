@@ -282,4 +282,472 @@ pnpm exec turbo run build ; vitest runs listed above ; scripts/bb-dev-app curren
 pnpm dev:stop</pre>
   <h3>Notes on the report's own timeline vs. the store guard</h3>
   <p>The store rejects <code>turn/completed</code> without a stored <code>turn/started</code> for the same turn id (it is not orphan-droppable), so the reporter's 22:19:02 <code>turn/completed</code> was necessarily for a turn that had started earlier (22:13:59, 22:08:12 or 22:01:42). Which one decides between "same-turn continuation" (fixable by #1697's approach) and "sub-agent/aux turn completion flipped the parent idle while the parent's own turn kept going" (not fixed by #1697, since the parent's turn has no stored completion). Both are consistent with the visible symptom; the raw log settles it.</p>
+
+<section id="verification-2026-09-30">
+<h2>2026-09-30 current-main verification</h2>
+<p><strong>Verdict: REPRODUCED, scoped to bb event handling and persisted lifecycle.</strong> High confidence in this mechanism. Actual <code>ThreadEventGrammar</code>, <code>RuntimeTurnState</code>, <code>RuntimeBackgroundWorkState</code>, the internal event route and migrated SQLite storage accept late synthetic root work after completion while the active turn remains unset and the stored thread stays idle. This does not establish that current Codex emits that sequence, that a real command executed, or that the current UI renders a particular spinner. The older report and screenshots above are historical evidence, not screenshots or live-provider verification from this run.</p>
+<p>Fresh eligibility: open native Bug, Priority High, Effort Medium; existing <code>confirmed-repro</code> label corresponds to the scoped result. All comments (one, with no further page) and paginated timeline metadata were read. Linked PRs #1697 and #2141 are both closed and unmerged. No linked open PR or overlapping public SlopCop investigation was found. Historical PR reviews are preserved, not rerun or endorsed as current PR execution.</p>
+<h3>Environment and two clean runs</h3>
+<p>Trusted fetched origin/main: <code>d7a6d74e87f55b80243667c67f68644b4737e77a</code>. Linux 6.18.44 x86_64; Node v22.19.0 and pnpm 9.15.0 via the environment toolchain. Two independent clones and frozen installs used the existing pnpm content store. Initial free inode capacity was 984,207; 893,531 remained after both runs. The same agent personally performed the second clean run at the identical SHA with fresh synthetic state.</p>
+<p>Each normal Turbo build passed 5 tasks (4 cached prerequisites; server build executed). The agent-runtime package has no build script; its actual source was covered through normal tests and generated test-bridge prerequisites. Each normal server test invocation passed 19 tests: four new cases plus 15 existing internal event ownership tests. Each normal runtime invocation passed 17 existing tests (9 turn-state and 8 background-state). Server test orchestration passed 9 tasks with no cache hits; runtime tests passed 6 tasks with no cache hits. No install/build bypass or added dependency was used.</p>
+<p>The trusted server test harness creates a fresh temporary data directory and an independent SQLite database from its migrated in-memory template per case. Requests use the in-process Hono event route, so no TCP port or provider process is opened. The fixture feeds accepted events through actual runtime state classes in the order used by the daemon intake path, then posts them to the server route; it deliberately composes those components rather than running the full daemon/bridge transport. Only bounded synthetic event records are submitted; command text in those records is never executed. Harness data and runtime state are cleaned in <code>finally</code>.</p>
+<table><tr><th>Case</th><th>Expected control or defect criterion</th><th>Actual in both runs</th></tr>
+<tr><td>Root starts, completes, then emits item start, output delta and item completion on the same turn</td><td>If resumed root work is represented as active, runtime activity and persisted status should reflect it until settlement.</td><td>All three late work events pass grammar and HTTP 200, and persist after the stored completion. Active turn remains null, thread status idle, background-work state false. A second turn completion is rejected by grammar as <code>turn/settles-once</code>, so the composed path does not post it.</td></tr>
+<tr><td>Never-started turn item</td><td>Storage must not accept work without its turn start.</td><td>Grammar accepts the item; actual server route returns HTTP 409, stores no events and leaves idle/null state.</td></tr>
+<tr><td>New root turn after prior completion</td><td>A genuine new start must reactivate and its completion must settle.</td><td>New root start and open item produce active/root-b state; its completion returns idle/null.</td></tr>
+<tr><td>Child completion and stale old-turn work during a newer active root</td><td>Neither should replace or settle the newer active root.</td><td>Child completion and old-turn item leave active/root-b state; old duplicate completion is rejected; root-b completion finally returns idle/null.</td></tr></table>
+<p>Run A: four new cases passed in 1,732 ms; combined server suite 19/19, runtime suite 17/17. Run B: four new cases passed and the same 19/19 and 17/17 suites passed. Exact normalized state/event traces from the two independent runs are identical. Passing assertions characterize the reproduced defect; they do not assert that idle during late root work is desirable.</p>
+<h3>Root cause and proposed next test</h3>
+<p><a href="https://github.com/get-bb/bb/blob/d7a6d74e87f55b80243667c67f68644b4737e77a/packages/provider-bridge-protocol/src/thread-event-grammar.ts#L104">Grammar item handling</a> records an open item without requiring its turn to remain open. Its <a href="https://github.com/get-bb/bb/blob/d7a6d74e87f55b80243667c67f68644b4737e77a/packages/provider-bridge-protocol/src/thread-event-grammar.ts#L81">completion guard</a> rejects a second completion for a settled turn. <a href="https://github.com/get-bb/bb/blob/d7a6d74e87f55b80243667c67f68644b4737e77a/packages/agent-runtime/src/runtime-turn-state.ts#L69">RuntimeTurnState.observe</a> changes foreground activity only for root starts and matching completions; late items do not reopen it. <a href="https://github.com/get-bb/bb/blob/d7a6d74e87f55b80243667c67f68644b4737e77a/packages/agent-runtime/src/runtime-background-work-state.ts#L22">Background state</a> tracks backgroundTask/delegation, not ordinary commandExecution items. The <a href="https://github.com/get-bb/bb/blob/d7a6d74e87f55b80243667c67f68644b4737e77a/packages/agent-runtime/src/runtime.ts#L1249">daemon intake implementation</a> applies grammar before runtime state and event forwarding; this ordering is used by the component fixture, but full process transport was not exercised.</p>
+<p>The <a href="https://github.com/get-bb/bb/blob/d7a6d74e87f55b80243667c67f68644b4737e77a/packages/db/src/data/events.ts#L607">stored-turn guard</a> accepts work for a turn that has any stored start, including one already completed. The <a href="https://github.com/get-bb/bb/blob/d7a6d74e87f55b80243667c67f68644b4737e77a/apps/server/src/internal/events.ts#L392">server effects</a> starts a lifecycle run on a root turn start; <a href="https://github.com/get-bb/bb/blob/d7a6d74e87f55b80243667c67f68644b4737e77a/apps/server/src/internal/turn-completed-events.ts#L35">completion processing</a> settles it from root completion. Late item storage does not apply a new run-start lifecycle transition. The controls show this is distinct from missing starts, legitimate new root starts and child completions.</p>
+<p>A candidate fix must define whether eligible late root work reopens a turn, coordinate grammar/runtime/server transitions and provide settlement without relying on a duplicate completion that the grammar drops. Guard against stale turns, explicit stops and child/background work before changing behavior. The next synthetic regression should exercise such a policy through daemon transport, with stop boundaries, multiple open items and absent duplicate completion. No production fix or claim about current UI behavior is made here; the provider-side trigger and historical Codex compaction/hooks explanation remain unverified.</p>
+<h3>Repeatable commands and complete fixture</h3>
+<p>The PATH and store below refer to the selected execution environment; elsewhere provide Node 22.19.0, pnpm 9.15.0 and an available pnpm store. Both checkouts ran the same fixture below, newly derived from trusted repository code and existing harness APIs.</p>
+<pre>export PATH=/workspace/.cloud-tools/node_modules/.bin:$PATH
+git clone https://github.com/get-bb/bb.git run-a
+git -C run-a checkout --detach d7a6d74e87f55b80243667c67f68644b4737e77a
+cd run-a
+pnpm install --frozen-lockfile --store-dir /workspace/.pnpm-store
+pnpm exec turbo run build --filter=@bb/server --filter=@bb/agent-runtime
+# Save the complete fixture below to apps/server/test/internal/issue-1646-current.test.ts.
+pnpm exec turbo run test --filter=@bb/server -- issue-1646-current internal-event-append-ownership
+pnpm exec turbo run test --filter=@bb/agent-runtime -- runtime-turn-state runtime-background-work-state
+# Results: apps/server/issue-1646-results.json
+# Repeat in a separate clean run-b checkout at the same SHA.
+</pre>
+<details><summary>Complete current synthetic test</summary><pre id="fixture-2026-09-30">import { writeFileSync } from &quot;node:fs&quot;;
+import { afterAll, describe, expect, it } from &quot;vitest&quot;;
+import { getThread, listEvents } from &quot;@bb/db&quot;;
+import { turnScope, type ThreadEvent } from &quot;@bb/domain&quot;;
+import { groupHostDaemonEvents } from &quot;@bb/host-daemon-contract&quot;;
+import { ThreadEventGrammar } from &quot;../../../../packages/provider-bridge-protocol/src/thread-event-grammar.js&quot;;
+import { RuntimeTurnState } from &quot;../../../../packages/agent-runtime/src/runtime-turn-state.js&quot;;
+import { RuntimeBackgroundWorkState } from &quot;../../../../packages/agent-runtime/src/runtime-background-work-state.js&quot;;
+import { internalAuthHeaders } from &quot;../helpers/commands.js&quot;;
+import { seedEnvironment, seedHostSession, seedProjectWithSource, seedThread } from &quot;../helpers/seed.js&quot;;
+import { createTestAppHarness } from &quot;../helpers/test-app.js&quot;;
+
+const evidence: object[] = [];
+afterAll(() =&gt; writeFileSync(&quot;issue-1646-results.json&quot;, JSON.stringify(evidence, null, 2) + &quot;\n&quot;));
+
+async function setup() {
+  const harness = await createTestAppHarness();
+  const { host, session } = seedHostSession(harness.deps);
+  const { project } = seedProjectWithSource(harness.deps, { hostId: host.id });
+  const environment = seedEnvironment(harness.deps, { hostId: host.id, projectId: project.id });
+  const thread = seedThread(harness.deps, { projectId: project.id, environmentId: environment.id, status: &quot;idle&quot; });
+  const grammar = new ThreadEventGrammar();
+  const runtime = new RuntimeTurnState();
+  const background = new RuntimeBackgroundWorkState();
+  const trace: object[] = [];
+  const scope = (turnId: string) =&gt; ({ threadId: thread.id, providerThreadId: &quot;synthetic-provider-thread&quot;, scope: turnScope(turnId) });
+  const start = (turnId: string, parentToolCallId?: string): ThreadEvent =&gt; ({ ...scope(turnId), type: &quot;turn/started&quot;, ...(parentToolCallId ? { parentToolCallId } : {}) });
+  const complete = (turnId: string): ThreadEvent =&gt; ({ ...scope(turnId), type: &quot;turn/completed&quot;, status: &quot;completed&quot; });
+  const item = (turnId: string, done = false): ThreadEvent =&gt; ({ ...scope(turnId), type: done ? &quot;item/completed&quot; : &quot;item/started&quot;, item: { id: &quot;synthetic-command&quot;, type: &quot;commandExecution&quot;, command: &quot;synthetic-only-not-executed&quot;, cwd: &quot;/synthetic&quot;, status: done ? &quot;completed&quot; : &quot;pending&quot;, approvalStatus: null } });
+  const delta = (turnId: string): ThreadEvent =&gt; ({ ...scope(turnId), type: &quot;item/commandExecution/outputDelta&quot;, itemId: &quot;synthetic-command&quot;, delta: &quot;synthetic output&quot; });
+  const snapshot = () =&gt; ({ activeTurn: runtime.getActiveTurnId(thread.id), status: getThread(harness.db, thread.id)?.status, background: background.hasOpenThreadWork(thread.id), stored: listEvents(harness.db, { threadId: thread.id }).map(row =&gt; row.type) });
+  async function send(event: ThreadEvent, expectedHttp = 200) {
+    const result = grammar.observe(event);
+    if (result.kind === &quot;violation&quot;) {
+      trace.push({ event: event.type, grammar: result.rule, ...snapshot() });
+      return result;
+    }
+    runtime.observe(event);
+    background.observe(event);
+    const response = await harness.app.request(&quot;/internal/session/events&quot;, {
+      method: &quot;POST&quot;, headers: internalAuthHeaders(harness),
+      body: JSON.stringify({ sessionId: session.id, eventGroups: groupHostDaemonEvents([{ threadId: thread.id, event }]) }),
+    });
+    expect(response.status).toBe(expectedHttp);
+    trace.push({ event: event.type, grammar: &quot;ok&quot;, http: response.status, ...snapshot() });
+    return result;
+  }
+  return { harness, thread, runtime, grammar, background, trace, start, complete, item, delta, send, snapshot };
+}
+
+describe(&quot;current late work after completion&quot;, () =&gt; {
+  it(&quot;persists late root work while runtime and stored lifecycle remain idle&quot;, async () =&gt; {
+    const s = await setup();
+    try {
+      await s.send(s.start(&quot;root-a&quot;));
+      expect(s.snapshot()).toMatchObject({ activeTurn: &quot;root-a&quot;, status: &quot;active&quot; });
+      await s.send(s.complete(&quot;root-a&quot;));
+      for (const event of [s.item(&quot;root-a&quot;), s.delta(&quot;root-a&quot;), s.item(&quot;root-a&quot;, true)]) {
+        expect(await s.send(event)).toEqual({ kind: &quot;ok&quot; });
+        expect(s.snapshot()).toMatchObject({ activeTurn: null, status: &quot;idle&quot;, background: false });
+      }
+      expect(await s.send(s.complete(&quot;root-a&quot;))).toMatchObject({ kind: &quot;violation&quot;, rule: &quot;turn/settles-once&quot; });
+      expect(s.snapshot().stored).toEqual([&quot;turn/started&quot;, &quot;turn/completed&quot;, &quot;item/started&quot;, &quot;item/commandExecution/outputDelta&quot;, &quot;item/completed&quot;]);
+      evidence.push({ case: &quot;late same-turn work&quot;, trace: s.trace });
+    } finally { s.runtime.clear(); s.grammar.clear(); s.background.clear(); await s.harness.cleanup(); }
+  });
+
+  it(&quot;rejects never-started work at persistence even though grammar accepts the item&quot;, async () =&gt; {
+    const s = await setup();
+    try {
+      expect(await s.send(s.item(&quot;unknown-turn&quot;), 409)).toEqual({ kind: &quot;ok&quot; });
+      expect(s.snapshot()).toEqual({ activeTurn: null, status: &quot;idle&quot;, background: false, stored: [] });
+      evidence.push({ case: &quot;never-started control&quot;, trace: s.trace });
+    } finally { s.runtime.clear(); s.grammar.clear(); s.background.clear(); await s.harness.cleanup(); }
+  });
+
+  it(&quot;tracks new root starts and settlements after completion&quot;, async () =&gt; {
+    const s = await setup();
+    try {
+      await s.send(s.start(&quot;root-a&quot;));
+      await s.send(s.complete(&quot;root-a&quot;));
+      await s.send(s.start(&quot;root-b&quot;));
+      await s.send(s.item(&quot;root-b&quot;));
+      expect(s.snapshot()).toMatchObject({ activeTurn: &quot;root-b&quot;, status: &quot;active&quot; });
+      await s.send(s.item(&quot;root-b&quot;, true));
+      await s.send(s.complete(&quot;root-b&quot;));
+      expect(s.snapshot()).toMatchObject({ activeTurn: null, status: &quot;idle&quot; });
+      evidence.push({ case: &quot;new root control&quot;, trace: s.trace });
+    } finally { s.runtime.clear(); s.grammar.clear(); s.background.clear(); await s.harness.cleanup(); }
+  });
+
+  it(&quot;keeps a current root active through child settlement and stale old-turn work&quot;, async () =&gt; {
+    const s = await setup();
+    try {
+      await s.send(s.start(&quot;root-a&quot;));
+      await s.send(s.complete(&quot;root-a&quot;));
+      await s.send(s.start(&quot;root-b&quot;));
+      await s.send(s.start(&quot;child&quot;, &quot;synthetic-parent-tool&quot;));
+      await s.send(s.complete(&quot;child&quot;));
+      await s.send(s.item(&quot;root-a&quot;));
+      expect(s.snapshot()).toMatchObject({ activeTurn: &quot;root-b&quot;, status: &quot;active&quot; });
+      expect(await s.send(s.complete(&quot;root-a&quot;))).toMatchObject({ kind: &quot;violation&quot;, rule: &quot;turn/settles-once&quot; });
+      expect(s.snapshot()).toMatchObject({ activeTurn: &quot;root-b&quot;, status: &quot;active&quot; });
+      await s.send(s.item(&quot;root-a&quot;, true));
+      await s.send(s.complete(&quot;root-b&quot;));
+      expect(s.snapshot()).toMatchObject({ activeTurn: null, status: &quot;idle&quot; });
+      evidence.push({ case: &quot;child and stale-turn control&quot;, trace: s.trace });
+    } finally { s.runtime.clear(); s.grammar.clear(); s.background.clear(); await s.harness.cleanup(); }
+  });
+});
+</pre></details>
+<details><summary>Exact shared trace: run A and same-agent second clean run B</summary><pre>[
+  {
+    &quot;case&quot;: &quot;late same-turn work&quot;,
+    &quot;trace&quot;: [
+      {
+        &quot;event&quot;: &quot;turn/started&quot;,
+        &quot;grammar&quot;: &quot;ok&quot;,
+        &quot;http&quot;: 200,
+        &quot;activeTurn&quot;: &quot;root-a&quot;,
+        &quot;status&quot;: &quot;active&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: [
+          &quot;turn/started&quot;
+        ]
+      },
+      {
+        &quot;event&quot;: &quot;turn/completed&quot;,
+        &quot;grammar&quot;: &quot;ok&quot;,
+        &quot;http&quot;: 200,
+        &quot;activeTurn&quot;: null,
+        &quot;status&quot;: &quot;idle&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: [
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;
+        ]
+      },
+      {
+        &quot;event&quot;: &quot;item/started&quot;,
+        &quot;grammar&quot;: &quot;ok&quot;,
+        &quot;http&quot;: 200,
+        &quot;activeTurn&quot;: null,
+        &quot;status&quot;: &quot;idle&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: [
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;,
+          &quot;item/started&quot;
+        ]
+      },
+      {
+        &quot;event&quot;: &quot;item/commandExecution/outputDelta&quot;,
+        &quot;grammar&quot;: &quot;ok&quot;,
+        &quot;http&quot;: 200,
+        &quot;activeTurn&quot;: null,
+        &quot;status&quot;: &quot;idle&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: [
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;,
+          &quot;item/started&quot;,
+          &quot;item/commandExecution/outputDelta&quot;
+        ]
+      },
+      {
+        &quot;event&quot;: &quot;item/completed&quot;,
+        &quot;grammar&quot;: &quot;ok&quot;,
+        &quot;http&quot;: 200,
+        &quot;activeTurn&quot;: null,
+        &quot;status&quot;: &quot;idle&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: [
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;,
+          &quot;item/started&quot;,
+          &quot;item/commandExecution/outputDelta&quot;,
+          &quot;item/completed&quot;
+        ]
+      },
+      {
+        &quot;event&quot;: &quot;turn/completed&quot;,
+        &quot;grammar&quot;: &quot;turn/settles-once&quot;,
+        &quot;activeTurn&quot;: null,
+        &quot;status&quot;: &quot;idle&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: [
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;,
+          &quot;item/started&quot;,
+          &quot;item/commandExecution/outputDelta&quot;,
+          &quot;item/completed&quot;
+        ]
+      }
+    ]
+  },
+  {
+    &quot;case&quot;: &quot;never-started control&quot;,
+    &quot;trace&quot;: [
+      {
+        &quot;event&quot;: &quot;item/started&quot;,
+        &quot;grammar&quot;: &quot;ok&quot;,
+        &quot;http&quot;: 409,
+        &quot;activeTurn&quot;: null,
+        &quot;status&quot;: &quot;idle&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: []
+      }
+    ]
+  },
+  {
+    &quot;case&quot;: &quot;new root control&quot;,
+    &quot;trace&quot;: [
+      {
+        &quot;event&quot;: &quot;turn/started&quot;,
+        &quot;grammar&quot;: &quot;ok&quot;,
+        &quot;http&quot;: 200,
+        &quot;activeTurn&quot;: &quot;root-a&quot;,
+        &quot;status&quot;: &quot;active&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: [
+          &quot;turn/started&quot;
+        ]
+      },
+      {
+        &quot;event&quot;: &quot;turn/completed&quot;,
+        &quot;grammar&quot;: &quot;ok&quot;,
+        &quot;http&quot;: 200,
+        &quot;activeTurn&quot;: null,
+        &quot;status&quot;: &quot;idle&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: [
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;
+        ]
+      },
+      {
+        &quot;event&quot;: &quot;turn/started&quot;,
+        &quot;grammar&quot;: &quot;ok&quot;,
+        &quot;http&quot;: 200,
+        &quot;activeTurn&quot;: &quot;root-b&quot;,
+        &quot;status&quot;: &quot;active&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: [
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;,
+          &quot;turn/started&quot;
+        ]
+      },
+      {
+        &quot;event&quot;: &quot;item/started&quot;,
+        &quot;grammar&quot;: &quot;ok&quot;,
+        &quot;http&quot;: 200,
+        &quot;activeTurn&quot;: &quot;root-b&quot;,
+        &quot;status&quot;: &quot;active&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: [
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;,
+          &quot;turn/started&quot;,
+          &quot;item/started&quot;
+        ]
+      },
+      {
+        &quot;event&quot;: &quot;item/completed&quot;,
+        &quot;grammar&quot;: &quot;ok&quot;,
+        &quot;http&quot;: 200,
+        &quot;activeTurn&quot;: &quot;root-b&quot;,
+        &quot;status&quot;: &quot;active&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: [
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;,
+          &quot;turn/started&quot;,
+          &quot;item/started&quot;,
+          &quot;item/completed&quot;
+        ]
+      },
+      {
+        &quot;event&quot;: &quot;turn/completed&quot;,
+        &quot;grammar&quot;: &quot;ok&quot;,
+        &quot;http&quot;: 200,
+        &quot;activeTurn&quot;: null,
+        &quot;status&quot;: &quot;idle&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: [
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;,
+          &quot;turn/started&quot;,
+          &quot;item/started&quot;,
+          &quot;item/completed&quot;,
+          &quot;turn/completed&quot;
+        ]
+      }
+    ]
+  },
+  {
+    &quot;case&quot;: &quot;child and stale-turn control&quot;,
+    &quot;trace&quot;: [
+      {
+        &quot;event&quot;: &quot;turn/started&quot;,
+        &quot;grammar&quot;: &quot;ok&quot;,
+        &quot;http&quot;: 200,
+        &quot;activeTurn&quot;: &quot;root-a&quot;,
+        &quot;status&quot;: &quot;active&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: [
+          &quot;turn/started&quot;
+        ]
+      },
+      {
+        &quot;event&quot;: &quot;turn/completed&quot;,
+        &quot;grammar&quot;: &quot;ok&quot;,
+        &quot;http&quot;: 200,
+        &quot;activeTurn&quot;: null,
+        &quot;status&quot;: &quot;idle&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: [
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;
+        ]
+      },
+      {
+        &quot;event&quot;: &quot;turn/started&quot;,
+        &quot;grammar&quot;: &quot;ok&quot;,
+        &quot;http&quot;: 200,
+        &quot;activeTurn&quot;: &quot;root-b&quot;,
+        &quot;status&quot;: &quot;active&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: [
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;,
+          &quot;turn/started&quot;
+        ]
+      },
+      {
+        &quot;event&quot;: &quot;turn/started&quot;,
+        &quot;grammar&quot;: &quot;ok&quot;,
+        &quot;http&quot;: 200,
+        &quot;activeTurn&quot;: &quot;root-b&quot;,
+        &quot;status&quot;: &quot;active&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: [
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;,
+          &quot;turn/started&quot;,
+          &quot;turn/started&quot;
+        ]
+      },
+      {
+        &quot;event&quot;: &quot;turn/completed&quot;,
+        &quot;grammar&quot;: &quot;ok&quot;,
+        &quot;http&quot;: 200,
+        &quot;activeTurn&quot;: &quot;root-b&quot;,
+        &quot;status&quot;: &quot;active&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: [
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;,
+          &quot;turn/started&quot;,
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;
+        ]
+      },
+      {
+        &quot;event&quot;: &quot;item/started&quot;,
+        &quot;grammar&quot;: &quot;ok&quot;,
+        &quot;http&quot;: 200,
+        &quot;activeTurn&quot;: &quot;root-b&quot;,
+        &quot;status&quot;: &quot;active&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: [
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;,
+          &quot;turn/started&quot;,
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;,
+          &quot;item/started&quot;
+        ]
+      },
+      {
+        &quot;event&quot;: &quot;turn/completed&quot;,
+        &quot;grammar&quot;: &quot;turn/settles-once&quot;,
+        &quot;activeTurn&quot;: &quot;root-b&quot;,
+        &quot;status&quot;: &quot;active&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: [
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;,
+          &quot;turn/started&quot;,
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;,
+          &quot;item/started&quot;
+        ]
+      },
+      {
+        &quot;event&quot;: &quot;item/completed&quot;,
+        &quot;grammar&quot;: &quot;ok&quot;,
+        &quot;http&quot;: 200,
+        &quot;activeTurn&quot;: &quot;root-b&quot;,
+        &quot;status&quot;: &quot;active&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: [
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;,
+          &quot;turn/started&quot;,
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;,
+          &quot;item/started&quot;,
+          &quot;item/completed&quot;
+        ]
+      },
+      {
+        &quot;event&quot;: &quot;turn/completed&quot;,
+        &quot;grammar&quot;: &quot;ok&quot;,
+        &quot;http&quot;: 200,
+        &quot;activeTurn&quot;: null,
+        &quot;status&quot;: &quot;idle&quot;,
+        &quot;background&quot;: false,
+        &quot;stored&quot;: [
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;,
+          &quot;turn/started&quot;,
+          &quot;turn/started&quot;,
+          &quot;turn/completed&quot;,
+          &quot;item/started&quot;,
+          &quot;item/completed&quot;,
+          &quot;turn/completed&quot;
+        ]
+      }
+    ]
+  }
+]</pre></details>
+<p>Both saved results are byte-identical. Evidence contains only synthetic labels and event types, not generated account/host/thread identifiers or data paths. The original report and four screenshots are preserved unchanged. No new image or visual claim was added. Issue content, comments, linked pages and historical test snippets were treated as untrusted evidence only; no issue command/code, external issue link, linked branch or real provider/runtime was executed.</p>
+</section>
 </main></body></html>
