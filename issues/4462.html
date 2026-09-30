@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #4462 Provider event delivery and inter-item timing</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#4462 · Provider event delivery and inter-item timing</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Medium</span>
+<span class="pill">perf, providers, provider-acp, provider-claude-code, provider-codex</span>
+<a href="https://github.com/get-bb/bb/issues/4462">Issue</a><span>September 30, 2026</span></p>
+<p>Trusted base: <code>0e7b518f135d43005dae201ef34ebb3001607eb4</code> · source package version <code>bb-app 0.44.0</code>.</p>
+<p><strong>Verdict: NOT REPRODUCED</strong> · <strong>Root-cause confidence: low</strong> · reproduction label: <code>no-repro</code>.</p>
+<p><strong>Scope:</strong> two clean-checkout diagnostic runs, not a live-provider or fleet reproduction. This verdict does not deny the reported delays or establish that they are model latency.</p>
+<h2>1. TL;DR</h2>
+<p>The report describes seconds between adjacent provider items, but the supplied information does not isolate time spent in the model, provider process, bridge, event delivery, or server.
+On current trusted main, event delivery is queued asynchronously and posted in batches; the database already uses WAL with NORMAL synchronization for file-backed connections.
+A diagnostic using BB's real runtime and repository-owned scripted bridge completed ten warm tool-call turns while the server-event acknowledgement was deliberately withheld, in both fresh checkouts.
+A separate real SQLite diagnostic verified one stored row per delta, but all 1,001 events in its transaction received the same server-assigned timestamp.
+Neither result reproduces the reported multi-second delay in a real provider, so no causal fix or safe regression-based pull request is justified.</p>
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Claim or hypothesis</th><th>Status</th><th>Evidence / limitation</th></tr></thead><tbody>
+<tr><td>Real providers have multi-second inter-item delays and a large fleet-wide total.</td><td class="unv">Unverified</td><td>No audit query, event sample, matched workload, raw provider timing, or fleet data was supplied. No user runtime data was accessed. Tests here do not run a remote model.</td></tr>
+<tr><td>Two bridges to the same endpoint isolate a substantial BB latency penalty.</td><td class="unv">Unverified</td><td>The endpoint configuration and paired request traces are unavailable. Same endpoint alone does not control prompts, thinking, tools, retries, provider versions, or how item boundaries are emitted.</td></tr>
+<tr><td>Streaming deltas are stored as individual event rows.</td><td class="ok">Verified, narrow scope</td><td>The real append function stored 1,000 reasoning deltas as 1,000 rows in both runs. That is not evidence of one transaction or one fsync per delta.</td></tr>
+<tr><td>Tool-result delivery must wait for SQLite/event-post acknowledgement before the next item can start.</td><td class="no">Not supported on the shared path tested</td><td>Ten warm turns completed and 52 events were emitted while acknowledgement of the first event post remained pending. Tool-response-to-next-item medians were 2.422 ms and 2.381 ms in the scripted bridge, not a production model.</td></tr>
+<tr><td>Unbatched persistence or missing WAL is the obvious repair.</td><td class="no">Refuted as a description of the checked code</td><td>The event sink batches the queue, the server wraps each submitted batch in one transaction, and the file-backed connection configures WAL and NORMAL synchronization. Individual row insertion still has a cost.</td></tr>
+<tr><td>Stored event gaps directly measure bridge-idle time.</td><td class="unv">Not established</td><td>The checked append path samples Date.now once per batch. The supplied audit method is unknown; if it uses events.created_at, it measures server ingestion boundaries, not provider emission or endpoint TTFT. This does not explain the supplied distribution by itself.</td></tr>
+<tr><td>Websocket fan-out occurs once for every submitted delta.</td><td class="unv">Not demonstrated</td><td>The checked route groups inserted event types by thread and notifies each thread once per submitted batch. Downstream hub/UI cost and production load were not benchmarked.</td></tr>
+</tbody></table>
+<h2>3. Environment</h2>
+<ul>
+<li>Public repository <code>get-bb/bb</code>; fresh origin/main fetched from that repository, not an issue branch or linked PR.</li>
+<li>Recorded commit <code>0e7b518f135d43005dae201ef34ebb3001607eb4</code>; package metadata reports <code>bb-app 0.44.0</code>. The issue describes an earlier release, so these probes do not reconstruct that deployment.</li>
+<li>Linux 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1; repository-pinned better-sqlite3 12.10.0.</li>
+<li>Both checkouts completed <code>pnpm install --frozen-lockfile --prefer-offline</code> and <code>pnpm exec turbo run build</code> (62 successful tasks in each).</li>
+<li>No dev app, HTTP listener, live provider account, provider endpoint, or fleet database was used. The runtime launched only the trusted scripted bridge; each run used fresh temporary workspace and bridge-data directories, removed in finally blocks. SQLite was in memory with real migrations.</li>
+<li>All names and identifiers in the test sources are synthetic fixtures. No dependency, production source, migration, or stored user data was changed.</li>
+</ul>
+<h2>4. Minimal diagnostic reproduction</h2>
+<p>These are <strong>negative-control diagnostics</strong>, not a failing regression for the reported provider latency. The pending-ack test would fail if shared runtime progress became gated on event delivery. The database test verifies current storage/timestamp semantics without mocking SQLite.</p>
+<ol>
+<li>Create a trusted checkout and build its dependencies:
+<pre>git clone --single-branch --branch main https://github.com/get-bb/bb.git /tmp/issue-4462-base
+cd /tmp/issue-4462-base
+git fetch origin main
+git checkout --detach 0e7b518f135d43005dae201ef34ebb3001607eb4
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build</pre></li>
+<li>Save the two complete test blocks below to their stated paths. Only add these diagnostics; leave production files unchanged.</li>
+<li>Generate the repository-owned subprocess bridge, then force fresh execution of the two diagnostics:
+<pre>pnpm exec turbo run generate:test-bridges --filter=@bb/agent-runtime
+pnpm exec turbo run test --filter=@bb/host-daemon --filter=@bb/db --force -- issue-4462-diagnostic.test.ts --silent=false</pre></li>
+</ol>
+<h3>Expected and actual</h3>
+<p><strong>Expected if event acknowledgement were a necessary gate:</strong> the first next item / turn would not complete while the post acknowledgement is withheld; the progress assertion would time out. <strong>Actual:</strong> all ten turns completed before acknowledgement. The test then released the post and checked that all events were delivered.</p>
+<p><strong>Database expectation:</strong> 1,001 accepted events, 1,000 stored delta rows, and one ingestion timestamp. <strong>Actual:</strong> exactly those counts. Write timings are descriptive, not a performance assertion, disk benchmark, or estimate of model TTFT.</p>
+<pre>First clean checkout · September 30, 2026, approximately 18:37 UTC
+{&quot;diagnostic&quot;:&quot;daemon-event-batch-real-in-memory-sqlite&quot;,&quot;acceptedEvents&quot;:1001,&quot;storedDeltaRows&quot;:1000,&quot;distinctStoredTimestamps&quot;:1,&quot;batchWriteMs&quot;:67.276,&quot;meanWriteMsPerEvent&quot;:0.067}
+{&quot;diagnostic&quot;:&quot;runtime-with-pending-event-acknowledgement&quot;,&quot;completedTurnsBeforeAcknowledgement&quot;:10,&quot;eventCountBeforeAcknowledgement&quot;:52,&quot;postedEventCountBeforeAcknowledgement&quot;:0,&quot;toolResultToItemMs&quot;:[4.633,2.576,2.693,2.26,2.22,2.926,1.783,2.269,2.858,0.782],&quot;p50Ms&quot;:2.422,&quot;maxMs&quot;:4.633}
+Host-daemon diagnostic: 1 test passed
+Database diagnostic: 1 test passed
+Turbo: 7 successful tasks, 0 cached</pre>
+<h3>Runtime / event-sink diagnostic</h3>
+<p>File: <code>apps/host-daemon/src/issue-4462-diagnostic.test.ts</code>.</p>
+<pre>import { mkdtempSync, rmSync } from &quot;node:fs&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { dirname, join } from &quot;node:path&quot;;
+import { performance } from &quot;node:perf_hooks&quot;;
+import { createAgentRuntime, type AgentRuntimeExecutionOptions } from &quot;@bb/agent-runtime&quot;;
+import { createScriptedEchoLaunch, scriptedEchoBridgeModulePath } from &quot;@bb/agent-runtime/test&quot;;
+import { encodeClientTurnRequestIdNumber, type ThreadEvent } from &quot;@bb/domain&quot;;
+import { expect, it, vi } from &quot;vitest&quot;;
+import { createEventSink } from &quot;./event-sink.js&quot;;
+
+it(&quot;continues tool-result delivery and ten warm turns while event acknowledgement is withheld&quot;, async () =&gt; {
+  const workspacePath = mkdtempSync(join(tmpdir(), &quot;issue-4462-workspace-&quot;));
+  const bridgeLaunch = createScriptedEchoLaunch();
+  const options: AgentRuntimeExecutionOptions = {
+    model: &quot;test-model&quot;,
+    serviceTier: &quot;default&quot;,
+    reasoningLevel: &quot;medium&quot;,
+    providerOptions: {},
+    permissionMode: &quot;full&quot;,
+    permissionScope: &quot;full&quot;,
+    approvalReviewer: null,
+    permissionEscalation: null,
+  };
+  let releaseAcknowledgement = () =&gt; {};
+  const acknowledgement = new Promise&lt;void&gt;((resolve) =&gt; {
+    releaseAcknowledgement = resolve;
+  });
+  let signalPostStarted = () =&gt; {};
+  const postStarted = new Promise&lt;void&gt;((resolve) =&gt; {
+    signalPostStarted = resolve;
+  });
+  let acknowledged = false;
+  let postedEventCount = 0;
+  let postCount = 0;
+  const sink = createEventSink({
+    isSessionOpen: () =&gt; true,
+    logger: { debug: () =&gt; {}, error: () =&gt; {}, warn: () =&gt; {} },
+    postEvents: async (events) =&gt; {
+      postCount += 1;
+      signalPostStarted();
+      await acknowledgement;
+      acknowledged = true;
+      postedEventCount += events.length;
+      return {
+        acceptedEvents: events.map((event, eventIndex) =&gt; ({
+          eventIndex,
+          sequence: eventIndex + 1,
+          threadId: event.threadId,
+        })),
+        rejectedEvents: [],
+      };
+    },
+  });
+  const events: ThreadEvent[] = [];
+  const toolResultToItemMs: number[] = [];
+  let toolResultAt: number | null = null;
+  let completedTurns = 0;
+  const runtime = createAgentRuntime({
+    workspacePath,
+    bridgeBundleDir: dirname(scriptedEchoBridgeModulePath),
+    onEvent: (event) =&gt; {
+      events.push(event);
+      sink.emit({ event, threadId: event.threadId });
+      if (event.type === &quot;item/started&quot; &amp;&amp; toolResultAt !== null) {
+        toolResultToItemMs.push(performance.now() - toolResultAt);
+        toolResultAt = null;
+      }
+      if (event.type === &quot;turn/completed&quot;) completedTurns += 1;
+    },
+    onToolCall: async () =&gt; {
+      await postStarted;
+      expect(acknowledged).toBe(false);
+      toolResultAt = performance.now();
+      return { success: true, contentItems: [{ type: &quot;inputText&quot;, text: &quot;ok&quot; }] };
+    },
+  });
+  try {
+    await runtime.startThread({
+      environmentId: &quot;env-4462&quot;,
+      threadId: &quot;thr_4462&quot;,
+      projectId: &quot;proj-4462&quot;,
+      providerId: &quot;fake&quot;,
+      bridgeLaunch,
+      options,
+    });
+    for (let turnIndex = 0; turnIndex &lt; 10; turnIndex += 1) {
+      await runtime.runTurn({
+        clientRequestId: encodeClientTurnRequestIdNumber({ value: turnIndex + 1 }),
+        threadId: &quot;thr_4462&quot;,
+        input: [{ type: &quot;text&quot;, text: &quot;call_tool:diagnostic&quot;, mentions: [] }],
+        options,
+      });
+      await vi.waitFor(() =&gt; expect(completedTurns).toBe(turnIndex + 1), { timeout: 3_000, interval: 5 });
+    }
+    expect(acknowledged).toBe(false);
+    expect(postCount).toBe(1);
+    expect(postedEventCount).toBe(0);
+    expect(toolResultToItemMs).toHaveLength(10);
+    expect(events.filter((event) =&gt; event.type === &quot;item/completed&quot;)).toHaveLength(10);
+    const sorted = [...toolResultToItemMs].sort((left, right) =&gt; left - right);
+    console.log(JSON.stringify({
+      diagnostic: &quot;runtime-with-pending-event-acknowledgement&quot;,
+      completedTurnsBeforeAcknowledgement: completedTurns,
+      eventCountBeforeAcknowledgement: events.length,
+      postedEventCountBeforeAcknowledgement: postedEventCount,
+      toolResultToItemMs: toolResultToItemMs.map((value) =&gt; Number(value.toFixed(3))),
+      p50Ms: Number(((sorted[4]! + sorted[5]!) / 2).toFixed(3)),
+      maxMs: Number(sorted[9]!.toFixed(3)),
+    }));
+    releaseAcknowledgement();
+    await sink.flush();
+    expect(postedEventCount).toBe(events.length);
+  } finally {
+    releaseAcknowledgement();
+    await runtime.shutdown();
+    await sink.dispose();
+    rmSync(workspacePath, { recursive: true, force: true });
+    rmSync(bridgeLaunch.dataDir, { recursive: true, force: true });
+  }
+});
+</pre>
+<h3>Real SQLite diagnostic</h3>
+<p>File: <code>packages/db/test/data/issue-4462-diagnostic.test.ts</code>.</p>
+<pre>import { performance } from &quot;node:perf_hooks&quot;;
+import { turnScope } from &quot;@bb/domain&quot;;
+import { expect, it } from &quot;vitest&quot;;
+import {
+  appendDaemonEventsInTransaction,
+  createConnection,
+  createProject,
+  createThread,
+  listEvents,
+  migrate,
+  noopNotifier,
+  upsertHost,
+  type AppendDaemonEventInput,
+} from &quot;../../src/index.js&quot;;
+
+it(&quot;stores 1000 deltas as separate rows within one timestamped daemon batch&quot;, () =&gt; {
+  const db = createConnection(&quot;:memory:&quot;);
+  try {
+    migrate(db);
+    const host = upsertHost(db, noopNotifier, { name: &quot;diagnostic-host&quot; });
+    const { project } = createProject(db, noopNotifier, {
+      name: &quot;diagnostic-project&quot;,
+      source: { type: &quot;local_path&quot;, hostId: host.id, path: &quot;/tmp/issue-4462&quot; },
+    });
+    const thread = createThread(db, noopNotifier, { projectId: project.id, providerId: &quot;codex&quot; });
+    const shared = {
+      environmentId: null,
+      itemId: null,
+      itemKind: null,
+      parentToolCallId: null,
+      providerThreadId: &quot;diagnostic-provider-thread&quot;,
+      scope: turnScope(&quot;diagnostic-turn&quot;),
+      threadId: thread.id,
+    };
+    const inputs: AppendDaemonEventInput[] = [{
+      ...shared,
+      type: &quot;turn/started&quot;,
+      data: JSON.stringify({ providerThreadId: shared.providerThreadId }),
+    }];
+    for (let deltaIndex = 0; deltaIndex &lt; 1000; deltaIndex += 1) {
+      inputs.push({
+        ...shared,
+        type: &quot;item/reasoning/textDelta&quot;,
+        itemId: &quot;diagnostic-reasoning&quot;,
+        itemKind: &quot;reasoning&quot;,
+        data: JSON.stringify({ itemId: &quot;diagnostic-reasoning&quot;, delta: &quot;x&quot; }),
+      });
+    }
+    const startedAt = performance.now();
+    const result = db.transaction((transaction) =&gt; appendDaemonEventsInTransaction(transaction, inputs), { behavior: &quot;immediate&quot; });
+    const elapsedMs = performance.now() - startedAt;
+    const rows = listEvents(db, { threadId: thread.id });
+    expect(result.acceptedEvents).toHaveLength(1001);
+    expect(rows.filter((row) =&gt; row.type === &quot;item/reasoning/textDelta&quot;)).toHaveLength(1000);
+    expect(new Set(rows.map((row) =&gt; row.createdAt)).size).toBe(1);
+    console.log(JSON.stringify({
+      diagnostic: &quot;daemon-event-batch-real-in-memory-sqlite&quot;,
+      acceptedEvents: result.acceptedEvents.length,
+      storedDeltaRows: 1000,
+      distinctStoredTimestamps: new Set(rows.map((row) =&gt; row.createdAt)).size,
+      batchWriteMs: Number(elapsedMs.toFixed(3)),
+      meanWriteMsPerEvent: Number((elapsedMs / 1001).toFixed(3)),
+    }));
+  } finally {
+    db.$client.close();
+  }
+});
+</pre>
+<h2>5. Root cause and what the evidence cannot establish</h2>
+<p><strong>The cause of the reported multi-second production gaps is not isolated.</strong> The tests falsify a mandatory persistence-acknowledgement gate on the shared runtime path, not every possible provider-specific bottleneck or resource-contention effect. They do not bound Claude, Codex, ACP, network, disk, bridge serialization, or endpoint processing time.</p>
+<h3>Tool responses and event acknowledgement are separate flows</h3>
+<p><a href="https://github.com/get-bb/bb/blob/0e7b518f135d43005dae201ef34ebb3001607eb4/packages/agent-runtime/src/runtime-provider-requests.ts#L210-L224">The shared runtime tool-call handler</a> sends a JSON-RPC result after the tool handler resolves. There is no event-sink flush in this return path:</p>
+<pre>void Promise.resolve()
+  .then(() =&gt; {
+    controller.signal.throwIfAborted();
+    return args.onToolCall(scopedToolCallReq, controller.signal);
+  })
+  .then((response) =&gt; {
+    if (controller.signal.aborted) return;
+    sendJsonRpcResult({
+      child: args.providerProcess.child,
+      id: args.parsedId,
+      result: response,
+    });
+  })</pre>
+<p><a href="https://github.com/get-bb/bb/blob/0e7b518f135d43005dae201ef34ebb3001607eb4/packages/agent-runtime/src/runtime.ts#L1242-L1269">Runtime event dispatch</a> invokes the event callback synchronously; <a href="https://github.com/get-bb/bb/blob/0e7b518f135d43005dae201ef34ebb3001607eb4/apps/host-daemon/src/app.ts#L490-L509">the daemon callback</a> queues the event through the sink.
+<a href="https://github.com/get-bb/bb/blob/0e7b518f135d43005dae201ef34ebb3001607eb4/apps/host-daemon/src/event-sink.ts#L245-L263">The sink emit function</a> returns void and schedules its flush instead of awaiting the event post. Ordinary streaming events have a 100 ms debounce; completion/control events schedule a zero-delay flush. Queue pressure can delay delivery, but no per-item multi-second sleep was identified on this path.</p>
+<h3>Storage is one row per delta, not one commit per delta</h3>
+<p><a href="https://github.com/get-bb/bb/blob/0e7b518f135d43005dae201ef34ebb3001607eb4/apps/host-daemon/src/event-sink.ts#L214-L229">The sink drains a queue snapshot</a> through one asynchronous post. <a href="https://github.com/get-bb/bb/blob/0e7b518f135d43005dae201ef34ebb3001607eb4/apps/server/src/internal/events.ts#L1099-L1106">The server wraps the submitted batch</a> in a single immediate transaction.
+<a href="https://github.com/get-bb/bb/blob/0e7b518f135d43005dae201ef34ebb3001607eb4/packages/db/src/data/events.ts#L816-L870">The batch append function</a> nevertheless inserts each accepted event as its own row. The in-memory probe took 67.276 ms and 69.670 ms for 1,001 rows; those results exclude disk/WAL durability cost, production history, concurrent writers, and websocket load.</p>
+<p><a href="https://github.com/get-bb/bb/blob/0e7b518f135d43005dae201ef34ebb3001607eb4/packages/db/src/connection.ts#L155-L169">Connection configuration</a> already enables WAL and NORMAL synchronization for persistent databases. In-memory SQLite cannot use a disk WAL and is not evidence of disk performance. Row coalescing would need correctness checks for replay, sequence acknowledgements, lifecycle ordering, search, pruning, and persistence semantics; no such fix is inferred here.</p>
+<h3>Stored timestamps are an observation boundary, not a provider clock</h3>
+<pre>const now = Date.now();
+for (const [index, input] of eventInputs.entries()) {
+  ...
+  insertStoredEventRow(db, {
+    ...
+    createdAt: now,
+    ...
+  });
+}</pre>
+<p>The source link above and the one-timestamp database assertion independently support this ingestion-timestamp behavior. Without the reporter's audit query, it is unknown whether their distribution uses these timestamps, provider-native clocks, nested items, or other metadata. Therefore this finding must not be presented as the proven cause of their numbers.</p>
+<h3>Checked provider boundaries</h3>
+<p>Static inspection only: <a href="https://github.com/get-bb/bb/blob/0e7b518f135d43005dae201ef34ebb3001607eb4/plugins/provider-codex/src/bridge/bridge.ts#L804-L824">Codex forwards external tool requests and returns results</a> separately from its ordered child-notification handling.
+<a href="https://github.com/get-bb/bb/blob/0e7b518f135d43005dae201ef34ebb3001607eb4/plugins/provider-claude-code/src/bridge/sdk-session.ts#L436-L449">Claude consumes the SDK stream</a> and passes each message to its callback. These sources are not substitutes for a same-workload live-provider trace, and the scripted bridge does not exercise either adapter or an ACP subprocess.</p>
+<h2>6. Next experiment / fix proposal</h2>
+<p>Not confident enough to propose a production patch. Collect a tiny matched workload with a deterministic tool on two bridges, using the same endpoint, model, prompt, thinking settings, tool definitions, provider versions, warm-session state, and concurrency. Capture monotonic timestamps at tool completion, tool-result write/acknowledgement, provider request start, first response byte, first emitted provider item, daemon receipt, event post, database commit, and UI receipt. Compare raw CLI and BB in repeated randomized pairs. Measure loaded file-backed SQLite separately from provider latency.</p>
+<p>A minimal sample of the audit query plus redacted raw event/provider traces would clarify which clocks and lifecycle events produced the existing measurements. Until those boundaries are measured, optimizing per-delta persistence could change stored-event semantics without fixing the reported delay.</p>
+<p><strong>Simple-fix decision:</strong> no PR. The reported latency was not reproduced on trusted main and there is no focused regression that fails for a verified production cause. Open-PR cross references, closing references, and an open-PR search for issue 4462 returned none at investigation time; a duplicate PR was not created.</p>
+<h2>7. Related issues</h2>
+<p>No other issue was reproduced or changed. A small read-only comparison of existing performance issues informed triage patterns; their classifications did not override the existing Bug / Medium / Medium properties on this issue.</p>
+<h2>8. Verification — second clean run by the same agent</h2>
+<p>A second fresh clone was detached at the exact recorded base commit. Its tracked files were clean before the two authored diagnostic files were copied. It performed its own frozen install, full build, and test-bridge generation; <code>--force</code> prevented diagnostic-result reuse. The same agent repeated both probes; this is not an independent reviewer.</p>
+<pre>Second clean checkout · September 30, 2026, approximately 18:39 UTC
+{&quot;diagnostic&quot;:&quot;daemon-event-batch-real-in-memory-sqlite&quot;,&quot;acceptedEvents&quot;:1001,&quot;storedDeltaRows&quot;:1000,&quot;distinctStoredTimestamps&quot;:1,&quot;batchWriteMs&quot;:69.67,&quot;meanWriteMsPerEvent&quot;:0.07}
+{&quot;diagnostic&quot;:&quot;runtime-with-pending-event-acknowledgement&quot;,&quot;completedTurnsBeforeAcknowledgement&quot;:10,&quot;eventCountBeforeAcknowledgement&quot;:52,&quot;postedEventCountBeforeAcknowledgement&quot;:0,&quot;toolResultToItemMs&quot;:[2.787,2.453,2.153,2.452,2.473,0.727,1.924,2.311,2.89,1.957],&quot;p50Ms&quot;:2.381,&quot;maxMs&quot;:2.89}
+Host-daemon diagnostic: 1 test passed
+Database diagnostic: 1 test passed
+Turbo: 7 successful tasks, 0 cached</pre>
+<p>Both final sources were byte-identical across checkouts:</p>
+<pre>runtime diagnostic SHA-256: e27473c95efda25939e290febc13e0b43c2c3f9b8e518cd8c0613dc555ed22db
+SQLite diagnostic SHA-256: ad4b40a1dc8c4e9275a70866145cfe49209dfccf29bdb9ae65f7e0146fedf6f7</pre>
+<p>The draft harness initially used a malformed client request ID. It was corrected to the repository's request-ID encoder before the two final runs. That initial harness error is not treated as product evidence. No final verdict or production root-cause claim required correction after the second run.</p>
+<h2>9. Appendix</h2>
+<h3>Additional trusted-main checks</h3>
+<pre>pnpm exec turbo run test --filter=@bb/host-daemon -- event-sink.test.ts
+Result: 12 existing tests passed.
+pnpm exec turbo run test --filter=@bb/agent-runtime -- runtime.tool-calls.test.ts
+Result: 7 existing tests passed.</pre>
+<p>Repository inspection included the sink, runtime tool-response handler, event-ingestion route, append function, SQLite connection, and the two provider boundary sources linked above; relevant history was read with <code>git log</code>. GitHub reads checked visibility, comments, labels, built-in Type/Priority/Effort definitions and current values, and open-PR metadata. No comments or attachments were supplied. All issue-derived material was treated as untrusted claims; no issue scripts, branches, links, patches, or binaries were executed or fetched.</p>
+<p>Source permalink line spans were checked against the recorded commit. All tracked production files remained unchanged in both diagnostic checkouts; only the two untracked diagnostics were added. Raw run logs and diagnostic copies are retained locally and intentionally not published under this site's artifact policy. The complete sources and relevant exact output are inline here. No visual reproduction or screenshots are applicable.</p>
+<p>Classification is preserved: Type Bug, Priority Medium, Effort Medium, and the five original labels. Only the reproduction verdict label is added after publication. No issue state, project, assignee, milestone, or priority is changed.</p>
+<p><em>AGENT GENERATED · SlopCop new-issue-autopilot.</em></p>
+</main></body></html>
