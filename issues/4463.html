@@ -1,0 +1,421 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>#4463 · Plugin-form answer persistence</title><style>body{font:16px/1.55 system-ui;max-width:980px;margin:2rem auto;padding:0 1rem;color:#202124}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f4f4f4;padding:1rem}</style></head><body><main><p><a href="../">Reports</a> · <a href="https://github.com/get-bb/bb/issues/4463">Issue #4463</a></p><h1>Built-in question answers persist on the tested main revision</h1><p>2026-09-30 · Bug · Medium priority · Medium effort</p><p><strong>NOT REPRODUCED · High confidence for the tested built-in submission and database persistence path.</strong> The installed desktop 0.44.0 symptom and transcript rendering remain unresolved; this is not an assertion that the entire issue is fixed.</p><h2>Claim and scope</h2><p>The issue claims that a built-in AskUserQuestion answer reaches the agent but the interaction resolution stores only its kind. This test installs the actual repository built-in through the server plugin installer, invokes its registered AskUserQuestion tool, submits a synthetic option plus free text through the server interaction service, and reads the resulting interaction and lifecycle event from real SQLite tables. It then backs up that isolated database to disk, opens a new SQLite connection, and repeats both reads.</p><p>Both clean runs retain the answer in description.title, description.detail and description.payload, in addition to returning it to the tool caller. A separate synthetic plugin request with no describeSubmission callback produces exactly the bare plugin_submitted resolution while returning its answer in memory. That control establishes the distinction between delivery and persistence; it does not prove that a missing callback caused the installed-app incident.</p><p>The fixture uses the real plugin registration/API/lifecycle and database code. Synthetic host, project and thread rows provide context, with no connected host daemon, external provider session, browser, desktop bundle or real user data. The harness database begins in memory; the separate file backup and reopened connection validate database contents, not crash durability or a running server restart. No UI behavior is claimed, so no screenshot is presented.</p><h2>Expected and actual</h2><p>Expected: answering “Which display color?” with “Blue” and free text “with large text” preserves the answer. Actual in both runs: tool execution succeeds; interaction status is resolved; the interaction row and lifecycle event contain the title “Answered Which display color? — Blue; with large text”, matching detail and structured answer payload. The reopened database has identical records. The no-description control stores only the kind. The full actual output appears below.</p><h2>Trusted base and environment</h2>
+<p>Fetched public origin/main: <code>379cc870fdcd3019c906104d3cb51ad4e3c1e06a</code>. Linux x86_64, Node 24.19.0, repository-pinned pnpm 9.15.0, Vitest 4.1.1. Separate clean worktrees at the same SHA, separate node_modules and writable caches, shared dependency download store. Both frozen installs and server builds exit 0. No new dependency was added. Each run creates and cleans fresh synthetic harness state; no listener or test port is required.</p>
+<h2>Exact repeatable steps</h2>
+<pre>git clone https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout --detach 379cc870fdcd3019c906104d3cb51ad4e3c1e06a
+corepack pnpm install --frozen-lockfile
+corepack pnpm exec turbo run build --filter=@bb/server --force
+# Save the test below as apps/server/test/services/plugins/issue-4463.test.ts
+corepack pnpm exec turbo run test --filter=@bb/server --force -- test/services/plugins/issue-4463.test.ts --silent=false
+</pre>
+<p>Ensure pnpm 9.15.0 is also used by subprocesses. This environment used a task-local Corepack shim and disposable writable caches. Repeat the same commands and identical test in a second clean checkout at the same SHA. Both final test commands must exit 0 with one passing test and the two JSON evidence records. No source modification beyond this temporary test is required.</p>
+<h3>apps/server/test/services/plugins/issue-4463.test.ts</h3>
+<pre>import { join } from &quot;node:path&quot;;
+import { eq } from &quot;drizzle-orm&quot;;
+import { expect, it, vi } from &quot;vitest&quot;;
+import { createConnection, pendingInteractions, events } from &quot;@bb/db&quot;;
+import { createTestAppHarness } from &quot;../../helpers/test-app.js&quot;;
+import { seedEnvironment, seedHostSession, seedProjectWithSource, seedThread } from &quot;../../helpers/seed.js&quot;;
+
+it(&quot;4463 submits the actual built-in form and reads its description from a reopened database&quot;, async () =&gt; {
+  const harness = await createTestAppHarness();
+  try {
+    const { host } = seedHostSession(harness.deps, { id: &quot;host-synthetic-form&quot; });
+    const { project } = seedProjectWithSource(harness.deps, { hostId: host.id });
+    const environment = seedEnvironment(harness.deps, { hostId: host.id, projectId: project.id });
+    const thread = seedThread(harness.deps, { projectId: project.id, environmentId: environment.id });
+    const installed = await harness.pluginService.install(&quot;builtin:ask-user-question&quot;, { kind: &quot;root&quot; });
+    expect(installed.status).toBe(&quot;running&quot;);
+    const found = harness.pluginService.findAgentTool(&quot;AskUserQuestion&quot;);
+    expect(found).toBeDefined();
+    const call = harness.pluginService.invokeAgentTool({
+      ...found!, input: { questions: [{ question: &quot;Which display color?&quot;, header: &quot;Color&quot;, multiSelect: false,
+        options: [{ label: &quot;Blue&quot;, description: &quot;Blue display&quot; }, { label: &quot;Green&quot;, description: &quot;Green display&quot; }] }] },
+      ctx: { threadId: thread.id, projectId: project.id, signal: new AbortController().signal },
+    });
+    await vi.waitFor(() =&gt; expect(harness.deps.pendingInteractions.listPendingThreadInteractions(thread.id)).toHaveLength(1));
+    const [pending] = harness.deps.pendingInteractions.listPendingThreadInteractions(thread.id);
+    const selected = { answers: { q0: { selected: [&quot;q0o0&quot;], freeText: &quot;with large text&quot; } } };
+    const submitted = await harness.deps.pendingInteractions.respondToPluginInteraction({
+      interactionId: pending!.id, threadId: thread.id, value: selected,
+    });
+    const toolResult = await call;
+    expect(toolResult.success).toBe(true);
+    expect(JSON.stringify(toolResult)).toContain(&quot;Blue; with large text&quot;);
+    const read = (db: typeof harness.db) =&gt; {
+      const row = db.select({ status: pendingInteractions.status, resolution: pendingInteractions.resolution })
+        .from(pendingInteractions).where(eq(pendingInteractions.id, pending!.id)).get()!;
+      const lifecycle = db.select({ type: events.type, data: events.data }).from(events)
+        .where(eq(events.threadId, thread.id)).all().filter(row =&gt; row.type === &quot;system/interaction/lifecycle&quot;)
+        .map(row =&gt; JSON.parse(row.data)).at(-1);
+      return { status: row.status, resolution: JSON.parse(row.resolution!), lifecycleResolution: lifecycle?.interaction?.resolution };
+    };
+    const expectedDescription = { title: &quot;Answered Which display color? — Blue; with large text&quot;,
+      detail: &quot;- Which display color? — Blue; with large text&quot; };
+    const direct = read(harness.db);
+    expect(direct.status).toBe(&quot;resolved&quot;);
+    expect(direct.resolution).toMatchObject({ kind: &quot;plugin_submitted&quot;, description: expectedDescription });
+    expect(direct.lifecycleResolution).toMatchObject({ kind: &quot;plugin_submitted&quot;, description: expectedDescription });
+    expect(submitted.resolution).toEqual(direct.resolution);
+    const snapshot = join(harness.config.dataDir, &quot;synthetic-persisted.sqlite&quot;);
+    await harness.db.$client.backup(snapshot);
+    const reopened = createConnection(snapshot);
+    let durable;
+    try { durable = read(reopened); expect(durable).toEqual(direct); }
+    finally { reopened.$client.close(); }
+    console.log(JSON.stringify({ phase: &quot;actual-builtin-persistence&quot;, toolResult, direct, reopened: durable }));
+    const fallback = harness.deps.pendingInteractions.requestPluginInteraction({
+      pluginId: &quot;synthetic-no-description&quot;, threadId: thread.id, rendererId: &quot;color&quot;, title: &quot;Color&quot;,
+      payload: { colors: [&quot;Blue&quot;, &quot;Green&quot;] }, describeSubmission: null, timeoutMs: 10000,
+    });
+    const [control] = harness.deps.pendingInteractions.listPendingThreadInteractions(thread.id);
+    await harness.deps.pendingInteractions.respondToPluginInteraction({ interactionId: control!.id, threadId: thread.id, value: { color: &quot;Blue&quot; } });
+    expect(await fallback).toEqual({ outcome: &quot;submitted&quot;, value: { color: &quot;Blue&quot; } });
+    const controlRow = harness.db.select({ resolution: pendingInteractions.resolution }).from(pendingInteractions)
+      .where(eq(pendingInteractions.id, control!.id)).get()!;
+    expect(JSON.parse(controlRow.resolution!)).toEqual({ kind: &quot;plugin_submitted&quot; });
+    console.log(JSON.stringify({ phase: &quot;no-description-control&quot;, resolution: JSON.parse(controlRow.resolution!) }));
+  } finally { await harness.cleanup(); }
+}, 60000);
+</pre>
+<h2>Actual evidence and same-agent second clean reproduction</h2>
+<h3>First clean checkout</h3>
+<pre>[
+  {
+    &quot;phase&quot;: &quot;actual-builtin-persistence&quot;,
+    &quot;toolResult&quot;: {
+      &quot;success&quot;: true,
+      &quot;contentItems&quot;: [
+        {
+          &quot;type&quot;: &quot;inputText&quot;,
+          &quot;text&quot;: &quot;{\&quot;questions\&quot;:[{\&quot;question\&quot;:\&quot;Which display color?\&quot;,\&quot;header\&quot;:\&quot;Color\&quot;,\&quot;options\&quot;:[{\&quot;label\&quot;:\&quot;Blue\&quot;,\&quot;description\&quot;:\&quot;Blue display\&quot;},{\&quot;label\&quot;:\&quot;Green\&quot;,\&quot;description\&quot;:\&quot;Green display\&quot;}],\&quot;multiSelect\&quot;:false}],\&quot;answers\&quot;:{\&quot;Which display color?\&quot;:\&quot;Blue; with large text\&quot;},\&quot;annotations\&quot;:{\&quot;Which display color?\&quot;:{\&quot;notes\&quot;:\&quot;with large text\&quot;}}}&quot;
+        }
+      ]
+    },
+    &quot;direct&quot;: {
+      &quot;status&quot;: &quot;resolved&quot;,
+      &quot;resolution&quot;: {
+        &quot;kind&quot;: &quot;plugin_submitted&quot;,
+        &quot;description&quot;: {
+          &quot;title&quot;: &quot;Answered Which display color? \u2014 Blue; with large text&quot;,
+          &quot;detail&quot;: &quot;- Which display color? \u2014 Blue; with large text&quot;,
+          &quot;payload&quot;: {
+            &quot;questions&quot;: [
+              {
+                &quot;question&quot;: &quot;Which display color?&quot;,
+                &quot;header&quot;: &quot;Color&quot;,
+                &quot;options&quot;: [
+                  {
+                    &quot;label&quot;: &quot;Blue&quot;,
+                    &quot;description&quot;: &quot;Blue display&quot;
+                  },
+                  {
+                    &quot;label&quot;: &quot;Green&quot;,
+                    &quot;description&quot;: &quot;Green display&quot;
+                  }
+                ],
+                &quot;multiSelect&quot;: false
+              }
+            ],
+            &quot;answers&quot;: {
+              &quot;Which display color?&quot;: &quot;Blue; with large text&quot;
+            },
+            &quot;annotations&quot;: {
+              &quot;Which display color?&quot;: {
+                &quot;notes&quot;: &quot;with large text&quot;
+              }
+            }
+          }
+        }
+      },
+      &quot;lifecycleResolution&quot;: {
+        &quot;kind&quot;: &quot;plugin_submitted&quot;,
+        &quot;description&quot;: {
+          &quot;title&quot;: &quot;Answered Which display color? \u2014 Blue; with large text&quot;,
+          &quot;detail&quot;: &quot;- Which display color? \u2014 Blue; with large text&quot;,
+          &quot;payload&quot;: {
+            &quot;questions&quot;: [
+              {
+                &quot;question&quot;: &quot;Which display color?&quot;,
+                &quot;header&quot;: &quot;Color&quot;,
+                &quot;options&quot;: [
+                  {
+                    &quot;label&quot;: &quot;Blue&quot;,
+                    &quot;description&quot;: &quot;Blue display&quot;
+                  },
+                  {
+                    &quot;label&quot;: &quot;Green&quot;,
+                    &quot;description&quot;: &quot;Green display&quot;
+                  }
+                ],
+                &quot;multiSelect&quot;: false
+              }
+            ],
+            &quot;answers&quot;: {
+              &quot;Which display color?&quot;: &quot;Blue; with large text&quot;
+            },
+            &quot;annotations&quot;: {
+              &quot;Which display color?&quot;: {
+                &quot;notes&quot;: &quot;with large text&quot;
+              }
+            }
+          }
+        }
+      }
+    },
+    &quot;reopened&quot;: {
+      &quot;status&quot;: &quot;resolved&quot;,
+      &quot;resolution&quot;: {
+        &quot;kind&quot;: &quot;plugin_submitted&quot;,
+        &quot;description&quot;: {
+          &quot;title&quot;: &quot;Answered Which display color? \u2014 Blue; with large text&quot;,
+          &quot;detail&quot;: &quot;- Which display color? \u2014 Blue; with large text&quot;,
+          &quot;payload&quot;: {
+            &quot;questions&quot;: [
+              {
+                &quot;question&quot;: &quot;Which display color?&quot;,
+                &quot;header&quot;: &quot;Color&quot;,
+                &quot;options&quot;: [
+                  {
+                    &quot;label&quot;: &quot;Blue&quot;,
+                    &quot;description&quot;: &quot;Blue display&quot;
+                  },
+                  {
+                    &quot;label&quot;: &quot;Green&quot;,
+                    &quot;description&quot;: &quot;Green display&quot;
+                  }
+                ],
+                &quot;multiSelect&quot;: false
+              }
+            ],
+            &quot;answers&quot;: {
+              &quot;Which display color?&quot;: &quot;Blue; with large text&quot;
+            },
+            &quot;annotations&quot;: {
+              &quot;Which display color?&quot;: {
+                &quot;notes&quot;: &quot;with large text&quot;
+              }
+            }
+          }
+        }
+      },
+      &quot;lifecycleResolution&quot;: {
+        &quot;kind&quot;: &quot;plugin_submitted&quot;,
+        &quot;description&quot;: {
+          &quot;title&quot;: &quot;Answered Which display color? \u2014 Blue; with large text&quot;,
+          &quot;detail&quot;: &quot;- Which display color? \u2014 Blue; with large text&quot;,
+          &quot;payload&quot;: {
+            &quot;questions&quot;: [
+              {
+                &quot;question&quot;: &quot;Which display color?&quot;,
+                &quot;header&quot;: &quot;Color&quot;,
+                &quot;options&quot;: [
+                  {
+                    &quot;label&quot;: &quot;Blue&quot;,
+                    &quot;description&quot;: &quot;Blue display&quot;
+                  },
+                  {
+                    &quot;label&quot;: &quot;Green&quot;,
+                    &quot;description&quot;: &quot;Green display&quot;
+                  }
+                ],
+                &quot;multiSelect&quot;: false
+              }
+            ],
+            &quot;answers&quot;: {
+              &quot;Which display color?&quot;: &quot;Blue; with large text&quot;
+            },
+            &quot;annotations&quot;: {
+              &quot;Which display color?&quot;: {
+                &quot;notes&quot;: &quot;with large text&quot;
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    &quot;phase&quot;: &quot;no-description-control&quot;,
+    &quot;resolution&quot;: {
+      &quot;kind&quot;: &quot;plugin_submitted&quot;
+    }
+  }
+]</pre>
+<pre> Test Files  1 passed (1)
+      Tests  1 passed (1)
+   Duration  5.64s (transform 3.34s, setup 1.13s, import 3.51s, tests 859ms, environment 0ms)</pre>
+<h3>Second clean checkout</h3>
+<pre>[
+  {
+    &quot;phase&quot;: &quot;actual-builtin-persistence&quot;,
+    &quot;toolResult&quot;: {
+      &quot;success&quot;: true,
+      &quot;contentItems&quot;: [
+        {
+          &quot;type&quot;: &quot;inputText&quot;,
+          &quot;text&quot;: &quot;{\&quot;questions\&quot;:[{\&quot;question\&quot;:\&quot;Which display color?\&quot;,\&quot;header\&quot;:\&quot;Color\&quot;,\&quot;options\&quot;:[{\&quot;label\&quot;:\&quot;Blue\&quot;,\&quot;description\&quot;:\&quot;Blue display\&quot;},{\&quot;label\&quot;:\&quot;Green\&quot;,\&quot;description\&quot;:\&quot;Green display\&quot;}],\&quot;multiSelect\&quot;:false}],\&quot;answers\&quot;:{\&quot;Which display color?\&quot;:\&quot;Blue; with large text\&quot;},\&quot;annotations\&quot;:{\&quot;Which display color?\&quot;:{\&quot;notes\&quot;:\&quot;with large text\&quot;}}}&quot;
+        }
+      ]
+    },
+    &quot;direct&quot;: {
+      &quot;status&quot;: &quot;resolved&quot;,
+      &quot;resolution&quot;: {
+        &quot;kind&quot;: &quot;plugin_submitted&quot;,
+        &quot;description&quot;: {
+          &quot;title&quot;: &quot;Answered Which display color? \u2014 Blue; with large text&quot;,
+          &quot;detail&quot;: &quot;- Which display color? \u2014 Blue; with large text&quot;,
+          &quot;payload&quot;: {
+            &quot;questions&quot;: [
+              {
+                &quot;question&quot;: &quot;Which display color?&quot;,
+                &quot;header&quot;: &quot;Color&quot;,
+                &quot;options&quot;: [
+                  {
+                    &quot;label&quot;: &quot;Blue&quot;,
+                    &quot;description&quot;: &quot;Blue display&quot;
+                  },
+                  {
+                    &quot;label&quot;: &quot;Green&quot;,
+                    &quot;description&quot;: &quot;Green display&quot;
+                  }
+                ],
+                &quot;multiSelect&quot;: false
+              }
+            ],
+            &quot;answers&quot;: {
+              &quot;Which display color?&quot;: &quot;Blue; with large text&quot;
+            },
+            &quot;annotations&quot;: {
+              &quot;Which display color?&quot;: {
+                &quot;notes&quot;: &quot;with large text&quot;
+              }
+            }
+          }
+        }
+      },
+      &quot;lifecycleResolution&quot;: {
+        &quot;kind&quot;: &quot;plugin_submitted&quot;,
+        &quot;description&quot;: {
+          &quot;title&quot;: &quot;Answered Which display color? \u2014 Blue; with large text&quot;,
+          &quot;detail&quot;: &quot;- Which display color? \u2014 Blue; with large text&quot;,
+          &quot;payload&quot;: {
+            &quot;questions&quot;: [
+              {
+                &quot;question&quot;: &quot;Which display color?&quot;,
+                &quot;header&quot;: &quot;Color&quot;,
+                &quot;options&quot;: [
+                  {
+                    &quot;label&quot;: &quot;Blue&quot;,
+                    &quot;description&quot;: &quot;Blue display&quot;
+                  },
+                  {
+                    &quot;label&quot;: &quot;Green&quot;,
+                    &quot;description&quot;: &quot;Green display&quot;
+                  }
+                ],
+                &quot;multiSelect&quot;: false
+              }
+            ],
+            &quot;answers&quot;: {
+              &quot;Which display color?&quot;: &quot;Blue; with large text&quot;
+            },
+            &quot;annotations&quot;: {
+              &quot;Which display color?&quot;: {
+                &quot;notes&quot;: &quot;with large text&quot;
+              }
+            }
+          }
+        }
+      }
+    },
+    &quot;reopened&quot;: {
+      &quot;status&quot;: &quot;resolved&quot;,
+      &quot;resolution&quot;: {
+        &quot;kind&quot;: &quot;plugin_submitted&quot;,
+        &quot;description&quot;: {
+          &quot;title&quot;: &quot;Answered Which display color? \u2014 Blue; with large text&quot;,
+          &quot;detail&quot;: &quot;- Which display color? \u2014 Blue; with large text&quot;,
+          &quot;payload&quot;: {
+            &quot;questions&quot;: [
+              {
+                &quot;question&quot;: &quot;Which display color?&quot;,
+                &quot;header&quot;: &quot;Color&quot;,
+                &quot;options&quot;: [
+                  {
+                    &quot;label&quot;: &quot;Blue&quot;,
+                    &quot;description&quot;: &quot;Blue display&quot;
+                  },
+                  {
+                    &quot;label&quot;: &quot;Green&quot;,
+                    &quot;description&quot;: &quot;Green display&quot;
+                  }
+                ],
+                &quot;multiSelect&quot;: false
+              }
+            ],
+            &quot;answers&quot;: {
+              &quot;Which display color?&quot;: &quot;Blue; with large text&quot;
+            },
+            &quot;annotations&quot;: {
+              &quot;Which display color?&quot;: {
+                &quot;notes&quot;: &quot;with large text&quot;
+              }
+            }
+          }
+        }
+      },
+      &quot;lifecycleResolution&quot;: {
+        &quot;kind&quot;: &quot;plugin_submitted&quot;,
+        &quot;description&quot;: {
+          &quot;title&quot;: &quot;Answered Which display color? \u2014 Blue; with large text&quot;,
+          &quot;detail&quot;: &quot;- Which display color? \u2014 Blue; with large text&quot;,
+          &quot;payload&quot;: {
+            &quot;questions&quot;: [
+              {
+                &quot;question&quot;: &quot;Which display color?&quot;,
+                &quot;header&quot;: &quot;Color&quot;,
+                &quot;options&quot;: [
+                  {
+                    &quot;label&quot;: &quot;Blue&quot;,
+                    &quot;description&quot;: &quot;Blue display&quot;
+                  },
+                  {
+                    &quot;label&quot;: &quot;Green&quot;,
+                    &quot;description&quot;: &quot;Green display&quot;
+                  }
+                ],
+                &quot;multiSelect&quot;: false
+              }
+            ],
+            &quot;answers&quot;: {
+              &quot;Which display color?&quot;: &quot;Blue; with large text&quot;
+            },
+            &quot;annotations&quot;: {
+              &quot;Which display color?&quot;: {
+                &quot;notes&quot;: &quot;with large text&quot;
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    &quot;phase&quot;: &quot;no-description-control&quot;,
+    &quot;resolution&quot;: {
+      &quot;kind&quot;: &quot;plugin_submitted&quot;
+    }
+  }
+]</pre>
+<pre> Test Files  1 passed (1)
+      Tests  1 passed (1)
+   Duration  5.81s (transform 3.49s, setup 1.25s, import 3.58s, tests 852ms, environment 0ms)</pre>
+<p>The same agent personally executed the final test in both clean checkouts; this is not independent verification. Both tests exited 0 and emitted identical evidence. Preliminary first-checkout setup attempts used an incorrect relative path and then an unsupported installPath call for a reserved built-in. These stopped before form submission and were corrected to the supported builtin installer; they are not counted as bug results. No unsupported installed-version or visual conclusion was carried forward.</p><h2>Source evidence and precise uncertainty</h2><ul>
+<li><a href="https://github.com/get-bb/bb/blob/379cc870fdcd3019c906104d3cb51ad4e3c1e06a/plugins/ask-user-question/src/server.ts#L62">Built-in describeSubmission callback</a> parses the submitted response and constructs the description.</li>
+<li><a href="https://github.com/get-bb/bb/blob/379cc870fdcd3019c906104d3cb51ad4e3c1e06a/plugins/ask-user-question/src/translate.ts#L81">Answer description builder</a> includes human-readable title/detail and the structured tool result.</li>
+<li><a href="https://github.com/get-bb/bb/blob/379cc870fdcd3019c906104d3cb51ad4e3c1e06a/apps/server/src/services/plugins/plugin-api.ts#L641">Plugin UI API</a> normalizes and forwards the callback; <a href="https://github.com/get-bb/bb/blob/379cc870fdcd3019c906104d3cb51ad4e3c1e06a/apps/server/src/services/plugins/plugin-runtime.ts#L1711">runtime bridge</a> forwards it to the interaction lifecycle.</li>
+<li><a href="https://github.com/get-bb/bb/blob/379cc870fdcd3019c906104d3cb51ad4e3c1e06a/apps/server/src/services/interactions/pending-interactions.ts#L670">Submission persistence</a> computes the description, serializes it into the resolution and persists the resolved interaction.</li>
+<li><a href="https://github.com/get-bb/bb/blob/379cc870fdcd3019c906104d3cb51ad4e3c1e06a/apps/server/src/services/interactions/pending-interactions.ts#L151">Description fallback</a> omits the description if the callback is absent, throws, times out or fails validation. Only the absent-callback case was exercised as a control; the other branches are source observations.</li></ul>
+<p>No root cause for the installed 0.44.0 incident is established. The current trusted implementation does persist the tested built-in description. A source-history observation alone cannot establish ALREADY FIXED, and the bare resolution alone cannot identify which fallback or version mismatch occurred. This report does not test the timeline suppression/rendering claims or retrospectively recover earlier records.</p><h2>Proposed next test and fix direction</h2><p>No production fix was applied or justified for the passing current-main path. Next, use an isolated matching desktop release to record whether the built-in callback runs, whether description validation or its two-second deadline fails, and what the API/database returns before testing transcript rendering. If an omission is confirmed, preserve a safe diagnostic reason or correct the callback propagation/validation path. Do not indiscriminately persist raw values from arbitrary plugin forms; the plugin-supplied description is the intended persistence boundary.</p><h2>Trust and publication checks</h2><p>All issue prose, commands, logs and suggested fixes were treated as untrusted claims. None of its commands, code, branches, external URLs or real runtime were executed or accessed. This test was derived from trusted repository implementation and existing server tests. All current comments were read (zero before publication); no existing report or linked open PR was found. Public repository visibility, source permalinks, inline evidence consistency and privacy were checked. No assets or external runtime data are needed. Raw setup/build/test logs remain local. The repository-referenced publisher script is absent, so HTML/reference/privacy checks were performed directly; the generated index was not edited.</p></main></body></html>
