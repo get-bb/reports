@@ -1,0 +1,326 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>#4446 · Tasks project-default host selection</title><style>body{font:16px/1.55 system-ui;max-width:980px;margin:2rem auto;padding:0 1rem;color:#202124}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f4f4f4;padding:1rem}table{border-collapse:collapse}td,th{padding:.5rem;border:1px solid #bbb;text-align:left}</style></head><body><main><p><a href="../">Reports</a> · <a href="https://github.com/get-bb/bb/issues/4446">Issue #4446</a></p><h1>Tasks project-default dispatch fails when the sole project source belongs to another host</h1><p>2026-09-30 · Bug · Medium priority · Medium effort</p><p><strong>REPRODUCED · High confidence in the Tasks-to-server host-selection failure.</strong> Remote workspace creation and model execution are outside the tested boundary.</p><h2>Claim and exact observed result</h2><p>Two synthetic connected hosts are seeded in the real server test database. One is primary; the project has a single default local-path source on the other. The actual Tasks delegation handler sends its project-default preset to the actual server thread-creation API through a test adapter. The server returns HTTP 404 with code invalid_request and message “Project has no local-path source for host”. Tasks keeps the task in todo with no attached thread.</p><p>This is a failure before successful dispatch, not evidence that work actually started on the wrong machine. With an explicit secondary-host worktree preset, the server returns 201 and records a provisioning intent naming that secondary host. A project whose source is on the primary host also succeeds with project-default. Explicitly choosing the wrong primary host for the secondary-only project fails with 409. Both clean runs produce the same results.</p><table><thead><tr><th>Case</th><th>Server result</th><th>Task / destination</th></tr></thead><tbody><tr><td>Secondary-only source, project-default</td><td>404, missing local-path source for host</td><td>todo, zero attached threads; no successful destination</td></tr><tr><td>Secondary-only source, explicit secondary</td><td>201</td><td>in_progress, one attached thread; secondary provisioning intent</td></tr><tr><td>Primary source, project-default</td><td>201</td><td>in_progress, one attached thread; primary provisioning intent</td></tr><tr><td>Secondary-only source, explicit primary</td><td>409, no project source configured for host</td><td>todo, zero attached threads</td></tr></tbody></table><p>Expected: project-default can select the project’s usable default source host when the primary host has no source, while existing primary-host projects keep their current destination. The regression asserts successful secondary-host selection for the failing case; both assertions fail in both runs.</p><h2>Fixture boundaries</h2><p>The fixture executes actual Tasks storage, preset selection, RPC delegation and task updates, plus the real server API, source resolution and thread-provisioning records. Both Tasks and server use real isolated SQLite databases. The SDK testing host routes its threads.spawn method into an in-process server request; this adapter forwards the project, environment and synthetic prompt under a test Codex provider. It does not exercise network transport, real plugin installation, provider-specific execution options or a Tasks CLI/browser.</p><p>Hosts and sessions are synthetic database entries, and Git inspection responses come from the repository host-RPC test harness. A fake git-worktree environment provider holds provisioning in a waiting state. Thus a 201 and destination intent prove selection and thread attachment, not worktree creation or actual execution on a remote machine. No real filesystem workspace, enrolled host, user runtime, external model or network listener is used. No UI claim or screenshot is needed for the reproduced 404 boundary.</p><h2>Trusted base and environment</h2>
+<p>Fetched public origin/main: <code>36aacc040ec0a2b092785d65dee7869d02cec08e</code>. Linux x86_64, Node 24.19.0, pinned pnpm 9.15.0, Vitest 4.1.1. Two clean worktrees at the same SHA, identical final test bytes, fresh harness/database state, separate node_modules and caches, shared dependency download store. Both frozen installs and server builds exit 0. Tests use --force. No added dependency or production fix.</p>
+<h2>Exact repeatable steps</h2>
+<pre>git clone https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout --detach 36aacc040ec0a2b092785d65dee7869d02cec08e
+corepack pnpm install --frozen-lockfile
+corepack pnpm exec turbo run build --filter=@bb/server --force
+# Save the inline test as apps/server/test/services/plugins/issue-4446.test.ts
+corepack pnpm exec turbo run test --filter=@bb/server --force -- test/services/plugins/issue-4446.test.ts --silent=false
+</pre>
+<p>Ensure pnpm 9.15.0 is also used by subprocesses. This environment used a task-local Corepack shim and disposable writable caches. Repeat the identical test in a second clean checkout at the same SHA. Each final test exits 1 with one failing regression and two desired-behavior assertion failures. The explicit-secondary, primary-default, wrong-explicit and task-state controls pass before those assertions.</p>
+<h3>apps/server/test/services/plugins/issue-4446.test.ts</h3>
+<pre>import { expect, it } from &quot;vitest&quot;;
+import { createFakePluginHost } from &quot;@get-bb/plugin-sdk/testing&quot;;
+import { createStore } from &quot;../../../../../plugins/tasks/api/index.js&quot;;
+import { registerDelegation } from &quot;../../../../../plugins/tasks/delegate/index.js&quot;;
+import { createTestAppHarness } from &quot;../../helpers/test-app.js&quot;;
+import { seedHostSession, seedPrimaryHost, seedProjectWithSource } from &quot;../../helpers/seed.js&quot;;
+import { installFakeGitWorktreeProvider } from &quot;../../helpers/environment-provider.js&quot;;
+import { getThreadProvisionContext } from &quot;../../../src/services/threads/thread-startup-store.js&quot;;
+
+it(&quot;4446 routes project-default Tasks dispatch to the project source host&quot;, async () =&gt; {
+  const server = await createTestAppHarness();
+  const observations: unknown[] = [];
+  const plugin = createFakePluginHost({ pluginId: &quot;tasks&quot;, sdk: {
+    system: { config: async () =&gt; ({ primaryHostId: &quot;host-synthetic-primary&quot; }) },
+    threads: {
+      spawn: async args =&gt; {
+        const response = await server.app.request(&quot;/api/v1/threads&quot;, { method: &quot;POST&quot;, headers: { &quot;content-type&quot;: &quot;application/json&quot; },
+          body: JSON.stringify({ projectId: args.projectId, providerId: &quot;codex&quot;, origin: &quot;plugin&quot;, originPluginId: &quot;tasks&quot;,
+            input: [{ type: &quot;text&quot;, text: args.prompt }], environment: args.environment }) });
+        const body = await response.json();
+        if (response.status !== 201) {
+          observations.push({ environment: args.environment, status: response.status, error: body });
+          throw Object.assign(new Error(body.message), { status: response.status, code: body.code });
+        }
+        const intent = getThreadProvisionContext(server.db, body.id)?.request.environmentIntent;
+        observations.push({ environment: args.environment, status: response.status, intent });
+        return { id: body.id };
+      },
+      get: async args =&gt; {
+        const response = await server.app.request(`/api/v1/threads/${args.threadId}`);
+        return response.json();
+      },
+    },
+  } });
+  try {
+    installFakeGitWorktreeProvider();
+    const primary = seedHostSession(server.deps, { id: &quot;host-synthetic-primary&quot; });
+    const secondary = seedHostSession(server.deps, { id: &quot;host-synthetic-secondary&quot; });
+    seedPrimaryHost(server.deps, primary.host.id);
+    const onSecondary = seedProjectWithSource(server.deps, { hostId: secondary.host.id, name: &quot;Secondary fixture&quot;, path: &quot;/synthetic/secondary-project&quot; });
+    const onPrimary = seedProjectWithSource(server.deps, { hostId: primary.host.id, name: &quot;Primary fixture&quot;, path: &quot;/synthetic/primary-project&quot; });
+    expect(onSecondary.source.isDefault).toBe(true);
+    const store = createStore(plugin.bb);
+    registerDelegation(plugin.bb, store);
+    const preset = (kind: &quot;project-default&quot; | &quot;new-worktree&quot;, machineId: string | null) =&gt; store.tasks.createPreset({
+      name: `Synthetic ${kind} ${machineId ?? &quot;default&quot;}`, providerId: &quot;codex&quot;, modelId: &quot;gpt-5&quot;, reasoningLevel: &quot;high&quot;, serviceTier: null,
+      permissionMode: &quot;full&quot;, environmentKind: kind, baseBranch: null, machineId, instructions: &quot;&quot;, builtin: false,
+    });
+    const defaults = preset(&quot;project-default&quot;, null);
+    const explicitSecondary = preset(&quot;new-worktree&quot;, secondary.host.id);
+    const explicitPrimary = preset(&quot;new-worktree&quot;, primary.host.id);
+    const dispatch = async (linkedBbProjectId: string, presetId: string, name: string) =&gt; {
+      const project = store.tasks.createProject({ name, prefix: name.slice(0, 10), color: &quot;blue&quot;, linkedBbProjectId });
+      const task = store.tasks.createTask({ projectId: project.id, title: &quot;Synthetic routing check&quot;, status: &quot;todo&quot; });
+      let succeeded = false; let message: string | null = null;
+      try { await plugin.harness.callRpc(&quot;delegate&quot;, { taskId: task.id, presetId }); succeeded = true; }
+      catch (error) { message = error instanceof Error ? error.message : String(error); }
+      return { name, succeeded, message, taskStatus: store.tasks.getTask(task.id)?.status,
+        attachedThreads: store.tasks.listTaskThreads(task.id).length, dispatch: observations.at(-1) };
+    };
+    const missingPrimarySource = await dispatch(onSecondary.project.id, defaults.id, &quot;REMOTEDEFAULT&quot;);
+    const secondaryControl = await dispatch(onSecondary.project.id, explicitSecondary.id, &quot;REMOTEEXPLICIT&quot;);
+    const primaryControl = await dispatch(onPrimary.project.id, defaults.id, &quot;PRIMARYDEFAULT&quot;);
+    const wrongExplicitControl = await dispatch(onSecondary.project.id, explicitPrimary.id, &quot;WRONGEXPLICIT&quot;);
+    console.log(JSON.stringify({ phase: &quot;tasks-host-routing&quot;, primary: primary.host.id, soleDefaultSourceHost: onSecondary.source.hostId,
+      missingPrimarySource, secondaryControl, primaryControl, wrongExplicitControl }));
+    expect(secondaryControl.succeeded).toBe(true);
+    expect(secondaryControl.dispatch).toMatchObject({ status: 201, intent: { machine: { hostId: secondary.host.id } } });
+    expect(primaryControl.succeeded).toBe(true);
+    expect(primaryControl.dispatch).toMatchObject({ status: 201, intent: { machine: { hostId: primary.host.id } } });
+    expect(wrongExplicitControl.succeeded).toBe(false);
+    expect(missingPrimarySource.taskStatus).toBe(&quot;todo&quot;);
+    expect(missingPrimarySource.attachedThreads).toBe(0);
+    expect.soft(missingPrimarySource.succeeded).toBe(true);
+    expect.soft(missingPrimarySource.dispatch).toMatchObject({ status: 201, intent: { machine: { hostId: secondary.host.id } } });
+  } finally { await plugin.harness.dispose(); await server.cleanup(); }
+}, 60000);
+</pre>
+<h2>Actual evidence and same-agent second clean reproduction</h2>
+<h3>First clean checkout</h3>
+<pre>{
+  &quot;phase&quot;: &quot;tasks-host-routing&quot;,
+  &quot;primary&quot;: &quot;host-synthetic-primary&quot;,
+  &quot;soleDefaultSourceHost&quot;: &quot;host-synthetic-secondary&quot;,
+  &quot;missingPrimarySource&quot;: {
+    &quot;name&quot;: &quot;REMOTEDEFAULT&quot;,
+    &quot;succeeded&quot;: false,
+    &quot;message&quot;: &quot;Project has no local-path source for host&quot;,
+    &quot;taskStatus&quot;: &quot;todo&quot;,
+    &quot;attachedThreads&quot;: 0,
+    &quot;dispatch&quot;: {
+      &quot;environment&quot;: {
+        &quot;type&quot;: &quot;project-default&quot;
+      },
+      &quot;status&quot;: 404,
+      &quot;error&quot;: {
+        &quot;code&quot;: &quot;invalid_request&quot;,
+        &quot;message&quot;: &quot;Project has no local-path source for host&quot;
+      }
+    }
+  },
+  &quot;secondaryControl&quot;: {
+    &quot;name&quot;: &quot;REMOTEEXPLICIT&quot;,
+    &quot;succeeded&quot;: true,
+    &quot;message&quot;: null,
+    &quot;taskStatus&quot;: &quot;in_progress&quot;,
+    &quot;attachedThreads&quot;: 1,
+    &quot;dispatch&quot;: {
+      &quot;environment&quot;: {
+        &quot;type&quot;: &quot;host&quot;,
+        &quot;hostId&quot;: &quot;host-synthetic-secondary&quot;,
+        &quot;workspace&quot;: {
+          &quot;type&quot;: &quot;managed-worktree&quot;,
+          &quot;baseBranch&quot;: {
+            &quot;kind&quot;: &quot;default&quot;
+          }
+        }
+      },
+      &quot;status&quot;: 201,
+      &quot;intent&quot;: {
+        &quot;type&quot;: &quot;provider&quot;,
+        &quot;environmentProviderId&quot;: &quot;git-worktree&quot;,
+        &quot;machine&quot;: {
+          &quot;type&quot;: &quot;existing&quot;,
+          &quot;hostId&quot;: &quot;host-synthetic-secondary&quot;
+        },
+        &quot;inputs&quot;: {
+          &quot;branch&quot;: {
+            &quot;kind&quot;: &quot;default&quot;
+          }
+        },
+        &quot;selectionResolved&quot;: true
+      }
+    }
+  },
+  &quot;primaryControl&quot;: {
+    &quot;name&quot;: &quot;PRIMARYDEFAULT&quot;,
+    &quot;succeeded&quot;: true,
+    &quot;message&quot;: null,
+    &quot;taskStatus&quot;: &quot;in_progress&quot;,
+    &quot;attachedThreads&quot;: 1,
+    &quot;dispatch&quot;: {
+      &quot;environment&quot;: {
+        &quot;type&quot;: &quot;project-default&quot;
+      },
+      &quot;status&quot;: 201,
+      &quot;intent&quot;: {
+        &quot;type&quot;: &quot;provider&quot;,
+        &quot;environmentProviderId&quot;: &quot;git-worktree&quot;,
+        &quot;machine&quot;: {
+          &quot;type&quot;: &quot;existing&quot;,
+          &quot;hostId&quot;: &quot;host-synthetic-primary&quot;
+        },
+        &quot;inputs&quot;: {
+          &quot;branch&quot;: {
+            &quot;kind&quot;: &quot;named&quot;,
+            &quot;name&quot;: &quot;origin/main&quot;
+          }
+        },
+        &quot;selectionResolved&quot;: true
+      }
+    }
+  },
+  &quot;wrongExplicitControl&quot;: {
+    &quot;name&quot;: &quot;WRONGEXPLICIT&quot;,
+    &quot;succeeded&quot;: false,
+    &quot;message&quot;: &quot;Could not create a worktree on host-synthetic-primary from the default branch: No project source configured for this host&quot;,
+    &quot;taskStatus&quot;: &quot;todo&quot;,
+    &quot;attachedThreads&quot;: 0,
+    &quot;dispatch&quot;: {
+      &quot;environment&quot;: {
+        &quot;type&quot;: &quot;host&quot;,
+        &quot;hostId&quot;: &quot;host-synthetic-primary&quot;,
+        &quot;workspace&quot;: {
+          &quot;type&quot;: &quot;managed-worktree&quot;,
+          &quot;baseBranch&quot;: {
+            &quot;kind&quot;: &quot;default&quot;
+          }
+        }
+      },
+      &quot;status&quot;: 409,
+      &quot;error&quot;: {
+        &quot;code&quot;: &quot;invalid_request&quot;,
+        &quot;message&quot;: &quot;No project source configured for this host&quot;
+      }
+    }
+  }
+}</pre>
+<pre>AssertionError: expected false to be true // Object.is equality
+AssertionError: expected { …(3) } to match object { status: 201, intent: { …(1) } }
+ Test Files  1 failed (1)
+      Tests  1 failed (1)
+   Duration  6.31s (transform 3.81s, setup 1.25s, import 4.11s, tests 794ms, environment 0ms)</pre>
+<h3>Second clean checkout</h3>
+<pre>{
+  &quot;phase&quot;: &quot;tasks-host-routing&quot;,
+  &quot;primary&quot;: &quot;host-synthetic-primary&quot;,
+  &quot;soleDefaultSourceHost&quot;: &quot;host-synthetic-secondary&quot;,
+  &quot;missingPrimarySource&quot;: {
+    &quot;name&quot;: &quot;REMOTEDEFAULT&quot;,
+    &quot;succeeded&quot;: false,
+    &quot;message&quot;: &quot;Project has no local-path source for host&quot;,
+    &quot;taskStatus&quot;: &quot;todo&quot;,
+    &quot;attachedThreads&quot;: 0,
+    &quot;dispatch&quot;: {
+      &quot;environment&quot;: {
+        &quot;type&quot;: &quot;project-default&quot;
+      },
+      &quot;status&quot;: 404,
+      &quot;error&quot;: {
+        &quot;code&quot;: &quot;invalid_request&quot;,
+        &quot;message&quot;: &quot;Project has no local-path source for host&quot;
+      }
+    }
+  },
+  &quot;secondaryControl&quot;: {
+    &quot;name&quot;: &quot;REMOTEEXPLICIT&quot;,
+    &quot;succeeded&quot;: true,
+    &quot;message&quot;: null,
+    &quot;taskStatus&quot;: &quot;in_progress&quot;,
+    &quot;attachedThreads&quot;: 1,
+    &quot;dispatch&quot;: {
+      &quot;environment&quot;: {
+        &quot;type&quot;: &quot;host&quot;,
+        &quot;hostId&quot;: &quot;host-synthetic-secondary&quot;,
+        &quot;workspace&quot;: {
+          &quot;type&quot;: &quot;managed-worktree&quot;,
+          &quot;baseBranch&quot;: {
+            &quot;kind&quot;: &quot;default&quot;
+          }
+        }
+      },
+      &quot;status&quot;: 201,
+      &quot;intent&quot;: {
+        &quot;type&quot;: &quot;provider&quot;,
+        &quot;environmentProviderId&quot;: &quot;git-worktree&quot;,
+        &quot;machine&quot;: {
+          &quot;type&quot;: &quot;existing&quot;,
+          &quot;hostId&quot;: &quot;host-synthetic-secondary&quot;
+        },
+        &quot;inputs&quot;: {
+          &quot;branch&quot;: {
+            &quot;kind&quot;: &quot;default&quot;
+          }
+        },
+        &quot;selectionResolved&quot;: true
+      }
+    }
+  },
+  &quot;primaryControl&quot;: {
+    &quot;name&quot;: &quot;PRIMARYDEFAULT&quot;,
+    &quot;succeeded&quot;: true,
+    &quot;message&quot;: null,
+    &quot;taskStatus&quot;: &quot;in_progress&quot;,
+    &quot;attachedThreads&quot;: 1,
+    &quot;dispatch&quot;: {
+      &quot;environment&quot;: {
+        &quot;type&quot;: &quot;project-default&quot;
+      },
+      &quot;status&quot;: 201,
+      &quot;intent&quot;: {
+        &quot;type&quot;: &quot;provider&quot;,
+        &quot;environmentProviderId&quot;: &quot;git-worktree&quot;,
+        &quot;machine&quot;: {
+          &quot;type&quot;: &quot;existing&quot;,
+          &quot;hostId&quot;: &quot;host-synthetic-primary&quot;
+        },
+        &quot;inputs&quot;: {
+          &quot;branch&quot;: {
+            &quot;kind&quot;: &quot;named&quot;,
+            &quot;name&quot;: &quot;origin/main&quot;
+          }
+        },
+        &quot;selectionResolved&quot;: true
+      }
+    }
+  },
+  &quot;wrongExplicitControl&quot;: {
+    &quot;name&quot;: &quot;WRONGEXPLICIT&quot;,
+    &quot;succeeded&quot;: false,
+    &quot;message&quot;: &quot;Could not create a worktree on host-synthetic-primary from the default branch: No project source configured for this host&quot;,
+    &quot;taskStatus&quot;: &quot;todo&quot;,
+    &quot;attachedThreads&quot;: 0,
+    &quot;dispatch&quot;: {
+      &quot;environment&quot;: {
+        &quot;type&quot;: &quot;host&quot;,
+        &quot;hostId&quot;: &quot;host-synthetic-primary&quot;,
+        &quot;workspace&quot;: {
+          &quot;type&quot;: &quot;managed-worktree&quot;,
+          &quot;baseBranch&quot;: {
+            &quot;kind&quot;: &quot;default&quot;
+          }
+        }
+      },
+      &quot;status&quot;: 409,
+      &quot;error&quot;: {
+        &quot;code&quot;: &quot;invalid_request&quot;,
+        &quot;message&quot;: &quot;No project source configured for this host&quot;
+      }
+    }
+  }
+}</pre>
+<pre>AssertionError: expected false to be true // Object.is equality
+AssertionError: expected { …(3) } to match object { status: 201, intent: { …(1) } }
+ Test Files  1 failed (1)
+      Tests  1 failed (1)
+   Duration  5.39s (transform 3.21s, setup 1.14s, import 3.38s, tests 728ms, environment 0ms)</pre>
+<p>The same agent personally executed both final tests in separate clean checkouts; this is not independent verification. Their evidence is identical. An initial first-checkout setup attempt reused a preset name and hit the Tasks database uniqueness constraint before dispatch. The fixture was corrected to unique preset names and valid project-prefix lengths; that setup attempt is not counted as bug evidence. The final fixture is unchanged across both reported runs.</p><h2>Root cause and source permalinks</h2><ul>
+<li><a href="https://github.com/get-bb/bb/blob/36aacc040ec0a2b092785d65dee7869d02cec08e/plugins/tasks/delegate/index.ts#L188">Tasks preset environment selection</a> returns only type:project-default for that preset kind; an explicit worktree preset includes its selected host.</li>
+<li><a href="https://github.com/get-bb/bb/blob/36aacc040ec0a2b092785d65dee7869d02cec08e/plugins/tasks/delegate/index.ts#L329">Tasks spawn call</a> forwards that environment with the linked BB project.</li>
+<li><a href="https://github.com/get-bb/bb/blob/36aacc040ec0a2b092785d65dee7869d02cec08e/apps/server/src/services/threads/thread-default-policy.ts#L264">Project-default host selection</a> selects the connected primary host before resolving the project source. It does not try the project default source on another host.</li>
+<li><a href="https://github.com/get-bb/bb/blob/36aacc040ec0a2b092785d65dee7869d02cec08e/apps/server/src/services/projects/project-workspace.ts#L67">Host-constrained source resolution</a> searches that host and throws the observed 404 when no matching local-path source exists.</li></ul>
+<h2>Fix proposal and next test</h2><p>Resolve a suitable project source and its connected host before choosing the environment: preserve the primary host when it has a usable source, otherwise consider the project’s usable default source with an explicit deterministic policy. Preserve explicit-host requests and clear errors for offline or ambiguous sources. Keep the personal/projectless policy separate. No production fix was applied.</p><p>Add regression cases for primary-source preference, secondary default-source fallback, disconnected sources and multiple eligible sources. After a policy change, use two isolated real host daemons to verify worktree provisioning and execution reaches the selected host. Do not treat the fixture’s 201 as proof of that remote execution.</p><h2>Trust and publication checks</h2><p>Issue instructions, commands, proposed patches and environment descriptions were treated as untrusted claims. None of its commands, code, branches, external URLs or real runtime were used. The fixture is derived from trusted Tasks/server implementation and existing test helpers. All comments were read (zero before publication); current report and linked PR metadata were checked. Public visibility, source permalinks, evidence consistency and privacy were validated. Test code and output are inline; raw artifacts remain local. The referenced publisher script is absent, so direct HTML/reference/privacy checks were used without editing the generated index.</p></main></body></html>
