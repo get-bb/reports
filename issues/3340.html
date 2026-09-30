@@ -17,6 +17,198 @@
 </style></head><body><main><h1>#3340 · Unbounded restart retries and non-atomic diagnostics</h1>
 <p class="meta">Bug · High priority · Medium effort · host · cli · 2026-09-09<br>Trusted origin/main: <code>e13605d71e261d863e907801987f7df9d6a6243b</code><br><a href="https://github.com/get-bb/bb/issues/3340">GitHub issue</a></p>
 <p><strong>Verdict: PARTIALLY REPRODUCED</strong> · Root-cause confidence: <strong>high</strong></p>
+<section id="verification-2026-09-30"><h2>2026-09-30 verification: actual supervisor and diagnostic writer</h2>
+<p><strong>PARTIALLY REPRODUCED · High confidence in the scoped mechanisms.</strong> This dated section supersedes the historical VM probe as current module-level evidence; the original report and artifacts below remain unchanged. It does not verify the original incident end to end.</p>
+<p>Fresh eligibility: open native Bug, High priority, Medium effort; labels cli, host, partial-repro. PR #3339 is now closed and unmerged, reviewed as metadata only. The September 9 public SlopCop comment is external historical evidence, not this agent’s verification. No overlapping public investigation or open linked fix was found at the publication check.</p>
+<p>Trusted fetched origin/main: <code>a7562b9532a1f0b4edf1e30d7f7ffef57a7e8843</code>. Linux x86_64, Node 22.19.0, pnpm 9.15.0. Both clean detached checkouts completed normal frozen installation and the normal full <code>turbo run build --filter=bb-app</code> build (53 successful tasks each). The same agent personally ran both repetitions with fresh temporary directories and the existing control’s newly allocated local HTTP port. No installation or build bypass was used. No new dependency was added.</p>
+<h3>Expected versus actual, identical in both runs</h3>
+<table><tr><th>Case</th><th>Expected robustness/control</th><th>Actual in each run</th></tr>
+<tr><td>Previously running synthetic server exits; restart always rejects</td><td>A product retry budget or increasing delay would stop or space repeated failures.</td><td>8 callback attempts; 8 delay requests, all 1000 ms. Test shutdown at attempt 8 ends the loop. This is a bounded observation, not an infinite execution.</td></tr>
+<tr><td>Restart recovers after two failures</td><td>Third start succeeds and no extra restart occurs.</td><td>3 attempts, 3 requests of 1000 ms including the initial restart delay; replacement accepted, then explicit test shutdown.</td></tr>
+<tr><td>Shutdown already requested / requested during first delay</td><td>No restart callback.</td><td>0 attempts; respectively 0 / 1 delay requests; shutdown returned.</td></tr>
+<tr><td>Existing healthy-server takeover control</td><td>Stop daemon rather than restart into occupied healthy server.</td><td>Passed; zero restart attempts, daemon SIGTERM counter.</td></tr>
+<tr><td>Diagnostic write fails after creating final file</td><td>Failed publication should not leave an empty final diagnostic.</td><td>8 thrown synthetic ENOSPC errors, 8 empty final JSON files left.</td></tr>
+<tr><td>Successful diagnostic writes</td><td>Valid JSON with original synthetic error.</td><td>8 valid files, zero empty files. All 8 retained; no long-duration retention claim.</td></tr>
+<tr><td>Diagnostic recovery after one failure</td><td>Subsequent writes succeed; failed artifact cleanup can be checked.</td><td>7 valid reports and the first empty file still present.</td></tr></table>
+<p>Each run: supervisor suite 5/5 (4 new tests plus 1 existing control); diagnostic suite 3/3; total 8/8. Delay callbacks record requested durations and resolve immediately; elapsed wall-clock backoff is not measured. The writer’s actual implementation runs with only its filesystem write boundary fault-injected. That injection creates an empty file and throws; it neither exhausts disk space nor changes permissions.</p>
+<h3>Root cause and next change</h3><p>The exported <a href="https://github.com/get-bb/bb/blob/a7562b9532a1f0b4edf1e30d7f7ffef57a7e8843/packages/bb-app/src/launcher.ts#L3175-L3288">full-stack supervisor</a> reaches the actual private <a href="https://github.com/get-bb/bb/blob/a7562b9532a1f0b4edf1e30d7f7ffef57a7e8843/packages/bb-app/src/launcher.ts#L3094-L3125">restart loop</a>, which repeats rejected starts until shutdown and requests the same delay. Source inspection establishes the missing attempt budget/backoff beyond the bounded observation. The actual <a href="https://github.com/get-bb/bb/blob/a7562b9532a1f0b4edf1e30d7f7ffef57a7e8843/packages/process-utils/src/index.ts#L587-L622">diagnostic writer</a> writes directly to a unique final filename without atomic publication, cleanup after failure, or pruning.</p>
+<p>Proposed small fix: add an explicit retry budget/backoff policy and surface exhaustion; write diagnostics to a temporary file, publish atomically, clean failed temporary files, and define retention. Next test: simulate exhaustion and failures before/after temporary write and rename, checking original stderr preservation and shutdown responsiveness. No production fix was made.</p>
+<p>Limits: supervisor callbacks and diagnostic writing were tested separately, not as a real child startup chain. No real child processes, provider, bb runtime, systemd, full disk, permissions change, rendered UI, incident timing or incident file count was exercised. Initial-start behavior and server stderr fallback remain historical evidence, not freshly executed here. Issue text, comments and links were treated solely as untrusted claims; no issue-supplied code, commands, external links or PR branches were executed. No visual claims or new screenshots.</p>
+<h3>Exact reproduction</h3><p>Use Node 22.19.0 and pnpm 9.15.0. Locally the frozen installs additionally used <code>--store-dir /workspace/.pnpm-store</code>, an existing dependency cache; a fresh store is also supported by the command below. Save the fixture text verbatim. Results are written to each package’s <code>issue-3340-results.json</code>; temporary synthetic data is removed by the tests.</p><pre>git clone https://github.com/get-bb/bb.git run-a
+cd run-a
+git checkout --detach a7562b9532a1f0b4edf1e30d7f7ffef57a7e8843
+pnpm install --frozen-lockfile
+pnpm exec turbo run build --filter=bb-app
+# Save the two complete fixtures below at their indicated paths.
+pnpm --filter bb-app exec vitest run test/issue-3340-current.test.ts test/supervisor-port-takeover.test.ts
+pnpm --filter @bb/process-utils exec vitest run test/issue-3340-current.test.ts
+# Repeat in a separate clean run-b clone at the same SHA with the same fixtures.
+</pre>
+<h3>packages/bb-app/test/issue-3340-current.test.ts</h3><pre id="supervisor-fixture">import { mkdtempSync, rmSync, writeFileSync } from &quot;node:fs&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { afterAll, expect, it } from &quot;vitest&quot;;
+import { superviseFullStackProcesses, type BbAppStartContext, type ManagedProcessRun, type NamedProcessExitResult } from &quot;../src/launcher.js&quot;;
+const results: unknown[] = [];
+afterAll(() =&gt; writeFileSync(&quot;issue-3340-results.json&quot;, JSON.stringify(results, null, 2)));
+for (const mode of [&quot;failure&quot;, &quot;recovery&quot;, &quot;pre-abort&quot;, &quot;delay-abort&quot;] as const) {
+  it(`bounds actual supervisor ${mode}`, async () =&gt; {
+    const root = mkdtempSync(join(tmpdir(), &quot;bb-3340-supervisor-&quot;));
+    let shutdown = mode === &quot;pre-abort&quot;;
+    let attempts = 0;
+    const delays: number[] = [];
+    const makeRun = (processName: &quot;server&quot; | &quot;daemon&quot;) =&gt; {
+      let finish!: (v: NamedProcessExitResult) =&gt; void;
+      const run: ManagedProcessRun = { exit: new Promise(resolve =&gt; { finish = resolve; }), terminate: async signal =&gt; finish({ processName, result: {code:null, signal} }) };
+      return {run, finish: () =&gt; finish({processName, result:{code:1, signal:null}})};
+    };
+    const server = makeRun(&quot;server&quot;);
+    const daemon = makeRun(&quot;daemon&quot;);
+    const replacement = makeRun(&quot;server&quot;);
+    const processes = {serverRun: server.run as ManagedProcessRun | null, daemonRun: daemon.run as ManagedProcessRun | null};
+    const context = Object.fromEntries([&quot;appDistDir&quot;,&quot;configFile&quot;,&quot;daemonBundleDir&quot;,&quot;daemonEntry&quot;,&quot;daemonLockDir&quot;,&quot;daemonLockFile&quot;,&quot;dataDir&quot;,&quot;dbPath&quot;,&quot;envFile&quot;,&quot;logDir&quot;,&quot;packageRoot&quot;,&quot;serverEntry&quot;].map(key =&gt; [key, join(root,key)])) as unknown as BbAppStartContext;
+    Object.assign(context, {appVersion:&quot;0.0.0-test&quot;,serverPort:0,daemonPort:0,serverUrl:&quot;http://127.0.0.1:0&quot;});
+    const supervision = superviseFullStackProcesses({context,processes,
+      isShutdownRequested: () =&gt; shutdown || attempts &gt;= 8,
+      delayMilliseconds: async ({ms}) =&gt; {delays.push(ms); if(mode === &quot;delay-abort&quot;) shutdown = true;},
+      isHealthyServerAnswering: async () =&gt; false,
+      readServerMovedFile: async () =&gt; null,
+      onServerMoved: async () =&gt; {throw new Error(&quot;Unexpected move&quot;);},
+      startDaemon: async () =&gt; {throw new Error(&quot;Unexpected daemon restart&quot;);},
+      startServer: async () =&gt; {
+        attempts++;
+        if(mode === &quot;recovery&quot; &amp;&amp; attempts === 3) {
+          processes.serverRun = replacement.run;
+          setTimeout(() =&gt; {shutdown = true; replacement.finish();}, 0);
+          return replacement.run;
+        }
+        throw new Error(&quot;Synthetic bounded start failure&quot;);
+      }
+    });
+    server.finish();
+    try {
+      const outcome = await supervision;
+      expect(outcome).toBe(&quot;shutdown&quot;);
+      expect(attempts).toBe(mode === &quot;failure&quot; ? 8 : mode === &quot;recovery&quot; ? 3 : 0);
+      expect(delays).toEqual(Array(mode === &quot;failure&quot; ? 8 : mode === &quot;recovery&quot; ? 3 : mode === &quot;delay-abort&quot; ? 1 : 0).fill(1000));
+      results.push({mode,attempts,delays,outcome});
+    } finally {
+      shutdown = true; server.finish(); daemon.finish(); replacement.finish();
+      await supervision;
+      rmSync(root,{recursive:true,force:true});
+    }
+  }, 5000);
+}
+</pre>
+<h3>packages/process-utils/test/issue-3340-current.test.ts</h3><pre id="diagnostic-fixture">import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from &quot;node:fs&quot;;
+import { join } from &quot;node:path&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { afterAll, expect, it, vi } from &quot;vitest&quot;;
+const fault = vi.hoisted(() =&gt; ({enabled:false}));
+vi.mock(&quot;node:fs&quot;, async importOriginal =&gt; {
+  const actual = await importOriginal&lt;typeof import(&quot;node:fs&quot;)&gt;();
+  return {...actual, writeFileSync: (...args: Parameters&lt;typeof actual.writeFileSync&gt;) =&gt; {
+    if(fault.enabled &amp;&amp; typeof args[0] === &quot;string&quot; &amp;&amp; args[0].includes(&quot;process-synthetic-server-&quot;)) {
+      actual.writeFileSync(args[0], &quot;&quot;);
+      throw Object.assign(new Error(&quot;Synthetic write failure&quot;), {code:&quot;ENOSPC&quot;});
+    }
+    return actual.writeFileSync(...args);
+  }};
+});
+import { writeSafeProcessDiagnosticReport } from &quot;../src/index.js&quot;;
+const results: unknown[] = [];
+afterAll(() =&gt; writeFileSync(&quot;issue-3340-results.json&quot;, JSON.stringify(results,null,2)));
+for(const mode of [&quot;failure&quot;,&quot;success&quot;,&quot;recovery&quot;] as const) {
+  it(`actual diagnostic writer ${mode}`, () =&gt; {
+    const root = mkdtempSync(join(tmpdir(), &quot;bb-3340-diagnostic-&quot;));
+    let failures = 0;
+    try {
+      for(let i=0;i&lt;8;i++) {
+        fault.enabled = mode === &quot;failure&quot; || (mode === &quot;recovery&quot; &amp;&amp; i === 0);
+        try {
+          writeSafeProcessDiagnosticReport({logsDir:root,processName:&quot;synthetic-server&quot;,kind:&quot;startupFailure&quot;,error:new Error(&quot;Synthetic start failure&quot;),now:()=&gt;new Date(&quot;2026-09-30T00:00:00Z&quot;),createReportId:()=&gt;`attempt-${i}`});
+        } catch(error) {expect((error as NodeJS.ErrnoException).code).toBe(&quot;ENOSPC&quot;); failures++;}
+      }
+      const files = readdirSync(root);
+      const contents = files.map(file =&gt; readFileSync(join(root,file),&quot;utf8&quot;));
+      const empty = contents.filter(content =&gt; content.length === 0).length;
+      const valid = contents.filter(Boolean).map(content =&gt; JSON.parse(content));
+      expect(files.length).toBe(8);
+      expect(failures).toBe(mode === &quot;failure&quot; ? 8 : mode === &quot;recovery&quot; ? 1 : 0);
+      expect(empty).toBe(failures);
+      expect(valid.every(report =&gt; report.kind === &quot;startupFailure&quot; &amp;&amp; report.error.message === &quot;Synthetic start failure&quot;)).toBe(true);
+      results.push({mode,attempts:8,failures,files:files.length,empty,valid:valid.length});
+    } finally {fault.enabled = false; rmSync(root,{recursive:true,force:true});}
+  });
+}
+</pre>
+<h3>Sanitized result objects (identical in both clean runs)</h3><pre>[
+  {
+    &quot;mode&quot;: &quot;failure&quot;,
+    &quot;attempts&quot;: 8,
+    &quot;delays&quot;: [
+      1000,
+      1000,
+      1000,
+      1000,
+      1000,
+      1000,
+      1000,
+      1000
+    ],
+    &quot;outcome&quot;: &quot;shutdown&quot;
+  },
+  {
+    &quot;mode&quot;: &quot;recovery&quot;,
+    &quot;attempts&quot;: 3,
+    &quot;delays&quot;: [
+      1000,
+      1000,
+      1000
+    ],
+    &quot;outcome&quot;: &quot;shutdown&quot;
+  },
+  {
+    &quot;mode&quot;: &quot;pre-abort&quot;,
+    &quot;attempts&quot;: 0,
+    &quot;delays&quot;: [],
+    &quot;outcome&quot;: &quot;shutdown&quot;
+  },
+  {
+    &quot;mode&quot;: &quot;delay-abort&quot;,
+    &quot;attempts&quot;: 0,
+    &quot;delays&quot;: [
+      1000
+    ],
+    &quot;outcome&quot;: &quot;shutdown&quot;
+  }
+]
+[
+  {
+    &quot;mode&quot;: &quot;failure&quot;,
+    &quot;attempts&quot;: 8,
+    &quot;failures&quot;: 8,
+    &quot;files&quot;: 8,
+    &quot;empty&quot;: 8,
+    &quot;valid&quot;: 0
+  },
+  {
+    &quot;mode&quot;: &quot;success&quot;,
+    &quot;attempts&quot;: 8,
+    &quot;failures&quot;: 0,
+    &quot;files&quot;: 8,
+    &quot;empty&quot;: 0,
+    &quot;valid&quot;: 8
+  },
+  {
+    &quot;mode&quot;: &quot;recovery&quot;,
+    &quot;attempts&quot;: 8,
+    &quot;failures&quot;: 1,
+    &quot;files&quot;: 8,
+    &quot;empty&quot;: 1,
+    &quot;valid&quot;: 7
+  }
+]</pre></section>
 <h2>1. TL;DR</h2>
 <p>A managed child that exits after startup can enter a restart loop whose failures have no attempt budget and always request a one-second delay. Diagnostic reports are written directly to their final JSON filenames with no retention or cleanup after a failed write. Two clean-checkout source-function probes each reached our 32-attempt safety stop, retained all 32 successful reports, and left 32 empty JSON files under an injected storage-write failure. A real disk-full incident and Linux systemd behavior were not replayed. The server already preserves its original startup error on stderr when diagnostic writing throws.</p>
 <h2>2. Claims vs findings</h2>
