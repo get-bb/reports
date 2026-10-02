@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>#4675 · Persisted task comments are gated on agent delivery</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p><h1>#4675 · Persisted task comments are gated on agent delivery</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Low</span><span class="pill">plugins · tasks · perf</span><a href="https://github.com/get-bb/bb/issues/4675">GitHub issue</a><span>October 2, 2026 · base <code>049d6a932ebae9e9060eb9fdd08030f7cc597d28</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2><p>Saving a task comment with agent notification enabled can leave the caller waiting even though the new comment is already in SQLite. The Tasks RPC handler awaits the notification helper before returning the comment or publishing its change event. Either a pending thread lookup or a pending message send holds that response open. A controlled delivery gate reproduces this behavior in two separate clean main checkouts; no live provider or production data is involved.</p>
+<h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr><tr><td>Agent delivery blocks the save response after persistence.</td><td class="ok">Verified</td><td>Both blocked-get and blocked-send tests find two committed comments, but the save promise has not returned.</td></tr><tr><td>The initial comment change event is behind delivery.</td><td class="ok">Verified by source</td><td>The only initial publish is after the awaited delivery in the base implementation (lines 430–443).</td></tr><tr><td>Rejected delivery leaves notification count at zero.</td><td class="ok">Verified</td><td>The existing helper catches thread failures and returns zero; the added post-fix RPC failure test checks persisted data and a warning.</td></tr><tr><td>CLI JSON needs a final notification count.</td><td class="ok">Verified</td><td>The existing CLI regression asserts notifiedCount=1; the complete CLI suite still passes with explicit waiting.</td></tr><tr><td>Busy-server latency and slower comment-list opening.</td><td class="unv">Unverified at runtime</td><td>No load benchmark or live UI/HTTP run was performed. Comment-list optimization is outside this fix.</td></tr></table>
+<h2>3. Environment</h2><p>Public repository get-bb/bb; main base <code>049d6a932ebae9e9060eb9fdd08030f7cc597d28</code>; Linux x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1; Tasks 0.1.2; Plugin SDK 0.6.13; better-sqlite3 12.10.0. The official plugin-host test harness creates a fresh temporary storage directory and a real SQLite database. Only its thread transport is controlled. No HTTP ports, enrolled machines, live providers, or personal runtime data were used.</p>
+<h2>4. Minimal reproduction</h2><ol><li>Start from the pinned public main commit.</li><li>Install frozen dependencies and build the Tasks subsystem.</li><li>Apply the supplied test-only patch. It adds two cases to the existing typed RPC owner test.</li><li>Run the filtered Turbo command below. Each test commits an earlier agent reply, starts a notified save, leaves either lookup or send pending, then checks persistence and response completion after an event-loop turn.</li></ol><pre>git clone https://github.com/get-bb/bb.git repro-4675
+cd repro-4675
+git checkout 049d6a932ebae9e9060eb9fdd08030f7cc597d28
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=bb-plugin-tasks
+curl -fsS https://get-bb.github.io/reports/issues/4675/repro/regression.patch -o /tmp/issue-4675-regression.patch
+git apply /tmp/issue-4675-regression.patch
+pnpm exec turbo run test --filter=bb-plugin-tasks -- api/api.test.ts -t 'returns and publishes a persisted comment'</pre>
+<p><strong>Expected:</strong> two comments are committed; the save response has returned with initial notifiedCount=0; comments:changed has published once before delivery is released. After release, the persisted count becomes 1 and a second event publishes. <strong>Actual on main:</strong> persistence succeeds, but responseReturned remains false. Both cases fail before reaching the initial-event assertion.</p><pre>bb-plugin-tasks:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+bb-plugin-tasks:test: 
+bb-plugin-tasks:test:  FAIL  |bb-plugin-tasks| api/api.test.ts &gt; Tasks RPC domain API &gt; returns and publishes a persisted comment while notification get is blocked
+bb-plugin-tasks:test:  FAIL  |bb-plugin-tasks| api/api.test.ts &gt; Tasks RPC domain API &gt; returns and publishes a persisted comment while notification send is blocked
+bb-plugin-tasks:test: AssertionError: expected false to be true // Object.is equality
+bb-plugin-tasks:test: 
+bb-plugin-tasks:test: - Expected
+bb-plugin-tasks:test: + Received
+bb-plugin-tasks:test: 
+bb-plugin-tasks:test: - true
+bb-plugin-tasks:test: + false
+bb-plugin-tasks:test: 
+bb-plugin-tasks:test:  ❯ api/api.test.ts:67:34
+bb-plugin-tasks:test:      65|         await new Promise&lt;void&gt;((resolve) =&gt; setImmediate(resolve));
+bb-plugin-tasks:test:      66|         expect(store.tasks.listComments(task.id)).toHaveLength(2);
+bb-plugin-tasks:test:      67|         expect(responseReturned).toBe(true);
+bb-plugin-tasks:test:        |                                  ^
+bb-plugin-tasks:test:      68|         const { comment } = await response;
+bb-plugin-tasks:test:      69|         expect(comment.notifiedCount).toBe(0);
+bb-plugin-tasks:test: 
+bb-plugin-tasks:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+bb-plugin-tasks:test: 
+bb-plugin-tasks:test: 
+bb-plugin-tasks:test:  Test Files  1 failed (1)
+bb-plugin-tasks:test:       Tests  2 failed | 22 skipped (24)
+</pre>
+<p><a href="4675/repro/regression.patch">Exact test-only patch used in both clean checkouts</a> · <a href="4675/repro/api.test.ts">Complete baseline test file with regression added</a></p><p>Regression test excerpt (imports and the surrounding existing tests are in the complete artifact):</p><pre>  it.each([&quot;get&quot;, &quot;send&quot;])(
+    &quot;returns and publishes a persisted comment while notification %s is blocked&quot;,
+    async (blockedOperation) =&gt; {
+      let releaseDelivery = () =&gt; {};
+      const deliveryGate = new Promise&lt;void&gt;((resolve) =&gt; {
+        releaseDelivery = resolve;
+      });
+      const { bb, harness } = createFakePluginHost({
+        pluginId: &quot;tasks&quot;,
+        sdk: {
+          threads: {
+            get: async ({ threadId }) =&gt; {
+              if (blockedOperation === &quot;get&quot;) await deliveryGate;
+              return makeThreadResponse({ id: threadId, status: &quot;active&quot; });
+            },
+            send: async () =&gt; {
+              if (blockedOperation === &quot;send&quot;) await deliveryGate;
+            },
+          },
+        },
+      });
+      const store = createStore(bb);
+      registerTasksApi(bb, store);
+      const project = store.tasks.createProject({
+        name: &quot;Delivery gate&quot;,
+        prefix: &quot;GATE&quot;,
+        color: &quot;blue&quot;,
+      });
+      const task = store.tasks.createTask({
+        projectId: project.id,
+        title: &quot;Persist before delivery&quot;,
+      });
+      store.tasks.createComment({
+        taskId: task.id,
+        kind: &quot;agent&quot;,
+        authorName: &quot;Worker&quot;,
+        threadId: &quot;thr_delivery_gate&quot;,
+        body: &quot;Prior reply&quot;,
+      });
+      let responseReturned = false;
+      const response = harness
+        .callRpc(&quot;createComment&quot;, {
+          taskId: task.id,
+          body: &quot;New context&quot;,
+          notify: true,
+        })
+        .then((result) =&gt; {
+          responseReturned = true;
+          return tasksRpcContract.createComment.output.parse(result);
+        });
+      try {
+        await new Promise&lt;void&gt;((resolve) =&gt; setImmediate(resolve));
+        expect(store.tasks.listComments(task.id)).toHaveLength(2);
+        expect(responseReturned).toBe(true);
+        const { comment } = await response;
+        expect(comment.notifiedCount).toBe(0);
+        expect(harness.realtimeSignals).toEqual([
+          { channel: &quot;comments:changed&quot;, payload: { taskId: task.id } },
+        ]);
+        releaseDelivery();
+        await expect
+          .poll(() =&gt; store.tasks.getComment(comment.id)?.notifiedCount)
+          .toBe(1);
+        expect(harness.realtimeSignals).toEqual([
+          { channel: &quot;comments:changed&quot;, payload: { taskId: task.id } },
+          { channel: &quot;comments:changed&quot;, payload: { taskId: task.id } },
+        ]);
+      } finally {
+        releaseDelivery();
+        await response;
+        await harness.dispose();
+      }
+    },
+  );
+
+</pre>
+<h2>5. Root cause</h2><p>The insert is a synchronous database transaction. The async helper then awaits external thread operations before it updates the count, publishes the comment event, and returns. Durable persistence and agent-side acknowledgement are therefore on the same response critical path. No rollback, SQLite lock, or data loss is needed for the reproduced stall.</p><p><a href="https://github.com/get-bb/bb/blob/049d6a932ebae9e9060eb9fdd08030f7cc597d28/plugins/tasks/api/index.ts#L414-L443">Base createComment, lines 414–443</a></p><pre>if (input.notify) {
+  const notifiedCount = await deliverCommentToLatestAgent(bb, store.tasks, {
+    taskId: comment.taskId,
+    commentId: comment.id,
+    body: comment.body,
+    authorName: comment.authorName,
+  });
+  comment = store.transaction(() =&gt;
+    store.tasks.updateComment(comment.id, { notifiedCount }),
+  );
+}
+publishCommentsChanged(bb, input.taskId);
+return comment;</pre>
+<p><a href="https://github.com/get-bb/bb/blob/049d6a932ebae9e9060eb9fdd08030f7cc597d28/plugins/tasks/steer/index.ts#L25-L56">Delivery helper, lines 25–56</a> awaits threads.get then threads.send with steer-if-active, catches transport errors, logs them, and returns zero on failure. <a href="https://github.com/get-bb/bb/blob/049d6a932ebae9e9060eb9fdd08030f7cc597d28/plugins/tasks/views/activity/task-activity.tsx#L319-L341">The composer awaits this same RPC before clearing its input</a>. The API regression establishes the blocking dependency; it does not measure real agent-turn cost.</p>
+<h2>6. Proposed fix and tested implementation</h2><p>Publish the initial change immediately after committing the insert. Let the app/SDK RPC return that saved comment without awaiting delivery. Keep an explicit internal awaitDelivery choice for CLI calls, preserving their final JSON count. Delivery persists its final count and publishes a second change; rejected transport still logs and leaves zero. Catch background update failures so they do not become unhandled promise rejections.</p><p>The verified candidate is confined to the Tasks subsystem: five files, 164 changed text lines (157 additions + 7 deletions), no dependencies, generated files, migrations, stored-data changes, public field or schema changes, or daemon wire changes. No public wait option is introduced; CLI flags remain unchanged.</p>
+<h2>7. Related work</h2><p>No linked open pull request was present in the issue timeline or the open-PR search at investigation time. No related issue was required to explain this root cause. Comment-list thread/provider enrichment remains separate work.</p>
+<h2>8. Verification</h2><p>The same agent repeated the exact test-only patch and filtered command in a second clean detached checkout of <code>049d6a932ebae9e9060eb9fdd08030f7cc597d28</code>, with a fresh frozen install and new harness-created SQLite storage. Both blocked operations again failed with expected true / received false. This is a second clean reproduction, not an independent-agent review. No correction to the causal finding was needed.</p><p>Before fix: two focused regressions failed in each checkout. After fix: the API and CLI suites passed all 52 tests; the complete Tasks suite passed 411 tests in 40 files. After updating the composer test caller for the required internal option, its focused suite passed 13 tests. Final Tasks lint and typecheck passed; lint emitted 31 existing warnings and zero errors. git diff --check passed. The failure test confirms saved body, notifiedCount=0, and warning logging when send rejects.</p>
+<h2>9. Appendix</h2><ul><li><a href="4675/repro/base.log">First trusted baseline test log</a></li><li><a href="4675/repro/verify.log">Second clean baseline test log</a></li><li><a href="4675/repro/focused-after.log">Post-fix API and CLI test log</a></li><li><a href="4675/repro/checks.log">Final lint/typecheck log</a></li></ul><p>Additional commands: <code>pnpm exec turbo run lint typecheck test --filter=bb-plugin-tasks</code> (all 411 tests passed; it exposed one missing internal argument in a test caller, subsequently fixed), <code>pnpm exec turbo run test --filter=bb-plugin-tasks -- views/activity/task-activity.test.tsx</code>, <code>pnpm exec turbo run lint typecheck --filter=bb-plugin-tasks</code>, <code>pnpm exec oxfmt &lt;changed Tasks paths&gt;</code>, <code>git diff --check</code>, and <code>git diff --numstat origin/main</code>. All source links use the pinned trusted commit. Issue claims were treated as untrusted evidence; no contributor patch, branch, script, or external issue link was executed.</p><p>&gt; AGENT GENERATED</p>
+</main></body></html>
