@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #4837 Source grant acquisition runs behind its own write freeze</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#4837 · Source grant acquisition runs behind its own write freeze</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High</span><span class="pill">Effort: Low</span><span class="pill">remote · connect</span><a href="https://github.com/get-bb/bb/issues/4837">GitHub issue</a><span>2026-10-04 · base <code>4d15c1da0a848fa4834c1e5d0480a0891683bbe9</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · reproduction label: <code>confirmed-repro</code></p>
+
+<h2>1. TL;DR</h2>
+<p>A Connect server move can block the account RPC needed to obtain its source machine's access grant. The coordinator freezes public writes before it asks for that grant. The account RPC is a POST, so the actual write-freeze middleware rejects it with HTTP 503. An isolated regression exercising the real coordinator, a migrated SQLite database, and the real HTTP middleware reproduced this failure twice on trusted main. Resolving the grant before freezing writes lets the same regression finish the move without exempting any RPC from the freeze.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Reported claim</th><th>Finding</th><th>Evidence / limit</th></tr>
+<tr><td>Source grant lookup runs after the write freeze.</td><td class="ok">Verified</td><td>Trusted coordinator sequencing and both failing runs.</td></tr>
+<tr><td>The account RPC receives HTTP 503 while the move resolves its grant.</td><td class="ok">Verified at the transport boundary</td><td>The real middleware returned 503 for the account fetch RPC POST during source grant resolution. The unfrozen endpoint returns 200 after the sequencing fix.</td></tr>
+<tr><td>Connect uses the account plugin and reduces unavailability to a pairing error.</td><td class="ok">Verified in source</td><td>Account-client RPC transport and hosted machine-code error mapping. No authenticated cloud request was made.</td></tr>
+<tr><td>All moves on the reported macOS installation fail, including five retries and target re-enrollment.</td><td class="unv">Unverified</td><td>No reporter desktop, credentials, or VM was used. Existing saved grants can avoid the account-fetch acquisition path.</td></tr>
+<tr><td>The error also appears in machine settings.</td><td class="unv">Source-supported, not UI-reproduced</td><td>The server access resolver persists acquisition errors in the host status message.</td></tr></table>
+
+<h2>3. Environment</h2>
+<ul><li>Public repository <code>get-bb/bb</code>; trusted main commit <code>4d15c1da0a848fa4834c1e5d0480a0891683bbe9</code>; package version 0.45.0.</li><li>Linux x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li><li>Frozen dependency install and normal Turbo build succeeded in both checkouts.</li><li>Real migrated SQLite test harness; fresh temporary data directories generated per test and cleaned by the harness. HTTP requests use Hono's in-process request API; no listening server, production instance, cloud credentials, or agent provider is needed.</li><li>The source grant callback uses the production freeze middleware with the same database freeze state as the coordinator. The successful account handler and daemon replies are fixtures: this is a lifecycle/HTTP-boundary reproduction, not a live account or desktop end-to-end test.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol><li>Create a fresh checkout of the public main commit and install its locked dependencies.<pre>git clone https://github.com/get-bb/bb.git bb-4837
+cd bb-4837
+git checkout --detach 4d15c1da0a848fa4834c1e5d0480a0891683bbe9
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build</pre></li>
+<li>Save the complete agent-authored regression change shown below as <code>regression.patch</code> in this checkout and apply it. It extends the existing Connect move test to send an HTTP account fetch RPC through the real freeze middleware during grant acquisition. Production code remains unchanged.<pre>git apply regression.patch
+pnpm exec turbo run test --filter=@bb/server -- test/server-move/coordinator.test.ts -t 'source grant requires'</pre></li>
+<li>Expected: account RPC returns 200, then the source grant is handed to the target and the move retires the source. Actual on main: account RPC returns 503 and the move does not complete.<pre>AssertionError: expected [ 503 ] to deeply equal [ 200 ]
+
+- Expected
++ Received
+
+  [
+-   200,
++   503,
+  ]
+
+Test Files  1 failed (1)
+Tests  1 failed | 23 skipped (24)</pre></li></ol>
+<details><summary>Complete regression test change</summary><pre>diff --git a/apps/server/test/server-move/coordinator.test.ts b/apps/server/test/server-move/coordinator.test.ts
+index 941e81ba0..fb1c4945e 100644
+--- a/apps/server/test/server-move/coordinator.test.ts
++++ b/apps/server/test/server-move/coordinator.test.ts
+@@ -13,8 +13,11 @@ import {
+ } from &quot;@bb/server-archive&quot;;
+ import type { ServerMoveStatus } from &quot;@bb/server-contract&quot;;
+ import { createDeferredPromise } from &quot;@bb/test-helpers&quot;;
++import { Hono } from &quot;hono&quot;;
+ import { describe, expect, it, vi } from &quot;vitest&quot;;
++import { createServerErrorHandler } from &quot;../../src/errors.js&quot;;
+ import { createServerMoveCoordinator } from &quot;../../src/services/server-move/coordinator.js&quot;;
++import { serverMoveFreezeMiddleware } from &quot;../../src/services/server-move/freeze.js&quot;;
+ import {
+   isServerMoveFrozen,
+   isServerMoveSnapshotFenced,
+@@ -32,7 +35,11 @@ import {
+   type FakeDaemonReply,
+ } from &quot;../helpers/server-move.js&quot;;
+ import { seedHost, seedPrimaryHost } from &quot;../helpers/seed.js&quot;;
+-import { withTestHarness, type TestAppHarness } from &quot;../helpers/test-app.js&quot;;
++import {
++  testLogger,
++  withTestHarness,
++  type TestAppHarness,
++} from &quot;../helpers/test-app.js&quot;;
+ 
+ const OLD = &quot;host-old&quot;;
+ const NEW = &quot;host-new&quot;;
+@@ -550,12 +557,24 @@ describe(&quot;server move coordinator&quot;, () =&gt; {
+       await expect.poll(() =&gt; events.includes(&quot;retire&quot;)).toBe(true);
+     }));
+ 
+-  it(&quot;moves a bb connect server with the old server&#x27;s own grant and no address probe&quot;, () =&gt;
++  it(&quot;moves a bb connect server whose source grant requires a writable account RPC&quot;, () =&gt;
+     withTestHarness(async (harness) =&gt; {
+       seedTopology(harness);
+       const base = createTestServerMoveEnvironment(harness);
+       const { events } = base;
+       const grantHeaders = { &quot;x-bb-connect-machine&quot;: &quot;bbcm_laptop&quot; };
++      const accountRpcStatuses: number[] = [];
++      const accountRpcPath =
++        &quot;/api/v1/plugins/bb-account/rpc/bb-account.v1.fetch&quot;;
++      const accountRpc = new Hono();
++      accountRpc.onError(createServerErrorHandler(testLogger));
++      accountRpc.use(
++        &quot;/api/v1/*&quot;,
++        serverMoveFreezeMiddleware({
++          isFrozen: () =&gt; isServerMoveFrozen(harness.db),
++        }),
++      );
++      accountRpc.post(accountRpcPath, (context) =&gt; context.json({ ok: true }));
+       const coordinator = createServerMoveCoordinator({
+         ...base.environment,
+         resolveMode: async () =&gt; ({
+@@ -565,6 +584,13 @@ describe(&quot;server move coordinator&quot;, () =&gt; {
+         }),
+         resolveServerHostGrant: async (hostId) =&gt; {
+           events.push(`grant:${hostId}`);
++          const response = await accountRpc.request(accountRpcPath, {
++            method: &quot;POST&quot;,
++          });
++          accountRpcStatuses.push(response.status);
++          if (!response.ok) {
++            throw new Error(await response.text());
++          }
+           return { serverUrl: CONNECT_URL, headers: grantHeaders };
+         },
+       });
+@@ -593,6 +619,7 @@ describe(&quot;server move coordinator&quot;, () =&gt; {
+         serverUrl: CONNECT_URL,
+         destinationStatusUrl: null,
+       });
++      await expect.poll(() =&gt; accountRpcStatuses).toEqual([200]);
+       await expect.poll(() =&gt; events.includes(&quot;retire&quot;)).toBe(true);
+ 
+       expect(events).toEqual([
+</pre></details>
+<p>The inline patch contains the complete test change; all unchanged imports and helper setup come from the trusted repository test file. Run it in the existing repository test harness, not as a standalone script. Raw logs and the full extended test file are retained locally, outside the public reports repository.</p>
+
+<h2>5. Root cause</h2>
+<ol><li><a href="https://github.com/get-bb/bb/blob/4d15c1da0a848fa4834c1e5d0480a0891683bbe9/apps/server/src/services/server-move/coordinator.ts#L544-L575"><code>apps/server/src/services/server-move/coordinator.ts:544</code></a> sets the write freeze at line 546, stops running work, and only then resolves the source host grant at lines 557–566.</li>
+<li><a href="https://github.com/get-bb/bb/blob/4d15c1da0a848fa4834c1e5d0480a0891683bbe9/apps/server/src/services/server-move/environment.ts#L144-L156"><code>apps/server/src/services/server-move/environment.ts:144</code></a> delegates grant resolution to the server access subsystem. <a href="https://github.com/get-bb/bb/blob/4d15c1da0a848fa4834c1e5d0480a0891683bbe9/plugins/connect/src/server-access.ts#L129-L176"><code>plugins/connect/src/server-access.ts:129</code></a> can reuse a stored result, but otherwise mints a machine code and redeems it to obtain a grant.</li>
+<li><a href="https://github.com/get-bb/bb/blob/4d15c1da0a848fa4834c1e5d0480a0891683bbe9/plugins/connect/src/account-client.ts#L133-L178"><code>plugins/connect/src/account-client.ts:133</code></a> uses <code>sdk.plugins.callRpc</code> for <code>bb-account.v1.fetch</code>. <a href="https://github.com/get-bb/bb/blob/4d15c1da0a848fa4834c1e5d0480a0891683bbe9/packages/sdk/src/areas/plugins.ts#L418-L432"><code>packages/sdk/src/areas/plugins.ts:418</code></a> sends that operation over HTTP POST.</li>
+<li><a href="https://github.com/get-bb/bb/blob/4d15c1da0a848fa4834c1e5d0480a0891683bbe9/apps/server/src/server.ts#L828-L842"><code>apps/server/src/server.ts:828</code></a> applies the global freeze middleware to <code>/api/v1/*</code>. <a href="https://github.com/get-bb/bb/blob/4d15c1da0a848fa4834c1e5d0480a0891683bbe9/apps/server/src/services/server-move/freeze.ts#L4-L30"><code>apps/server/src/services/server-move/freeze.ts:4</code></a> allows read methods and server-move routes, not account RPC POSTs. The rejection is <code>503 server_moving</code>.</li>
+<li><a href="https://github.com/get-bb/bb/blob/4d15c1da0a848fa4834c1e5d0480a0891683bbe9/plugins/connect/src/account-client.ts#L147-L152"><code>plugins/connect/src/account-client.ts:147</code></a> turns HTTP 503 into <code>AccountUnavailableError</code>; <a href="https://github.com/get-bb/bb/blob/4d15c1da0a848fa4834c1e5d0480a0891683bbe9/plugins/connect/src/hosted.ts#L150-L170"><code>plugins/connect/src/hosted.ts:150</code></a> maps that to <code>MachineCodeError("not_paired")</code>. <a href="https://github.com/get-bb/bb/blob/4d15c1da0a848fa4834c1e5d0480a0891683bbe9/apps/server/src/services/plugins/plugin-service.ts#L1403-L1412"><code>apps/server/src/services/plugins/plugin-service.ts:1403</code></a> converts a failed isolated provider call to the generic server-access error, obscuring the freeze rejection.</li>
+<li><a href="https://github.com/get-bb/bb/blob/4d15c1da0a848fa4834c1e5d0480a0891683bbe9/apps/server/src/services/machines/server-access.ts#L178-L226"><code>apps/server/src/services/machines/server-access.ts:178</code></a> persists an acquisition error to the machine status message. This supports the reported side effect without claiming a UI reproduction.</li></ol>
+<p>Relevant trusted history: commit <code>f9e0b51a6</code> introduced the account-plugin transport. No newer trusted main change to the investigated paths was present when checked.</p>
+
+<h2>6. Proposed fix</h2>
+<p>Resolve the source grant while the server and account plugin can still accept writes. Respect cancellation, then freeze writes, pause schedules, stop running work, and suspend plugins as before. This preserves all existing freeze exemptions and authentication/authorization behavior. Do not broadly exempt account or Connect RPC writes: the coordinator only needs this grant before entering its frozen stage.</p>
+<p>The local fix changes two files in the server-move subsystem, with 55 added-plus-deleted text lines. It changes no dependency, stored-data format, public protocol, or security boundary. The focused regression passes after the fix; all 97 existing and updated server-move tests in 16 files pass, including freeze fences, cancellation, recovery, and handoff. Server typecheck, formatting checks, and <code>git diff --check</code> also pass.</p>
+
+<h2>7. Verification</h2>
+<p>The same agent repeated the reproduction in a second fresh temporary detached checkout at <code>4d15c1da0a848fa4834c1e5d0480a0891683bbe9</code> (temporary directory identifier redacted). Only the same regression-test patch was applied; production files remained identical to trusted main. This checkout performed its own frozen install and normal Turbo build and ran the command from section 4. The test again failed with actual <code>[503]</code> versus expected <code>[200]</code>, proving the original finding was not a dirty-tree artifact. Turbo showed a cache miss for the server test in both failing runs. No substantive report correction was required. This is a second clean verification, not independent-agent verification.</p>
+<pre>AssertionError: expected [ 503 ] to deeply equal [ 200 ]
+
+- Expected
++ Received
+
+  [
+-   200,
++   503,
+  ]
+
+Test Files  1 failed (1)
+Tests  1 failed | 23 skipped (24)</pre>
+
+<h2>8. Related issues</h2>
+<p>Nearby server-move reports cover interrupted target transfer and external-path plugin settings. Those are separate failure modes; this reproduction stops earlier at grant acquisition. GitHub cross-reference metadata and an open-PR search showed no existing open pull request linked to #4837 during investigation.</p>
+
+<h2>9. Appendix</h2>
+<p>Verbatim result summaries after the fix (full raw logs retained locally):</p>
+<pre>Focused regression:
+Test Files  1 passed (1)
+Tests  1 passed | 23 skipped (24)
+
+Server-move suites:
+Test Files  16 passed (16)
+Tests  97 passed (97)
+
+Server typecheck:
+Tasks:    5 successful, 5 total
+
+Formatting:
+All matched files use the correct format.</pre>
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/server-move
+pnpm exec turbo run typecheck --filter=@bb/server
+pnpm exec oxfmt --check apps/server/src/services/server-move/coordinator.ts apps/server/test/server-move/coordinator.test.ts
+git diff --check
+git diff --numstat origin/main</pre>
+<p>Trust note: issue prose and proposed remedies were treated as untrusted hypotheses. No command, patch, linked branch, or external resource supplied by the issue was executed or fetched. The reproduction and fix were authored from trusted repository evidence. No real account information, credentials, production data, or home paths are published.</p>
+</main></body></html>
