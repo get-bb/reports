@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #4839 Retry scheduling omits temporary gateway failures</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#4839 · Retry scheduling omits temporary gateway failures</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High</span><span class="pill">Effort: Medium</span><span class="pill">providers · provider-retry</span><a href="https://github.com/get-bb/bb/issues/4839">open on GitHub</a><span>2026-10-04 · base <code>4d15c1da0a848fa4834c1e5d0480a0891683bbe9</code></span></p>
+<p class="verdict">Verdict: REPRODUCED · Root-cause confidence: high · Reproduction label: confirmed-repro</p>
+
+<h2>1. TL;DR</h2>
+<p>The automatic retry plugin does not schedule another turn for the gateway failure shapes examined here. The trusted Claude classifier produces a rate-limit category for HTTP 429 and an internal category for HTTP 502/503; the trusted Codex translator preserves exhausted-attempt and disconnected-stream categories even when a retryable HTTP status accompanies them. The retry policy accepts only overloads and resettable subscription-window limits, so these cases exit before requesting a queued retry. A direct, enabled-plugin test reproduced five missing retry requests in two clean checkouts of main. This is a deterministic classifier-to-plugin reproduction, not a reenactment of the reported production outages.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Claude 429 without a rate-limit snapshot is declined.</td><td class="ok">Verified</td><td>The real classifier and enabled retry plugin return no-rate-limit-state and issue zero retry requests.</td></tr>
+<tr><td>Codex terminal 429 exhaustion is not retried.</td><td class="ok">Verified</td><td>A schema-valid synthetic terminal notification through the real translator yields too-many-failed-attempts; the enabled plugin requests no retry.</td></tr>
+<tr><td>Claude 502 and Codex 502 disconnects are declined.</td><td class="ok">Verified</td><td>Both real classification paths reach not-retryable and zero retry requests. A synthetic Claude 503 case behaves the same way.</td></tr>
+<tr><td>The pool sends its earliest reset as Retry-After.</td><td class="ok">Verified at the pool boundary</td><td>Existing quota-exhaustion tests for both provider families return 429 with retry-after: 60, then recover. They pass on this base.</td></tr>
+<tr><td>An unreachable upstream can produce a pool-generated 502.</td><td class="ok">Verified at the pool boundary</td><td>The existing sanitized-transport-failure test injects a fetch failure and asserts HTTP 502; it passes.</td></tr>
+<tr><td>Authentication failures must remain non-retryable.</td><td class="ok">Verified for classified HTTP 401</td><td>The negative control issues no retry; it does not exercise real credentials.</td></tr>
+<tr><td>The retry plugin caused the described production downtime.</td><td class="unv">Not established</td><td>The report states that the plugin was disabled during those incidents. They cannot demonstrate the behavior of an enabled retry plugin. No production data or provider sessions were accessed.</td></tr>
+</table>
+
+<h2>3. Environment</h2>
+<ul><li>Trusted repository: public get-bb/bb; origin/main and the official repository main ref both resolved to <code>4d15c1da0a848fa4834c1e5d0480a0891683bbe9</code>.</li>
+<li>Linux x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1. Built-in provider-retry package 0.1.0.</li>
+<li>Both checkouts received a frozen, prefer-offline install and the normal Turbo build: 63 of 63 build tasks succeeded in each.</li>
+<li>No development application, enrolled host, real provider process, browser, or user's runtime store was used. The retry API is a recording fake supplied by the repository's plugin test harness. Failure events and provider notifications are synthetic; provider classification and the retry plugin are real.</li>
+<li>No new dependency, migration, generated module, or production source change was made.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol><li>Create a clean trusted checkout and build it:
+<pre>git clone https://github.com/get-bb/bb.git bb-repro-4839
+cd bb-repro-4839
+git checkout --detach 4d15c1da0a848fa4834c1e5d0480a0891683bbe9
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build</pre></li>
+<li>Save the complete test in the next section as <code>apps/server/test/internal/issue-4839.test.ts</code>. The location intentionally allows the diagnostic to import the three production plugins without changing a forkable plugin's dependency boundary.</li>
+<li>Run the owner-boundary diagnostic through Turbo:
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/internal/issue-4839.test.ts</pre></li>
+<li>Expected behavior for the five temporary-status candidates is one retry request per event. Actual behavior is zero. The HTTP 401 negative control and existing HTTP 529 overload positive control both pass. This probe establishes scheduling eligibility only; it cannot prove Retry-After timing because that header is not present in the failure event.</li></ol>
+<p>Verbatim diagnostic output from the first final run:</p><pre>@bb/server:test: {&quot;errorInfo&quot;:{&quot;category&quot;:&quot;rate-limit&quot;,&quot;providerCode&quot;:null,&quot;httpStatusCode&quot;:429},&quot;decision&quot;:{&quot;kind&quot;:&quot;decline&quot;,&quot;reason&quot;:&quot;no-rate-limit-state&quot;},&quot;retries&quot;:0}
+@bb/server:test: {&quot;errorInfo&quot;:{&quot;category&quot;:&quot;internal&quot;,&quot;providerCode&quot;:null,&quot;httpStatusCode&quot;:502},&quot;decision&quot;:{&quot;kind&quot;:&quot;decline&quot;,&quot;reason&quot;:&quot;not-retryable&quot;},&quot;retries&quot;:0}
+@bb/server:test: {&quot;errorInfo&quot;:{&quot;category&quot;:&quot;internal&quot;,&quot;providerCode&quot;:null,&quot;httpStatusCode&quot;:503},&quot;decision&quot;:{&quot;kind&quot;:&quot;decline&quot;,&quot;reason&quot;:&quot;not-retryable&quot;},&quot;retries&quot;:0}
+@bb/server:test: {&quot;errorInfo&quot;:{&quot;category&quot;:&quot;too-many-failed-attempts&quot;,&quot;providerCode&quot;:&quot;responseTooManyFailedAttempts&quot;,&quot;httpStatusCode&quot;:429},&quot;decision&quot;:{&quot;kind&quot;:&quot;decline&quot;,&quot;reason&quot;:&quot;not-retryable&quot;},&quot;retries&quot;:0}
+@bb/server:test: {&quot;errorInfo&quot;:{&quot;category&quot;:&quot;stream-disconnected&quot;,&quot;providerCode&quot;:&quot;responseStreamDisconnected&quot;,&quot;httpStatusCode&quot;:502},&quot;decision&quot;:{&quot;kind&quot;:&quot;decline&quot;,&quot;reason&quot;:&quot;not-retryable&quot;},&quot;retries&quot;:0}
+@bb/server:test: AssertionError: expected [] to have a length of 1 but got +0
+@bb/server:test: AssertionError: expected [] to have a length of 1 but got +0
+@bb/server:test: AssertionError: expected [] to have a length of 1 but got +0
+@bb/server:test:       Tests  5 failed | 2 passed (7)</pre>
+<p>The five regression candidates fail with an expected queue length of 1 and actual length of 0. Exit status: 1. The same outcome occurs in the second clean checkout.</p>
+<h3>Complete reproduction test</h3>
+<p>This is an intentionally failing diagnostic, not a landed regression test. SHA-256: <code>5670201b3b1cc3f16f9fb21ca0f7139e7853221b7eb2d8563ea928e13ad3fcc5</code>.</p>
+<pre id="repro-source">import { describe, expect, it } from &quot;vitest&quot;;
+import type { PluginTurnFailedEvent } from &quot;@get-bb/plugin-sdk&quot;;
+import {
+  createFakePluginHost,
+  makeTurnFailedEvent,
+} from &quot;@get-bb/plugin-sdk/testing&quot;;
+import { buildClaudeProviderErrorInfo } from &quot;../../../../plugins/provider-claude-code/src/error-info.js&quot;;
+import {
+  createCodexEventTranslationState,
+  translateCodexEventToDeltas,
+} from &quot;../../../../plugins/provider-codex/src/delta-translation.js&quot;;
+import plugin from &quot;../../../../plugins/provider-retry/server.js&quot;;
+import {
+  DEFAULT_MAXIMUM_WAIT_MS,
+  decideRetry,
+} from &quot;../../../../plugins/provider-retry/src/retry-policy.js&quot;;
+
+const NOW = Date.parse(&quot;2026-10-04T12:00:00.000Z&quot;);
+type ErrorInfo = NonNullable&lt;PluginTurnFailedEvent[&quot;errorInfo&quot;]&gt;;
+
+function codexError(
+  kind: &quot;attempts&quot; | &quot;disconnect&quot;,
+  status: number,
+): ErrorInfo {
+  const codexErrorInfo =
+    kind === &quot;attempts&quot;
+      ? { responseTooManyFailedAttempts: { httpStatusCode: status } }
+      : { responseStreamDisconnected: { httpStatusCode: status } };
+  const deltas = translateCodexEventToDeltas(
+    {
+      method: &quot;error&quot;,
+      params: {
+        threadId: &quot;synthetic-provider-thread&quot;,
+        turnId: &quot;synthetic-provider-turn&quot;,
+        error: {
+          message: &quot;Synthetic terminal provider failure&quot;,
+          codexErrorInfo,
+          additionalDetails: null,
+        },
+        willRetry: false,
+      },
+    },
+    createCodexEventTranslationState(),
+  );
+  const delta = deltas.find((entry) =&gt; entry.kind === &quot;provider.error&quot;);
+  if (delta?.kind !== &quot;provider.error&quot; || !delta.errorInfo) {
+    throw new Error(&quot;Trusted Codex translator did not emit an error&quot;);
+  }
+  return delta.errorInfo;
+}
+
+function claudeError(status: number): ErrorInfo {
+  const errorInfo = buildClaudeProviderErrorInfo({ httpStatusCode: status });
+  if (!errorInfo) throw new Error(&quot;Trusted Claude classifier emitted no error&quot;);
+  return errorInfo;
+}
+
+async function assertQueue(errorInfo: ErrorInfo, expectedCount: number) {
+  const retries: { threadId: string }[] = [];
+  const host = createFakePluginHost({
+    pluginId: &quot;provider-retry&quot;,
+    sdk: {
+      threads: {
+        retry: async (args: { threadId: string }) =&gt; {
+          retries.push(args);
+          return { ok: true };
+        },
+      },
+    },
+  });
+  try {
+    await plugin(host.bb);
+    const failure = makeTurnFailedEvent({
+      threadId: &quot;synthetic-thread&quot;,
+      requestId: &quot;synthetic-request&quot;,
+      errorInfo,
+      rateLimits: null,
+      attemptNumber: 1,
+    });
+    const decision = decideRetry({
+      failure,
+      maximumWaitMs: DEFAULT_MAXIMUM_WAIT_MS,
+      now: NOW,
+      random: 0,
+    });
+    const { errors } = await host.harness.behavior.emitThreadEvent(
+      &quot;turn.failed&quot;,
+      failure,
+    );
+    console.log(
+      JSON.stringify({ errorInfo, decision, retries: retries.length }),
+    );
+    expect(errors).toEqual([]);
+    expect(retries).toHaveLength(expectedCount);
+  } finally {
+    await host.harness.dispose();
+  }
+}
+
+describe(&quot;temporary HTTP failures reaching provider retry&quot;, () =&gt; {
+  it.each([429, 502, 503])(
+    &quot;queues a Claude HTTP %s failure&quot;,
+    async (status) =&gt; {
+      await assertQueue(claudeError(status), 1);
+    },
+  );
+
+  it(&quot;queues a Codex terminal HTTP 429 exhaustion&quot;, async () =&gt; {
+    await assertQueue(codexError(&quot;attempts&quot;, 429), 1);
+  });
+
+  it(&quot;queues a Codex HTTP 502 disconnect&quot;, async () =&gt; {
+    await assertQueue(codexError(&quot;disconnect&quot;, 502), 1);
+  });
+
+  it(&quot;keeps HTTP 401 non-retryable&quot;, async () =&gt; {
+    await assertQueue(claudeError(401), 0);
+  });
+
+  it(&quot;queues the already-supported overload control&quot;, async () =&gt; {
+    await assertQueue(claudeError(529), 1);
+  });
+});
+</pre>
+
+<h2>5. Root cause</h2>
+<ol><li>The pool's <a href="https://github.com/get-bb/bb/blob/4d15c1da0a848fa4834c1e5d0480a0891683bbe9/plugins/account-pool/src/hub.ts#L1240-L1280">no-eligible-account response</a> calculates an earliest reset and puts it in an HTTP Retry-After header. Its <a href="https://github.com/get-bb/bb/blob/4d15c1da0a848fa4834c1e5d0480a0891683bbe9/plugins/account-pool/src/hub.ts#L543-L563">transport-failure path</a> produces HTTP 502. These pool behaviors are not the queueing policy.</li>
+<li><a href="https://github.com/get-bb/bb/blob/4d15c1da0a848fa4834c1e5d0480a0891683bbe9/plugins/provider-claude-code/src/error-info.ts#L17-L36">Claude HTTP classification</a> maps 429 to rate-limit and 502/503 to internal. <a href="https://github.com/get-bb/bb/blob/4d15c1da0a848fa4834c1e5d0480a0891683bbe9/plugins/provider-codex/src/delta-translation.ts#L423-L450">Codex classification</a> maps the structured transport/exhaustion variants to stream-disconnected and too-many-failed-attempts while preserving the status number.</li>
+<li>The <a href="https://github.com/get-bb/bb/blob/4d15c1da0a848fa4834c1e5d0480a0891683bbe9/packages/domain/src/provider-event.ts#L79-L84">shared error-info schema</a> contains category, providerCode, and httpStatusCode, but no gateway origin, retry-after, or retry deadline. The <a href="https://github.com/get-bb/bb/blob/4d15c1da0a848fa4834c1e5d0480a0891683bbe9/packages/plugin-sdk/src/backend-contract.ts#L219-L256">turn-failure event contract</a> adds provider rate-limit snapshots, not gateway response headers.</li>
+<li>The <a href="https://github.com/get-bb/bb/blob/4d15c1da0a848fa4834c1e5d0480a0891683bbe9/apps/server/src/services/threads/turn-failed.ts#L168-L215">server failure-event builder</a> copies recorded provider error classification and the last thread rate-limit event. When no such rate-limit event exists, it supplies null; it does not reconstruct a gateway reset from an error status.</li>
+<li><a href="https://github.com/get-bb/bb/blob/4d15c1da0a848fa4834c1e5d0480a0891683bbe9/plugins/provider-retry/src/retry-policy.ts#L66-L106">decideRetry</a> retries overloaded independently of rate-limit state. Every other category except rate-limit is declined. Rate-limit requires a blocked, resettable subscription window. HTTP status is not consulted.</li>
+<li>The <a href="https://github.com/get-bb/bb/blob/4d15c1da0a848fa4834c1e5d0480a0891683bbe9/plugins/provider-retry/server.ts#L39-L54">enabled plugin event handler</a> immediately returns on a decline. Consequently the queueing API is never called for any of the five failing candidates.</li></ol>
+<pre>if (failure.errorInfo?.category !== "rate-limit") {
+  return { kind: "decline", reason: "not-retryable" };
+}
+const rateLimits = failure.rateLimits;
+if (rateLimits === null || rateLimits.status !== "blocked") {
+  return { kind: "decline", reason: "no-rate-limit-state" };
+}</pre>
+<p>Important distinction: provider-retry is not losing a Retry-After value that it already received. Its input does not contain that value. Changing only its category allowlist cannot implement the reset-aware behavior requested here.</p>
+
+<h2>6. Proposed fix and safety assessment</h2>
+<p>First establish a typed way for the server retry policy to identify a temporary gateway failure and receive its retry deadline without confusing it with a provider subscription window. Preserve HTTP 401/403 rejection behavior. Apply the configured maximum wait to an explicit gateway deadline and reuse bounded overload backoff only for a failure whose temporary status is established. Then extend the canonical plugin tests for queueing, deadline bounds, retry caps, and non-retryable authentication.</p>
+<p>No automatic fix PR was opened. This is not a safe one-subsystem policy edit: reset-aware handling needs gateway/provider-to-thread metadata that the current shared failure contract does not carry, or a product decision to broaden retries without that distinction. A generic retry of every exhausted-attempt or stream-disconnect category would include unrelated failures and still ignore the pool deadline. That fails the rule's one-subsystem/no-public-contract-or-product-decision simple-fix bar. No fix branch was created or pushed.</p>
+
+<h2>7. Verification</h2>
+<p>The same agent repeated the test, not an independent reviewer. Before installing the probe, the second temporary checkout was clean and its HEAD was the exact base commit. It received its own frozen install, build outputs, and the identical final probe bytes. No production file changed in either checkout. The first final test run started at 08:31:32 UTC; the second at 08:31:49 UTC on October 4, 2026.</p>
+<table><tr><th>Check</th><th>Result</th></tr>
+<tr><td>First clean checkout: @bb/server diagnostic</td><td>5 failed, 2 passed; exit 1; all failures are zero retry requests where one was expected.</td></tr>
+<tr><td>Second clean checkout: identical @bb/server diagnostic</td><td>5 failed, 2 passed; exit 1; identical classifications and decline reasons.</td></tr>
+<tr><td>Existing retry suite: server.test.ts</td><td>15 passed.</td></tr>
+<tr><td>Existing pool boundary tests: both provider quota reset cases plus transport-failure case</td><td>3 passed; 172 unrelated cases skipped by the filter.</td></tr>
+<tr><td>provider-retry lint and typecheck</td><td>6 of 6 Turbo tasks passed; no warnings or lint errors.</td></tr>
+<tr><td>Whitespace checks</td><td>git diff --check passed in both scratch checkouts.</td></tr>
+</table>
+<p>Report correction during verification: an initial version placed this cross-plugin probe inside the forkable retry plugin, where its imports violated the repository's forkability lint rule. The final probe lives in the server test directory instead; both final reproductions use that placement. No lint rule was disabled or relaxed.</p>
+<p>No linked open PR was found by either issue cross-reference metadata or the open-PR search for the trusted issue number. A final main fetch showed no newer relevant implementation.</p>
+
+<h2>8. Related implementation history</h2>
+<p>The trusted <a href="https://github.com/get-bb/bb/blob/4d15c1da0a848fa4834c1e5d0480a0891683bbe9/plugins/provider-retry/src/retry-policy.ts#L66-L106">current policy</a> follows the explicit overload support added by <a href="https://github.com/get-bb/bb/commit/d33caab0cf012d4448fb35abcb0b4a0342870041">commit d33caab0c</a>. That change deliberately left resettable subscription-window handling distinct from overload backoff; it did not introduce gateway retry metadata.</p>
+
+<h2>9. Appendix and limits</h2>
+<pre>pnpm exec turbo run test --filter=bb-plugin-provider-retry -- server.test.ts
+pnpm exec turbo run test --filter=bb-plugin-account-pool -- src/server.test.ts -t 'quota exhaustion and reset with session affinity|logs a sanitized transport cause when pooled fetch fails'
+pnpm exec turbo run lint typecheck --filter=bb-plugin-provider-retry
+pnpm exec oxfmt apps/server/test/internal/issue-4839.test.ts
+git diff --check</pre>
+<p>Raw build/test logs and the two temporary checkouts remain outside the public reports repository. The self-contained test and exact observed results above are the public reproduction artifact. No screenshots are applicable to this scheduling bug. Runtime queue persistence, real provider transport recovery, exact gateway Retry-After propagation, the desktop releases mentioned by the reporter, and the incident duration claims were not reenacted.</p>
+<p>Issue content was handled solely as untrusted claims to test. No issue-supplied instruction, script, patch, external URL, or linked branch was executed.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
+
