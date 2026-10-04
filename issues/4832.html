@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #4832 premature Connect response deadline</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#4832 · Connect response deadline includes request upload</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High</span><span class="pill">Effort: Medium</span><span class="pill">bug · remote · connect · partial-repro</span><a href="https://github.com/get-bb/bb/issues/4832">GitHub issue</a><span>2026-10-04</span></p>
+<p>Trusted base: <code>c201f6490a63b10fd3d72561f89516134444c266</code></p>
+<p class="verdict v-partial">Verdict: PARTIALLY REPRODUCED · Root-cause confidence: high for the transport mechanism; unmeasured for the reported live model call.</p>
+
+<h2>1. TL;DR</h2>
+<p>Connect can return a gateway-generated HTTP 504 while a request is still uploading, or while a healthy origin is taking longer than 30 seconds to send headers. The existing Durable Object HTTP path and the optional worker-held relay path both start a fixed 30-second response deadline before uploading the body. A deterministic test against unchanged main reproduces the exact gateway error in both paths, including a case with a completely uploaded body. Fast requests succeed in the same harness. This does not prove that a particular large model context caused the reported live failure: no provider credentials, private thread context, production logs, or actual model timing were used.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>The response deadline is 30 seconds and includes upload time.</td><td class="ok">Verified</td><td>Both transport implementations and both clean test runs: upload still active at t=30,000 ms, HTTP 504.</td></tr>
+<tr><td>A request whose body is already uploaded can still fail before model headers arrive.</td><td class="ok">Verified mechanism</td><td>Body completion at t=0, simulated origin headers at t=35,000 ms; both paths return 504 at t=30,000 ms.</td></tr>
+<tr><td>Small requests succeed on the same path.</td><td class="ok">Verified in harness</td><td>Two controls with headers at t=5,000 ms return 200.</td></tr>
+<tr><td>Account Pool contributes the Claude API endpoint and can perform quota waits before an upstream response.</td><td class="ok">Verified in source</td><td>Server-side environment contribution, request parsing, inline hold limit and upstream await. These were not timed in an end-to-end pool run.</td></tr>
+<tr><td>The affected live request crossed Connect and exceeded this deadline because of its context size.</td><td class="unv">Unverified</td><td>No live context-size sweep or upload/response-header measurement. The test uses a synthetic 64 KiB body and controlled time, not a large-context provider call.</td></tr>
+<tr><td>Retry durations, compaction failure and the provider-status advice arise from this same cause.</td><td class="unv">Unverified</td><td>The relay error is reproduced verbatim; provider retry policy, compaction and user-facing status advice are not exercised.</td></tr>
+</tbody></table>
+
+<h2>3. Environment</h2>
+<ul><li>Public target repository: get-bb/bb; fetched trusted origin/main at <code>c201f6490a63b10fd3d72561f89516134444c266</code>.</li><li>Linux 4.19.0-gvisor x86_64; Node v22.19.0; pnpm 9.15.0; Vitest v4.1.1.</li><li>Two separate temporary detached Git worktrees at the same base. Each received a frozen lockfile install. The first full Turbo build passed all 63 tasks.</li><li>No development server, network port, runtime data directory, database, browser or provider process was started. No production instance or Connect logging session was accessed.</li><li>Only the reproduction test was added to the source checkout. Production source and package definitions stayed unchanged.</li><li>WebSocket and Cloudflare Durable Object platform interfaces are represented by minimal test doubles. No database is mocked or queried. The HTTP handlers and frame encoders/decoders are the real repository implementations; fake timers advance their real timeout callbacks.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the trusted repository and select the recorded base:
+<pre>git clone https://github.com/get-bb/bb.git bb-4832
+cd bb-4832
+git checkout --detach c201f6490a63b10fd3d72561f89516134444c266
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build</pre></li>
+<li>Copy the complete reproduction test from the expandable section below into <code>apps/connect/src/issue-4832-repro.test.ts</code>. It is written from repository evidence and has no external setup or credentials.</li>
+<li>Execute through the normal shared-worker test configuration:
+<pre>pnpm exec turbo run test --filter=@bb/connect -- src/issue-4832-repro.test.ts</pre></li></ol>
+<p>The final assertion intentionally expects a successful simulated origin response. The slow cases are diagnostic regression candidates, not an approved timeout policy. The command must exit nonzero on the recorded base.</p>
+<table><thead><tr><th>Scenario, run in both transports</th><th>Request-body completion</th><th>Origin headers</th><th>Actual result</th></tr></thead><tbody>
+<tr><td>Small fast control</td><td>0 ms</td><td>5,000 ms</td><td>200, passes</td></tr>
+<tr><td>Upload still active at deadline</td><td>31,000 ms</td><td>35,000 ms</td><td>504 at 30,000 ms; final expected-200 assertion fails</td></tr>
+<tr><td>Upload finished but headers delayed</td><td>0 ms</td><td>35,000 ms</td><td>504 at 30,000 ms; final expected-200 assertion fails</td></tr>
+</tbody></table>
+<p>Expected for each diagnostic candidate: <code>200</code> from the simulated origin. Actual failure, verbatim:</p>
+<pre>bb connect: timed out waiting for the tunnel client
+
+AssertionError: expected 504 to be 200 // Object.is equality
+Tests  4 failed | 2 passed (6)</pre>
+<p>The harness first confirms that requests are unresolved at 29,999 ms. It then records the returned status and whether a body-end frame was sent at 30,000 ms. The 35,000 ms origin response cannot replace the already-returned 504. No screenshot is appropriate: this is an HTTP transport bug, not a visual defect.</p>
+<details><summary>Complete reproduction test</summary><pre>import { afterEach, describe, expect, it, vi } from &quot;vitest&quot;;
+import { decodeFrame, encodeFrame, type Frame } from &quot;@bb/tunnel-contract&quot;;
+import { RELAY_HEADER } from &quot;./protocol-headers.js&quot;;
+import { fetchThroughRelay } from &quot;./relay.js&quot;;
+import { TunnelDO, type Env } from &quot;./tunnel-do.js&quot;;
+
+class ReproSocket extends EventTarget {
+  binaryType = &quot;arraybuffer&quot;;
+  readyState = 1;
+  readonly sent: Frame[] = [];
+  closed = false;
+
+  accept(): void {}
+
+  deserializeAttachment(): null {
+    return null;
+  }
+
+  send(data: Uint8Array): void {
+    if (this.closed) throw new Error(&quot;socket closed&quot;);
+    this.sent.push(decodeFrame(data));
+  }
+
+  close(): void {
+    this.closed = true;
+  }
+
+  deliver(frame: Frame): void {
+    const event = new Event(&quot;message&quot;);
+    Object.defineProperty(event, &quot;data&quot;, { value: encodeFrame(frame) });
+    this.dispatchEvent(event);
+  }
+}
+
+afterEach(() =&gt; {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
+
+async function startRequest(
+  path: string,
+  socket: ReproSocket,
+  request: Request,
+): Promise&lt;{
+  response: Promise&lt;Response | null&gt;;
+  deliver: (frame: Frame) =&gt; void;
+}&gt; {
+  if (path === &quot;worker-relay&quot;) {
+    const stub = {
+      async fetch() {
+        return {
+          status: 101,
+          headers: new Headers({ [RELAY_HEADER]: &quot;1&quot; }),
+          webSocket: socket,
+        } as unknown as Response;
+      },
+    };
+    return {
+      response: fetchThroughRelay(stub, request),
+      deliver: (frame) =&gt; socket.deliver(frame),
+    };
+  }
+
+  vi.stubGlobal(&quot;WebSocketRequestResponsePair&quot;, class {});
+  const tunnel = socket as unknown as WebSocket;
+  const state = {
+    getWebSockets: (tag?: string) =&gt;
+      tag === undefined || tag === &quot;tunnel&quot; ? [tunnel] : [],
+    getTags: () =&gt; [&quot;tunnel&quot;],
+    setWebSocketAutoResponse: () =&gt; {},
+    blockConcurrencyWhile: (callback: () =&gt; Promise&lt;void&gt;) =&gt; callback(),
+    storage: { get: async () =&gt; undefined },
+  } as unknown as DurableObjectState;
+  const object = new TunnelDO(state, {} as Env);
+  return {
+    response: Promise.resolve(object.fetch(request)),
+    deliver: (frame) =&gt; {
+      const encoded = encodeFrame(frame);
+      object.webSocketMessage(tunnel, Uint8Array.from(encoded).buffer);
+    },
+  };
+}
+
+describe.each([&quot;durable-object&quot;, &quot;worker-relay&quot;])(
+  &quot;issue 4832 %s deadline&quot;,
+  (path) =&gt; {
+    it.each([
+      { name: &quot;small fast control&quot;, uploadMs: 0, headMs: 5_000 },
+      {
+        name: &quot;upload still active at deadline&quot;,
+        uploadMs: 31_000,
+        headMs: 35_000,
+      },
+      {
+        name: &quot;upload finished but headers delayed&quot;,
+        uploadMs: 0,
+        headMs: 35_000,
+      },
+    ])(&quot;$name&quot;, async ({ name, uploadMs, headMs }) =&gt; {
+      vi.useFakeTimers();
+      const socket = new ReproSocket();
+      const body = new ReadableStream&lt;Uint8Array&gt;({
+        start(controller) {
+          controller.enqueue(new Uint8Array(64 * 1024));
+          setTimeout(() =&gt; controller.close(), uploadMs);
+        },
+      });
+      const request = new Request(
+        &quot;https://example.invalid/api/v1/plugins/account-pool/http/v1/messages&quot;,
+        { method: &quot;POST&quot;, body, duplex: &quot;half&quot; } as RequestInit,
+      );
+      const started = await startRequest(path, socket, request);
+      const responsePromise = started.response;
+      let response: Response | null = null;
+      void responsePromise.then((value) =&gt; {
+        response = value;
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      setTimeout(() =&gt; {
+        started.deliver({
+          type: &quot;resp-head&quot;,
+          streamId: 1,
+          status: 200,
+          headers: [],
+        });
+        started.deliver({ type: &quot;body-end&quot;, streamId: 1 });
+      }, headMs);
+
+      if (headMs &gt; 30_000) {
+        await vi.advanceTimersByTimeAsync(29_999);
+        expect(response).toBeNull();
+        await vi.advanceTimersByTimeAsync(1);
+        const timedOut = await Promise.race([
+          responsePromise,
+          Promise.resolve(null),
+        ]);
+        const bodyEnded = socket.sent.some(
+          (frame) =&gt; frame.type === &quot;body-end&quot;,
+        );
+        expect(bodyEnded).toBe(uploadMs &lt; 30_000);
+        console.log(
+          `${path} ${name}: t=30000ms status=${timedOut?.status ?? &quot;pending&quot;} upload-complete=${bodyEnded}`,
+        );
+        if (timedOut?.status === 504) console.log(await timedOut.text());
+        await vi.advanceTimersByTimeAsync(headMs - 30_000);
+      } else {
+        await vi.advanceTimersByTimeAsync(headMs);
+      }
+
+      const finalResponse = await responsePromise;
+      console.log(
+        `${path} ${name}: t=${headMs}ms final-status=${finalResponse?.status}`,
+      );
+      expect(finalResponse?.status).toBe(200);
+    });
+  },
+);
+</pre></details>
+
+<h2>5. Root cause</h2>
+<p>The default HTTP forwarding path defines <a href="https://github.com/get-bb/bb/blob/c201f6490a63b10fd3d72561f89516134444c266/apps/connect/src/tunnel-do.ts#L49">RESP_HEAD_TIMEOUT_MS = 30_000</a>. In <a href="https://github.com/get-bb/bb/blob/c201f6490a63b10fd3d72561f89516134444c266/apps/connect/src/tunnel-do.ts#L503">proxyHttp</a>, it starts the timer while registering a pending response, before sending the open-http frame and before calling the request-body pump:</p>
+<pre>const timeout = setTimeout(() =&gt; {
+  this.failHttpStream(streamId, 504, "timed out waiting for the tunnel client");
+}, RESP_HEAD_TIMEOUT_MS);
+...
+if (hasBody) {
+  void this.pumpRequestBody(streamId, request.body!, tunnel);
+}</pre>
+<p>The pending stream therefore shares one deadline across upload and all origin work before response headers. <a href="https://github.com/get-bb/bb/blob/c201f6490a63b10fd3d72561f89516134444c266/apps/connect/src/tunnel-do.ts#L608">failHttpStream</a> resolves an HTTP 504 with the observed error text and removes the pending entry. Subsequent response headers are too late.</p>
+<p>The optional worker-held implementation is not a workaround. <a href="https://github.com/get-bb/bb/blob/c201f6490a63b10fd3d72561f89516134444c266/apps/connect/src/relay.ts#L16">RELAY_RESP_HEAD_TIMEOUT_MS</a> is also 30,000 ms. <a href="https://github.com/get-bb/bb/blob/c201f6490a63b10fd3d72561f89516134444c266/apps/connect/src/relay.ts#L142">relayResponse deadline</a> precedes <a href="https://github.com/get-bb/bb/blob/c201f6490a63b10fd3d72561f89516134444c266/apps/connect/src/relay.ts#L216">pumpRequestBody invocation</a>, and timeout closes the relay and settles the HTTP 504. Both implementations enforce this without a model-route-specific budget.</p>
+<p>The upstream path is plausible but not sufficient to establish context-size causality. Account Pool <a href="https://github.com/get-bb/bb/blob/c201f6490a63b10fd3d72561f89516134444c266/plugins/account-pool/src/server.ts#L285">contributes ANTHROPIC_BASE_URL via a serverPath</a>; the host <a href="https://github.com/get-bb/bb/blob/c201f6490a63b10fd3d72561f89516134444c266/apps/host-daemon/src/operation-environment.ts#L12">resolves contributed paths using BB_SERVER_URL</a>. Account Pool <a href="https://github.com/get-bb/bb/blob/c201f6490a63b10fd3d72561f89516134444c266/plugins/account-pool/src/hub.ts#L426">parses the request</a>, <a href="https://github.com/get-bb/bb/blob/c201f6490a63b10fd3d72561f89516134444c266/plugins/account-pool/src/hub.ts#L48">defines a 20,000 ms inline hold limit</a>, <a href="https://github.com/get-bb/bb/blob/c201f6490a63b10fd3d72561f89516134444c266/plugins/account-pool/src/hub.ts#L478">can wait for an eligible quota hold</a>, and <a href="https://github.com/get-bb/bb/blob/c201f6490a63b10fd3d72561f89516134444c266/plugins/account-pool/src/hub.ts#L542">awaits upstream fetch</a>. These steps consume the same relay pre-header budget when the configured server URL traverses Connect. No assumption about the affected machine's actual server URL is needed for the transport reproduction.</p>
+
+<h2>6. Proposed fix and simple-fix decision</h2>
+<p>Separate a bounded request-upload deadline from the response-header deadline, and decide an appropriate finite model-route header budget. Preserve disconnect, cancellation and stalled-upload cleanup in both Connect HTTP implementations. Instrument body completion and upstream-header timing on an isolated synthetic model endpoint first, then compare representative real requests only with appropriate access and consent.</p>
+<p>No pull request is safe under this rule's simple-fix criteria. Increasing or removing the model-route deadline requires a timeout-policy decision; moving the existing timer alone does not fix the already-uploaded, delayed-header case and can remove the only bound on a stalled upload. Changing the model-routing architecture is unnecessary for confirming the transport mechanism and is outside this investigation. The report is partial because the claimed context-size relationship has not been measured. No production patch, source branch, source commit, dependency, protocol or stored-data change was made.</p>
+<p>GitHub issue timeline and open-PR search had no linked open pull request at investigation time. No linked PR branch or code was executed.</p>
+
+<h2>7. Verification</h2>
+<p>The same agent repeated the reproduction in a second initially clean detached worktree at <code>c201f6490a63b10fd3d72561f89516134444c266</code>, with a separate frozen install and no shared runtime data. The exact command was <code>pnpm exec turbo run test --filter=@bb/connect -- src/issue-4832-repro.test.ts</code>. It exited 1 with the same four expected-200 versus actual-504 failures and two successful controls. The test bytes match the first worktree. This is a second clean run, not an independent-agent verification.</p>
+<p>The final clean run supports all transport findings. An earlier fixture incorrectly returned the tunnel for relay-tag queries; that platform-fixture error was corrected before the final first and second runs. No production change was needed. An attempted global Vitest exclude did not remove a project-level test, so the diagnostic file was moved out before checking the unmodified existing suite. The final existing Connect suite passed; its exact log is linked below.</p>
+<p>The existing suite command was <code>pnpm exec turbo run test --filter=@bb/connect</code> after removing the diagnostic test from the second checkout. It exited 0: 8 test files and 192 tests passed. Exact first and second reproduction logs are embedded below. Temporary absolute checkout paths are replaced with CHECKOUT_A and CHECKOUT_B; statuses, timing and assertions are unchanged. Raw artifacts remain outside the public reports repository in accordance with its publication rules.</p>
+
+<h2>8. Related issues</h2>
+<p><a href="https://github.com/get-bb/bb/issues/3998">#3998</a> concerns Connect response-timeout diagnostics. Its open metadata was read; it is not treated as proof of any shipped fix. This report establishes deterministic deadline behavior, not the separate intermittent mobile failure.</p>
+
+<h2>9. Appendix</h2>
+<p>Source evidence links point to the checked-out trusted base and were checked against line-numbered local source. Issue content was used only as claims to test. Suggested changes and links in the issue were not followed as instructions; no issue-supplied URL, code or private runtime data was fetched or executed.</p>
+<p>Investigation commands: GitHub repository visibility, issue properties, labels, comments, linked PR timeline and open PR search were read; missing classification values were written through SlopCop and read back. Source preparation used <code>git fetch origin main</code>, two <code>git worktree add --detach</code> operations, frozen installs, the full first Turbo build and a dependency-filtered second build. The source inspection used <code>rg</code>, <code>sed</code> and line-numbered source. Only this test was authored. No application instance or model API call was run.</p>
+<details><summary>First-run exact diagnostic log</summary><pre>• turbo 2.10.12
+
+   • Packages in scope: @bb/connect
+   • Running test in 1 packages
+   • Remote caching disabled, using shared worktree cache
+
+//:ensure-native-modules: cache bypass, force executing 7c68bfcc22dbd7ee
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules CHECKOUT_A
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+@bb/connect:test: cache miss, executing a48773f19808f2b5
+@bb/connect:test: 
+@bb/connect:test: &gt; @bb/connect@0.0.1 test CHECKOUT_A/apps/connect
+@bb/connect:test: &gt; vitest run --config vitest.config.ts &quot;src/issue-4832-repro.test.ts&quot;
+@bb/connect:test: 
+@bb/connect:test: 
+@bb/connect:test:  RUN  v4.1.1 CHECKOUT_A/apps/connect
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 durable-object deadline &gt; 'small fast control'
+@bb/connect:test: durable-object small fast control: t=5000ms final-status=200
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 durable-object deadline &gt; 'upload still active at deadline'
+@bb/connect:test: durable-object upload still active at deadline: t=30000ms status=504 upload-complete=false
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 durable-object deadline &gt; 'upload still active at deadline'
+@bb/connect:test: bb connect: timed out waiting for the tunnel client
+@bb/connect:test: 
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 durable-object deadline &gt; 'upload still active at deadline'
+@bb/connect:test: durable-object upload still active at deadline: t=35000ms final-status=504
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 durable-object deadline &gt; 'upload finished but headers delayed'
+@bb/connect:test: durable-object upload finished but headers delayed: t=30000ms status=504 upload-complete=true
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 durable-object deadline &gt; 'upload finished but headers delayed'
+@bb/connect:test: bb connect: timed out waiting for the tunnel client
+@bb/connect:test: 
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 durable-object deadline &gt; 'upload finished but headers delayed'
+@bb/connect:test: durable-object upload finished but headers delayed: t=35000ms final-status=504
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 worker-relay deadline &gt; 'small fast control'
+@bb/connect:test: worker-relay small fast control: t=5000ms final-status=200
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 worker-relay deadline &gt; 'upload still active at deadline'
+@bb/connect:test: worker-relay upload still active at deadline: t=30000ms status=504 upload-complete=false
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 worker-relay deadline &gt; 'upload still active at deadline'
+@bb/connect:test: bb connect: timed out waiting for the tunnel client
+@bb/connect:test: 
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 worker-relay deadline &gt; 'upload still active at deadline'
+@bb/connect:test: worker-relay upload still active at deadline: t=35000ms final-status=504
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 worker-relay deadline &gt; 'upload finished but headers delayed'
+@bb/connect:test: worker-relay upload finished but headers delayed: t=30000ms status=504 upload-complete=true
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 worker-relay deadline &gt; 'upload finished but headers delayed'
+@bb/connect:test: bb connect: timed out waiting for the tunnel client
+@bb/connect:test: 
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 worker-relay deadline &gt; 'upload finished but headers delayed'
+@bb/connect:test: worker-relay upload finished but headers delayed: t=35000ms final-status=504
+@bb/connect:test: 
+@bb/connect:test:  ❯ |@bb/connect:isolated| src/issue-4832-repro.test.ts (6 tests | 4 failed) 48ms
+@bb/connect:test:      ✓ 'small fast control' 25ms
+@bb/connect:test:      × 'upload still active at deadline' 9ms
+@bb/connect:test:      × 'upload finished but headers delayed' 5ms
+@bb/connect:test:      ✓ 'small fast control' 3ms
+@bb/connect:test:      × 'upload still active at deadline' 3ms
+@bb/connect:test:      × 'upload finished but headers delayed' 2ms
+@bb/connect:test: 
+@bb/connect:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 4 ⎯⎯⎯⎯⎯⎯⎯
+@bb/connect:test: 
+@bb/connect:test:  FAIL  |@bb/connect:isolated| src/issue-4832-repro.test.ts &gt; issue 4832 durable-object deadline &gt; 'upload still active at deadline'
+@bb/connect:test:  FAIL  |@bb/connect:isolated| src/issue-4832-repro.test.ts &gt; issue 4832 durable-object deadline &gt; 'upload finished but headers delayed'
+@bb/connect:test:  FAIL  |@bb/connect:isolated| src/issue-4832-repro.test.ts &gt; issue 4832 worker-relay deadline &gt; 'upload still active at deadline'
+@bb/connect:test:  FAIL  |@bb/connect:isolated| src/issue-4832-repro.test.ts &gt; issue 4832 worker-relay deadline &gt; 'upload finished but headers delayed'
+@bb/connect:test: AssertionError: expected 504 to be 200 // Object.is equality
+@bb/connect:test: 
+@bb/connect:test: - Expected
+@bb/connect:test: + Received
+@bb/connect:test: 
+@bb/connect:test: - 200
+@bb/connect:test: + 504
+@bb/connect:test: 
+@bb/connect:test:  ❯ src/issue-4832-repro.test.ts:154:37
+@bb/connect:test:     152|         `${path} ${name}: t=${headMs}ms final-status=${finalResponse?.…
+@bb/connect:test:     153|       );
+@bb/connect:test:     154|       expect(finalResponse?.status).toBe(200);
+@bb/connect:test:        |                                     ^
+@bb/connect:test:     155|     });
+@bb/connect:test:     156|   },
+@bb/connect:test: 
+@bb/connect:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/4]⎯
+@bb/connect:test: 
+@bb/connect:test: 
+@bb/connect:test:  Test Files  1 failed (1)
+@bb/connect:test:       Tests  4 failed | 2 passed (6)
+@bb/connect:test:    Start at  01:07:28
+@bb/connect:test:    Duration  836ms (transform 294ms, setup 0ms, import 587ms, tests 48ms, environment 0ms)
+@bb/connect:test: 
+@bb/connect:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/connect#test:  ERROR  command (CHECKOUT_A/apps/connect) /usr/local/bin/pnpm run test src/issue-4832-repro.test.ts exited (1)
+
+ Tasks:    1 successful, 2 total
+Cached:    0 cached, 2 total
+  Time:    2.279s 
+Failed:    @bb/connect#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details>
+<details><summary>Second-run exact diagnostic log</summary><pre>• turbo 2.10.12
+
+   • Packages in scope: @bb/connect
+   • Running test in 1 packages
+   • Remote caching disabled, using shared worktree cache
+
+//:ensure-native-modules: cache bypass, force executing 7c68bfcc22dbd7ee
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules CHECKOUT_B
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+//:ensure-native-modules: [ensure-native-modules] Detached hardlinked better-sqlite3 binary before verification
+@bb/connect:test: cache miss, executing a48773f19808f2b5
+@bb/connect:test: 
+@bb/connect:test: &gt; @bb/connect@0.0.1 test CHECKOUT_B/apps/connect
+@bb/connect:test: &gt; vitest run --config vitest.config.ts &quot;src/issue-4832-repro.test.ts&quot;
+@bb/connect:test: 
+@bb/connect:test: 
+@bb/connect:test:  RUN  v4.1.1 CHECKOUT_B/apps/connect
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 durable-object deadline &gt; 'small fast control'
+@bb/connect:test: durable-object small fast control: t=5000ms final-status=200
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 durable-object deadline &gt; 'upload still active at deadline'
+@bb/connect:test: durable-object upload still active at deadline: t=30000ms status=504 upload-complete=false
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 durable-object deadline &gt; 'upload still active at deadline'
+@bb/connect:test: bb connect: timed out waiting for the tunnel client
+@bb/connect:test: 
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 durable-object deadline &gt; 'upload still active at deadline'
+@bb/connect:test: durable-object upload still active at deadline: t=35000ms final-status=504
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 durable-object deadline &gt; 'upload finished but headers delayed'
+@bb/connect:test: durable-object upload finished but headers delayed: t=30000ms status=504 upload-complete=true
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 durable-object deadline &gt; 'upload finished but headers delayed'
+@bb/connect:test: bb connect: timed out waiting for the tunnel client
+@bb/connect:test: 
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 durable-object deadline &gt; 'upload finished but headers delayed'
+@bb/connect:test: durable-object upload finished but headers delayed: t=35000ms final-status=504
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 worker-relay deadline &gt; 'small fast control'
+@bb/connect:test: worker-relay small fast control: t=5000ms final-status=200
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 worker-relay deadline &gt; 'upload still active at deadline'
+@bb/connect:test: worker-relay upload still active at deadline: t=30000ms status=504 upload-complete=false
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 worker-relay deadline &gt; 'upload still active at deadline'
+@bb/connect:test: bb connect: timed out waiting for the tunnel client
+@bb/connect:test: 
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 worker-relay deadline &gt; 'upload still active at deadline'
+@bb/connect:test: worker-relay upload still active at deadline: t=35000ms final-status=504
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 worker-relay deadline &gt; 'upload finished but headers delayed'
+@bb/connect:test: worker-relay upload finished but headers delayed: t=30000ms status=504 upload-complete=true
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 worker-relay deadline &gt; 'upload finished but headers delayed'
+@bb/connect:test: bb connect: timed out waiting for the tunnel client
+@bb/connect:test: 
+@bb/connect:test: 
+@bb/connect:test: stdout | src/issue-4832-repro.test.ts &gt; issue 4832 worker-relay deadline &gt; 'upload finished but headers delayed'
+@bb/connect:test: worker-relay upload finished but headers delayed: t=35000ms final-status=504
+@bb/connect:test: 
+@bb/connect:test:  ❯ |@bb/connect:isolated| src/issue-4832-repro.test.ts (6 tests | 4 failed) 46ms
+@bb/connect:test:      ✓ 'small fast control' 21ms
+@bb/connect:test:      × 'upload still active at deadline' 9ms
+@bb/connect:test:      × 'upload finished but headers delayed' 4ms
+@bb/connect:test:      ✓ 'small fast control' 3ms
+@bb/connect:test:      × 'upload still active at deadline' 4ms
+@bb/connect:test:      × 'upload finished but headers delayed' 2ms
+@bb/connect:test: 
+@bb/connect:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 4 ⎯⎯⎯⎯⎯⎯⎯
+@bb/connect:test: 
+@bb/connect:test:  FAIL  |@bb/connect:isolated| src/issue-4832-repro.test.ts &gt; issue 4832 durable-object deadline &gt; 'upload still active at deadline'
+@bb/connect:test:  FAIL  |@bb/connect:isolated| src/issue-4832-repro.test.ts &gt; issue 4832 durable-object deadline &gt; 'upload finished but headers delayed'
+@bb/connect:test:  FAIL  |@bb/connect:isolated| src/issue-4832-repro.test.ts &gt; issue 4832 worker-relay deadline &gt; 'upload still active at deadline'
+@bb/connect:test:  FAIL  |@bb/connect:isolated| src/issue-4832-repro.test.ts &gt; issue 4832 worker-relay deadline &gt; 'upload finished but headers delayed'
+@bb/connect:test: AssertionError: expected 504 to be 200 // Object.is equality
+@bb/connect:test: 
+@bb/connect:test: - Expected
+@bb/connect:test: + Received
+@bb/connect:test: 
+@bb/connect:test: - 200
+@bb/connect:test: + 504
+@bb/connect:test: 
+@bb/connect:test:  ❯ src/issue-4832-repro.test.ts:154:37
+@bb/connect:test:     152|         `${path} ${name}: t=${headMs}ms final-status=${finalResponse?.…
+@bb/connect:test:     153|       );
+@bb/connect:test:     154|       expect(finalResponse?.status).toBe(200);
+@bb/connect:test:        |                                     ^
+@bb/connect:test:     155|     });
+@bb/connect:test:     156|   },
+@bb/connect:test: 
+@bb/connect:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/4]⎯
+@bb/connect:test: 
+@bb/connect:test: 
+@bb/connect:test:  Test Files  1 failed (1)
+@bb/connect:test:       Tests  4 failed | 2 passed (6)
+@bb/connect:test:    Start at  01:08:19
+@bb/connect:test:    Duration  816ms (transform 332ms, setup 0ms, import 580ms, tests 46ms, environment 0ms)
+@bb/connect:test: 
+@bb/connect:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/connect#test:  ERROR  command (CHECKOUT_B/apps/connect) /usr/local/bin/pnpm run test src/issue-4832-repro.test.ts exited (1)
+
+ Tasks:    1 successful, 2 total
+Cached:    0 cached, 2 total
+  Time:    2.27s 
+Failed:    @bb/connect#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
