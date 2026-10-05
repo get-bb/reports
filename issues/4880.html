@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #4880 Move freeze incorrectly clears the live connect account</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+  <p class="meta"><a href="../">← reports</a></p>
+  <h1>#4880 · Move freeze incorrectly clears the live connect account</h1>
+  <p class="meta">
+    <span class="pill">Bug</span> <span class="pill high">High</span> <span class="pill">Effort: Low</span> <span class="pill">remote · connect · confirmed-repro</span>
+    <a href="https://github.com/get-bb/bb/issues/4880">open on GitHub</a>
+    <span>2026-10-05 · base <code>300a08b859f7786452c4fcab4e3a2bef56b823bb</code></span>
+  </p>
+  <p><strong>Verdict:</strong> REPRODUCED · <strong>Root-cause confidence:</strong> high</p>
+
+
+<h2>1. TL;DR</h2>
+<p>During a server move, the source server pauses public writes but deliberately keeps its account and connect plugins running. Those plugins still communicate through POST RPCs, so the freeze rejects their account reads with HTTP 503 and code <code>server_moving</code>. Connect collapses that temporary response into an account-unavailable error, clears its last known account, and closes the live tunnel. A local test with the real account and connect plugins reproduces the disconnect after the real 25-second long-poll expires; a separate real freeze-middleware and SDK test verifies the HTTP-to-error translation. Both failures repeat in a second clean checkout of the same trusted main commit.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>The move retains the account and connect plugins.</td><td>Verified in source</td><td>The move environment excludes both plugin sources from suspension.</td></tr>
+<tr><td>The freeze blocks account status, wait, and credential RPCs.</td><td>Verified dynamically</td><td>The Hono reproduction requests all three routes and checks status 503 and code server_moving.</td></tr>
+<tr><td>The account long-poll has a 25-second deadline.</td><td>Verified</td><td>Trusted contract and account implementation; both plugin reproductions fail after approximately 25.1 seconds.</td></tr>
+<tr><td>The freeze is interpreted as losing the account and tears down connect.</td><td>Verified dynamically</td><td>The HTTP bridge loses the server_moving code; the plugin test observes paired=false and disconnected after two blocked reads.</td></tr>
+<tr><td>A real macOS-to-Ubuntu move fails during transfer, then reconnects on rollback.</td><td>Unverified end to end</td><td>No production accounts, enrolled machines, or user runtime were used. This report reproduces the causal account/tunnel failure, not a complete migration.</td></tr>
+<tr><td>A locally modified desktop bundle completed a move.</td><td>Unverified</td><td>No issue-supplied bundle, patch, command, or PR branch was executed.</td></tr>
+<tr><td>The same cause explains earlier migration failures.</td><td>Unverified for those incidents</td><td>Related issues were not reproduced here.</td></tr></table>
+
+<h2>3. Environment</h2>
+<ul><li>Public target repository: get-bb/bb; trusted origin/main commit <code>300a08b859f7786452c4fcab4e3a2bef56b823bb</code>; checked again before applying the fix.</li>
+<li>Linux x86_64, Node v22.19.0, pnpm 9.15.0, Vitest 4.1.1; source package bb-app 0.45.0.</li>
+<li>Two separate temporary clones. Both use frozen-lockfile installation and the normal Turbo build: 63 successful tasks each.</li>
+<li>No live BB server, daemon, browser, provider, production tunnel, or persistent runtime data. The real plugin implementations run in the repository's plugin harness with fresh local StubGetbb HTTP/WebSocket servers on ephemeral loopback ports and disposable harness storage. The HTTP bridge uses Hono in process, requiring no listening port.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<p>The integration test injects a typed server-moving HTTP failure only at the plugin RPC boundary; it does not implement account classification, AccountLink retry behavior, or tunnel teardown. Those are the production implementations. The second reproduction connects actual freeze middleware, HTTP serialization, SDK parsing, and the actual account client, removing uncertainty about the injected error shape.</p>
+<ol><li>Start a fresh trusted checkout, install existing dependencies, and build:<pre>git clone --branch main https://github.com/get-bb/bb.git bb-4880
+cd bb-4880
+git checkout --detach 300a08b859f7786452c4fcab4e3a2bef56b823bb
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build</pre></li>
+<li>Copy the complete regression diff below into <code>regression.diff</code> and apply it to this checkout:<pre>git apply regression.diff</pre>Only test code changes; production code remains unchanged.</li>
+<li>Run the account/tunnel regression:<pre>pnpm exec turbo run test --filter=bb-plugin-connect -- src/account-integration.test.ts -t 'keeps the live tunnel through a server move freeze'</pre></li>
+<li>Expected: account remains paired, connect stays connected, the same live WebSocket remains open, and account polling resumes after the pause without another tunnel dial. Actual on trusted main (exit 1):<pre>bb-plugin-connect:test: AssertionError: expected { state: &#x27;disconnected&#x27;, …(11) } to match object { paired: true, state: &#x27;connected&#x27; }
+bb-plugin-connect:test: (10 matching properties omitted from actual)
+bb-plugin-connect:test: 
+bb-plugin-connect:test: - Expected
+bb-plugin-connect:test: + Received
+bb-plugin-connect:test: 
+bb-plugin-connect:test:   {
+bb-plugin-connect:test: -   &quot;paired&quot;: true,
+bb-plugin-connect:test: -   &quot;state&quot;: &quot;connected&quot;,
+bb-plugin-connect:test: +   &quot;paired&quot;: false,
+bb-plugin-connect:test: +   &quot;state&quot;: &quot;disconnected&quot;,
+bb-plugin-connect:test:   }
+bb-plugin-connect:test: 
+</pre></li>
+<li>Copy the complete HTTP bridge test below into <code>apps/server/test/server-move/account-freeze-repro.test.ts</code> and run:<pre>pnpm exec turbo run test --filter=@bb/server -- test/server-move/account-freeze-repro.test.ts</pre>All three account RPC paths return the expected freeze error. The final assertion fails because the client replaces <code>BbHttpError(status=503, code=server_moving)</code> with <code>AccountUnavailableError</code>.</li></ol>
+<h3>Focused regression added to the existing integration suite</h3><pre>  it(&quot;keeps the live tunnel through a server move freeze and resumes account polling&quot;, async () =&gt; {
+    await loadBoth();
+    await signInAccount();
+    startTunnel();
+    await waitForConnected(1);
+    const socket = stub.tunnelDials[0]!.socket!;
+
+    serverMoving = true;
+    await vi.waitFor(
+      () =&gt; expect(blockedAccountReads).toBeGreaterThanOrEqual(2),
+      { timeout: 30_000 },
+    );
+
+    expect(await connectStatus()).toMatchObject({
+      paired: true,
+      state: &quot;connected&quot;,
+    });
+    expect(socket.readyState).toBe(1);
+
+    const readsBeforeResume = successfulAccountReads;
+    serverMoving = false;
+    await vi.waitFor(() =&gt;
+      expect(successfulAccountReads).toBeGreaterThan(readsBeforeResume),
+    );
+    expect(await connectStatus()).toMatchObject({
+      paired: true,
+      state: &quot;connected&quot;,
+    });
+    expect(stub.tunnelDials).toHaveLength(1);
+    expect(socket.readyState).toBe(1);
+  }, 35_000);
+
+</pre>
+<h3>Complete regression diff, including setup and RPC-boundary injection</h3><pre>diff --git a/plugins/connect/src/account-integration.test.ts b/plugins/connect/src/account-integration.test.ts
+index d91b6bf..abb0169 100644
+--- a/plugins/connect/src/account-integration.test.ts
++++ b/plugins/connect/src/account-integration.test.ts
+@@ -36,12 +36,24 @@ let stub: StubGetbb;
+ let accountHost: FakePluginHost;
+ let connectHost: FakePluginHost;
+ let accountRunning = true;
++let serverMoving = false;
++let blockedAccountReads = 0;
++let successfulAccountReads = 0;
+ let credentialReads = 0;
+ let failCredentialRead: number | null = null;
+ let tunnelService: { controller: AbortController; done: Promise&lt;void&gt; } | null =
+   null;
+ 
+ function callAccountRpc(args: RpcArgs): Promise&lt;unknown&gt; {
++  if (serverMoving) {
++    blockedAccountReads += 1;
++    return Promise.reject(
++      Object.assign(new Error(&quot;HTTP 503: Changes are paused&quot;), {
++        status: 503,
++        code: &quot;server_moving&quot;,
++      }),
++    );
++  }
+   if (args.method === &quot;bb-account.v1.connectCredential&quot;) credentialReads += 1;
+   const failRead =
+     args.method === &quot;bb-account.v1.connectCredential&quot; &amp;&amp;
+@@ -57,7 +69,10 @@ function callAccountRpc(args: RpcArgs): Promise&lt;unknown&gt; {
+     .callRpc(args.method, args.input ?? null, {
+       experimental_caller: { kind: &quot;plugin&quot;, pluginId: &quot;connect&quot; },
+     })
+-    .then((result) =&gt; args.outputSchema.parse(result));
++    .then((result) =&gt; {
++      successfulAccountReads += 1;
++      return args.outputSchema.parse(result);
++    });
+   const signal = args.signal;
+   if (signal === undefined) return call;
+   return new Promise((resolve, reject) =&gt; {
+@@ -144,6 +159,9 @@ async function storedCredential(): Promise&lt;string&gt; {
+ beforeEach(async () =&gt; {
+   stub = await StubGetbb.start();
+   accountRunning = true;
++  serverMoving = false;
++  blockedAccountReads = 0;
++  successfulAccountReads = 0;
+   credentialReads = 0;
+   failCredentialRead = null;
+ });
+@@ -160,6 +178,38 @@ afterEach(async () =&gt; {
+ });
+ 
+ describe(&quot;connect on top of bb account&quot;, () =&gt; {
++  it(&quot;keeps the live tunnel through a server move freeze and resumes account polling&quot;, async () =&gt; {
++    await loadBoth();
++    await signInAccount();
++    startTunnel();
++    await waitForConnected(1);
++    const socket = stub.tunnelDials[0]!.socket!;
++
++    serverMoving = true;
++    await vi.waitFor(
++      () =&gt; expect(blockedAccountReads).toBeGreaterThanOrEqual(2),
++      { timeout: 30_000 },
++    );
++
++    expect(await connectStatus()).toMatchObject({
++      paired: true,
++      state: &quot;connected&quot;,
++    });
++    expect(socket.readyState).toBe(1);
++
++    const readsBeforeResume = successfulAccountReads;
++    serverMoving = false;
++    await vi.waitFor(() =&gt;
++      expect(successfulAccountReads).toBeGreaterThan(readsBeforeResume),
++    );
++    expect(await connectStatus()).toMatchObject({
++      paired: true,
++      state: &quot;connected&quot;,
++    });
++    expect(stub.tunnelDials).toHaveLength(1);
++    expect(socket.readyState).toBe(1);
++  }, 35_000);
++
+   it(&quot;waits while signed out, then dials the gate with the account&#x27;s credential the moment it signs in&quot;, async () =&gt; {
+     await loadBoth();
+     startTunnel();
+</pre>
+<h3>Complete freeze/SDK bridge reproduction</h3><pre>import { createBbSdk, createHttpTransport } from &quot;@bb/sdk/browser&quot;;
+import { Hono } from &quot;hono&quot;;
+import { expect, it } from &quot;vitest&quot;;
+import { createAccountClient } from &quot;../../../../plugins/connect/src/account-client.js&quot;;
+import { ApiError } from &quot;../../src/errors.js&quot;;
+import { serverMoveFreezeMiddleware } from &quot;../../src/services/server-move/freeze.js&quot;;
+
+it(&quot;preserves the server-moving error through the account client&quot;, async () =&gt; {
+  const app = new Hono();
+  app.onError((error) =&gt; {
+    if (error instanceof ApiError) return error.toResponse();
+    throw error;
+  });
+  app.use(&quot;/api/v1/*&quot;, serverMoveFreezeMiddleware({ isFrozen: () =&gt; true }));
+  app.post(&quot;/api/v1/*&quot;, (context) =&gt; context.json({ ok: true }));
+  const sdk = createBbSdk({
+    transport: createHttpTransport({
+      baseUrl: &quot;http://repro.invalid&quot;,
+      runtime: &quot;browser&quot;,
+      fetch: (input, init) =&gt; app.request(input, init),
+    }),
+  });
+
+  for (const method of [
+    &quot;bb-account.v1.status&quot;,
+    &quot;bb-account.v1.waitForStatusChange&quot;,
+    &quot;bb-account.v1.connectCredential&quot;,
+  ]) {
+    const response = await app.request(
+      `/api/v1/plugins/bb-account/rpc/${method}`,
+      { method: &quot;POST&quot; },
+    );
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ code: &quot;server_moving&quot; });
+  }
+
+  const account = createAccountClient(() =&gt; sdk);
+  await expect(account.status()).rejects.toMatchObject({
+    name: &quot;BbHttpError&quot;,
+    status: 503,
+    code: &quot;server_moving&quot;,
+  });
+});
+</pre>
+
+<h2>5. Root cause</h2>
+<p>The write freeze classifies all non-move POST routes as writes, including plugin RPCs that only read account state. The SDK preserves the freeze's distinct error code, but the account client throws that information away when it translates every 503 into account unavailable. AccountLink reserves that error for situations in which it must clear the account, so it calls the connect tunnel with null. Connect's existing identity-change path then tears down the current tunnel. The retry path cannot restore the account while status RPCs continue returning the freeze response.</p>
+<h3><a href="https://github.com/get-bb/bb/blob/300a08b859f7786452c4fcab4e3a2bef56b823bb/apps/server/src/services/server-move/freeze.ts#L11-L29">apps/server/src/services/server-move/freeze.ts:11</a></h3><pre>export function isServerMoveFreezeExempt(
+  method: string,
+  path: string,
+): boolean {
+  return READ_METHODS.has(method) || SERVER_MOVE_ROUTE_PATTERN.test(path);
+}
+
+export function serverMoveFreezeMiddleware(
+  state: ServerMoveFreezeState,
+): MiddlewareHandler {
+  return async (context, next) =&gt; {
+    if (
+      state.isFrozen() &amp;&amp;
+      !isServerMoveFreezeExempt(context.req.method, context.req.path)
+    ) {
+      throw serverMovingError();
+    }
+    await next();
+  };</pre>
+<h3><a href="https://github.com/get-bb/bb/blob/300a08b859f7786452c4fcab4e3a2bef56b823bb/apps/server/src/services/server-move/freeze-state.ts#L37-L44">apps/server/src/services/server-move/freeze-state.ts:37</a></h3><pre>export function serverMovingError(): ApiError {
+  return new ApiError(
+    503,
+    &quot;server_moving&quot;,
+    &quot;The server is moving to another machine. Changes are paused until the move finishes or is cancelled.&quot;,
+    false,
+  );
+}</pre>
+<h3><a href="https://github.com/get-bb/bb/blob/300a08b859f7786452c4fcab4e3a2bef56b823bb/packages/sdk/src/areas/plugins.ts#L418-L426">packages/sdk/src/areas/plugins.ts:418</a></h3><pre>    async callRpc(input) {
+      const envelope = await requestParsed(
+        pluginPath(input.pluginId, `/rpc/${encodeURIComponent(input.method)}`),
+        z.object({ ok: z.literal(true), result: jsonValueSchema }),
+        { ...jsonInit(&quot;POST&quot;, input.input ?? null), signal: input.signal },
+      );
+      return input.outputSchema.parse(envelope.result);
+    },
+    async checkUpdates(input = {}) {</pre>
+<h3><a href="https://github.com/get-bb/bb/blob/300a08b859f7786452c4fcab4e3a2bef56b823bb/packages/sdk/src/response.ts#L150-L155">packages/sdk/src/response.ts:150</a></h3><pre>  }
+  if (!response.ok) {
+    const { body, code, message } = await readHttpErrorInfo(response);
+    throw new BbHttpError({ body, code, message, status: response.status });
+  }
+  return response;</pre>
+<h3><a href="https://github.com/get-bb/bb/blob/300a08b859f7786452c4fcab4e3a2bef56b823bb/plugins/connect/src/account-client.ts#L147-L152">plugins/connect/src/account-client.ts:147</a></h3><pre>    } catch (error) {
+      const status = httpStatusOf(error);
+      if (status === 503 || status === 404) {
+        throw new AccountUnavailableError(`HTTP ${status}`);
+      }
+      throw error;</pre>
+<h3><a href="https://github.com/get-bb/bb/blob/300a08b859f7786452c4fcab4e3a2bef56b823bb/plugins/connect/src/account-link.ts#L62-L75">plugins/connect/src/account-link.ts:62</a></h3><pre>      } catch (error) {
+        if (signal.aborted) return;
+        if (error instanceof AccountUnavailableError) {
+          this.options.onAccount(null);
+        } else {
+          this.options.log.warn(
+            `could not read the bb account status: ${errorMessage(error)}`,
+          );
+        }
+        revision = null;
+        syncedRevision = null;
+        failures += 1;
+        const base = this.options.retryMinMs ?? RETRY_MIN_MS;
+        await sleep(Math.min(base * 2 ** (failures - 1), RETRY_MAX_MS), signal);</pre>
+<h3><a href="https://github.com/get-bb/bb/blob/300a08b859f7786452c4fcab4e3a2bef56b823bb/plugins/connect/src/tunnel.ts#L107-L120">plugins/connect/src/tunnel.ts:107</a></h3><pre>  setAccount(account: Account | null): void {
+    const next = identityOf(account);
+    if (sameIdentity(this.identity, next)) return;
+    const running = !this.stopped;
+    this.teardown();
+    this.options.shares.clearMachineDeclarations();
+    this.identity = next;
+    this.lastError = null;
+    if (running) {
+      this.stopped = false;
+      this.openTunnel();
+      this.startShareActivation();
+    }
+    this.publish();</pre>
+<h3><a href="https://github.com/get-bb/bb/blob/300a08b859f7786452c4fcab4e3a2bef56b823bb/plugins/bb-account/src/contract.ts#L20-L29">plugins/bb-account/src/contract.ts:20</a></h3><pre>export const WAIT_FOR_STATUS_CHANGE_METHOD =
+  &quot;bb-account.v1.waitForStatusChange&quot;;
+export const FETCH_METHOD = &quot;bb-account.v1.fetch&quot;;
+export const ADOPT_CONNECT_CREDENTIAL_METHOD =
+  &quot;bb-account.v1.adoptConnectCredential&quot;;
+export const CONNECT_CREDENTIAL_METHOD = &quot;bb-account.v1.connectCredential&quot;;
+export const CONFIRM_REFUSED_CREDENTIAL_METHOD =
+  &quot;bb-account.v1.confirmRefusedCredential&quot;;
+
+export const LONG_POLL_TIMEOUT_MS = 25_000;</pre>
+<h3><a href="https://github.com/get-bb/bb/blob/300a08b859f7786452c4fcab4e3a2bef56b823bb/plugins/bb-account/src/account.ts#L129-L143">plugins/bb-account/src/account.ts:129</a></h3><pre>  waitForStatusChange(afterRevision: number): Promise&lt;AccountStatus&gt; {
+    if (this.revision &gt; afterRevision || this.disposed) {
+      return Promise.resolve(this.status());
+    }
+    return new Promise((resolve) =&gt; {
+      const finish = () =&gt; {
+        clearTimeout(timer);
+        this.waiters.delete(finish);
+        resolve(this.status());
+      };
+      const timer = setTimeout(finish, LONG_POLL_TIMEOUT_MS);
+      timer.unref?.();
+      this.waiters.add(finish);
+    });
+  }</pre>
+<h3><a href="https://github.com/get-bb/bb/blob/300a08b859f7786452c4fcab4e3a2bef56b823bb/apps/server/src/services/server-move/environment.ts#L133-L139">apps/server/src/services/server-move/environment.ts:133</a></h3><pre>      setSchedulesPaused: (paused) =&gt; pluginService.setSchedulesPaused(paused),
+      stop: () =&gt; pluginService.stop(),
+      suspendAllButConnect: async () =&gt; {
+        await pluginService.suspendPlugins({
+          keep: (plugin) =&gt;
+            CONNECT_HOLD_SOURCES.some((source) =&gt; source === plugin.source),
+        });</pre>
+<p>This is a distinction between a paused server and an absent account plugin, not a transport reset. Approximately 25 seconds is the maximum wait until an already active long-poll returns under otherwise stable conditions, not a universal timer from the start of every move.</p>
+
+<h2>6. Proposed fix</h2>
+<p>In connect's existing account RPC error boundary, retain the original error specifically when its status is 503 and its code is server_moving. AccountLink already logs and retries non-unavailable failures without clearing the last known account. Keep normal missing/stopped-plugin responses, actual sign-out, and credential rejection behavior unchanged. This changes neither the freeze allowlist nor any authentication or authorization rule, protocol, package, data schema, or stored data.</p>
+<p>The proposed local fix changes only the connect client and its existing integration test. It addresses this account-poll-induced teardown, not every remaining failure in a full server move. In particular, a blocked move-time grant is a separate concern.</p>
+
+<h2>7. Verification</h2>
+<p>The same agent created checkout 2 from the recorded trusted commit, detached HEAD, ran a fresh frozen install and a successful normal Turbo build, and copied only the two new reproduction tests. Production code in checkout 2 remained byte-for-byte at the trusted commit. No issue patch or PR branch was used.</p>
+<table><tr><th>Run</th><th>Command</th><th>Observed result</th></tr>
+<tr><td>Checkout 1 / unchanged production</td><td>Connect integration command above</td><td>Exit 1; disconnected and unpaired; test duration 25.112 s.</td></tr>
+<tr><td>Checkout 2 / unchanged production</td><td>Same connect integration command</td><td>Exit 1; same disconnect and unpairing; test duration 25.143 s.</td></tr>
+<tr><td>Checkout 1 / unchanged production</td><td>Server bridge command above</td><td>Exit 1; AccountUnavailableError replaces BbHttpError after successful freeze-route checks.</td></tr>
+<tr><td>Checkout 2 / unchanged production</td><td>Same server bridge command</td><td>Exit 1; same error translation failure.</td></tr>
+<tr><td>Checkout 1 / local client fix</td><td>Connect integration command</td><td>Exit 0; same tunnel socket stays open and polling resumes without redial.</td></tr></table>
+<p>No correction was needed after the second clean run. This is repeated verification by the same agent, not independent verification. Limits: no actual server data transfer, enrolled-daemon session, macOS desktop, or production gate was exercised.</p>
+<p>After the local fix, <code>pnpm exec turbo run test typecheck lint --filter=bb-plugin-connect</code> completed successfully: all 134 plugin tests in six files passed and the plugin typecheck passed. This plugin has no lint script, so the requested Turbo lint task did not run a plugin linter. Existing sign-out, credential-rejection, and stopped-account coverage remained green. <code>pnpm exec turbo run test --filter=@bb/server -- test/server-move/account-freeze-repro.test.ts test/server-move/freeze.test.ts test/server-move/connect-hold.test.ts</code> also passed all four tests in three files. The server bridge is investigation evidence only, not part of the proposed patch.</p>
+
+<h2>8. Related issues</h2>
+<p><a href="https://github.com/get-bb/bb/issues/4837">#4837</a> concerns another account RPC during a move. <a href="https://github.com/get-bb/bb/issues/4394">#4394</a> concerns migration disconnections. These are context only; this investigation does not prove their exact root causes. No open pull request linking #4880 was present when checked before the fix.</p>
+
+<h2>9. Appendix</h2>
+<p>Raw local evidence is retained privately, not committed to the public report repository. Reproduction sources and the exact observed mismatch are inline so no artifact download is needed.</p>
+<h3>Second clean tunnel run</h3><pre> ⎯⎯⎯⎯⎯⎯⎯
+bb-plugin-connect:test: 
+bb-plugin-connect:test:  FAIL  |bb-plugin-connect| src/account-integration.test.ts &gt; connect on top of bb account &gt; keeps the live tunnel through a server move freeze and resumes account polling
+bb-plugin-connect:test: AssertionError: expected { state: &#x27;disconnected&#x27;, …(11) } to match object { paired: true, state: &#x27;connected&#x27; }
+bb-plugin-connect:test: (10 matching properties omitted from actual)
+bb-plugin-connect:test: 
+bb-plugin-connect:test: - Expected
+bb-plugin-connect:test: + Received
+bb-plugin-connect:test: 
+bb-plugin-connect:test:   {
+bb-plugin-connect:test: -   &quot;paired&quot;: true,
+bb-plugin-connect:test: -   &quot;state&quot;: &quot;connected&quot;,
+bb-plugin-connect:test: +   &quot;paired&quot;: false,
+bb-plugin-connect:test: +   &quot;state&quot;: &quot;disconnected&quot;,
+bb-plugin-connect:test:   }
+bb-plugin-connect:test: 
+bb-plugin-connect:test:  ❯ src/account-integration.test.ts:194:35
+bb-plugin-connect:test:     192|     );
+bb-plugin-connect:test:     193|
+bb-plugin-connect:test:     194|     expect(await connectStatus()).toMatchObject({
+bb-plugin-connect:test:        |                                   ^
+bb-plugin-connect:test:     195|       paired: true,
+bb-plugin-connect:test:     196|       state: &quot;connected&quot;,
+bb-plugin-connect:test: 
+bb-plugin-connect:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+bb-plugin-connect:test: 
+bb-plugin-connect:test: 
+bb-plugin-connect:test:  Test Files  1 failed (1)
+bb-plugin-connect:test:       Tests  1 failed | 11 skipped (12)
+bb-plugin-connect:test:    Start at  02:27:02
+bb-plugin-connect:test:    Duration  26.52s (transform 854ms, setup 0ms, import 1.19s, tests 25.14s, environment 0ms)
+bb-plugin-connect:test: 
+bb-plugin-connect:test:  ELIFECYCLE  Test failed. See above for more details.
+bb-plugin-connect#test:  ERROR  command (&lt;checkout-2&gt;/plugins/connect) /usr/local/bin/pnpm run test src/account-integration.test.ts -t keeps the live tunnel through a server move freeze exited (1)
+
+ Tasks:    4 successful, 5 total
+Cached:    0 cached, 5 total
+  Time:    28.482s 
+Failed:    bb-plugin-connect#test
+
+ ERROR  run failed: command  exited (1)
+</pre>
+<h3>Second clean HTTP bridge run</h3><pre> ⎯⎯⎯⎯⎯⎯⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server| test/server-move/account-freeze-repro.test.ts &gt; preserves the server-moving error through the account client
+@bb/server:test: AssertionError: expected AccountUnavailableError: bb account isn&#x27;t… to match object { name: &#x27;BbHttpError&#x27;, …(2) }
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test: - {
+@bb/server:test: -   &quot;code&quot;: &quot;server_moving&quot;,
+@bb/server:test: -   &quot;name&quot;: &quot;BbHttpError&quot;,
+@bb/server:test: -   &quot;status&quot;: 503,
+@bb/server:test: + AccountUnavailableError {
+@bb/server:test: +   &quot;name&quot;: &quot;AccountUnavailableError&quot;,
+@bb/server:test:   }
+@bb/server:test: 
+@bb/server:test:  ❯ test/server-move/account-freeze-repro.test.ts:38:33
+@bb/server:test:      36|
+@bb/server:test:      37|   const account = createAccountClient(() =&gt; sdk);
+@bb/server:test:      38|   await expect(account.status()).rejects.toMatchObject({
+@bb/server:test:        |                                 ^
+@bb/server:test:      39|     name: &quot;BbHttpError&quot;,
+@bb/server:test:      40|     status: 503,
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  1 failed (1)
+@bb/server:test:    Start at  02:28:33
+@bb/server:test:    Duration  2.27s (transform 1.31s, setup 1.46s, import 584ms, tests 31ms, environment 0ms)
+@bb/server:test: 
+@bb/server:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/server#test:  ERROR  command (&lt;checkout-2&gt;/apps/server) /usr/local/bin/pnpm run test test/server-move/account-freeze-repro.test.ts exited (1)
+
+ Tasks:    8 successful, 9 total
+Cached:    0 cached, 9 total
+  Time:    30.123s 
+Failed:    @bb/server#test
+
+ ERROR  run failed: command  exited (1)
+</pre>
+<h3>Fixed plugin suite result</h3><pre>bb-plugin-connect:test:  ✓ |bb-plugin-connect| src/tunnel-lifecycle.test.ts (15 tests) 89ms
+bb-plugin-connect:test:  ✓ |bb-plugin-connect| app.test.tsx (19 tests) 887ms
+bb-plugin-connect:test:  ✓ |bb-plugin-connect| src/connect.test.ts (71 tests) 2419ms
+bb-plugin-connect:test:      ✓ backs off while getbb.app can&#x27;t answer the adoption  502ms
+bb-plugin-connect:test:  ✓ |bb-plugin-connect| src/account-integration.test.ts (12 tests) 29880ms
+bb-plugin-connect:test:      ✓ keeps the live tunnel through a server move freeze and resumes account polling  25232ms
+bb-plugin-connect:test:      ✓ redials with the credential after the gate drops the tunnel  1390ms
+bb-plugin-connect:test:      ✓ signs out everywhere when getbb.app rejects the credential  1228ms
+bb-plugin-connect:test:      ✓ retries when bb account is briefly unavailable while handing over the credential  1381ms
+bb-plugin-connect:test: 
+bb-plugin-connect:test:  Test Files  6 passed (6)
+bb-plugin-connect:test:       Tests  134 passed (134)
+bb-plugin-connect:test:    Start at  02:31:53
+bb-plugin-connect:test:    Duration  31.59s (transform 3.65s, setup 0ms, import 5.81s, tests 33.42s, environment 860ms)
+bb-plugin-connect:test: 
+
+ Tasks:    7 successful, 7 total
+Cached:    4 cached, 7 total
+  Time:    33.18s 
+</pre>
+<p>Investigation commands: trusted repository metadata and issue/comment reads with GitHub CLI; trusted main clone/fetch and commit inspection; frozen installation; Turbo build; the two exact Turbo reproduction commands above; source line inspection using git show at the recorded commit. The integration uses the real 25-second long-poll rather than fake timers. All local loopback servers and services close in the test's afterEach hooks.</p>
+<p>Issue content was treated as untrusted claims. No embedded instruction, command, patch, external issue link, or linked PR code was executed.</p>
+</main></body></html>
