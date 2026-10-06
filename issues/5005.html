@@ -1,0 +1,529 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Report · #5005 Global maintenance gate starves settled-thread pruning</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#5005 · Global maintenance gate starves settled-thread pruning</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Low</span><span class="pill">perf · threads</span><a href="https://github.com/get-bb/bb/issues/5005">GitHub issue</a><span>October 6, 2026 · base <code>df913a79dc687341d9bec06e483ff545376225de</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · reproduction label: <code>confirmed-repro</code></p>
+<h2>1. TL;DR</h2>
+<p>Background cleanup does not remove eligible old events from settled threads while any other thread is running, starting, or awaiting an interaction. The sweep checks workspace-wide activity before advancing even one policy. A frequently busy workspace can therefore indefinitely delay existing cleanup, independently of whether the settled thread is safe to prune. Four real migrated-SQLite regression cases fail at the same settled-history assertion in two clean checkouts. This does not establish the reported production database size, or promise substantial space savings from these retention rules.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>An unrelated active or starting thread prevents cleanup of settled history.</td><td class="ok">Verified</td><td>Both parameterized thread-status cases retain sequences [1, 2, 3] instead of [3], in both checkouts.</td></tr>
+<tr><td>A pending interaction anywhere prevents the sweep.</td><td class="ok">Verified</td><td>Pending and resolving interaction cases show the same failure.</td></tr>
+<tr><td>The background sweep is bounded and uses nonblocking SQLite write-lock acquisition.</td><td class="ok">Verified from source</td><td>50 ms/64-advance sweep budget; 500-event pages for usage/diffs; busy_timeout is temporarily zero. These limits do not guarantee that each synchronous statement completes within 50 ms.</td></tr>
+<tr><td>Production has a large database and many unpruned rows.</td><td class="unv">Unverified</td><td>No production data or credentials accessed. The reproduction uses six synthetic events.</td></tr>
+<tr><td>Changing vacuum limits is necessary to solve this defect.</td><td class="unv">Not established</td><td>The failure occurs before any event deletion. Vacuum behavior and payload retention are separate questions.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Trusted repository: public <code>get-bb/bb</code>; origin/main commit <code>df913a79dc687341d9bec06e483ff545376225de</code>.</li><li>Linux 4.19.0-gvisor, Node v22.19.0, pnpm 9.15.0, Vitest 4.1.1.</li><li>Two separately installed clean clones at the same commit. Only the authored regression test differs from that commit during reproduction.</li><li>Existing server test harness creates and migrates isolated SQLite databases and new temporary test-data directories; no live server or provider session is started. No listening ports are required.</li><li>Dependencies installed with <code>pnpm install --frozen-lockfile</code>; test prerequisites built through Turbo. No dependency added.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the trusted repository at the recorded commit and install the frozen dependencies:<pre>git clone https://github.com/get-bb/bb.git bb-5005
+cd bb-5005
+git checkout --detach df913a79dc687341d9bec06e483ff545376225de
+pnpm install --frozen-lockfile</pre></li>
+<li>Apply the authored test-only patch:<pre>curl -fsS https://get-bb.github.io/reports/issues/5005/repro/reproduction.patch -o /tmp/reproduction-5005.patch
+git apply /tmp/reproduction-5005.patch</pre></li>
+<li>Run the actual sweep against the real test database:<pre>pnpm exec turbo run test --filter=@bb/server -- test/system/thread-pruning-sweep.test.ts -t 'prunes settled history while another thread'</pre></li>
+<li>The fixture seeds a busy thread and a settled thread, each containing three obsolete turn-diff snapshots. It marks only the first thread active/starting, or adds a pending/resolving interaction belonging only to it. After the sweep, the busy history must be unchanged while the settled history must retain only its current tail. Once the busy state clears, a subsequent sweep must revisit that thread.</li></ol>
+<p>Expected: busy thread <code>[1, 2, 3]</code>; settled thread <code>[3]</code>. Actual: both retain <code>[1, 2, 3]</code>. All four cases fail at the settled-thread assertion, not during setup.</p>
+<pre> FAIL  |@bb/server| test/system/thread-pruning-sweep.test.ts &gt; thread pruning sweep &gt; prunes settled history while another thread is active, then revisits it when idle
+@bb/server:test:  FAIL  |@bb/server| test/system/thread-pruning-sweep.test.ts &gt; thread pruning sweep &gt; prunes settled history while another thread is starting, then revisits it when idle
+@bb/server:test:  FAIL  |@bb/server| test/system/thread-pruning-sweep.test.ts &gt; thread pruning sweep &gt; prunes settled history while another thread is pending, then revisits it when idle
+@bb/server:test:  FAIL  |@bb/server| test/system/thread-pruning-sweep.test.ts &gt; thread pruning sweep &gt; prunes settled history while another thread is resolving, then revisits it when idle
+@bb/server:test: AssertionError: expected [ 1, 2, 3 ] to deeply equal [ 3 ]
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test:   [
+@bb/server:test: +   1,
+@bb/server:test: +   2,
+@bb/server:test:     3,
+@bb/server:test:   ]
+@bb/server:test: 
+@bb/server:test:  ❯ test/system/thread-pruning-sweep.test.ts:116:45
+@bb/server:test:     114|         await runThreadPruningSweep(harness.deps, UNTIMED_SWEEP_LIMITS…
+@bb/server:test:     115|         expect(sequences(busyThread.id)).toEqual([1, 2, 3]);
+@bb/server:test:     116|         expect(sequences(settledThread.id)).toEqual([3]);
+@bb/server:test:        |                                             ^
+@bb/server:test:     117|         harness.db
+@bb/server:test:     118|           .update(threads)
+@bb/server:test:  ❯ withTestHarness test/helpers/test-app.ts:367:12
+@bb/server:test:  ❯ test/system/thread-pruning-sweep.test.ts:84:7
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/4]⎯
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test: </pre>
+<p>Artifacts: <a href="5005/repro/reproduction.patch">test-only patch</a>, <a href="5005/repro/thread-pruning-sweep.test.ts">complete test file</a>, <a href="5005/repro/first-run.log">first run</a>, <a href="5005/repro/second-run.log">second run</a>.</p>
+<h3>Regression test file</h3><pre>import { performance } from &quot;node:perf_hooks&quot;;
+import { eq, sql } from &quot;drizzle-orm&quot;;
+import { describe, expect, it, vi } from &quot;vitest&quot;;
+import {
+  advanceThreadPruning,
+  events,
+  getNextThreadPruningPolicy,
+  getThreadEventRewriteGeneration,
+  pendingInteractions,
+  threadPruningCursors,
+  threads,
+} from &quot;@bb/db&quot;;
+import {
+  threadTimelineResponseSchema,
+  type ThreadTimelineResponse,
+} from &quot;@bb/server-contract&quot;;
+import {
+  runThreadPruningSweep,
+  THREAD_PRUNING_SWEEP_LIMITS,
+  type ThreadPruningSweepLimits,
+} from &quot;../../src/services/system/thread-pruning-sweep.js&quot;;
+import {
+  seedHost,
+  seedProjectWithSource,
+  seedThread,
+} from &quot;../helpers/seed.js&quot;;
+import { readJson } from &quot;../helpers/json.js&quot;;
+import { withTestHarness, type TestAppHarness } from &quot;../helpers/test-app.js&quot;;
+
+function seed(harness: TestAppHarness, count: number) {
+  const host = seedHost(harness.deps);
+  const { project } = seedProjectWithSource(harness.deps, { hostId: host.id });
+  const thread = seedThread(harness.deps, { projectId: project.id });
+  harness.db.transaction((tx) =&gt; {
+    for (let sequence = 1; sequence &lt;= count; sequence++)
+      tx.insert(events)
+        .values({
+          id: `${thread.id}-${sequence}`,
+          threadId: thread.id,
+          sequence,
+          scopeKind: &quot;turn&quot;,
+          turnId: &quot;turn&quot;,
+          type: &quot;turn/diff/updated&quot;,
+          data: '{&quot;diff&quot;:&quot;unused&quot;}',
+          createdAt: 1,
+        })
+        .run();
+  });
+  return thread;
+}
+
+async function getTimeline(
+  harness: TestAppHarness,
+  threadId: string,
+  afterSequence?: number,
+): Promise&lt;ThreadTimelineResponse&gt; {
+  const query =
+    afterSequence === undefined ? &quot;&quot; : `?afterSequence=${afterSequence}`;
+  const response = await harness.app.request(
+    `/api/v1/threads/${threadId}/timeline${query}`,
+  );
+  expect(response.status).toBe(200);
+  return threadTimelineResponseSchema.parse(await readJson(response));
+}
+
+function removedEvents(fields: unknown): boolean {
+  return (
+    typeof fields === &quot;object&quot; &amp;&amp;
+    fields !== null &amp;&amp;
+    &quot;removed&quot; in fields &amp;&amp;
+    fields.removed !== 0
+  );
+}
+
+const UNTIMED_SWEEP_LIMITS: ThreadPruningSweepLimits = {
+  elapsedBudgetMs: Number.POSITIVE_INFINITY,
+  maxAdvances: THREAD_PRUNING_SWEEP_LIMITS.maxAdvances,
+};
+
+describe(&quot;thread pruning sweep&quot;, () =&gt; {
+  it.each([&quot;active&quot;, &quot;starting&quot;, &quot;pending&quot;, &quot;resolving&quot;] as const)(
+    &quot;prunes settled history while another thread is %s, then revisits it when idle&quot;,
+    async (activity) =&gt; {
+      await withTestHarness(async (harness) =&gt; {
+        const busyThread = seed(harness, 3);
+        const settledThread = seed(harness, 3);
+        if (activity === &quot;active&quot; || activity === &quot;starting&quot;) {
+          harness.db
+            .update(threads)
+            .set({ status: activity })
+            .where(eq(threads.id, busyThread.id))
+            .run();
+        } else {
+          harness.db
+            .insert(pendingInteractions)
+            .values({
+              id: &quot;pruning-interaction&quot;,
+              threadId: busyThread.id,
+              status: activity,
+              payload: &quot;{}&quot;,
+              createdAt: 1,
+              updatedAt: 1,
+            })
+            .run();
+        }
+        const sequences = (threadId: string) =&gt;
+          harness.db
+            .select({ sequence: events.sequence })
+            .from(events)
+            .where(eq(events.threadId, threadId))
+            .orderBy(events.sequence)
+            .all()
+            .map((event) =&gt; event.sequence);
+        await runThreadPruningSweep(harness.deps, UNTIMED_SWEEP_LIMITS);
+        expect(sequences(busyThread.id)).toEqual([1, 2, 3]);
+        expect(sequences(settledThread.id)).toEqual([3]);
+        harness.db
+          .update(threads)
+          .set({ status: &quot;idle&quot; })
+          .where(eq(threads.id, busyThread.id))
+          .run();
+        harness.db
+          .delete(pendingInteractions)
+          .where(eq(pendingInteractions.threadId, busyThread.id))
+          .run();
+        await runThreadPruningSweep(harness.deps, UNTIMED_SWEEP_LIMITS);
+        expect(sequences(busyThread.id)).toEqual([3]);
+      });
+    },
+  );
+
+  it(&quot;skips busy work and rechecks activity after a committed advance&quot;, async () =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      const thread = seed(harness, 1200);
+      harness.db
+        .update(threads)
+        .set({ status: &quot;active&quot; })
+        .where(eq(threads.id, thread.id))
+        .run();
+      await runThreadPruningSweep(harness.deps, UNTIMED_SWEEP_LIMITS);
+      expect(harness.db.select().from(threadPruningCursors).all()).toEqual([]);
+      harness.db
+        .update(threads)
+        .set({ status: &quot;idle&quot; })
+        .where(eq(threads.id, thread.id))
+        .run();
+      const generation = getThreadEventRewriteGeneration(thread.id);
+      const notify = vi
+        .spyOn(harness.deps.hub, &quot;notifyThread&quot;)
+        .mockImplementation(() =&gt; {});
+      const debug = vi
+        .spyOn(harness.deps.logger, &quot;debug&quot;)
+        .mockImplementation((fields, message) =&gt; {
+          if (
+            message === &quot;Thread pruning policy advanced&quot; &amp;&amp;
+            removedEvents(fields)
+          ) {
+            expect(getThreadEventRewriteGeneration(thread.id)).toBeGreaterThan(
+              generation,
+            );
+            expect(harness.db.select().from(events).all()).toHaveLength(700);
+            harness.db
+              .update(threads)
+              .set({ status: &quot;active&quot; })
+              .where(eq(threads.id, thread.id))
+              .run();
+          }
+        });
+      await runThreadPruningSweep(harness.deps, UNTIMED_SWEEP_LIMITS);
+      expect(notify).toHaveBeenCalledExactlyOnceWith(thread.id, [
+        &quot;history-compacted&quot;,
+      ]);
+      expect(harness.db.select().from(events).all()).toHaveLength(700);
+      notify.mockRestore();
+      debug.mockRestore();
+    });
+  });
+
+  it(&quot;keeps notifications for earlier commits when the next transaction fails, then resumes&quot;, async () =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      const thread = seed(harness, 1200);
+      const notify = vi
+        .spyOn(harness.deps.hub, &quot;notifyThread&quot;)
+        .mockImplementation(() =&gt; {});
+      const debug = vi
+        .spyOn(harness.deps.logger, &quot;debug&quot;)
+        .mockImplementation((fields, message) =&gt; {
+          if (
+            message === &quot;Thread pruning policy advanced&quot; &amp;&amp;
+            removedEvents(fields)
+          )
+            harness.db.run(
+              sql`CREATE TRIGGER fail_next_prune BEFORE UPDATE ON thread_pruning_cursors BEGIN SELECT RAISE(ABORT, 'next batch failed'); END`,
+            );
+        });
+      await expect(
+        runThreadPruningSweep(harness.deps, UNTIMED_SWEEP_LIMITS),
+      ).rejects.toThrow(&quot;next batch failed&quot;);
+      debug.mockRestore();
+      expect(notify).toHaveBeenCalledExactlyOnceWith(thread.id, [
+        &quot;history-compacted&quot;,
+      ]);
+      expect(harness.db.select().from(events).all()).toHaveLength(700);
+      harness.db.run(sql`DROP TRIGGER fail_next_prune`);
+      notify.mockRestore();
+      for (let i = 0; i &lt; 3; i++)
+        await runThreadPruningSweep(harness.deps, UNTIMED_SWEEP_LIMITS);
+      expect(
+        harness.db
+          .select()
+          .from(events)
+          .all()
+          .map((row) =&gt; row.sequence),
+      ).toEqual([1200]);
+    });
+  });
+
+  it(&quot;notifies one history compaction per thread and answers every earlier viewer with a full timeline&quot;, async () =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      const thread = seed(harness, 2400);
+      harness.db
+        .insert(events)
+        .values({
+          id: `${thread.id}-message`,
+          threadId: thread.id,
+          sequence: 2401,
+          scopeKind: &quot;turn&quot;,
+          turnId: &quot;turn&quot;,
+          type: &quot;item/completed&quot;,
+          data: JSON.stringify({
+            item: { type: &quot;agentMessage&quot;, id: &quot;assistant-1&quot;, text: &quot;Done.&quot; },
+          }),
+          createdAt: 1,
+        })
+        .run();
+      const before = await getTimeline(harness, thread.id);
+      expect(before.maxSeq).toBe(2401);
+      const notify = vi.spyOn(harness.deps.hub, &quot;notifyThread&quot;);
+      const debug = vi.spyOn(harness.deps.logger, &quot;debug&quot;);
+
+      await runThreadPruningSweep(harness.deps, UNTIMED_SWEEP_LIMITS);
+
+      expect(
+        debug.mock.calls.filter(
+          ([fields, message]) =&gt;
+            message === &quot;Thread pruning policy advanced&quot; &amp;&amp;
+            removedEvents(fields),
+        ).length,
+      ).toBeGreaterThan(1);
+      expect(notify).toHaveBeenCalledExactlyOnceWith(thread.id, [
+        &quot;history-compacted&quot;,
+      ]);
+      expect(harness.db.select().from(events).all().length).toBeLessThan(2401);
+      const cold = await getTimeline(harness, thread.id);
+      const firstViewer = await getTimeline(harness, thread.id, before.maxSeq);
+      const secondViewer = await getTimeline(harness, thread.id, before.maxSeq);
+      for (const after of [firstViewer, secondViewer]) {
+        expect(after.maxSeq).toBe(before.maxSeq);
+        expect(after.delta).toBeUndefined();
+        expect(after.rows).toEqual(cold.rows);
+      }
+      harness.db
+        .insert(events)
+        .values({
+          id: `${thread.id}-follow-up`,
+          threadId: thread.id,
+          sequence: 2402,
+          scopeKind: &quot;turn&quot;,
+          turnId: &quot;turn&quot;,
+          type: &quot;item/completed&quot;,
+          data: JSON.stringify({
+            item: { type: &quot;agentMessage&quot;, id: &quot;assistant-2&quot;, text: &quot;More.&quot; },
+          }),
+          createdAt: 2,
+        })
+        .run();
+      const caughtUp = await getTimeline(harness, thread.id, before.maxSeq);
+      expect(caughtUp.delta).toBeUndefined();
+      expect(caughtUp.maxSeq).toBe(2402);
+      const next = await getTimeline(harness, thread.id, caughtUp.maxSeq);
+      expect(next.delta).toEqual({ upsertRows: [] });
+      notify.mockRestore();
+      debug.mockRestore();
+    });
+  });
+
+  it(&quot;stops at the elapsed budget between advances&quot;, async () =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      seed(harness, 1200);
+      let elapsed = 0;
+      const now = vi
+        .spyOn(performance, &quot;now&quot;)
+        .mockImplementation(() =&gt; elapsed);
+      const debug = vi
+        .spyOn(harness.deps.logger, &quot;debug&quot;)
+        .mockImplementation((_fields, message) =&gt; {
+          if (message === &quot;Thread pruning policy advanced&quot;) elapsed = 51;
+        });
+      try {
+        await runThreadPruningSweep(harness.deps, THREAD_PRUNING_SWEEP_LIMITS);
+        expect(
+          debug.mock.calls.filter(
+            (call) =&gt; call[1] === &quot;Thread pruning policy advanced&quot;,
+          ),
+        ).toHaveLength(1);
+      } finally {
+        now.mockRestore();
+        debug.mockRestore();
+      }
+    });
+  });
+
+  it(&quot;reports an advance that overruns the elapsed budget and then yields&quot;, async () =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      seed(harness, 1200);
+      const now = vi
+        .spyOn(performance, &quot;now&quot;)
+        .mockReturnValueOnce(0)
+        .mockReturnValueOnce(0)
+        .mockReturnValueOnce(0)
+        .mockReturnValue(75);
+      const warn = vi.spyOn(harness.deps.logger, &quot;warn&quot;);
+      const debug = vi.spyOn(harness.deps.logger, &quot;debug&quot;);
+      try {
+        await runThreadPruningSweep(harness.deps, THREAD_PRUNING_SWEEP_LIMITS);
+        expect(warn).toHaveBeenCalledWith(
+          expect.objectContaining({ advanceElapsedMs: 75 }),
+          &quot;Slow thread pruning advance&quot;,
+        );
+        expect(debug).toHaveBeenCalledWith(
+          expect.objectContaining({
+            advances: 1,
+            maxAdvanceMs: 75,
+            reason: &quot;budget&quot;,
+          }),
+          &quot;Thread pruning sweep finished&quot;,
+        );
+      } finally {
+        now.mockRestore();
+        warn.mockRestore();
+        debug.mockRestore();
+      }
+    });
+  });
+
+  it(&quot;rotates durable policy progress and honors the advance budget&quot;, async () =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      const first = seed(harness, 0);
+      for (let i = 0; i &lt; 100; i++)
+        seedThread(harness.deps, { projectId: first.projectId });
+      const debug = vi.spyOn(harness.deps.logger, &quot;debug&quot;);
+      await runThreadPruningSweep(harness.deps, UNTIMED_SWEEP_LIMITS);
+      const steps = debug.mock.calls.filter(
+        (call) =&gt; call[1] === &quot;Thread pruning policy advanced&quot;,
+      );
+      expect(steps.length).toBeLessThanOrEqual(64);
+      expect(harness.db.select().from(threadPruningCursors).all()).toHaveLength(
+        4,
+      );
+      const before = getNextThreadPruningPolicy(harness.db, new Set());
+      expect(before).not.toBeNull();
+      if (before === null) throw new Error(&quot;Missing next policy&quot;);
+      advanceThreadPruning(harness.db, before);
+      expect(getNextThreadPruningPolicy(harness.db, new Set())).not.toBe(
+        before,
+      );
+      debug.mockRestore();
+    });
+  });
+});
+</pre>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/df913a79dc687341d9bec06e483ff545376225de/apps/server/src/services/system/thread-pruning-sweep.ts#L35-L52">The sweep checks global maintenance idleness before selecting a policy</a>:</p><pre>    while (
+      advances &lt; limits.maxAdvances &amp;&amp;
+      performance.now() - startedAt &lt; limits.elapsedBudgetMs &amp;&amp;
+      completed.size &lt; THREAD_PRUNING_POLICIES.length
+    ) {
+      const activity = getDatabaseMaintenanceActivity(deps.db);
+      if (!isDatabaseMaintenanceIdle(activity)) {
+        reason = &quot;busy&quot;;
+        deps.logger.debug(
+          { activity, advances },
+          &quot;Thread pruning skipped while app work is active&quot;,
+        );
+        break;
+      }
+      const policy = getNextThreadPruningPolicy(deps.db, completed);
+      if (policy === null) break;
+      const advanceStartedAt = performance.now();
+      const result = advanceThreadPruning(deps.db, policy);</pre>
+<p><a href="https://github.com/get-bb/bb/blob/df913a79dc687341d9bec06e483ff545376225de/packages/db/src/data/maintenance.ts#L260-L271">The predicate includes all active threads and pending interactions</a>. Any nonzero count immediately exits the sweep, so safe settled threads cannot be reached:</p><pre>export function isDatabaseMaintenanceIdle(
+  activity: DatabaseMaintenanceActivity,
+): boolean {
+  return (
+    activity.activeEnvironmentProvisioningCount === 0 &amp;&amp;
+    activity.activePendingInteractionCount === 0 &amp;&amp;
+    activity.activeProjectDeletionCount === 0 &amp;&amp;
+    activity.activeThreadCount === 0 &amp;&amp;
+    activity.activeThreadProvisioningCount === 0
+  );
+}
+</pre>
+<p>Simply deleting the gate would be unsafe: <a href="https://github.com/get-bb/bb/blob/df913a79dc687341d9bec06e483ff545376225de/packages/db/src/data/thread-pruning.ts#L129-L164">the existing cursor traversal selects threads by ID and rechecks only existence</a>, without checking their activity. A cursor can also point at a thread that became busy between yielded advances.</p><pre>      if (cursor.currentThreadId === null) {
+        const next = tx
+          .select({ id: threads.id })
+          .from(threads)
+          .where(
+            threadScope === undefined
+              ? gt(threads.id, cursor.lastThreadId)
+              : eq(threads.id, threadScope),
+          )
+          .orderBy(threads.id)
+          .limit(1)
+          .get();
+        if (!next) {
+          cursor.lastThreadId = &quot;&quot;;
+          cursor.cycle += 1;
+          action = &quot;cycle-complete&quot;;
+        } else {
+          cursor.currentThreadId = next.id;
+          cursor.upperSequence = getHighWaterMarks(tx, [next.id])[next.id] ?? 0;
+          cursor.sequence = 0;
+          cursor.step = 0;
+          cursor.latestRootSequence = 0;
+          cursor.latestContextSequence = 0;
+          Object.assign(cursor, emptyResolvedItemPruningProbe());
+        }
+      }
+      const threadId = cursor.currentThreadId;
+      if (threadId !== null) {
+        const thread = tx
+          .select({ id: threads.id })
+          .from(threads)
+          .where(eq(threads.id, threadId))
+          .get();
+        if (!thread) {
+          action = &quot;missing-thread&quot;;
+        } else if (policy === &quot;rate-limits&quot;) {</pre>
+<p><a href="https://github.com/get-bb/bb/blob/df913a79dc687341d9bec06e483ff545376225de/packages/db/src/data/thread-pruning.ts#L335-L355">Advance temporarily uses busy_timeout = 0 and restores it afterward</a>. That bounds lock waiting, not all SQLite execution time.</p>
+<h2>6. Proposed fix</h2>
+<p>Move background eligibility to the existing transactional thread traversal: select only threads that are neither active nor starting and have no pending/resolving interaction, and recheck that eligibility before every resumed deletion batch. Skipped threads must become eligible again on a later cursor cycle. Leave live per-thread pruning behavior unchanged. Retain the existing global pause during project deletion or environment provisioning and leave database-vacuum gates and limits unchanged. Exercise activity changes between advances, interaction lifecycle states, and deferred-thread recovery through regression tests.</p>
+<h2>7. Verification</h2>
+<p>The same agent repeated the reproduction in a second clean temporary clone at <code>df913a79dc687341d9bec06e483ff545376225de</code>, with a fresh frozen dependency installation and fresh harness data directories. It applied only the same authored test patch, then ran the exact Turbo command from section 4. The second run again reports <code>4 failed | 6 skipped</code>, with the same expected <code>[3]</code> versus actual <code>[1, 2, 3]</code> assertion. This is a repeated check by the same agent, not independent verification. No report correction was needed.</p>
+<h2>8. Related issues</h2>
+<p><a href="https://github.com/get-bb/bb/issues/2534">#2534</a> concerns event-loop blocking by unbounded pruning, rather than starvation from global idleness. The proposed repair must preserve existing bounded batches and yields. GitHub cross-reference metadata and an open-PR search found no linked open pull request at investigation time.</p>
+<h2>9. Appendix</h2>
+<p>Both complete test logs are linked above; checkout-specific filesystem prefixes are replaced with symbolic checkout names, without changing assertion output. Source permalinks were checked against the recorded base commit. No visual evidence is needed for this nonvisual database-maintenance defect. The issue was treated only as untrusted claims: no issue-provided command, linked script, external attachment, or pull-request branch was executed. Production size and performance claims remain unverified.</p>
+<pre>Reads: gh repo view get-bb/bb --json nameWithOwner,isPrivate
+gh issue view 5005 --repo get-bb/bb --json number,title,body,labels,comments
+gh pr list --repo get-bb/bb --state open --search 5005 --json number,url,title
+git fetch origin main
+git rev-parse origin/main
+git log --oneline -- packages/db/src/data/thread-pruning.ts apps/server/src/services/system/thread-pruning-sweep.ts
+Reproduction: frozen install plus exact section-4 Turbo command, in each clean checkout.</pre>
+</main></body></html>
