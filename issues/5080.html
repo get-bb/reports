@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Report · #5080 Session restoration uses the wrong request deadline</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#5080 · Session restoration uses the wrong request deadline</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High</span><span class="pill">Effort: Low</span><span class="pill">providers · provider-pi · confirmed-repro</span><a href="https://github.com/get-bb/bb/issues/5080">Issue on GitHub</a><span>October 7, 2026 · base <code>68a1e8b7aa84fbd836eb8825e4d042ae0c52e74a</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>Restoring an existing provider session can fail even when the provider is healthy and eventually answers. The runtime gives new and forked sessions a two-minute construction deadline, but leaves restoration on the transport's shorter 30-second deadline. Two fresh checkouts reproduced this mismatch through the real runtime, bridge worker, JSON-RPC transport, and repository scripted-echo provider. Restoration also ignores an explicitly configured construction deadline: a request configured for 500 ms incorrectly succeeds after that deadline. A one-line runtime correction makes both restoration cases behave as specified while keeping the existing new-session behavior.</p>
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Reported claim, paraphrased</th><th>Finding</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>Restoration falls back to the transport deadline.</td><td class="ok">Verified</td><td>At 30,001 ms of simulated runtime time, restoration rejects with the exact transport timeout. The start-session control succeeds.</td></tr>
+<tr><td>Start and fork already use the construction deadline.</td><td class="ok">Verified</td><td>Both sendCommand call sites pass the same construction deadline in the pinned source; start is also exercised as the behavioral control.</td></tr>
+<tr><td>The pi bridge responds only after session initialization.</td><td class="ok">Verified in source</td><td>The construction function awaits session.start(); the resume handler awaits construction before sending the identity result.</td></tr>
+<tr><td>The reported large session takes over 30 seconds on the affected host.</td><td class="unv">Not independently measured</td><td>No production data, private session, or real pi account was accessed. Provider latency is modeled using the repository's existing scripted provider and parent-process fake timers.</td></tr>
+<tr><td>Restoration needs a new test-provider delay control.</td><td class="no">Refuted</td><td>The existing startDelayMs fixture already delays resume and fork as well as start. No provider or protocol change is needed.</td></tr>
+</tbody></table>
+<h2>3. Environment</h2>
+<ul><li>Public repository: get-bb/bb; trusted origin/main commit <code>68a1e8b7aa84fbd836eb8825e4d042ae0c52e74a</code>, package version 0.45.0.</li><li>Linux 4.19.0-gvisor x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li><li>Repository scripted-echo provider loaded through the actual built bridge worker and bridge artifact. Provider construction delay: 1,500 ms of real child-process time. Only parent runtime timers are advanced.</li><li>Two separate temporary Git worktrees: <code>base/</code> and <code>verification/</code>. Each received a frozen dependency install and normal Turbo build; both builds passed all 64 tasks.</li><li>No HTTP server, browser, or public port was started. Each runtime and fixture uses fresh temporary workspace/provider directories; shutdown reaps its worker processes.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Check out the pinned trusted base, install and build it, then apply only the independently authored regression-test patch:<pre>git clone https://github.com/get-bb/bb.git bb-5080
+cd bb-5080
+git checkout 68a1e8b7aa84fbd836eb8825e4d042ae0c52e74a
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+curl --fail --output regression.patch https://get-bb.github.io/reports/issues/5080/repro/regression.patch
+git apply regression.patch
+pnpm exec turbo run test --filter=@bb/agent-runtime -- src/runtime.lifecycle.test.ts -t 'uses the construction deadline'</pre></li>
+<li>The test waits until the child bridge has received the session-construction request. It advances the parent's runtime clock while the child has a real delayed reply. Three cases exercise the same production boundary:
+<ul><li>Default start deadline: advance 30,001 ms; expect successful construction.</li><li>Default resume deadline: advance 30,001 ms; expect successful construction.</li><li>Resume with a 500 ms construction deadline: advance 501 ms; expect timeout and removal of failed runtime session state.</li></ul></li>
+<li>Expected before fixing production: the new restoration expectations fail, while the original start control passes. Observed in <strong>both</strong> runs:<pre>Test Files  1 failed (1)
+Tests       2 failed | 1 passed | 23 skipped (26)
+Default resume: expected status "resolved"; received status "rejected"
+Error message: JSON-RPC request timed out: thread/resume
+Configured 500 ms resume: expected status "rejected"; received status "resolved"</pre></li></ol>
+<p>The skipped tests are intentional name-filter exclusions, not unavailable providers. Download the <a href="5080/repro/regression.patch">test-only patch</a> and <a href="5080/repro/construction-deadline.case.ts">test case excerpt</a>. The excerpt belongs inside the existing lifecycle suite; the patch is the executable reproduction artifact.</p>
+<details><summary>Complete regression case</summary><pre>    it.each([
+      {
+        method: &quot;start&quot;,
+        requestTimeoutMs: undefined,
+        advanceMs: 30_001,
+        timesOut: false,
+      },
+      {
+        method: &quot;resume&quot;,
+        requestTimeoutMs: undefined,
+        advanceMs: 30_001,
+        timesOut: false,
+      },
+      {
+        method: &quot;resume&quot;,
+        requestTimeoutMs: 500,
+        advanceMs: 501,
+        timesOut: true,
+      },
+    ] as const)(
+      &quot;uses the construction deadline for thread/$method (requestTimeoutMs=$requestTimeoutMs)&quot;,
+      async ({ method, requestTimeoutMs, advanceMs, timesOut }) =&gt; {
+        const realSetTimeout = setTimeout;
+        const sleepReal = (ms: number): Promise&lt;void&gt; =&gt;
+          new Promise((resolve) =&gt; {
+            realSetTimeout(resolve, ms);
+          });
+        vi.useFakeTimers();
+        const record = createScriptedEchoRequestRecord();
+        const runtime = createScriptedEchoRuntime({
+          runtime: {
+            workspacePath: tmpDir,
+            env: record.env,
+            onEvent: () =&gt; undefined,
+            threadCreation: { requestTimeoutMs },
+          },
+          launch: { scripted: { startDelayMs: 1_500 } },
+        });
+        let settled = false;
+        const threadArgs = {
+          environmentId: &quot;env-1&quot;,
+          threadId: &quot;t1&quot;,
+          projectId: &quot;p1&quot;,
+          providerId: &quot;fake&quot;,
+          options: fullRuntimeOptions,
+        };
+        const construction =
+          method === &quot;start&quot;
+            ? runtime.startThread(threadArgs)
+            : runtime.resumeThread({
+                ...threadArgs,
+                providerThreadId: &quot;prov-1&quot;,
+              });
+        const constructionOutcome = construction.then(
+          (result) =&gt; ({ status: &quot;resolved&quot; as const, result }),
+          (error: unknown) =&gt; ({ status: &quot;rejected&quot; as const, error }),
+        );
+        void constructionOutcome.then(() =&gt; {
+          settled = true;
+        });
+
+        try {
+          for (
+            let attempt = 0;
+            record.last(`thread/${method}`) === undefined;
+            attempt += 1
+          ) {
+            if (attempt &gt;= 1_000) {
+              throw new Error(`The bridge never received thread/${method}`);
+            }
+            await sleepReal(10);
+          }
+          await vi.advanceTimersByTimeAsync(advanceMs);
+
+          if (timesOut) {
+            expect(await constructionOutcome).toEqual({
+              status: &quot;rejected&quot;,
+              error: new Error(`JSON-RPC request timed out: thread/${method}`),
+            });
+            expect(runtime.hasThread(&quot;t1&quot;)).toBe(false);
+            expect(runtime.getProviderSession(&quot;t1&quot;)).toBeNull();
+          } else {
+            expect(settled).toBe(false);
+            expect(await constructionOutcome).toEqual({
+              status: &quot;resolved&quot;,
+              result: { providerThreadId: &quot;prov-1&quot; },
+            });
+          }
+        } finally {
+          vi.useRealTimers();
+          await runtime.shutdown();
+        }
+      },
+    );
+
+</pre></details>
+<h2>5. Root cause</h2>
+<p>The runtime's <a href="https://github.com/get-bb/bb/blob/68a1e8b7aa84fbd836eb8825e4d042ae0c52e74a/packages/agent-runtime/src/runtime.ts#L269">construction timeout setting</a> defaults to <a href="https://github.com/get-bb/bb/blob/68a1e8b7aa84fbd836eb8825e4d042ae0c52e74a/packages/agent-runtime/src/runtime.ts#L234">120,000 ms</a>. The <a href="https://github.com/get-bb/bb/blob/68a1e8b7aa84fbd836eb8825e4d042ae0c52e74a/packages/agent-runtime/src/runtime.ts#L1604">start</a> and <a href="https://github.com/get-bb/bb/blob/68a1e8b7aa84fbd836eb8825e4d042ae0c52e74a/packages/agent-runtime/src/runtime.ts#L1745">fork</a> call sites forward that value to sendCommand. The <a href="https://github.com/get-bb/bb/blob/68a1e8b7aa84fbd836eb8825e4d042ae0c52e74a/packages/agent-runtime/src/runtime.ts#L1938">resume call</a> forwards only the command, result schema, and recovery metadata:</p>
+<pre>const result = await sendCommand({
+  proc,
+  message: plan,
+  resultSchema: threadIdentityResultSchema,
+  recovery: {
+    providerId,
+    providerThreadId: adapterCommand.providerThreadId,
+    threadId,
+  },
+});</pre>
+<p><a href="https://github.com/get-bb/bb/blob/68a1e8b7aa84fbd836eb8825e4d042ae0c52e74a/packages/agent-runtime/src/runtime.ts#L440">sendCommand</a> forwards an optional timeout only when supplied. The <a href="https://github.com/get-bb/bb/blob/68a1e8b7aa84fbd836eb8825e4d042ae0c52e74a/packages/provider-bridge-protocol/src/bridge-kit/runtime-json-rpc.ts#L294">JSON-RPC request timer</a> therefore selects its 30,000 ms fallback. This also explains the opposite configured-deadline failure: choosing a shorter construction limit has no effect on resume.</p>
+<p>On pi, <a href="https://github.com/get-bb/bb/blob/68a1e8b7aa84fbd836eb8825e4d042ae0c52e74a/plugins/provider-pi/src/bridge/bridge.ts#L748">constructPiThreadSession</a> awaits session.start() at line 777. The <a href="https://github.com/get-bb/bb/blob/68a1e8b7aa84fbd836eb8825e4d042ae0c52e74a/plugins/provider-pi/src/bridge/bridge.ts#L886">resume construction handler</a> does not send its result until that construction finishes. Thus, a construction that takes between 30 seconds and the intended two-minute limit is rejected prematurely. The test reaches the same runtime/transport boundary without depending on a private large session. The <a href="https://github.com/get-bb/bb/blob/68a1e8b7aa84fbd836eb8825e4d042ae0c52e74a/tests/scripted-echo-provider/src/provider-bridge.ts#L1010">scripted resume handler</a> already uses <a href="https://github.com/get-bb/bb/blob/68a1e8b7aa84fbd836eb8825e4d042ae0c52e74a/tests/scripted-echo-provider/src/provider-bridge.ts#L850">afterStartDelay</a>, so no new test support is required.</p>
+<h2>6. Proposed fix and verified result</h2>
+<p>Forward the existing construction deadline in the resume sendCommand call, just as start and fork do. Do not change the transport default, command schema, bridge protocol, provider implementation, or daemon wire contract. Extend the existing lifecycle regression rather than adding a mock call-shape test.</p>
+<pre>timeoutMs: threadCreationRequestTimeoutMs,</pre>
+<p>After this correction, the focused test passes all three cases. The complete agent-runtime suite passes <strong>309 tests in 23 files</strong>; package lint and typecheck also pass. The diff is <strong>127 changed text lines in two files</strong>: one production addition, plus 82 test additions and 44 test deletions. No dependencies, generated files, binary files, migrations, stored data, or public contracts change. A truly unresponsive provider can now hold a resume request for the same two-minute total limit as other construction commands; it still times out, and the short-deadline test checks failed-session cleanup.</p>
+<h2>7. Verification</h2>
+<p>The same agent repeated the reproduction, not an independent reviewer. A second initially clean worktree was detached at the exact pinned commit. Its pristine status was checked before applying the same test-only patch. It received its own frozen install and successful Turbo build, and then ran the identical focused command. The second run again produced two intended restoration failures and a passing start-session control. Production code remained unchanged in that checkout. No report corrections were necessary after repetition.</p>
+<p>First run: <a href="5080/repro/first-run.log">full sanitized output</a>. Second clean run: <a href="5080/repro/second-run.log">full sanitized output</a>. Fixed focused run: <a href="5080/repro/fixed-run.log">full sanitized output</a>. Full test/lint/typecheck gate: <a href="5080/repro/validation.log">full sanitized output</a>.</p>
+<p>Live pi performance, the reported production timeline, automatic idle-worker resumption through the UI, and real-provider integration tests were not run. The reproduction proves the request deadline failure and configured-deadline behavior at the runtime's owning boundary; it does not claim to benchmark large sessions.</p>
+<h2>8. Related issues and pull requests</h2>
+<p>No open pull request linked to issue 5080 was found in its timeline or the open-PR search before fixing. Searches surfaced <a href="https://github.com/get-bb/bb/issues/4461">#4461</a> as context about turn latency, but did not establish an identical root cause. No linked PR code or branch was executed.</p>
+<h2>9. Appendix</h2>
+<p>Issue content was treated as untrusted hypotheses; its proposed patch and testing directions were not executed. All code under test came from the pinned trusted origin/main and this agent's repository-derived test and one-line repair. Administrative issue writes use the supplied SlopCop identity command. No user runtime or production logs were accessed.</p>
+<pre>First and second base checkouts:
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec turbo run test --filter=@bb/agent-runtime -- src/runtime.lifecycle.test.ts -t 'uses the construction deadline'
+
+After the one-line repair:
+pnpm exec turbo run test --filter=@bb/agent-runtime -- src/runtime.lifecycle.test.ts -t 'uses the construction deadline'
+pnpm exec turbo run test lint typecheck --filter=@bb/agent-runtime
+pnpm exec oxfmt packages/agent-runtime/src/runtime.lifecycle.test.ts packages/agent-runtime/src/runtime.ts
+git diff --check
+git diff --numstat origin/main</pre>
+<p>AGENT GENERATED · October 7, 2026</p>
+</main></body></html>
