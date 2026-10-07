@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #5149 Empty catalog persistence and query recovery</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:960px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .verdict { color:var(--warn); font-weight:600; }
+  table { border-collapse:collapse; width:100%; font-size:14px; }
+  td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+  pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#5149 · Empty catalog persistence and query recovery</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Low</span><span class="pill">providers · ui · provider-pi</span><a href="https://github.com/get-bb/bb/issues/5149">GitHub issue</a><span>2026-10-07 · base <code>7ea48db13</code></span></p>
+<p><strong>Verdict:</strong> <span class="verdict">PARTIALLY REPRODUCED</span> · <strong>Root-cause confidence:</strong> medium overall; high for empty-cache persistence, low for the reported permanent lock.</p>
+
+<h2>1. TL;DR</h2>
+<p>A successful catalog response with no models is indeed saved to renderer localStorage. However, an enabled execution-options query still fetches after a simulated renderer restart and replaces that empty placeholder with a healthy catalog. This happened in both clean checkouts of trusted main. Explicitly disabling the query produces the reported combination of successful placeholder data, idle fetch status, no prior fetch, and <code>isStale: false</code>; enabling it starts the fetch. Empty persistence alone therefore does not explain the permanent failure, and this investigation does not establish which missing condition held in the desktop incident.</p>
+
+<h2>2. Claims vs findings</h2>
+<table>
+<tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>An empty successful response is persisted.</td><td>Verified</td><td>The first added test executes the actual hook and reads the actual cache: both model arrays are empty.</td></tr>
+<tr><td>An empty cached placeholder prevents an enabled never-fetched query from loading on mount.</td><td>Not supported at this boundary</td><td>A fresh QueryClient loads the empty placeholder, starts exactly one SDK request, and accepts the subsequent nonempty response.</td></tr>
+<tr><td>The reported idle, never-fetched, non-stale placeholder state is possible.</td><td>Verified with an additional condition</td><td>The second added test observes all seven query-state fields when <code>enabled: false</code>; changing to true starts the request.</td></tr>
+<tr><td>A stale provider preference can influence the request route.</td><td>Code finding only</td><td>A stored provider wins before availability is checked, while the ready-provider fallback is gated on an empty selection. This was not established as the cause of this incident.</td></tr>
+<tr><td>The desktop picker remains blocked across real restarts after Pi credentials are repaired.</td><td>Unverified</td><td>No macOS/Electron or real credential reproduction was attempted. Query lifecycle evidence does not reproduce this claim.</td></tr>
+</table>
+
+<h2>3. Environment and isolation</h2>
+<ul>
+<li>Trusted target: public <code>get-bb/bb</code>; full base commit <code>7ea48db13ebed5371b057ca024260e213ec63d0c</code>, fetched from its <code>origin/main</code>.</li>
+<li>Linux x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1; TanStack React Query 5.90.20; jsdom hook environment.</li>
+<li>Two separately cloned source directories. Each installs the frozen lockfile; each test run uses fresh in-memory QueryClients and jsdom localStorage. The second run forces execution instead of using cached test results.</li>
+<li>No server, host daemon, browser session, ports, database directory, real provider credentials, or live user state was used. Only the SDK transport response is stubbed; the app hook, query client factory, TanStack lifecycle, validation, and storage code are real.</li>
+<li>The first checkout's full <code>pnpm exec turbo run build</code> completed: 64 successful tasks, 4 cached. Both focused suites completed successfully.</li>
+</ul>
+
+<h2>4. Minimal repeatable reproduction</h2>
+<ol>
+<li>Clone the trusted repository into a new scratch checkout and detach at the recorded base:<pre>git clone --branch main --single-branch https://github.com/get-bb/bb.git bb-5149-check
+cd bb-5149-check
+git checkout --detach 7ea48db13ebed5371b057ca024260e213ec63d0c
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build</pre></li>
+<li>Save the patch in the next block as <code>/tmp/catalog-recovery.patch</code>, apply it, and run the owning suite:<pre>git apply /tmp/catalog-recovery.patch
+pnpm exec turbo run test --filter=@bb/app --force -- src/hooks/queries/system-queries.test.tsx</pre></li>
+<li>The first test fetches an empty successful Pi catalog, verifies the persisted empty arrays, unmounts, clears the first QueryClient, and creates another QueryClient with the same localStorage. It holds the next SDK response pending to observe the placeholder and in-flight request, then returns a nonempty catalog.</li>
+<li>The second test repeats the empty warm-up but disables the new query. It verifies the idle query-state signature, then enables the query and verifies that it fetches.</li>
+</ol>
+<p><strong>Expected if the proposed permanent-cache mechanism were sufficient:</strong> the enabled restarted query would stay idle and would not request the recovered catalog. <strong>Actual:</strong> it calls the SDK once, reports fetching while the response is pending, then exposes the recovered model and <code>isFetchedAfterMount: true</code>. The expected-recovery assertions pass on unchanged production code, so they do not qualify as a failing-before-fix regression.</p>
+<details><summary>Complete reproduction patch (copy this block into the patch file)</summary>
+<pre>diff --git a/apps/app/src/hooks/queries/system-queries.test.tsx b/apps/app/src/hooks/queries/system-queries.test.tsx
+index 71bb70810..e232a61a6 100644
+--- a/apps/app/src/hooks/queries/system-queries.test.tsx
++++ b/apps/app/src/hooks/queries/system-queries.test.tsx
+@@ -12,6 +12,10 @@ import type { ProviderCliStatusResponse } from "@bb/host-daemon-contract";
+ import { afterEach, describe, expect, it, vi } from "vitest";
+ import { sdk } from "@/lib/sdk";
+ import { createQueryClientTestHarness } from "@/test/queryClientTestHarness";
++import {
++  modelCatalogCacheKey,
++  readCachedModelCatalog,
++} from "@/lib/model-catalog-cache";
+ import {
+   hostProviderCliStatusQueryKey,
+   systemExecutionOptionsQueryKey,
+@@ -360,6 +364,95 @@ describe("useSystemExecutionOptions", () =&gt; {
+   };
+   const pendingForever = () =&gt; new Promise&lt;never&gt;(() =&gt; {});
+ 
++  it("recovers a persisted empty catalog after a renderer restart", async () =&gt; {
++    const routing = { hostId: "host-repro", providerId: "pi" };
++    const emptyCatalog: SystemExecutionOptionsResponse = {
++      ...EXECUTION_OPTIONS_RESPONSE,
++      providers: [makeProviderInfo({ id: "pi" })],
++    };
++    const recoveredCatalog: SystemExecutionOptionsResponse = {
++      ...emptyCatalog,
++      models: [{ ...CODEX_MODEL, id: "repro-model", model: "repro-model" }],
++    };
++    vi.mocked(sdk.system.executionOptions).mockResolvedValue(emptyCatalog);
++    const first = createQueryClientTestHarness();
++    const initial = renderHook(() =&gt; useSystemExecutionOptions(routing), {
++      wrapper: first.wrapper,
++    });
++    await waitFor(() =&gt; expect(initial.result.current.isFetched).toBe(true));
++    expect(initial.result.current.data?.models).toEqual([]);
++    expect(
++      readCachedModelCatalog(
++        modelCatalogCacheKey({ environmentId: null, ...routing }),
++      ),
++    ).toEqual({ models: [], selectedOnlyModels: [] });
++    initial.unmount();
++    first.queryClient.clear();
++    vi.mocked(sdk.system.executionOptions).mockClear();
++    let finishRecovery: (
++      response: SystemExecutionOptionsResponse,
++    ) =&gt; void = () =&gt; {};
++    vi.mocked(sdk.system.executionOptions).mockImplementation(
++      () =&gt;
++        new Promise((resolve) =&gt; {
++          finishRecovery = resolve;
++        }),
++    );
++    const restarted = createQueryClientTestHarness();
++    const recovered = renderHook(() =&gt; useSystemExecutionOptions(routing), {
++      wrapper: restarted.wrapper,
++    });
++    expect(recovered.result.current.isPlaceholderData).toBe(true);
++    expect(recovered.result.current.data?.models).toEqual([]);
++    await waitFor(() =&gt;
++      expect(sdk.system.executionOptions).toHaveBeenCalledTimes(1),
++    );
++    expect(recovered.result.current.fetchStatus).toBe("fetching");
++    await act(async () =&gt; finishRecovery(recoveredCatalog));
++    await waitFor(() =&gt;
++      expect(recovered.result.current.data?.models).toEqual(
++        recoveredCatalog.models,
++      ),
++    );
++    expect(recovered.result.current.isFetchedAfterMount).toBe(true);
++    expect(recovered.result.current.isPlaceholderData).toBe(false);
++  });
++
++  it("leaves a persisted empty placeholder idle only while explicitly disabled", async () =&gt; {
++    const routing = { hostId: "host-disabled", providerId: "pi" };
++    const emptyCatalog: SystemExecutionOptionsResponse = {
++      ...EXECUTION_OPTIONS_RESPONSE,
++      providers: [makeProviderInfo({ id: "pi" })],
++    };
++    vi.mocked(sdk.system.executionOptions).mockResolvedValue(emptyCatalog);
++    const first = createQueryClientTestHarness();
++    const initial = renderHook(() =&gt; useSystemExecutionOptions(routing), {
++      wrapper: first.wrapper,
++    });
++    await waitFor(() =&gt; expect(initial.result.current.isFetched).toBe(true));
++    initial.unmount();
++    first.queryClient.clear();
++    vi.mocked(sdk.system.executionOptions).mockClear();
++    const restarted = createQueryClientTestHarness();
++    const disabled = renderHook(
++      ({ enabled }) =&gt; useSystemExecutionOptions({ ...routing, enabled }),
++      { wrapper: restarted.wrapper, initialProps: { enabled: false } },
++    );
++    expect(disabled.result.current).toMatchObject({
++      status: "success",
++      fetchStatus: "idle",
++      isFetched: false,
++      isFetchedAfterMount: false,
++      isStale: false,
++      isPlaceholderData: true,
++      dataUpdatedAt: 0,
++    });
++    expect(sdk.system.executionOptions).not.toHaveBeenCalled();
++    disabled.rerender({ enabled: true });
++    await waitFor(() =&gt; expect(disabled.result.current.isFetched).toBe(true));
++    expect(sdk.system.executionOptions).toHaveBeenCalledTimes(1);
++  });
++
+   it("preloads a provider's last verified catalog until the probe lands", async () =&gt; {
+     vi.mocked(sdk.system.executionOptions).mockResolvedValue(CODEX_CATALOG);
+     const first = createQueryClientTestHarness();
+@@ -510,13 +603,16 @@ describe("useSystemExecutionOptions", () =&gt; {
+       };
+       vi.mocked(sdk.system.executionOptions).mockResolvedValue(initialCatalog);
+       const { result } = renderHook(
+-        () =&gt;
+-          useSystemExecutionOptions({ hostId: "host-a", providerId }),
++        () =&gt; useSystemExecutionOptions({ hostId: "host-a", providerId }),
+         { wrapper },
+       );
+       await waitFor(() =&gt; expect(result.current.data).toEqual(initialCatalog));
+       const loadedAt = result.current.dataUpdatedAt;
+-      const modelLoadError = { providerId: refreshProviderId, code, detail: null };
++      const modelLoadError = {
++        providerId: refreshProviderId,
++        code,
++        detail: null,
++      };
+       vi.mocked(sdk.system.executionOptions).mockResolvedValue({
+         ...CODEX_CATALOG,
+         providers: [makeProviderInfo({ id: refreshProviderId })],</pre>
+</details>
+<p>The exact disabled-state assertions that pass are:</p>
+<pre>{
+  status: "success",
+  fetchStatus: "idle",
+  isFetched: false,
+  isFetchedAfterMount: false,
+  isStale: false,
+  isPlaceholderData: true,
+  dataUpdatedAt: 0
+}</pre>
+
+<h2>5. Root cause and limits</h2>
+<p><strong>Confirmed persistence mechanism:</strong> <a href="https://github.com/get-bb/bb/blob/7ea48db13ebed5371b057ca024260e213ec63d0c/apps/app/src/hooks/queries/system-queries.ts#L295-L320">the response write path</a> checks only <code>response.modelLoadError === null</code> before saving the catalog. An empty successful catalog therefore qualifies. The <a href="https://github.com/get-bb/bb/blob/7ea48db13ebed5371b057ca024260e213ec63d0c/apps/app/src/hooks/queries/system-queries.ts#L104-L152">placeholder resolver</a> can read those empty arrays and presents them with no load error.</p>
+<pre>if (response.modelLoadError === null) {
+  const catalog = {
+    models: response.models,
+    selectedOnlyModels: response.selectedOnlyModels,
+  };
+  writeCachedModelCatalog(
+    modelCatalogCacheKey({ environmentId, hostId, providerId }),
+    catalog,
+  );
+}</pre>
+<p><strong>This is not proof of a permanent lock:</strong> <a href="https://github.com/get-bb/bb/blob/7ea48db13ebed5371b057ca024260e213ec63d0c/apps/app/src/hooks/queries/system-queries.ts#L367-L403">the public query hook</a> defaults to enabled and supplies the saved data as <em>placeholderData</em>, not as fetched query data. The installed TanStack <code>queryObserver.ts</code> loads an enabled query on mount when <code>query.state.data === undefined</code>. Its <code>isStale</code> calculation also explicitly returns false for a disabled query. Both behaviors were exercised rather than inferred solely from source.</p>
+<p><strong>Unresolved routing risk:</strong> <a href="https://github.com/get-bb/bb/blob/7ea48db13ebed5371b057ca024260e213ec63d0c/apps/app/src/hooks/useThreadCreationOptions.ts#L316-L318">stored provider selection</a> precedes availability checking, and <a href="https://github.com/get-bb/bb/blob/7ea48db13ebed5371b057ca024260e213ec63d0c/apps/app/src/hooks/useThreadCreationOptions.ts#L368-L379">ready-provider discovery</a> only runs for an empty stored selection. The issue's additional stale-provider allegation is a separate hypothesis, not a verified explanation for why a Pi-only recovery would never fetch.</p>
+
+<h2>6. Fix proposal and simple-fix gate</h2>
+<p>No production fix or pull request is offered. The reported permanent failure has not been reproduced on trusted main, and there is no focused regression that fails before a fix for that failure. Merely skipping empty writes would not explain or repair an explicitly disabled query or an incorrectly routed provider request.</p>
+<p>The next decisive experiment is an isolated desktop reproduction that records the mounted composer's execution-options <code>enabled</code> value, actual query key/provider route, observer identity, and request activity before and after credential repair. If an empty response overwrites a useful prior catalog, deciding whether to retain it is a separate cache-policy question: a legitimate zero-model response must not silently become an indefinitely stale nonempty catalog.</p>
+
+<h2>7. Verification: second clean checkout</h2>
+<p>The same agent cloned a second checkout from the trusted repository, detached it at the exact recorded base, installed the frozen lockfile, and applied only the locally authored reproduction patch. No production file changed. A forced Turbo test run repeated all 28 tests with fresh query clients and fresh jsdom storage. Without sharing the first checkout's runtime state, it confirmed empty persistence, successful enabled-query recovery, and the disabled-state control. This is a second clean run by the same investigator, not an independent-agent review.</p>
+<p>No ports or instance data directories exist because neither run needed a live instance. No report correction was necessary after the second run.</p>
+<pre>First clean run:
+✓ |@bb/app:isolated| src/hooks/queries/system-queries.test.tsx (28 tests) 2458ms
+Test Files  1 passed (1)
+     Tests  28 passed (28)
+Start at  22:45:26
+Duration  6.08s
+Tasks: 5 successful, 5 total; Cached: 0 cached, 5 total
+
+Second clean run (--force):
+✓ |@bb/app:isolated| src/hooks/queries/system-queries.test.tsx (28 tests) 2462ms
+Test Files  1 passed (1)
+     Tests  28 passed (28)
+Start at  22:46:22
+Duration  6.06s
+Tasks: 5 successful, 5 total; Cached: 0 cached, 5 total</pre>
+
+<h2>8. Linked pull requests and related issues</h2>
+<p>No open linked pull request was found by an issue-number search or the issue's cross-reference/connected-event metadata at investigation time. Other model-catalog reports exist, but this report does not assume they share the mechanism.</p>
+
+<h2>9. Evidence handling</h2>
+<p>Issue content was treated as untrusted claims. No issue-supplied command, patch, branch, script, external link, or test was executed or fetched. The reproduction was authored from trusted main code and existing owning-package test patterns. Public evidence is self-contained in this HTML; raw logs and scratch checkouts remain local. There is no screenshot because this report verifies the query/storage boundary, not the macOS visual incident.</p>
+<p>Reproduction label: <code>partial-repro</code>. The original permanent desktop symptom remains unresolved; the partial verdict is not a claim that it is fixed.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
