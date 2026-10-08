@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #5192 Incremental maintenance monopolizes the event loop</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#5192 · Incremental maintenance monopolizes the event loop</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">Priority: High</span><span class="pill">Effort: Low</span><span class="pill">perf · host</span>
+<a href="https://github.com/get-bb/bb/issues/5192">GitHub issue</a><span>October 8, 2026 · base <code>8d9195d8e0f123ea32b21eb9eb1104b35d97b916</code></span></p>
+<p class="verdict">Verdict: REPRODUCED · Root-cause confidence: high · Reproduction label: confirmed-repro</p>
+
+<h2>1. TL;DR</h2>
+<p>The hourly server maintenance job performs one synchronous SQLite vacuum covering up to 20,000 pages.
+While that native call runs, queued event-loop callbacks cannot execute, so unrelated request handling can wait behind maintenance.
+A purpose-built test against unchanged trusted main reclaimed exactly 20,000 pages and delayed queued work for 243 ms on a fresh 259 MiB in-memory database.
+The same agent repeated the test from a second clean checkout with a newly created database: queued work waited 240 ms and ran only after maintenance completed.
+This verifies the starvation mechanism, not the reporter's specific production durations or terminal-disconnection correlation.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim, paraphrased</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>The hourly job issues one synchronous large vacuum.</td><td class="ok">Verified</td><td>Trusted main source plus the actual slow-query instrumentation: one PRAGMA incremental_vacuum(20000) in each run.</td></tr>
+<tr><td>Maintenance monopolizes the event loop rather than yielding.</td><td class="ok">Verified</td><td>The queued setImmediate callback observed maintenanceComplete=true in both fresh databases. No maintenance warnings occurred.</td></tr>
+<tr><td>A maintenance pass should not monopolize requests for approximately 100 ms.</td><td class="ok">Defect verified</td><td>Observed queued-work delays were 243 and 240 ms. The assertion is based on ordering, not machine-specific timing.</td></tr>
+<tr><td>The incremental branch does not apply the full-compaction idle gate.</td><td class="ok">Verified in source</td><td>The incremental branch returns before the activity check at periodic-sweeps.ts:232. Existing maintenance tests exercise it with active app work.</td></tr>
+<tr><td>Reported production stalls last tens of seconds and coincide with disconnections.</td><td class="unv">Unverified</td><td>No production database, service, logs, or account was accessed. The synthetic reproduction demonstrates a shorter stall.</td></tr>
+<tr><td>Other background queries account for additional latency.</td><td class="unv">Outside scope</td><td>This test invokes only the real database-maintenance sweep. It does not measure commands routes or timeline work.</td></tr>
+</table>
+
+<h2>3. Environment</h2>
+<ul><li>Public repository: get-bb/bb. Both checkouts use trusted origin/main commit <code>8d9195d8e0f123ea32b21eb9eb1104b35d97b916</code>, fetched directly from the target repository.</li>
+<li>Linux x86_64; Node v22.19.0; pnpm 9.15.0; better-sqlite3 12.10.0; Vitest 4.1.1.</li>
+<li>Both checkouts completed the normal frozen installation and full Turbo build: 65 successful build tasks each.</li>
+<li>One fresh migrated in-memory SQLite database per run. Before maintenance: 66,330 pages, 44,037 free pages, page size 4,096 bytes. No production data.</li>
+<li>No app server, provider session, browser, HTTP port, host-daemon connection, or persistent application data directory was started. The existing server test harness was used by its normal test configuration.</li>
+<li>Existing area labels perf and host were preserved; missing Type, Priority, and Effort were set to Bug, High, and Low.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the target repository and select the recorded trusted commit:
+<pre>git clone https://github.com/get-bb/bb.git bb-repro-5192
+cd bb-repro-5192
+git checkout --detach 8d9195d8e0f123ea32b21eb9eb1104b35d97b916
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build</pre></li>
+<li>Save the complete test shown below at <code>apps/server/test/services/vacuum-responsiveness-5192.test.ts</code>. It uses a real migrated database, inserts 4,096 synthetic 64 KiB payloads, deletes two of every three rows, and queues an observer immediately before invoking the production maintenance sweep.</li>
+<li>Run through the repository's normal test orchestration:
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/services/vacuum-responsiveness-5192.test.ts</pre></li>
+<li>Expected: queued work executes while maintenance is still in progress, with free pages remaining to be reclaimed. Actual: the first observation happens only after the whole synchronous sweep. The command exits 1 with the regression assertion shown below.</li></ol>
+<h3>Complete reproduction test</h3>
+<pre>import {
+  createConnection,
+  DATABASE_INCREMENTAL_VACUUM_MAX_PAGES,
+  getDatabaseFreelistStats,
+  migrate,
+  type SlowDbQueryLogFields,
+} from &quot;@bb/db&quot;;
+import { performance } from &quot;node:perf_hooks&quot;;
+import { expect, it } from &quot;vitest&quot;;
+import { runDatabaseMaintenanceSweep } from &quot;../../src/services/system/periodic-sweeps.js&quot;;
+import type { ServerLogger } from &quot;../../src/types.js&quot;;
+
+it(&quot;serves queued event-loop work before a large maintenance sweep completes&quot;, async () =&gt; {
+  const vacuumQueries: SlowDbQueryLogFields[] = [];
+  const db = createConnection(&quot;:memory:&quot;, {
+    slowQueryThresholdMs: 0,
+    slowQueryLogger: {
+      info(fields) {
+        if (fields.sql.startsWith(&quot;PRAGMA incremental_vacuum&quot;)) {
+          vacuumQueries.push(fields);
+        }
+      },
+    },
+  });
+  const warnings: string[] = [];
+  const logger: ServerLogger = {
+    debug() {},
+    error() {},
+    info() {},
+    warn() {
+      warnings.push(&quot;maintenance warning&quot;);
+    },
+  };
+  try {
+    migrate(db);
+    db.$client.exec(
+      &quot;CREATE TABLE responsiveness_payloads (id INTEGER PRIMARY KEY, payload BLOB NOT NULL)&quot;,
+    );
+    const insert = db.$client.prepare(
+      &quot;INSERT INTO responsiveness_payloads (payload) VALUES (?)&quot;,
+    );
+    const payload = Buffer.alloc(64 * 1024, 65);
+    db.$client.transaction(() =&gt; {
+      for (let rowIndex = 0; rowIndex &lt; 4_096; rowIndex += 1) {
+        insert.run(payload);
+      }
+    })();
+    db.$client.exec(&quot;DELETE FROM responsiveness_payloads WHERE id % 3 != 0&quot;);
+    const before = getDatabaseFreelistStats(db);
+    expect(before.freelistCount).toBeGreaterThan(
+      DATABASE_INCREMENTAL_VACUUM_MAX_PAGES,
+    );
+    let maintenanceComplete = false;
+    const startedAt = performance.now();
+    const queuedWork = new Promise&lt;{
+      observedCompletion: boolean;
+      freelistCount: number;
+      delayMs: number;
+    }&gt;((resolve) =&gt; {
+      setImmediate(() =&gt; {
+        resolve({
+          observedCompletion: maintenanceComplete,
+          freelistCount: getDatabaseFreelistStats(db).freelistCount,
+          delayMs: Math.round(performance.now() - startedAt),
+        });
+      });
+    });
+    await runDatabaseMaintenanceSweep({ db, logger });
+    maintenanceComplete = true;
+    const sweepDurationMs = Math.round(performance.now() - startedAt);
+    const after = getDatabaseFreelistStats(db);
+    const observation = await queuedWork;
+    console.log(
+      JSON.stringify({
+        before,
+        after,
+        sweepDurationMs,
+        observation,
+        vacuumQueries: vacuumQueries.map(({ sql, durationMs }) =&gt; ({
+          sql,
+          durationMs,
+        })),
+        warnings,
+      }),
+    );
+    expect(warnings).toEqual([]);
+    expect(after.freelistCount).toBeLessThan(before.freelistCount);
+    expect(observation.observedCompletion).toBe(false);
+    expect(observation.freelistCount).toBeGreaterThan(after.freelistCount);
+  } finally {
+    db.$client.close();
+  }
+});
+</pre>
+<h3>First run: actual diagnostic output</h3>
+<pre>{
+  &quot;before&quot;: {
+    &quot;databaseBytes&quot;: 271687680,
+    &quot;freelistBytes&quot;: 180375552,
+    &quot;freelistCount&quot;: 44037,
+    &quot;pageCount&quot;: 66330,
+    &quot;pageSize&quot;: 4096
+  },
+  &quot;after&quot;: {
+    &quot;databaseBytes&quot;: 189669376,
+    &quot;freelistBytes&quot;: 98455552,
+    &quot;freelistCount&quot;: 24037,
+    &quot;pageCount&quot;: 46306,
+    &quot;pageSize&quot;: 4096
+  },
+  &quot;sweepDurationMs&quot;: 243,
+  &quot;observation&quot;: {
+    &quot;observedCompletion&quot;: true,
+    &quot;freelistCount&quot;: 24037,
+    &quot;delayMs&quot;: 243
+  },
+  &quot;vacuumQueries&quot;: [
+    {
+      &quot;sql&quot;: &quot;PRAGMA incremental_vacuum(20000)&quot;,
+      &quot;durationMs&quot;: 242.2
+    }
+  ],
+  &quot;warnings&quot;: []
+}
+
+AssertionError: expected true to be false // Object.is equality
+Test Files  1 failed (1)
+Tests       1 failed (1)
+Exit code: 1</pre>
+<p>The deliberate failing assertion is the responsiveness defect, not a setup or syntax failure. The guard assertions confirmed a large freelist, successful reclamation, and no maintenance warnings first. Tests do not mock the database or change production code.</p>
+
+<h2>5. Root cause</h2>
+<p>The maintenance job uses a one-hour cadence (<a href="https://github.com/get-bb/bb/blob/8d9195d8e0f123ea32b21eb9eb1104b35d97b916/apps/server/src/services/system/periodic-sweeps.ts#L87-L87">cadence constant</a>) and registers the same sweep directly (<a href="https://github.com/get-bb/bb/blob/8d9195d8e0f123ea32b21eb9eb1104b35d97b916/apps/server/src/services/system/periodic-sweeps.ts#L595-L600">job registration</a>).
+Its incremental branch chooses a single native operation, with no scheduling boundary inside it:</p>
+<p><a href="https://github.com/get-bb/bb/blob/8d9195d8e0f123ea32b21eb9eb1104b35d97b916/apps/server/src/services/system/periodic-sweeps.ts#L207-L229">periodic-sweeps.ts:207–229 at the recorded commit</a></p>
+<pre>    try {
+      const result = runIncrementalVacuum(deps.db, {
+        maxPages: DATABASE_INCREMENTAL_VACUUM_MAX_PAGES,
+      });
+      deps.logger.info({ result }, &quot;Incremental database vacuum completed&quot;);
+    } catch (error) {
+      deps.logger.warn({ err: error }, &quot;Incremental database vacuum failed&quot;);
+    }
+    return;</pre>
+<p><a href="https://github.com/get-bb/bb/blob/8d9195d8e0f123ea32b21eb9eb1104b35d97b916/packages/db/src/data/maintenance.ts#L13-L15">The configured page budget is 20,000</a>.
+The database helper issues two checkpoints surrounding one synchronous better-sqlite3 exec:</p>
+<p><a href="https://github.com/get-bb/bb/blob/8d9195d8e0f123ea32b21eb9eb1104b35d97b916/packages/db/src/data/maintenance.ts#L411-L431">maintenance.ts:411–431</a></p>
+<pre>export function runIncrementalVacuum(
+  db: DbConnection,
+  args: RunIncrementalVacuumArgs,
+): IncrementalVacuumResult {
+  return runWithMaintenanceBusyTimeout({
+    db,
+    work: () =&gt; {
+      const before = getDatabaseFreelistStats(db);
+
+      db.$client.exec(&quot;PRAGMA wal_checkpoint(PASSIVE)&quot;);
+      db.$client.exec(`PRAGMA incremental_vacuum(${args.maxPages})`);
+      db.$client.exec(&quot;PRAGMA wal_checkpoint(PASSIVE)&quot;);
+
+      return {
+        after: getDatabaseFreelistStats(db),
+        before,
+      };
+    },
+  });
+}
+</pre>
+<p>The 242.2 ms and 238.8 ms vacuum calls account for nearly the entire measured sweep delay. Awaiting the enclosing sweep from a job runner cannot preempt an already running synchronous native call.
+The <a href="https://github.com/get-bb/bb/blob/8d9195d8e0f123ea32b21eb9eb1104b35d97b916/packages/db/src/data/maintenance.ts#L189-L214">maintenance busy-timeout helper</a> limits lock waiting; it is not a wall-time limit on vacuum execution. The defect occurs without a second database connection or contending process.</p>
+<p>The incremental branch returns before the <a href="https://github.com/get-bb/bb/blob/8d9195d8e0f123ea32b21eb9eb1104b35d97b916/apps/server/src/services/system/periodic-sweeps.ts#L232-L238">full-compaction idle gate</a>. That confirms the code-path distinction, but adding an idle gate alone does not fix the non-yielding operation and could starve maintenance on busy servers.</p>
+
+<h2>6. Proposed fix</h2>
+<p>Keep the existing total page budget, but execute smaller bounded chunks and yield with a real event-loop scheduling boundary between them. Stop once the freelist is exhausted and retain existing bounded lock-wait/error handling. Keep the chunking policy in the existing server maintenance subsystem, leaving the synchronous database primitive as a small operation.</p>
+<p>Use the ordering regression above to verify that queued work runs before the final chunk. Also retain the WAL-reader and WAL-writer tests. A fixed page count per chunk does not guarantee a universal 100 ms deadline on every disk and database; validate worst-case chunk and checkpoint times before promising one.</p>
+
+<h2>7. PR review</h2>
+<h3><a href="https://github.com/get-bb/bb/pull/5193">PR #5193</a> — static review only</h3>
+<p>GitHub metadata shows an open, ready PR with a closing reference to #5192. No linked branch was checked out and no PR code or test was executed.</p>
+<p>The read-only diff introduces a server helper using 256-page chunks, a setImmediate yield between successive chunks, an empty-freelist exit, and an async maintenance sweep. The existing periodic-job contract already accepts Promise-returning jobs. It also changes relevant tests to await the sweep.</p>
+<p><strong>Static verdict:</strong> addresses the verified non-yielding root cause. This is not a runtime approval of the PR. No blocking finding is established by this review. A non-blocking validation concern remains in <code>apps/server/src/services/system/periodic-sweeps.ts</code>, proposed helper near lines 177–208: each chunk and its surrounding checkpoints remain synchronous, so bounded pages do not alone prove a strict latency ceiling.</p>
+<p>The test executed for this report was authored from trusted repository evidence and run against unchanged main only. A separate automatic fix was skipped to avoid duplicating the already linked PR.</p>
+
+<h2>8. Related issues</h2>
+<ul><li><a href="https://github.com/get-bb/bb/issues/5005">#5005</a>: pruning progress under busy application activity; a different maintenance scheduling concern.</li>
+<li><a href="https://github.com/get-bb/bb/issues/4674">#4674</a>: synchronous timeline building; a separate source of event-loop latency.</li></ul>
+
+<h2>9. Verification</h2>
+<p>The same agent created a second clean detached Git worktree at <code>8d9195d8e0f123ea32b21eb9eb1104b35d97b916</code>, verified its clean status before adding the authored test, completed a fresh frozen installation and full build, and repeated the same Turbo command. This is a repeated clean check, not independent verification.</p>
+<pre>git worktree add --detach ../bb-repro-5192-verify 8d9195d8e0f123ea32b21eb9eb1104b35d97b916
+cd ../bb-repro-5192-verify
+git status --short
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+
+After adding the same test source:
+pnpm exec turbo run test --filter=@bb/server -- test/services/vacuum-responsiveness-5192.test.ts</pre>
+<p>The test source was byte-identical (SHA-256 <code>7673886c898cd840e952293cc0ba616e0fc7c120f95f43238da379accc94e521</code>). Both maintenance production files were unchanged in both checkouts.</p>
+<h3>Second run: actual diagnostic output</h3>
+<pre>{
+  &quot;before&quot;: {
+    &quot;databaseBytes&quot;: 271687680,
+    &quot;freelistBytes&quot;: 180375552,
+    &quot;freelistCount&quot;: 44037,
+    &quot;pageCount&quot;: 66330,
+    &quot;pageSize&quot;: 4096
+  },
+  &quot;after&quot;: {
+    &quot;databaseBytes&quot;: 189669376,
+    &quot;freelistBytes&quot;: 98455552,
+    &quot;freelistCount&quot;: 24037,
+    &quot;pageCount&quot;: 46306,
+    &quot;pageSize&quot;: 4096
+  },
+  &quot;sweepDurationMs&quot;: 240,
+  &quot;observation&quot;: {
+    &quot;observedCompletion&quot;: true,
+    &quot;freelistCount&quot;: 24037,
+    &quot;delayMs&quot;: 240
+  },
+  &quot;vacuumQueries&quot;: [
+    {
+      &quot;sql&quot;: &quot;PRAGMA incremental_vacuum(20000)&quot;,
+      &quot;durationMs&quot;: 238.8
+    }
+  ],
+  &quot;warnings&quot;: []
+}
+
+AssertionError: expected true to be false // Object.is equality
+Test Files  1 failed (1)
+Tests       1 failed (1)
+Exit code: 1</pre>
+<p>No report correction was needed after the repeated run. A final fetch still resolved trusted origin/main to the recorded base commit.</p>
+<h3>Relevant existing tests</h3>
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/services/database-maintenance-sweep.test.ts
+Test Files  1 passed (1)
+Tests       5 passed (5)
+
+pnpm exec turbo run test --filter=@bb/db -- test/data/maintenance.test.ts
+Test Files  1 passed (1)
+Tests       7 passed (7)</pre>
+
+<h2>10. Appendix and limits</h2>
+<p>Evidence above contains the complete authored test and exact diagnostic JSON. Raw logs and test files remain outside the public reports repository, per its publication policy. No screenshots are necessary for this nonvisual scheduling defect.</p>
+<p>Investigation commands comprised: read-only issue fields/comments and repository labels; GitHub repository visibility checks; read-only PR metadata and diff; target main fetch/clone and second detached worktree creation; frozen installs; full Turbo builds; formatting the authored test; two focused regression runs; the two existing maintenance suites; production-diff and test-digest checks; and a final trusted-main fetch. The first attempt at the authored test had a local generation syntax error; it was corrected before either evidenced reproduction. That setup failure is not counted as evidence.</p>
+<p><strong>Trust boundary:</strong> issue text, linked PR text, scripts, and logs were treated as untrusted claims. Their instructions were not followed and their code was not run. No external URL from issue content was fetched. Public output excludes private paths, identities, credentials, runtime databases, and machine-specific data.</p>
+<p><strong>Limits:</strong> No production timing, remote route latency, terminal interruption, hardware-specific behavior, or PR runtime result is claimed. The confirmed result is repeatable event-loop starvation in the real maintenance sweep on trusted main.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
