@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #5354 Runtime replacement loses ownership</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#5354 · Runtime replacement loses ownership under overlapping requests</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High</span><span class="pill">Effort: Medium</span><span class="pill">host · threads · confirmed-repro</span><a href="https://github.com/get-bb/bb/issues/5354">Issue</a><span>2026-10-11 · base <code>3912f4aae</code></span></p>
+<p class="verdict">REPRODUCED · Root-cause confidence: high</p>
+<h2>1. TL;DR</h2>
+<p>Two callers asking the host daemon for the same environment can receive different runtimes during an idle-runtime replacement. A deterministic test on trusted main creates three runtimes rather than two: the original, an overlapping replacement, and the first caller's replacement. Only one replacement remains tracked, and shutting down the manager never shuts down the other replacement. Both skill-catalog invalidation and shell-generation invalidation reproduce this ownership defect. Live provider execution, duplicate commits, and lost messages were not recreated; this report confirms the runtime race, not every reported downstream consequence.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>Concurrent environment requests can create an untracked replacement runtime.</td><td class="ok">Verified</td><td>Both new regression cases return different runtime objects, create three runtimes, and leave one runtime with zero shutdown calls.</td></tr>
+<tr><td>Both skill and shell refresh can trigger the race.</td><td class="ok">Verified</td><td>Table-driven cases remove an initial skill catalog or retain a busy runtime across a shell refresh before making it idle.</td></tr>
+<tr><td>Two provider root turns, duplicate side effects, misleading idle state, and discarded input occurred in live threads.</td><td class="unv">Unverified in this investigation</td><td>No live provider sessions or reporter runtime data were used. The local manager loses ownership, which permits separate callers to operate separate runtime objects; the reported live sequence remains unverified.</td></tr>
+</table>
+<h2>3. Environment</h2>
+<ul><li>Public repository: <code>get-bb/bb</code>; trusted <code>origin/main</code>: <code>3912f4aaefb7dff55c7e0cb5003b26b5cf1457dc</code>.</li><li>Linux x86_64 (gVisor), Node <code>22.19.0</code>, pnpm <code>9.15.0</code>, Vitest <code>4.1.1</code>.</li><li>Two separate clean temporary clones at the same trusted commit, each installed with a frozen lockfile and built through Turbo.</li><li>Fresh temporary skill data per test. Workspace and agent-runtime boundaries use the existing repository test fixtures; the real RuntimeManager and skill staging code execute.</li><li>No running BB instance, network-facing plugins, browser, database, ports, or real provider session are needed.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the public target repository and check out the recorded trusted base.</li><li>Install and build the owning package.</li><li>Add the test below inside the existing <code>describe("RuntimeManager", ...)</code> in <code>apps/host-daemon/src/runtime-manager.test.ts</code>, immediately before the existing busy-runtime catalog test. It uses that file's existing helpers and imports, without any new dependency.</li><li>Run the focused Turbo command. On the base, both cases fail. With the ownership fix, both pass.</li></ol>
+<pre>git clone https://github.com/get-bb/bb.git bb-repro-5354
+cd bb-repro-5354
+git checkout --detach 3912f4aaefb7dff55c7e0cb5003b26b5cf1457dc
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/host-daemon
+pnpm exec turbo run test --filter=@bb/host-daemon -- --run src/runtime-manager.test.ts -t 'retains one runtime'</pre>
+<p>The test defers shutdown at the real replacement boundary, launches an overlapping ensure, and releases shutdown after the second request has entered the asynchronous skill-resolution path. Expected: two total runtime creations, identical replacement runtime objects, and exactly one shutdown for each created runtime. Actual output from both base runs:</p>
+<pre>FAIL  RuntimeManager &gt; retains one runtime when concurrent ensures overlap a catalog replacement
+FAIL  RuntimeManager &gt; retains one runtime when concurrent ensures overlap a shell replacement
+AssertionError: expected { …(30) } to be { …(30) } // Object.is equality
+Compared values have no visual difference.
+AssertionError: expected "vi.fn()" to be called 2 times, but got 3 times
+AssertionError: expected "vi.fn()" to be called 1 times, but got 0 times
+Test Files  1 failed (1)
+Tests  2 failed | 43 skipped (45)</pre>
+<h3>Regression test</h3>
+<pre>  it.each(["catalog", "shell"] as const)(
+    "retains one runtime when concurrent ensures overlap a %s replacement",
+    async (invalidation) =&gt; {
+      const dataDir = await makeTempDir("bb-runtime-replacement-");
+      const source = await writeInjectedSkillSource({
+        dataDir,
+        name: "race-check",
+        token: "catalog-before",
+      });
+      const createdRuntimes: ReturnType&lt;typeof createFakeRuntime&gt;[] = [];
+      const createRuntime = vi.fn(() =&gt; {
+        const runtime = createFakeRuntime();
+        createdRuntimes.push(runtime);
+        return runtime;
+      });
+      const manager = new RuntimeManager({
+        dataDir,
+        createRuntime,
+        provisionWorkspace: createProvisionWorkspaceMock("/tmp/race-workspace"),
+      });
+      const initial = await manager.ensureEnvironment({
+        environmentId: "replacement-env",
+        workspacePath: "/tmp/race-workspace",
+        injectedSkillSources: [source],
+      });
+      const initialRuntime = createdRuntimes[0]!;
+      if (invalidation === "shell") {
+        initialRuntime.setOpenBackgroundWork(true);
+        await manager.replaceBaseShellEnv({ PATH: "/refreshed/bin" });
+        initialRuntime.setOpenBackgroundWork(false);
+      }
+      const shutdownEntered = createDeferredPromise&lt;void&gt;();
+      const shutdownReleased = createDeferredPromise&lt;void&gt;();
+      initialRuntime.shutdown.mockImplementationOnce(async () =&gt; {
+        shutdownEntered.resolve();
+        await shutdownReleased.promise;
+      });
+      const args = {
+        environmentId: "replacement-env",
+        workspacePath: "/tmp/race-workspace",
+        injectedSkillSources: [],
+      };
+      const replacing = manager.ensureEnvironment(args);
+      await shutdownEntered.promise;
+      const concurrent = manager.ensureEnvironment(args);
+      await Promise.resolve();
+      shutdownReleased.resolve();
+      try {
+        const [replacement, overlapping] = await Promise.all([
+          replacing,
+          concurrent,
+        ]);
+        expect(replacement.runtime).not.toBe(initial.runtime);
+        expect.soft(overlapping.runtime).toBe(replacement.runtime);
+        expect(manager.get(args.environmentId)?.runtime).toBe(
+          replacement.runtime,
+        );
+        expect.soft(createRuntime).toHaveBeenCalledTimes(2);
+      } finally {
+        shutdownReleased.resolve();
+        await manager.shutdownAll();
+      }
+      for (const runtime of createdRuntimes) {
+        expect.soft(runtime.shutdown).toHaveBeenCalledTimes(1);
+      }
+    },
+  );</pre>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/3912f4aaefb7dff55c7e0cb5003b26b5cf1457dc/apps/host-daemon/src/runtime-manager.ts#L669-L735">Compatibility replacement</a> removes an idle entry before awaiting its runtime's shutdown. The shell-generation branch follows the same pattern. During that await, no entry exists and no replacement promise has been registered.</p>
+<pre>this.entries.delete(args.entry.environmentId);
+await args.entry.runtime.shutdown();</pre>
+<p><a href="https://github.com/get-bb/bb/blob/3912f4aaefb7dff55c7e0cb5003b26b5cf1457dc/apps/host-daemon/src/runtime-manager.ts#L874-L938">ensureEnvironment</a> checks entries before compatibility work, then checks pending creation promises. An overlapping caller can finish its own creation while the first caller is waiting in shutdown. The first caller's continuation does not re-read entries; if the overlapping creation promise has already been cleaned up, it creates another runtime and overwrites the map entry.</p>
+<pre>.then((entry) =&gt; {
+  this.entries.set(args.environmentId, entry);
+  return entry;
+})</pre>
+<p>The caller holding the overwritten runtime still has a valid runtime reference. Manager shutdown and idle maintenance only enumerate tracked entries, so they cannot see that runtime. The regression's zero shutdown count demonstrates this lost ownership rather than merely an extra factory invocation.</p>
+<p><a href="https://github.com/get-bb/bb/blob/3912f4aaefb7dff55c7e0cb5003b26b5cf1457dc/apps/host-daemon/src/command-handlers/thread.ts#L395-L422">Turn admission</a> checks the selected entry's runtime, not a process-wide registry. That explains how runtime ownership loss could undermine admission checks, but no two real provider turns were started in this reproduction.</p>
+<h2>6. Proposed fix</h2>
+<p>Track the entire ensure operation by environment before its first asynchronous gap, not just runtime creation. Overlapping callers await the in-flight operation and then re-evaluate compatibility against the resident runtime. Preserve pending-operation rejection: cancellation of a shared provision must reject all waiting callers rather than starting a second setup. Clear the operation by promise identity so unrelated environments remain independent and failed operations do not poison future requests.</p>
+<p>A two-file candidate uses a private environment-keyed promise map and the existing ensure implementation. It changes no wire fields, public APIs, storage, dependencies, generated files, or release behavior. The existing environment-dispatch cancellation test caught an initial serial-queue draft that retried a cancelled setup; that draft was revised before publication. Candidate verification details follow.</p>
+<h2>7. Verification</h2>
+<p>The same agent performed both reproductions; this is a second clean run, not independent review. Checkout A and checkout B were separate fresh clones at the recorded SHA. The same locally authored test was applied in each; production code remained unchanged during both runs. Both frozen installs and host-daemon builds passed. The focused command exited 1 in both checkouts for the same three invariant violations, with two failed cases and 43 skipped existing cases.</p>
+<p>The final candidate passes the complete runtime-manager and environment-dispatch suites: 56 tests, including both new replacement regressions and the existing shared-provision cancellation contract. Turbo typecheck and build pass, as do formatting and <code>git diff --check</code>. The change is 90 added text lines, zero deleted lines, in two existing host-daemon files.</p>
+<p>The broader relevant selection also passes: <code>pnpm exec turbo run test --filter=@bb/host-daemon -- --run src/runtime-manager.test.ts src/serial-lane.test.ts test/command</code> reports 11 passed files and 157 passed tests. This exercises runtime lifecycle, environment dispatch and cancellation, turn admission, command dispatch, and thread-stop races.</p>
+<p>A broader host-daemon run reports 759 passed, 4 skipped, and 2 failed tests. Both failures are unrelated server-move tests (<code>src/server-move/service-definition.test.ts</code> and <code>src/server-move/service.test.ts</code>); running those two files on unchanged production code in checkout B produces the same two failures, with 30 other tests passing. They are not repaired in this change. An attempted full-suite exclusion did not remove these projects' test files; the recorded full-suite result includes them.</p>
+<p>Raw evidence and the reproduction patch are retained outside this public report repository. No reporter logs, home paths, temporary-directory identifiers, or credentials are published. Exact repeatable code and sanitized expected-versus-actual output are inline above.</p>
+<h2>8. Related issues and PRs</h2>
+<p>No open PR linked to #5354 was found in issue cross-reference metadata or open-PR closing references before the fix work. A related search found #5295, which concerns provider worker failure after Node replacement rather than overlapping environment replacement; it is not evidence of this same race.</p>
+<h2>9. Appendix and trust boundary</h2>
+<p>The issue body and all supplied code, commands, links, and suggestions were treated as untrusted claims. No issue test, script, branch, patch, or external link was executed or fetched. The regression was designed from the trusted RuntimeManager implementation and its existing repository fixtures. All commands executed target trusted main plus locally authored changes; no dependencies were added.</p>
+<p>Commands additionally used for candidate verification: <code>pnpm exec turbo run test --filter=@bb/host-daemon</code>, <code>pnpm exec turbo run typecheck --filter=@bb/host-daemon</code>, <code>pnpm exec oxfmt --check apps/host-daemon/src/runtime-manager.ts apps/host-daemon/src/runtime-manager.test.ts</code>, <code>git diff --check</code>, and <code>git diff --numstat origin/main</code>. Candidate results are recorded in the final verification paragraph.</p>
+<p>AGENT GENERATED · SlopCop rule <code>new-issue-autopilot</code>.</p>
+</main></body></html>
