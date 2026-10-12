@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #5404 Launcher continues startup after detecting a live runtime owner</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#5404 · Launcher continues startup after detecting a live runtime owner</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High</span><span class="pill">Effort: Low</span><span class="pill">host · cli · confirmed-repro</span><a href="https://github.com/get-bb/bb/issues/5404">Issue</a><span>October 12, 2026 · base <code>b5618353309df57e67794e64ca275dccc88b2d34</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>Starting a second launcher against a data directory already served by a live launcher prints a warning, but still starts a server child. The child fails because the first server already owns the local port. Both clean runs produced a new server uncaught-exception diagnostic containing <code>EADDRINUSE</code>; the original instance stayed healthy. The runtime-record claim detects the other live process, but its false return is only used to print a warning. A small launcher guard now checks the existing health endpoint and exits with status 1 before any server launch when that endpoint is healthy.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>A second launcher warns but attempts server startup.</td><td>Verified</td><td>Real packaged launchers in two fresh stores; the regression reaches the public pre-launch callback on unchanged main.</td></tr>
+<tr><td>The duplicate child fails on the occupied port and writes a diagnostic.</td><td>Verified</td><td>One new server uncaught-exception diagnostic containing EADDRINUSE in each base run.</td></tr>
+<tr><td>Server initialization opens the shared store and runs recovery before binding.</td><td>Verified by code ordering</td><td>The launcher passes the same data directory to its child; server startup performs the recovery sweep before creating its listener.</td></tr>
+<tr><td>Recovery can interfere with another process's pending starts.</td><td>Not reproduced</td><td>The guard for starts in flight is process-local, but no workload or resulting damage was tested.</td></tr>
+<tr><td>Reported macOS CPU, memory, historical crash counts, and service-manager retry cadence.</td><td>Unverified</td><td>This investigation ran on Linux, without launchd or the reporter's store. Those measurements are not needed to establish the launcher defect.</td></tr>
+</table>
+<h2>3. Environment</h2>
+<ul><li>Public repository get-bb/bb, trusted origin/main at <code>b5618353309df57e67794e64ca275dccc88b2d34</code>; bb-app package version 0.46.0.</li><li>Linux x86_64, Node 22.19.0, pnpm 9.15.0.</li><li>Two separate clean Git worktrees, each installed with a frozen lockfile and built with Turbo. The second build restored trusted outputs from the shared Turbo cache.</li><li>Each live run allocated its own temporary data directory, temporary HOME and two unused loopback ports. No real runtime data, imported store, account, or provider turns were used.</li></ul>
+<table><tr><th>Run</th><th>Server / daemon ports</th><th>Duplicate exit</th><th>Server launch attempted</th><th>New server diagnostics</th><th>Owner healthy afterward</th></tr><tr><td>First trusted base run</td><td>40325 / 38692</td><td>1</td><td>true</td><td>1</td><td>true</td></tr><tr><td>Second clean trusted base run</td><td>54560 / 23243</td><td>1</td><td>true</td><td>1</td><td>true</td></tr><tr><td>Patched run</td><td>30043 / 26447</td><td>1</td><td>false</td><td>0</td><td>true</td></tr></table>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone only trusted main and install/build:
+<pre>git clone https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout --detach b5618353309df57e67794e64ca275dccc88b2d34
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=bb-app</pre></li>
+<li>Save the following investigator-authored script as <code>reproduce.mjs</code> outside the checkout, then run it with the checkout and an empty evidence-output directory. It starts the real owner, waits for health, starts the duplicate, records outcomes, and stops only its own process groups.
+<pre>node /path/to/reproduce.mjs /path/to/bb-repro /path/to/evidence-output</pre>
+<details><summary>Complete reproduction script</summary><pre>import { spawn } from &quot;node:child_process&quot;;
+import { once } from &quot;node:events&quot;;
+import { mkdtemp, mkdir, readdir, readFile, writeFile } from &quot;node:fs/promises&quot;;
+import { createServer } from &quot;node:net&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join, resolve } from &quot;node:path&quot;;
+import { setTimeout as delay } from &quot;node:timers/promises&quot;;
+
+const checkout = resolve(process.argv[2]);
+const output = resolve(process.argv[3]);
+const root = await mkdtemp(join(tmpdir(), &quot;bb-5404-runtime-&quot;));
+await mkdir(join(root, &quot;home&quot;));
+await mkdir(output, { recursive: true });
+async function freePort() {
+  const listener = createServer();
+  listener.listen(0, &quot;127.0.0.1&quot;);
+  await once(listener, &quot;listening&quot;);
+  const address = listener.address();
+  if (address === null || typeof address === &quot;string&quot;) throw new Error(&quot;No TCP address&quot;);
+  await new Promise((resolveClose) =&gt; listener.close(resolveClose));
+  return address.port;
+}
+const serverPort = await freePort();
+let daemonPort = await freePort();
+while (daemonPort === serverPort) daemonPort = await freePort();
+const dataDir = join(root, &quot;data&quot;);
+const env = {
+  PATH: process.env.PATH,
+  HOME: join(root, &quot;home&quot;),
+  XDG_CONFIG_HOME: join(root, &quot;home&quot;, &quot;.config&quot;),
+  NODE_ENV: &quot;production&quot;,
+  BB_DATA_DIR: dataDir,
+  BB_SERVER_PORT: String(serverPort),
+  BB_HOST_DAEMON_PORT: String(daemonPort),
+  BB_TELEMETRY: &quot;false&quot;,
+};
+const entry = join(checkout, &quot;packages&quot;, &quot;bb-app&quot;, &quot;dist&quot;, &quot;bb-app.js&quot;);
+const args = [entry, &quot;start&quot;, &quot;--no-in-app-updates&quot;, &quot;--data-dir&quot;, dataDir,
+  &quot;--server-port&quot;, String(serverPort), &quot;--host-daemon-port&quot;, String(daemonPort)];
+const owner = spawn(process.execPath, args, { env, detached: true, stdio: &quot;ignore&quot; });
+const ownerExit = once(owner, &quot;exit&quot;);
+let duplicate;
+try {
+  let healthy = false;
+  for (let attempt = 0; attempt &lt; 240; attempt += 1) {
+    if (owner.exitCode !== null) throw new Error(`Owner exited ${owner.exitCode}`);
+    try {
+      const response = await fetch(`http://127.0.0.1:${serverPort}/health`, {
+        signal: AbortSignal.timeout(500),
+      });
+      healthy = response.ok &amp;&amp; (await response.json()).ok === true;
+    } catch {}
+    if (healthy) break;
+    await delay(250);
+  }
+  if (!healthy) throw new Error(&quot;Owner never became healthy&quot;);
+  const runtimeBefore = await readFile(join(dataDir, &quot;bb-app-runtime.json&quot;), &quot;utf8&quot;);
+  const beforeFiles = await readdir(join(dataDir, &quot;logs&quot;));
+  let text = &quot;&quot;;
+  duplicate = spawn(process.execPath, args, { env, detached: true, stdio: [&quot;ignore&quot;, &quot;pipe&quot;, &quot;pipe&quot;] });
+  duplicate.stdout.on(&quot;data&quot;, (chunk) =&gt; { text += chunk; });
+  duplicate.stderr.on(&quot;data&quot;, (chunk) =&gt; { text += chunk; });
+  const timeout = setTimeout(() =&gt; process.kill(-duplicate.pid, &quot;SIGTERM&quot;), 30_000);
+  const [exitCode, signal] = await once(duplicate, &quot;exit&quot;);
+  clearTimeout(timeout);
+  const afterFiles = await readdir(join(dataDir, &quot;logs&quot;));
+  const addedDiagnostics = afterFiles.filter((name) =&gt;
+    name.startsWith(&quot;process-server-uncaughtException-&quot;) &amp;&amp; !beforeFiles.includes(name));
+  const diagnosticEvidence = [];
+  for (const name of addedDiagnostics) {
+    const diagnostic = await readFile(join(dataDir, &quot;logs&quot;, name), &quot;utf8&quot;);
+    diagnosticEvidence.push({ name, containsAddressInUse: diagnostic.includes(&quot;EADDRINUSE&quot;) });
+  }
+  const runtimeAfter = await readFile(join(dataDir, &quot;bb-app-runtime.json&quot;), &quot;utf8&quot;);
+  const response = await fetch(`http://127.0.0.1:${serverPort}/health`);
+  const result = {
+    serverPort, daemonPort, exitCode, signal,
+    attemptedServerStartup: text.includes(&quot;Starting server&quot;),
+    newServerDiagnostics: diagnosticEvidence,
+    ownerRecordUnchanged: runtimeBefore === runtimeAfter,
+    ownerStillHealthy: response.ok &amp;&amp; (await response.json()).ok === true,
+  };
+  await writeFile(join(output, &quot;duplicate-output.txt&quot;), text.replaceAll(root, &quot;&lt;temporary-runtime&gt;&quot;));
+  await writeFile(join(output, &quot;result.json&quot;), `${JSON.stringify(result, null, 2)}\n`);
+  console.log(JSON.stringify(result, null, 2));
+} finally {
+  for (const child of [duplicate, owner]) {
+    if (child &amp;&amp; child.exitCode === null &amp;&amp; child.signalCode === null) {
+      try { process.kill(-child.pid, &quot;SIGTERM&quot;); } catch {}
+    }
+  }
+  await Promise.race([ownerExit, delay(15_000)]);
+  if (owner.exitCode === null &amp;&amp; owner.signalCode === null) {
+    try { process.kill(-owner.pid, &quot;SIGKILL&quot;); } catch {}
+  }
+}
+</pre></details></li>
+<li>Expected: duplicate exit status 1, no server launch attempt, no new server diagnostic, owner still healthy and record unchanged. Actual on unchanged main:
+<pre>bb
+
+  !  Another bb already runs on this data directory
+     record: &lt;temporary-runtime&gt;/data/bb-app-runtime.json
+     Run `bb-app stop` to stop it.
+
+  ○  Starting server
+  ✗  Server failed to start
+     Server failed to become healthy: Process exited before becoming healthy: another server is already answering at http://127.0.0.1:40325/health
+     Check logs: &lt;temporary-runtime&gt;/data/logs/
+
+  ●  Shutting down</pre>
+<pre>{
+  &quot;serverPort&quot;: 40325,
+  &quot;daemonPort&quot;: 38692,
+  &quot;exitCode&quot;: 1,
+  &quot;attemptedServerStartup&quot;: true,
+  &quot;newServerDiagnostics&quot;: 1,
+  &quot;addressInUseDiagnostics&quot;: 1,
+  &quot;ownerRecordUnchanged&quot;: true,
+  &quot;ownerStillHealthy&quot;: true
+}</pre></li></ol>
+<h3>Focused regression</h3>
+<p>Save the complete test below at <code>packages/bb-app/test/startup-runtime-record.test.ts</code>. It exercises the real launcher with an actual temporary runtime record and HTTP health listener. Only package-artifact existence is substituted so the unit test does not require generated bundles. The existing public pre-server-start callback aborts before any child can spawn. The healthy live-owner case requires that this callback never run; unhealthy-owner and no-owner controls require startup to remain reachable. No database is mocked and no production test seam was added.</p>
+<pre>pnpm exec turbo run test --filter=bb-app -- test/startup-runtime-record.test.ts</pre>
+<details><summary>Complete regression test</summary><pre>import { once } from &quot;node:events&quot;;
+import { mkdtemp, rm } from &quot;node:fs/promises&quot;;
+import type { PathLike } from &quot;node:fs&quot;;
+import { createServer } from &quot;node:http&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { basename, join } from &quot;node:path&quot;;
+import {
+  readBbAppRuntimeFile,
+  writeBbAppRuntimeFile,
+} from &quot;@bb/config/app-runtime-file&quot;;
+import { expect, it, vi } from &quot;vitest&quot;;
+import { runBbApp } from &quot;../src/launcher.js&quot;;
+
+vi.mock(&quot;node:fs&quot;, async (importOriginal) =&gt; {
+  const actual = await importOriginal&lt;typeof import(&quot;node:fs&quot;)&gt;();
+  const artifacts = new Set([
+    &quot;daemon-bundle.mjs&quot;,
+    &quot;bb&quot;,
+    &quot;bb-provider-bridge-worker.mjs&quot;,
+    &quot;bb-parcel-watcher-child.mjs&quot;,
+    &quot;bb-plugin-host-worker.mjs&quot;,
+    &quot;index.js&quot;,
+    &quot;index.html&quot;,
+  ]);
+  return {
+    ...actual,
+    existsSync: (filePath: PathLike) =&gt;
+      (typeof filePath === &quot;string&quot; &amp;&amp; artifacts.has(basename(filePath))) ||
+      actual.existsSync(filePath),
+    readdirSync: (filePath: PathLike) =&gt;
+      typeof filePath === &quot;string&quot; &amp;&amp; basename(filePath) === &quot;bb-chunks&quot;
+        ? [&quot;chunk.js&quot;]
+        : actual.readdirSync(filePath),
+  };
+});
+
+it.each([
+  { liveOwner: true, healthy: true, shouldStart: false },
+  { liveOwner: true, healthy: false, shouldStart: true },
+  { liveOwner: false, healthy: true, shouldStart: true },
+])(
+  &quot;startup with live owner=$liveOwner and healthy=$healthy attempts server=$shouldStart&quot;,
+  async ({ liveOwner, healthy, shouldStart }) =&gt; {
+    const dataDir = await mkdtemp(join(tmpdir(), &quot;bb-startup-owner-&quot;));
+    const server = createServer((_request, response) =&gt; {
+      response.writeHead(200, { &quot;content-type&quot;: &quot;application/json&quot; });
+      response.end(JSON.stringify({ ok: healthy }));
+    });
+    const previousExitCode = process.exitCode;
+    const output = vi.spyOn(process.stdout, &quot;write&quot;).mockReturnValue(true);
+    const beforeServerStart = vi.fn(() =&gt; {
+      throw new Error(&quot;Startup reached the server launch boundary&quot;);
+    });
+    try {
+      server.listen(0, &quot;127.0.0.1&quot;);
+      await once(server, &quot;listening&quot;);
+      const address = server.address();
+      if (address === null || typeof address === &quot;string&quot;) {
+        throw new Error(&quot;Expected a TCP listener&quot;);
+      }
+      if (liveOwner) {
+        await writeBbAppRuntimeFile({
+          dataDir,
+          entryPath: process.execPath,
+          pid: process.ppid,
+          serverUrl: `http://127.0.0.1:${address.port}`,
+          startedAt: new Date().toISOString(),
+          surface: &quot;web&quot;,
+          version: &quot;0.0.0-test&quot;,
+        });
+      }
+      const recordBefore = await readBbAppRuntimeFile(dataDir);
+      await runBbApp(
+        [
+          &quot;start&quot;,
+          &quot;--no-in-app-updates&quot;,
+          &quot;--data-dir&quot;,
+          dataDir,
+          &quot;--server-port&quot;,
+          String(address.port),
+          &quot;--host-daemon-port&quot;,
+          String(address.port),
+        ],
+        { beforeServerStart, worktreePolicy: null },
+      );
+      expect(beforeServerStart).toHaveBeenCalledTimes(shouldStart ? 1 : 0);
+      expect(process.exitCode).toBe(1);
+      expect(await readBbAppRuntimeFile(dataDir)).toEqual(recordBefore);
+    } finally {
+      process.exitCode = previousExitCode;
+      output.mockRestore();
+      server.closeAllConnections();
+      await new Promise&lt;void&gt;((resolveClose) =&gt;
+        server.close(() =&gt; resolveClose()),
+      );
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  },
+);
+</pre></details>
+<pre>Unchanged production code, both clean checkouts:
+FAIL: startup with live owner=true and healthy=true attempts server=false
+AssertionError: expected "vi.fn()" to be called +0 times, but got 1 times
+Tests: 1 failed | 2 passed (3)
+
+After the launcher guard:
+Test Files: 1 passed (1)
+Tests: 3 passed (3)</pre>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/b5618353309df57e67794e64ca275dccc88b2d34/packages/config/src/app-runtime-file.ts#L50-L66">claimBbAppRuntimeFile</a> returns false when an existing record names another running process. <a href="https://github.com/get-bb/bb/blob/b5618353309df57e67794e64ca275dccc88b2d34/packages/bb-app/src/launcher.ts#L4120-L4132">runBbApp's runtime-record handling</a> prints the warning but continues into full-stack supervision. That supervision reaches <a href="https://github.com/get-bb/bb/blob/b5618353309df57e67794e64ca275dccc88b2d34/packages/bb-app/src/launcher.ts#L3077-L3101">startFullStackServerProcess</a> and spawns a real server before the health check can reject the foreign listener.</p>
+<p>The child receives the same data directory, opens the store at <a href="https://github.com/get-bb/bb/blob/b5618353309df57e67794e64ca275dccc88b2d34/apps/server/src/start-server.ts#L115-L120">initDb</a>, and reaches <a href="https://github.com/get-bb/bb/blob/b5618353309df57e67794e64ca275dccc88b2d34/apps/server/src/start-server.ts#L374-L404">startup recovery and listener creation</a> in that order. Listener creation is asynchronous, so the listening log can occur before the bind error is known. The verified problem is missing launcher short-circuiting, not an in-process supervisor restart.</p>
+<p><a href="https://github.com/get-bb/bb/blob/b5618353309df57e67794e64ca275dccc88b2d34/apps/server/src/services/system/periodic-sweeps.ts#L626-L632">runStartupRecoverySweep</a> re-drives environment and thread work. <a href="https://github.com/get-bb/bb/blob/b5618353309df57e67794e64ca275dccc88b2d34/apps/server/src/services/system/periodic-sweeps.ts#L323">The in-flight thread guard</a> does not prove inter-process coordination. The report does not claim observed corruption or duplicate thread starts.</p>
+<h2>6. Proposed fix and proof</h2>
+<p>When the runtime claim is rejected, use the launcher's existing validated health check against its configured local listener. If healthy, log the duplicate-instance error, set exit status 1 and return before constructing managed processes. Preserve startup when the record is unclaimed or the existing health check fails. This retains restart-on-failure takeover behavior while avoiding the doomed child and its shared-store initialization.</p>
+<p>The implemented change stays within packages/bb-app: launcher, README, and one regression test. It changes 112 text lines across three files (13 production/documentation additions and 99 test additions), with no dependency, generated file, stored-data or public protocol change.</p>
+<pre>bb
+
+  !  Another bb already runs on this data directory
+     record: &lt;temporary-runtime&gt;/data/bb-app-runtime.json
+     Run `bb-app stop` to stop it.
+
+  ✗  bb already serves http://127.0.0.1:30043 from this data directory</pre>
+<pre>{
+  &quot;serverPort&quot;: 30043,
+  &quot;daemonPort&quot;: 26447,
+  &quot;exitCode&quot;: 1,
+  &quot;attemptedServerStartup&quot;: false,
+  &quot;newServerDiagnostics&quot;: 0,
+  &quot;addressInUseDiagnostics&quot;: 0,
+  &quot;ownerRecordUnchanged&quot;: true,
+  &quot;ownerStillHealthy&quot;: true
+}</pre>
+<p>Full relevant verification: <code>pnpm exec turbo run test typecheck --filter=bb-app</code> passed; 22 test files and 206 tests passed. The packaged rebuild passed, and the same real-process reproduction after the fix reported no startup attempt and zero new server diagnostics. <code>git diff --check</code> passed. This guard does not solve concurrent runtime-record claim races or impose a new policy on unhealthy live owners.</p>
+<h2>7. Verification</h2>
+<p>The same investigator repeated the reproduction in a second clean worktree at the exact trusted base commit, using a new store, HOME, and ports (54560/23243). Frozen install and Turbo build succeeded. The live-process reproduction again yielded exit 1, an attempted server launch, one new EADDRINUSE diagnostic, unchanged owner record and a healthy incumbent. The authored regression was then copied into that second worktree and again failed only the healthy live-owner case. This is a second clean verification by the same agent, not an independent review. No report correction was required.</p>
+<h2>8. Related issues</h2>
+<p>Startup retry handling in <a href="https://github.com/get-bb/bb/issues/3340">#3340</a> concerns a different failure boundary. This reproduction requires a foreign healthy listener and occurs before full-stack readiness; an internal supervisor retry budget cannot prevent an external manager from launching another process.</p>
+<h2>9. Appendix and scope</h2>
+<p>No open pull request referencing #5404 was found in repository metadata when the fix check began. Linked branches and issue-supplied scripts were not fetched or executed. Issue content was treated as untrusted claims; its commands and instructions were not followed. All executable code came from trusted origin/main or this investigator's own changes.</p>
+<p>Report evidence is included inline. Raw temporary logs, diagnostics, and test files remain local and are not committed to the public reports repository. macOS, launchd cadence, workload recovery effects, and performance percentages are not verified. Browser and mobile checks are not relevant to this headless launcher change.</p>
+<details><summary>Second base run and patched run results</summary><pre>{
+  &quot;second&quot;: {
+    &quot;serverPort&quot;: 54560,
+    &quot;daemonPort&quot;: 23243,
+    &quot;exitCode&quot;: 1,
+    &quot;attemptedServerStartup&quot;: true,
+    &quot;newServerDiagnostics&quot;: 1,
+    &quot;addressInUseDiagnostics&quot;: 1,
+    &quot;ownerRecordUnchanged&quot;: true,
+    &quot;ownerStillHealthy&quot;: true
+  },
+  &quot;patched&quot;: {
+    &quot;serverPort&quot;: 30043,
+    &quot;daemonPort&quot;: 26447,
+    &quot;exitCode&quot;: 1,
+    &quot;attemptedServerStartup&quot;: false,
+    &quot;newServerDiagnostics&quot;: 0,
+    &quot;addressInUseDiagnostics&quot;: 0,
+    &quot;ownerRecordUnchanged&quot;: true,
+    &quot;ownerStillHealthy&quot;: true
+  }
+}</pre></details>
+</main></body></html>
