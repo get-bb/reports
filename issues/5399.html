@@ -68,10 +68,69 @@ Actual observed row:   { id: 'thr_1', lastReadAt: 200 }
 First run:  2 failed, 80 skipped; exit 1
 Second run: 2 failed, 80 skipped; exit 1</pre>
 <p>Artifacts: <a href="5399/repro/first-run.log">first-run output</a>, <a href="5399/repro/second-run.log">second-run output</a>, <a href="5399/repro/fixed-tests.log">post-fix suite output</a>. These are actual captured test results with local checkout paths replaced by neutral identifiers.</p>
+<details><summary>Standalone sidebar reproduction source and results</summary>
+<p>This additional minimal test directly inspects sidebar data rather than failing first at the project-list assertion. Download <a href="5399/repro/sidebar-read-state.test.ts">the tested source</a>, place it at <code>apps/app/src/hooks/sidebar-read-state.test.ts</code>, then run <code>pnpm exec turbo run test --filter=@bb/app -- src/hooks/sidebar-read-state.test.ts</code>. It fails both metadata cases on the unchanged second checkout and passes both on the fixed checkout: <a href="5399/repro/sidebar-baseline.log">baseline output</a> / <a href="5399/repro/sidebar-fixed.log">fixed output</a>. The temporary copy is removed afterwards; the permanent PR regression remains in the existing owner test file.</p>
+<pre>import { QueryObserver } from "@tanstack/react-query";
+import { afterEach, expect, it, vi } from "vitest";
+import { createAppQueryClient } from "@/lib/query-client";
+import { sidebarNavigationQueryKey } from "./queries/query-keys";
+import { createRealtimeCacheEffects } from "./realtime-cache-effects";
+
+afterEach(() =&gt; vi.useRealTimers());
+
+it.each(["project-1", undefined])(
+  "updates the observed sidebar timestamp after a read-state event (%s)",
+  async (projectId) =&gt; {
+    vi.useFakeTimers();
+    const queryClient = createAppQueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+      showMutationErrorToasts: false,
+    });
+    let lastReadAt = 200;
+    const response = () =&gt; ({
+      projects: [{ threads: [{ id: "thr_1", lastReadAt }] }],
+      personalProject: { threads: [] },
+    });
+    const queryKey = sidebarNavigationQueryKey();
+    queryClient.setQueryData(queryKey, response());
+    const observer = new QueryObserver(queryClient, {
+      queryKey,
+      queryFn: async () =&gt; response(),
+    });
+    const unsubscribe = observer.subscribe(() =&gt; {});
+    const effects = createRealtimeCacheEffects({ queryClient });
+    try {
+      lastReadAt = 0;
+      effects.handleChanged({
+        type: "changed",
+        entity: "thread",
+        id: "thr_1",
+        metadata: { projectId },
+        changes: ["read-state-changed"],
+      });
+      await vi.advanceTimersByTimeAsync(50);
+      expect(observer.getCurrentResult().data?.projects[0]?.threads[0]?.lastReadAt).toBe(0);
+    } finally {
+      effects.dispose();
+      unsubscribe();
+      queryClient.clear();
+    }
+  },
+);</pre>
+</details>
 
 <h2>5. Root cause</h2>
 <p>At the trusted base, <a href="https://github.com/get-bb/bb/blob/406c009502ad0f961fc6ce9c75c1d262cb3e3e7c/apps/app/src/hooks/cache-owners/realtime-cache-registry.ts#L428-L431">the read-state rule</a> runs <code>markThreadDetailQueryStale</code> and <code>markThreadListQueriesStale</code>. The latter <a href="https://github.com/get-bb/bb/blob/406c009502ad0f961fc6ce9c75c1d262cb3e3e7c/apps/app/src/hooks/cache-owners/realtime-cache-registry.ts#L997-L1029">invalidates sidebar, project, and global list queries with <code>refetchType: "none"</code></a>. No read-state patch handler updates cached rows.</p>
-<p>The <a href="https://github.com/get-bb/bb/blob/406c009502ad0f961fc6ce9c75c1d262cb3e3e7c/apps/app/src/hooks/queries/sidebar-navigation-query.ts#L21-L47">sidebar bootstrap query</a> uses <a href="https://github.com/get-bb/bb/blob/406c009502ad0f961fc6ce9c75c1d262cb3e3e7c/apps/app/src/hooks/queries/query-policies.ts#L43-L45">an infinite stale-time policy</a>, so an active observer does not refresh just because its cached value was marked invalid. The <a href="https://github.com/get-bb/bb/blob/406c009502ad0f961fc6ce9c75c1d262cb3e3e7c/packages/client-core/src/thread/thread-read-state.ts#L3-L7">read-state calculation</a> compares the cached read timestamp with the latest attention timestamp, making stale data directly relevant to the unread indicator.</p>
+<p>The <a href="https://github.com/get-bb/bb/blob/406c009502ad0f961fc6ce9c75c1d262cb3e3e7c/apps/app/src/hooks/queries/sidebar-navigation-query.ts#L21-L47">sidebar bootstrap query</a> uses <a href="https://github.com/get-bb/bb/blob/406c009502ad0f961fc6ce9c75c1d262cb3e3e7c/apps/app/src/hooks/queries/query-policies.ts#L43-L45">an infinite stale-time policy</a> and has no periodic polling. Suppressing the notification's refetch leaves its active observer with old data until another action triggers a load. The <a href="https://github.com/get-bb/bb/blob/406c009502ad0f961fc6ce9c75c1d262cb3e3e7c/packages/client-core/src/thread/thread-read-state.ts#L3-L7">read-state calculation</a> compares the cached read timestamp with the latest attention timestamp, making stale data directly relevant to the unread indicator.</p>
+<pre>"read-state-changed": {
+  flush: "debounced",
+  dirty: [markThreadDetailQueryStale, markThreadListQueriesStale],
+}
+
+queryClient.invalidateQueries({
+  queryKey: sidebarNavigationQueryKey(),
+  refetchType: "none",
+});</pre>
 <p>The trusted <a href="https://github.com/get-bb/bb/blob/406c009502ad0f961fc6ce9c75c1d262cb3e3e7c/packages/db/src/data/threads.ts#L1831-L1878">thread writer</a> persists <code>lastReadAt</code> and emits the change plus project metadata, but does not transmit the timestamp. Refreshing observed queries is therefore the smallest repair that needs no wire-format change. Existing tests explicitly preserved stale-only read notifications; one is replaced with the behavioral regression and the project-scoping expectation is updated.</p>
 
 <h2>6. Fix and safety assessment</h2>
