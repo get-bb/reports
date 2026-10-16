@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #5598 Parent resolution uses a thread-wide access path</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#5598 · Parent resolution uses a thread-wide access path</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Low</span><span class="pill">threads · perf · confirmed-repro</span>
+<a href="https://github.com/get-bb/bb/issues/5598">GitHub issue</a><span>2026-10-16 · base <code>4363ba27d6f942d6b42ae61c8f85800e756b9085</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+
+<h2>1. TL;DR</h2>
+<p>Opening a timeline can require looking up parents that are not in its current window. The database lookup for several parent IDs returns correct rows, but SQLite chooses an index that searches only by thread, not by item ID. That access path can visit the thread's entire event history even when the requested parents have no qualifying rows. A new test of the real exported lookup, using the real migrated SQLite schema, fails at the query-plan assertion in two clean trusted checkouts; its preceding row-content and ordering assertions pass. This proves the access-path defect, not the reported multi-second timing or every cause of server stalls.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>Multiple missing parent IDs can use a thread-only lookup.</td><td class="ok">Verified</td><td>Both runs capture SQL from the exported function and explain it with its actual bound arguments: events_thread_sequence_idx (thread_id=?).</td></tr>
+<tr><td>An existing thread-and-item partial index is available.</td><td class="ok">Verified</td><td>Trusted schema and migration define events_delegating_item_lookup_idx on thread_id, item_id, sequence, item_kind for toolCall/delegation rows.</td></tr>
+<tr><td>Missing or non-delegating parents need not produce results.</td><td class="ok">Verified</td><td>The test requests absent and commandExecution IDs alongside real toolCall and delegation parents. Only the latter lifecycle rows are returned, in sequence order and from the requested thread.</td></tr>
+<tr><td>The defect applies to the ordinary timeline path, not only a workflow plugin.</td><td class="ok">Verified in source</td><td>The server timeline builder calls this function for collected missing parents with no workflow-specific gate.</td></tr>
+<tr><td>A particular desktop/provider combination experiences about nine seconds of delay.</td><td class="unv">Unverified</td><td>No desktop, provider, private thread, or production database was used. No latency claim is made by this report.</td></tr>
+<tr><td>Exactly two IDs always trigger this plan; statistics never change it.</td><td class="unv">Not established</td><td>This reproduction requests four distinct nonempty IDs in a migrated database without ANALYZE. SQLite planner choices may vary with statistics and workload.</td></tr></table>
+
+<h2>3. Environment</h2>
+<ul><li>Trusted repository: public get-bb/bb, origin/main at <code>4363ba27d6f942d6b42ae61c8f85800e756b9085</code>; package version 0.46.1.</li>
+<li>Linux 4.19.0-gvisor, x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1; better-sqlite3 12.10.0; bundled SQLite 3.53.1.</li>
+<li>Two fresh source clones of the trusted repository, named source and verify under a temporary work directory. Neither linked PR code nor linked issue scripts were executed.</li>
+<li>Real SQLite databases created by createMigratedConnection(): the production migrations build a template, then each case receives its own database copy. No database mocks, dependency additions, statistics updates, dev server, ports, providers, account credentials, or user runtime data.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<p>The following patch is newly authored for this investigation from trusted repository evidence. It adds a test to the existing query-plan harness, rather than replacing the exported query with a hand-written approximation. The test protects the item-seek access-path contract and returned-row semantics. Existing neighboring tests do not exercise this multi-ID lookup. It needs no production test seam.</p>
+<ol><li>Clone the public repository into a new directory, check out the recorded trusted commit, and install/build normally:
+<pre>git clone https://github.com/get-bb/bb.git source
+cd source
+git checkout --detach 4363ba27d6f942d6b42ae61c8f85800e756b9085
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build</pre></li>
+<li>Save the complete patch below as <code>regression.patch</code> outside the checkout, then apply it:
+<pre>git apply ../regression.patch
+pnpm exec turbo run test --filter=@bb/db -- test/query-plans.test.ts -t 'seeks multiple missing timeline parents'</pre></li>
+<li>Expect a nonzero exit caused only by the plan assertion. Both output-cap cases first verify returned sequence numbers, item IDs/kinds/types, thread IDs, and JSON data. They then explain the SQL actually executed by the lookup, with the captured bound parameters. No result is synthesized by a database mock.</li></ol>
+<h3>Complete regression patch</h3><pre>diff --git a/packages/db/test/query-plans.test.ts b/packages/db/test/query-plans.test.ts
+index 4131da77a..3062aa9ec 100644
+--- a/packages/db/test/query-plans.test.ts
++++ b/packages/db/test/query-plans.test.ts
+@@ -33,6 +33,7 @@ import {
+   listStoredConversationOutlineEventRows,
+   listStoredEventRows,
+   listStoredEventRowsByParentToolCallIds,
++  listStoredDelegatingItemRowsByItemIds,
+   listStoredTurnCompletedKeys,
+   listTodoSnapshotEventRowsForThread,
+ } from &quot;../src/data/events.js&quot;;
+@@ -755,6 +756,86 @@ describe(&quot;slow query index plans&quot;, () =&gt; {
+     db.$client.close();
+   });
+ 
++  it.each([null, 32_000])(
++    &quot;seeks multiple missing timeline parents by item ID with output cap %s&quot;,
++    (maxInlineOutputChars) =&gt; {
++      const { db, project, thread } = setup();
++      try {
++        const otherThread = createThread(db, noopNotifier, {
++          projectId: project.id,
++          providerId: &quot;codex&quot;,
++        });
++        const fixtures = [
++          [9, &quot;parent-tool&quot;, &quot;toolCall&quot;, &quot;item/completed&quot;],
++          [3, &quot;parent-delegation&quot;, &quot;delegation&quot;, &quot;item/started&quot;],
++          [1, &quot;parent-tool&quot;, &quot;toolCall&quot;, &quot;item/started&quot;],
++          [7, &quot;parent-delegation&quot;, &quot;delegation&quot;, &quot;item/completed&quot;],
++          [5, &quot;command-parent&quot;, &quot;commandExecution&quot;, &quot;item/completed&quot;],
++        ] as const;
++        insertEvents(
++          db,
++          noopNotifier,
++          [thread.id, otherThread.id].flatMap((threadId) =&gt;
++            fixtures.map(([sequence, itemId, itemKind, type]) =&gt; ({
++              threadId,
++              sequence,
++              scope: threadScope(),
++              type,
++              itemId,
++              itemKind,
++              parentToolCallId: null,
++              data: JSON.stringify({ item: { id: itemId, type: itemKind } }),
++            })),
++          ),
++        );
++
++        const [query] = captureStatements(db, () =&gt; {
++          const rows = listStoredDelegatingItemRowsByItemIds(db, {
++            threadId: thread.id,
++            itemIds: [
++              &quot;parent-delegation&quot;,
++              &quot;command-parent&quot;,
++              &quot;parent-tool&quot;,
++              &quot;absent-parent&quot;,
++              &quot;parent-tool&quot;,
++              &quot;&quot;,
++            ],
++            maxInlineOutputChars,
++          });
++          expect(
++            rows.map((row) =&gt; [
++              row.sequence,
++              row.itemId,
++              row.itemKind,
++              row.type,
++              row.threadId,
++              row.data,
++            ]),
++          ).toEqual(
++            [fixtures[2], fixtures[1], fixtures[3], fixtures[0]].map(
++              ([sequence, itemId, itemKind, type]) =&gt; [
++                sequence,
++                itemId,
++                itemKind,
++                type,
++                thread.id,
++                JSON.stringify({ item: { id: itemId, type: itemKind } }),
++              ],
++            ),
++          );
++        });
++        if (!query) {
++          throw new Error(&quot;Expected the missing timeline parent lookup SQL&quot;);
++        }
++        expect(queryPlanDetails({ db, ...query })).toMatch(
++          /SEARCH events USING (?:COVERING )?INDEX events_delegating_item_lookup_idx \(thread_id=\? AND item_id=\?\)/u,
++        );
++      } finally {
++        db.$client.close();
++      }
++    },
++  );
++
+   it(&quot;scans background-task history once without a completed-set join&quot;, () =&gt; {
+     const { db, thread } = setup();
+ 
+</pre>
+<h3>Expected vs actual</h3>
+<p>Expected plan includes an item-constrained search (a temporary sort to restore global sequence order is acceptable):</p>
+<pre>SEARCH events USING INDEX events_delegating_item_lookup_idx (thread_id=? AND item_id=?)</pre>
+<p>Actual plan, verbatim in both runs:</p><pre>SEARCH events USING INDEX events_thread_sequence_idx (thread_id=?)</pre>
+<p>First-run Vitest output excerpt:</p><pre>FAIL  |@bb/db| test/query-plans.test.ts &gt; slow query index plans &gt; seeks multiple missing timeline parents by item ID with output cap null
+FAIL  |@bb/db| test/query-plans.test.ts &gt; slow query index plans &gt; seeks multiple missing timeline parents by item ID with output cap 32000
+AssertionError: expected 'SEARCH events USING INDEX events_thre…' to match /SEARCH events USING (?:COVERING )?IN…/u
+
++ Received:
+"SEARCH events USING INDEX events_thread_sequence_idx (thread_id=?)"
+
+Test Files  1 failed (1)
+     Tests  2 failed | 43 skipped (45)</pre>
+<p>There is no visual component, so screenshots are not applicable. All reproduction code and decisive output are embedded here; repository publishing policy forbids separate test files, logs, or diffs on the public reports site.</p>
+
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/4363ba27d6f942d6b42ae61c8f85800e756b9085/apps/server/src/services/threads/timeline.ts#L582-L590">The timeline caller</a> collects unresolved parent IDs and calls <code>listStoredDelegatingItemRowsByItemIds</code> without restricting the lookup to the visible sequence window. That unrestricted history lookup is necessary to find older parents, but it must seek the requested item IDs.</p>
+<p><a href="https://github.com/get-bb/bb/blob/4363ba27d6f942d6b42ae61c8f85800e756b9085/packages/db/src/data/events.ts#L1662-L1688">The exported lookup</a> deduplicates IDs, discards empty IDs, and uses this shape:</p>
+<pre>FROM events
+WHERE thread_id = ?
+  AND item_id IN (...)
+  AND item_kind IN ('toolCall', 'delegation')
+  AND type IN ('item/started', 'item/completed')
+ORDER BY sequence</pre>
+<p>With several item IDs, the planner chooses <code>events_thread_sequence_idx</code>, which delivers sequence order but constrains only thread_id. Filtering item IDs then happens while walking that thread's index entries. If none of the requested IDs qualify, it still must traverse the whole thread range to establish absence; the SQL has no LIMIT to bound that work.</p>
+<p><a href="https://github.com/get-bb/bb/blob/4363ba27d6f942d6b42ae61c8f85800e756b9085/packages/db/src/schema.ts#L816-L818">The existing partial index</a> instead begins with thread_id and item_id, followed by sequence and item_kind, and uses the same literal kind predicate. That access path can seek each requested ID but may need a temporary sort across matches. The emitted EXPLAIN result demonstrates the selected access path; it is not a wall-clock benchmark or a count of VM steps.</p>
+<p><a href="https://github.com/get-bb/bb/blob/4363ba27d6f942d6b42ae61c8f85800e756b9085/packages/db/src/connection.ts#L275-L289">The connection uses better-sqlite3</a>, and this query ends in a synchronous <code>.all()</code>. Consequently, extra work occurs on the executing server thread. The implication for event-loop responsiveness follows from the synchronous call; unrelated-request delays were not measured here.</p>
+
+<h2>6. Proposed fix from repository evidence</h2>
+<p>Constrain this narrow parent-resolution query to the existing delegating-item index while preserving the literal partial-index predicate, lifecycle-type filtering, deduplication, sequence ordering, and inline output cap. This repository already uses <code>INDEXED BY events_delegating_item_lookup_idx</code> for another delegating-item query. For a raw indexed FROM expression, use the existing SQL row projection helper so Drizzle retains the stored-row shape and capped-output expression. No index, migration, wire field, or caller contract needs to change.</p>
+<p>Risks: an unavailable or incompatible required index makes preparation fail, and requests for many matching IDs could have a different optimal plan. Keep a real migrated-database plan regression and row-semantic assertions for capped and uncapped output. A broader performance claim requires a separate representative workload measurement.</p>
+
+<h2>7. Linked PR: #5599 (static review only)</h2>
+<p><a href="https://github.com/get-bb/bb/pull/5599">PR #5599</a> was open and draft during investigation. GitHub metadata explicitly lists #5598 in its closing-issue references. Therefore the autopilot did not make or push a production fix and did not open a duplicate PR.</p>
+<p>The diff changes only the database lookup and its query-plan test: it requires the existing partial index, uses the existing SQL projection helper, and adds a migrated-database test that checks multi-ID row results and the plan with a numeric cap. Statically, those changes target the reproduced root cause rather than a timeline cache or UI workaround.</p>
+<p><strong>Findings:</strong> no demonstrated blocker in the small production diff. The raw indexed-table projection is accounted for by an existing helper in trusted main. <strong>Limit:</strong> this is not an execution-based approval; neither the PR branch nor its test was checked out or run, and its reported green checks are not claimed as our verification. Our newly authored red regression was run only on trusted main. The large-match-set crossover and released-app timing remain unmeasured.</p>
+
+<h2>8. Verification: second clean reproduction by the same agent</h2>
+<p>A second fresh clone named <code>verify</code> was checked out at exactly <code>4363ba27d6f942d6b42ae61c8f85800e756b9085</code>. Its working tree was clean before applying only this investigation's regression patch. It received its own frozen dependency install and fresh migrated-database test process. There are no ports or persistent data directories to reuse in this database-only test. This is a repeat by the same agent, not an independent review.</p>
+<pre>git clone https://github.com/get-bb/bb.git verify
+cd verify
+git checkout --detach 4363ba27d6f942d6b42ae61c8f85800e756b9085
+git status --porcelain
+git apply ../regression.patch
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run test --filter=@bb/db -- test/query-plans.test.ts -t 'seeks multiple missing timeline parents'</pre>
+<p>The same two cases reached the plan assertion with correct returned rows and failed with the same thread-only search:</p>
+<pre>"SEARCH events USING INDEX events_thread_sequence_idx (thread_id=?)"
+Test Files  1 failed (1)
+     Tests  2 failed | 43 skipped (45)
+Duration  8.48s (transform 2.81s, setup 0ms, import 3.59s, tests 51ms, environment 0ms)</pre>
+<p><strong>Result:</strong> the second run supports the same verdict and root cause. Report correction: none. The second clone did not execute linked PR code or reuse a user database.</p>
+
+<h2>9. Related issues</h2>
+<p>Repository search also surfaced <a href="https://github.com/get-bb/bb/issues/5192">#5192</a>, a broader server-stall investigation. This report establishes only the specific parent-query access path, not all timeline or maintenance costs. The explicitly linked open PR #5599 is why no new fix PR is safe or necessary.</p>
+
+<h2>10. Appendix</h2>
+<ul><li>Trusted origin/main resolved to the recorded base; production code stayed unchanged in both clones.</li>
+<li>Normal frozen installation succeeded in each clone. Initial build on trusted main: 66 successful Turbo tasks, 4 cached, 1m36.583s.</li>
+<li>First focused run: two intended plan failures, 43 skipped, 8.24s. Second run: the same failures, 43 skipped, 8.48s. Neither failure was a setup, migration, module-resolution, or row-content failure.</li>
+<li><code>pnpm exec turbo run typecheck --filter=@bb/db</code> passed after adding the new regression.</li>
+<li><code>git diff --check</code> passed. The local investigation patch is one text file, 81 additions and zero deletions; it was not committed or pushed to get-bb/bb.</li>
+<li>Other relevant inspection commands: <code>git fetch origin main</code>, <code>git rev-parse HEAD</code>, <code>git log -- packages/db/src/data/events.ts</code>, <code>gh pr view 5599 --repo get-bb/bb</code>, and read-only <code>gh pr diff 5599 --repo get-bb/bb</code>. No commands from the issue were executed.</li>
+<li>Trust note: issue text and PR contents were treated solely as untrusted claims. No external URLs from issue content were fetched; no supplied script, patch, test, or branch was executed. PR metadata and diff were read as untrusted data. Only trusted main and this investigation's own new regression executed. No production instances, credentials, or unrelated files were read.</li>
+<li>Reproduction label: <code>confirmed-repro</code>. Classification: Bug / Medium / Low / threads, perf. These were missing and were filled; no existing values were replaced.</li></ul>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
