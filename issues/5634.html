@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #5634 Terminal relay shares the server event loop</title>
+<style>
+:root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --ok:#0e8a16; --warn:#b26a00; }
+body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+main { max-width:1000px; margin:0 auto; padding:40px 24px 80px; }
+h1 { font-size:26px; line-height:1.25; } h2 { font-size:19px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+.meta { color:var(--muted); font-size:14px; } .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:white; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+a { color:var(--accent); } .ok { color:var(--ok); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#5634 · Terminal relay shares the server event loop</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: Medium</span> <span class="pill">Effort: High</span> <span class="pill">host</span> <span class="pill">ui</span> <span class="pill">perf</span> · <a href="https://github.com/get-bb/bb/issues/5634">GitHub issue</a> · 2026-10-16 · base <code>399d63d27702638622ed6522bf874808a364fb40</code></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · Label: <code>confirmed-repro</code></p>
+
+<h2>1. TL;DR</h2>
+<p>A terminal key can wait behind unrelated synchronous work in the server before its echo returns. A fresh probe using the real server WebSocket routes, real migrated SQLite, a separate client process, and an actual PTY reproduced approximately 903 ms of echo latency when input arrived 100 ms into a one-second server-thread stall. A separate delayed TCP connection added approximately 80 ms to echo latency, as expected for a round trip. The server data relay runs on the same event loop as product work; removing individual slow operations does not make that relay independent. Immediate predictive drawing would be new client behavior and is not approved by this report.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>Added connection RTT appears in terminal echo latency.</td><td class="ok">Verified</td><td>Each clean run compares a direct connection with a TCP proxy delaying both directions by 40 ms. Exact measurements follow.</td></tr>
+<tr><td>Unrelated server-thread blocking freezes terminal echo.</td><td class="ok">Verified</td><td>Input is sent by an unblocked child process into an already attached terminal while the server test worker spins. The responsiveness assertion fails at approximately 903 ms in both checkouts.</td></tr>
+<tr><td>The browser currently does not predict local printable input.</td><td class="ok">Verified by source inspection</td><td>The xterm input callback forwards data to the transport; the output callback writes received server data. This report does not measure browser frames.</td></tr>
+<tr><td>A particular deployed server experienced the reported seven-day stall counts and causes.</td><td class="unv">Unverified</td><td>No production instance, personal database, or production logs were accessed.</td></tr>
+<tr><td>A specific worker design or predictive-echo implementation is ready to adopt.</td><td class="unv">Unverified / design decision</td><td>No candidate implementation was executed. This investigation establishes the blocking boundary, not approval of an architecture or product feature.</td></tr>
+</tbody></table>
+
+<h2>3. Environment</h2>
+<ul>
+<li>Public repository <code>get-bb/bb</code>; trusted <code>origin/main</code> at <code>399d63d27702638622ed6522bf874808a364fb40</code>, independently matched to GitHub's main commit.</li>
+<li>Linux x86_64; Node <code>v22.19.0</code>; pnpm <code>9.15.0</code>; Vitest <code>4.1.1</code>. No provider or agent session was used.</li>
+<li>Two clean detached worktrees, <code>base-a</code> and <code>base-b</code>, each installed with a frozen lockfile and built through Turbo. Each build completed 66 tasks successfully.</li>
+<li>The repository test harness binds a fresh loopback port and creates a fresh temporary <code>bb-server-test-*</code> data directory with a real migration-derived SQLite connection. No installed bb instance is involved. Recorded ports are in the result objects.</li>
+<li>The child process uses the existing <code>ws</code> and <code>node-pty</code> dependencies. It starts <code>/bin/cat</code> with a minimal environment and implements only the daemon terminal protocol subset needed for input, output, and attachment. The complete host-daemon runtime is not launched.</li>
+</ul>
+
+<h2>4. Minimal reproduction</h2>
+<p>Run only in a disposable checkout: the test intentionally stalls its own server worker for one second. It does not signal or attach an inspector to another process.</p>
+<ol>
+<li>Obtain the trusted base and install/build its existing dependencies:<pre>git clone https://github.com/get-bb/bb.git bb-5634-a
+cd bb-5634-a
+git checkout --detach 399d63d27702638622ed6522bf874808a364fb40
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build</pre></li>
+<li>Save the two complete embedded diagnostic files into <code>apps/server/test/public/</code>: <a href="#regression-test">slopcop-5634.test.ts</a> and <a href="#pty-fixture">slopcop-5634-client.mjs</a>. They are new diagnostic code derived from the trusted route implementation, not the issue's scripts. The source is embedded rather than published as separate files, in accordance with this report site's rules.</li>
+<li>Run the focused responsiveness assertion:<pre>pnpm exec turbo run test --filter=@bb/server -- test/public/slopcop-5634.test.ts</pre></li>
+</ol>
+<p><strong>Expected contract:</strong> the actual PTY echoes every marker unchanged, a delayed connection adds its RTT, and unrelated main-thread work does not postpone the terminal echo beyond the generous 50 ms assertion. <strong>Actual:</strong> data is preserved and the RTT check passes, but the responsiveness assertion fails. This is an intentionally failing regression reproducer, not a passing fix test.</p>
+<h3>Run A: actual output</h3><pre>@bb/server:test: TERMINAL_PROBE {&quot;serverPort&quot;:&quot;56304&quot;,&quot;baseline&quot;:{&quot;echo&quot;:&quot;alpha&quot;,&quot;latencyMs&quot;:4.9},&quot;delayed&quot;:{&quot;echo&quot;:&quot;bravo&quot;,&quot;latencyMs&quot;:84.5},&quot;stalled&quot;:{&quot;echo&quot;:&quot;charlie&quot;,&quot;latencyMs&quot;:902.6},&quot;injectedStallMs&quot;:1000,&quot;productionCodeChanged&quot;:false}
+@bb/server:test: AssertionError: expected 902.6 to be less than 50
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  1 failed (1)</pre>
+<h3>Run B: actual output</h3><pre>@bb/server:test: TERMINAL_PROBE {&quot;serverPort&quot;:&quot;61358&quot;,&quot;baseline&quot;:{&quot;echo&quot;:&quot;alpha&quot;,&quot;latencyMs&quot;:5.5},&quot;delayed&quot;:{&quot;echo&quot;:&quot;bravo&quot;,&quot;latencyMs&quot;:84.2},&quot;stalled&quot;:{&quot;echo&quot;:&quot;charlie&quot;,&quot;latencyMs&quot;:903.2},&quot;injectedStallMs&quot;:1000,&quot;productionCodeChanged&quot;:false}
+@bb/server:test: AssertionError: expected 903.2 to be less than 50
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  1 failed (1)</pre>
+<p>The delayed probe tests remote echo, not visual local echo. There is one marker per condition in each run; these values are not percentile estimates or a sustained-throughput benchmark. The fixture does not include the production daemon's output batching, so its absolute baseline should not be compared directly with production p50 values.</p>
+<details id="regression-test"><summary>Complete regression reproducer: slopcop-5634.test.ts</summary><pre>import { fork } from &quot;node:child_process&quot;;
+import { once } from &quot;node:events&quot;;
+import { fileURLToPath } from &quot;node:url&quot;;
+import { createTerminalSession } from &quot;@bb/db&quot;;
+import { expect, it } from &quot;vitest&quot;;
+import { seedEnvironment, seedHostSession, seedProjectWithSource } from &quot;../helpers/seed.js&quot;;
+import { createTestDaemonHostKey, startTestServer } from &quot;../helpers/test-app.js&quot;;
+
+it(&quot;keeps terminal echo responsive during unrelated main-thread work&quot;, async () =&gt; {
+  const server = await startTestServer({ seedFirstPartyProviders: false });
+  const { host, session } = seedHostSession(server.deps, { id: &quot;probe-host&quot;, platform: &quot;linux&quot; });
+  const { project } = seedProjectWithSource(server.deps, { hostId: host.id, path: server.config.dataDir });
+  const environment = seedEnvironment(server.deps, {
+    hostId: host.id,
+    projectId: project.id,
+    path: server.config.dataDir,
+  });
+  const terminal = createTerminalSession(server.db, {
+    cols: 80,
+    rows: 24,
+    daemonSessionId: session.id,
+    environmentId: environment.id,
+    hostId: host.id,
+    initialCwd: server.config.dataDir,
+    status: &quot;running&quot;,
+    threadId: null,
+    title: &quot;probe&quot;,
+  });
+  const child = fork(fileURLToPath(new URL(&quot;./slopcop-5634-client.mjs&quot;, import.meta.url)), [], {
+    cwd: fileURLToPath(new URL(&quot;../../../../&quot;, import.meta.url)),
+    stdio: [&quot;ignore&quot;, &quot;inherit&quot;, &quot;inherit&quot;, &quot;ipc&quot;],
+    execArgv: [],
+  });
+  function request(payload: Record&lt;string, string | number&gt;) {
+    const response = once(child, &quot;message&quot;);
+    child.send(payload);
+    return response.then(([message]) =&gt; message);
+  }
+  try {
+    await request({
+      action: &quot;init&quot;,
+      url: server.baseUrl,
+      hostKey: createTestDaemonHostKey({ hostId: host.id }),
+      sessionId: session.id,
+      terminalId: terminal.id,
+      cwd: server.config.dataDir,
+    });
+    const baseline = await request({ action: &quot;measure&quot;, key: &quot;alpha&quot;, delayMs: 0 });
+    await request({ action: &quot;prepare&quot;, oneWayMs: 40 });
+    const delayed = await request({ action: &quot;measure&quot;, key: &quot;bravo&quot;, delayMs: 0 });
+    await request({ action: &quot;prepare&quot;, oneWayMs: 0 });
+    const stalledResponse = request({ action: &quot;measure&quot;, key: &quot;charlie&quot;, delayMs: 100 });
+    const blockUntil = performance.now() + 1000;
+    while (performance.now() &lt; blockUntil) {}
+    const stalled = await stalledResponse;
+    console.log(&quot;TERMINAL_PROBE&quot;, JSON.stringify({
+      serverPort: new URL(server.baseUrl).port,
+      baseline,
+      delayed,
+      stalled,
+      injectedStallMs: 1000,
+      productionCodeChanged: false,
+    }));
+    expect(baseline.echo).toBe(&quot;alpha&quot;);
+    expect(delayed.echo).toBe(&quot;bravo&quot;);
+    expect(stalled.echo).toBe(&quot;charlie&quot;);
+    expect(baseline.latencyMs).toBeLessThan(100);
+    expect(delayed.latencyMs - baseline.latencyMs).toBeGreaterThan(60);
+    expect(stalled.latencyMs).toBeLessThan(50);
+  } finally {
+    if (child.connected) {
+      await request({ action: &quot;stop&quot; });
+    }
+    child.kill();
+    await server.close();
+  }
+}, 30000);</pre></details>
+<details id="pty-fixture"><summary>Complete separate-process PTY and WebSocket fixture: slopcop-5634-client.mjs</summary><pre>import { createRequire } from &quot;node:module&quot;;
+import { createServer, connect } from &quot;node:net&quot;;
+import { once } from &quot;node:events&quot;;
+import { resolve } from &quot;node:path&quot;;
+import { setTimeout as sleep } from &quot;node:timers/promises&quot;;
+
+const serverRequire = createRequire(resolve(&quot;apps/server/package.json&quot;));
+const hostRequire = createRequire(resolve(&quot;apps/host-daemon/package.json&quot;));
+const WebSocket = serverRequire(&quot;ws&quot;);
+const { spawn } = hostRequire(&quot;node-pty&quot;);
+let daemon;
+let browser;
+let terminal;
+let terminalId;
+let serverUrl;
+let nextSeq = 0;
+let pending;
+let proxy;
+const sockets = new Set();
+
+async function openBrowser(oneWayMs) {
+  if (browser) {
+    browser.close();
+    await once(browser, &quot;close&quot;);
+  }
+  if (proxy) {
+    for (const socket of sockets) socket.destroy();
+    proxy.close();
+    proxy = null;
+  }
+  const address = new URL(serverUrl);
+  let port = address.port;
+  if (oneWayMs &gt; 0) {
+    proxy = createServer((downstream) =&gt; {
+      const upstream = connect(Number(address.port), &quot;127.0.0.1&quot;);
+      for (const socket of [upstream, downstream]) {
+        sockets.add(socket);
+        socket.on(&quot;close&quot;, () =&gt; sockets.delete(socket));
+        socket.on(&quot;error&quot;, () =&gt; {});
+      }
+      for (const [source, destination] of [[upstream, downstream], [downstream, upstream]]) {
+        source.on(&quot;data&quot;, (bytes) =&gt; setTimeout(() =&gt; {
+          if (!destination.destroyed) destination.write(bytes);
+        }, oneWayMs));
+        source.on(&quot;end&quot;, () =&gt; setTimeout(() =&gt; destination.end(), oneWayMs));
+      }
+    });
+    proxy.listen(0, &quot;127.0.0.1&quot;);
+    await once(proxy, &quot;listening&quot;);
+    port = proxy.address().port;
+  }
+  browser = new WebSocket(`ws://127.0.0.1:${port}/ws/terminals/${terminalId}`);
+  await new Promise((resolveAttached, reject) =&gt; {
+    browser.on(&quot;error&quot;, reject);
+    browser.on(&quot;message&quot;, (raw) =&gt; {
+      const message = JSON.parse(raw.toString());
+      if (message.type === &quot;attached&quot;) resolveAttached();
+      if (message.type === &quot;error&quot;) reject(new Error(message.message));
+      if (message.type === &quot;output&quot; &amp;&amp; pending) {
+        pending.text += Buffer.from(message.chunk.dataBase64, &quot;base64&quot;).toString();
+        if (pending.text.includes(pending.key)) {
+          const current = pending;
+          pending = null;
+          clearTimeout(current.timeout);
+          current.resolve({
+            echo: current.key,
+            latencyMs: Math.round((performance.now() - current.started) * 10) / 10,
+          });
+        }
+      }
+    });
+  });
+}
+
+async function initialize(message) {
+  serverUrl = message.url;
+  terminalId = message.terminalId;
+  terminal = spawn(&quot;/bin/cat&quot;, [], {
+    name: &quot;xterm-256color&quot;,
+    cols: 80,
+    rows: 24,
+    cwd: message.cwd,
+    env: { PATH: &quot;/usr/bin:/bin&quot;, TERM: &quot;xterm-256color&quot;, LANG: &quot;C.UTF-8&quot; },
+  });
+  daemon = new WebSocket(`${serverUrl.replace(&quot;http:&quot;, &quot;ws:&quot;)}/internal/ws?sessionId=${message.sessionId}`, &quot;bb-host-daemon.v1&quot;, {
+    headers: { Authorization: `Bearer ${message.hostKey}` },
+  });
+  daemon.on(&quot;message&quot;, (raw) =&gt; {
+    const command = JSON.parse(raw.toString());
+    if (command.type === &quot;terminal.attach&quot;) {
+      daemon.send(JSON.stringify({
+        type: &quot;terminal.replay&quot;,
+        requestId: command.requestId,
+        terminalId,
+        chunks: [],
+        replayStartSeq: nextSeq,
+        nextSeq,
+      }));
+    }
+    if (command.type === &quot;terminal.input&quot;) {
+      terminal.write(Buffer.from(command.dataBase64, &quot;base64&quot;).toString());
+    }
+  });
+  terminal.onData((text) =&gt; {
+    const bytes = Buffer.from(text);
+    daemon.send(JSON.stringify({
+      type: &quot;terminal.output&quot;,
+      terminalId,
+      chunk: { seq: nextSeq, dataBase64: bytes.toString(&quot;base64&quot;) },
+    }));
+    nextSeq += bytes.length;
+  });
+  await once(daemon, &quot;open&quot;);
+  await openBrowser(0);
+  return { ready: true };
+}
+
+async function measure(message) {
+  await sleep(message.delayMs);
+  return new Promise((resolveEcho, reject) =&gt; {
+    pending = {
+      key: message.key,
+      text: &quot;&quot;,
+      started: performance.now(),
+      resolve: resolveEcho,
+      timeout: setTimeout(() =&gt; reject(new Error(&quot;No terminal echo within 5 seconds&quot;)), 5000),
+    };
+    browser.send(JSON.stringify({ type: &quot;input&quot;, dataBase64: Buffer.from(message.key).toString(&quot;base64&quot;) }));
+  });
+}
+
+process.on(&quot;message&quot;, async (message) =&gt; {
+  try {
+    if (message.action === &quot;init&quot;) process.send(await initialize(message));
+    if (message.action === &quot;prepare&quot;) {
+      await openBrowser(message.oneWayMs);
+      process.send({ prepared: true });
+    }
+    if (message.action === &quot;measure&quot;) process.send(await measure(message));
+    if (message.action === &quot;stop&quot;) {
+      browser?.terminate();
+      daemon?.terminate();
+      terminal?.kill();
+      for (const socket of sockets) socket.destroy();
+      proxy?.close();
+      process.send({ stopped: true });
+    }
+  } catch (error) {
+    console.error(error);
+    process.send({ error: String(error) });
+  }
+});</pre></details>
+
+<h2>5. Root cause</h2>
+<p>The two WebSocket routes are installed into the same server instance. Their message callbacks directly invoke the terminal lifecycle and daemon protocol handlers; there is no independently scheduled data plane. A synchronous loop on the server worker prevents those callbacks from handling newly arriving bytes even while the external client and PTY remain schedulable.</p>
+<ul>
+<li><a href="https://github.com/get-bb/bb/blob/399d63d27702638622ed6522bf874808a364fb40/apps/server/src/server.ts#L965-L1000">Browser terminal route and direct input callbacks</a>.</li>
+<li><a href="https://github.com/get-bb/bb/blob/399d63d27702638622ed6522bf874808a364fb40/apps/server/src/server.ts#L1004-L1031">Shared daemon route and direct message callback</a>.</li>
+<li><a href="https://github.com/get-bb/bb/blob/399d63d27702638622ed6522bf874808a364fb40/apps/server/src/services/terminals/terminal-session-lifecycle.ts#L1830-L1870">Input forwarding</a> reads and updates terminal state, emits session updates, sends the daemon input message, and emits a plugin event on this path.</li>
+<li><a href="https://github.com/get-bb/bb/blob/399d63d27702638622ed6522bf874808a364fb40/apps/server/src/services/terminals/terminal-session-lifecycle.ts#L1683-L1701">Output forwarding</a> reads the terminal row and forwards its output chunk in the daemon message handler.</li>
+<li><a href="https://github.com/get-bb/bb/blob/399d63d27702638622ed6522bf874808a364fb40/apps/app/src/components/thread/terminal/ThreadTerminalView.tsx#L473-L489">Input conversion only calls the supplied input callback</a>; <a href="https://github.com/get-bb/bb/blob/399d63d27702638622ed6522bf874808a364fb40/apps/app/src/components/thread/terminal/ThreadTerminalView.tsx#L1096-L1143">the xterm integration separately receives output and forwards keystrokes</a>.</li>
+</ul>
+<pre>onMessage: (event, socket) =&gt;
+  onTerminalSocketMessage(deps, {
+    raw: event.data,
+    socket,
+    terminalId,
+  })</pre>
+<pre>const sent = this.options.hub.sendDaemonSessionMessage(
+  current.daemonSessionId,
+  {
+    type: "terminal.input",
+    terminalId: current.id,
+    dataBase64: args.message.dataBase64,
+  },
+);</pre>
+<p>The database work is part of the serial path, but this experiment does not attribute the injected stall to a slow database query. The stall is deliberately unrelated work in the same event loop. Caching terminal rows or shrinking one slow task cannot guarantee continuous I/O while that event loop is blocked. Separately, without local prediction the client cannot show confirmed PTY echo before the remote trip completes; a renderer replacement alone does not remove this network dependency.</p>
+
+<h2>6. Proposed fix and safe-fix gate</h2>
+<p>Establish an independently serviced terminal-byte path, keeping authorization, terminal lifecycle, database policy, and plugin event policy on the main server. Any design must preserve ordering, replay offsets, pacing/acks, disconnect revocation, session ownership, and daemon compatibility. In particular, moving only browser sockets while keeping incoming daemon bytes on the blocked server loop would not isolate output.</p>
+<p>Predictive local echo should be treated as a separate product feature, with explicit rules for passwords, alternate-screen programs, mismatches, settings, SDK, and CLI. This report does not authorize that feature.</p>
+<p><strong>No automatic PR:</strong> the verified failure is an execution/transport ownership problem. A safe repair requires architecture and potentially public daemon-protocol decisions, so it fails the simple-fix gate even if a small superficial optimization could fit the line limit. No production patch, branch, or push was made to bb. No linked open PR was found in the issue timeline or an open-PR search for this issue number.</p>
+
+<h2>7. Verification</h2>
+<p>The same agent repeated the reproduction in a second newly created clean checkout at the identical trusted commit. Both worktrees had clean tracked files before the two new probe files were added. Each performed its own frozen install and Turbo build, and each used a fresh test server, new port, fresh test data, and a new PTY child. The same Turbo test command above failed specifically at the latency assertion, after all echo equality checks and the added-delay check passed.</p>
+<p>Run B confirms the final diagnosis. No report correction was necessary. This is a repeated clean reproduction by one agent, not a claim of independent human or agent verification. Production code remained unchanged. Cleanup closes sockets and the temporary server, kills the PTY child, and removes harness-created data.</p>
+
+<h2>8. Related evidence</h2>
+<p>Trusted history shows commit <code>8abfcd77e</code> (terminal output pacing, PR #4993) already precedes this base; that protects a different output-flow behavior and does not detach sockets from the server event loop. A repository issue search also finds #4163 on plugin stall attribution and #1207 on synchronous thread-list work. These are context, not a verified source of this experiment's stall, and they were not modified.</p>
+
+<h2>9. Appendix</h2>
+<p>Verbatim result excerpts from both runs and the complete runnable diagnostic files are embedded above. Raw evidence is retained locally outside the public report repository; no raw logs or diagnostic source files are committed to the site.</p>
+<p>Investigation operations: fetched and validated trusted main; read the issue and all available comments as untrusted data; read repository classifications and nearby examples; applied only missing Type/Priority/Effort/area values; inspected trusted server, terminal lifecycle, client, test harness, and daemon schema; installed and built both clean worktrees; ran the diagnostic test in each; searched issue cross-reference metadata and open PRs; checked diffs for whitespace errors. No issue-supplied command, script, branch, patch, binary, test, or external link was executed or fetched. No production logs, credentials, or personal runtime data were read.</p>
+<p><strong>Untrusted-data note:</strong> the issue included runnable scripts and architectural suggestions. They were treated only as claims; the probes were authored anew from trusted repository evidence.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
