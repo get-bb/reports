@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>#5704 · PR detail reads have no shared request budget</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#5704 · PR detail reads have no shared request budget</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High</span><span class="pill">Effort: Medium</span><span class="pill">host · perf · github · partial-repro</span>
+<a href="https://github.com/get-bb/bb/issues/5704">Issue #5704</a><span>October 17, 2026 · base <code>ee36dfda7815e8c72672ab57e2bdb1b395ada9be</code></span></p>
+<p><strong>Verdict: PARTIALLY REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> for the request-amplification mechanism, not the reporter's exact live allowance consumption.</p>
+
+<h2>1. TL;DR</h2>
+<p>Every uncached environment PR read asks GitHub for detailed PR state, then asks separately about the merge queue for an open, non-draft PR.
+The existing ten-second server cache shares simultaneous reads only within one environment identity; it does not impose an aggregate request budget.
+A deterministic test through the real server cache and host lookup produced 7,200 detail commands plus 7,200 queue commands for sixty environments requested every thirty seconds over one simulated hour.
+The same test also reproduced duplicate reads across environment identities and a retry thirty seconds after a synthetic quota failure.
+No real GitHub quota was deliberately exhausted: exact point costs, the original process sample, and the original caller responsible for the observed traffic remain unverified.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence and limit</th></tr>
+<tr><td>Detailed PR and separate merge-queue reads account for traffic.</td><td class="ok">Verified mechanism</td><td>The trusted host lookup issues both commands. The sixty-environment model records 7,200 of each.</td></tr>
+<tr><td>Many active threads can consume a shared hourly allowance.</td><td class="unv">Partially verified</td><td>Requests scale with distinct environment keys and poll cadence, without an aggregate bound. Counts are subprocess invocations, not measured GraphQL points.</td></tr>
+<tr><td>The reported host executed the stated number of commands and lost allowance at the stated rate.</td><td class="unv">Unverified</td><td>No production process sampling, credentials, usage data, or live exhaustion experiment was used.</td></tr>
+<tr><td>The daemon independently polls every active thread.</td><td class="unv">Not established</td><td>The traced daemon handler responds to RPC requests. The UI has conditional thirty-second polling, but this test supplies demand directly and does not mount sixty UI observers.</td></tr>
+<tr><td>Duplicate PR reads are not coalesced.</td><td class="unv">Qualified</td><td>Sixty simultaneous reads of one environment coalesce successfully. Two different environment identities mapped to the same workspace issue two detail and two queue commands.</td></tr>
+<tr><td>Exhaustion does not stop later background reads.</td><td class="ok">Verified with synthetic failure</td><td>A synthetic failed detail subprocess is attempted again after thirty seconds. No real HTTP response, reset header, or credential bucket was exercised.</td></tr>
+<tr><td>A rate-limit endpoint differs from response headers; disabling another plugin does not help.</td><td class="unv">Unverified</td><td>Neither was tested against the reporter's account or production host. The core detail lookup exists independently of the GitHub plugin.</td></tr></table>
+
+<h2>3. Environment</h2>
+<ul><li>Public target: <code>get-bb/bb</code>; trusted main commit <code>ee36dfda7815e8c72672ab57e2bdb1b395ada9be</code>, fetched again unchanged after the runs.</li>
+<li>Source package version: <code>bb-app 0.46.1</code>; the reported older release was not executed.</li>
+<li>Linux 4.19.0-gvisor x86_64; Node 22.19.0; pnpm 9.15.0; Vitest 4.1.1. Installed gh 2.23.0 was not invoked by the reproduction.</li>
+<li>Two separate detached clean worktrees at the same trusted commit, each with its own frozen install and successful full Turbo build (67 tasks). The second build reused trusted build artifacts, while its reproduction test was forced to execute uncached.</li>
+<li>No BB instance, HTTP listener, provider, real database, or runtime data directory was used. Git and gh subprocesses were intercepted at the existing process utility boundary; the cache, memoization, parsing, and host lookup remained real.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<p>This is a bounded, offline model of request demand, not a one-hour live traffic capture. The PR fixture has a running check, which is eligible for the real UI's active-PR poll interval. The test invokes the server cache and host lookup directly, adapting the host result in the same shape as the daemon handler; it does not test HTTP routing, workspace resolution, React visibility, or plugin behavior.</p>
+<ol><li>Create a fresh worktree at the trusted commit and install/build:
+<pre>git clone https://github.com/get-bb/bb.git bb-5704
+cd bb-5704
+git checkout --detach ee36dfda7815e8c72672ab57e2bdb1b395ada9be
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build</pre></li>
+<li>Save the complete test below as <code>packages/host-workspace/test/issue-5704-repro.test.ts</code>. It adds no dependency or production seam.</li>
+<li>Run the focused test. Exit status 1 and three failing safety assertions are expected on the trusted base:
+<pre>pnpm exec turbo run test --force --filter=@bb/host-workspace -- test/issue-5704-repro.test.ts</pre></li>
+<li>Repeat in a second clean checkout at the same commit with the same test. Do not point any command at a live BB data directory.</li></ol>
+<h3>Expected vs actual</h3>
+<table><tr><th>Probe</th><th>Safety expectation</th><th>Observed</th></tr>
+<tr><td>Sixty overlapping same-environment reads</td><td>One detail read and one queue read</td><td>1 + 1; control passes</td></tr>
+<tr><td>Sixty distinct environments, 120 ticks, 30 seconds per tick</td><td>Fewer than 5,000 detail reads even before reserving user capacity</td><td>7,200 detail reads + 7,200 queue reads; fails</td></tr>
+<tr><td>Two environment identities for one workspace/PR</td><td>One shared detail read</td><td>Two detail reads + two queue reads; fails</td></tr>
+<tr><td>Synthetic quota error, then a tick 30 seconds later</td><td>Do not immediately resume the known exhausted read stream</td><td>Two failing detail attempts; fails</td></tr></table>
+<p>The 5,000-detail-read assertion is a deliberately conservative capacity guard, not a measurement or verification of GitHub's billing rules. Every model tick returns an unchanged PR. The clock advances in memory; the test runs in about one second after imports.</p>
+<h3>Complete test</h3><pre>import { beforeEach, describe, expect, it, vi } from &quot;vitest&quot;;
+import { WorkspaceReadCaches } from &quot;../../../apps/server/src/services/environments/workspace-read-cache.js&quot;;
+import { getPullRequestForCurrentBranch } from &quot;../src/git-host.js&quot;;
+
+const transport = vi.hoisted(() =&gt; ({
+  views: 0,
+  queues: 0,
+  exhausted: false,
+}));
+
+vi.mock(&quot;@bb/process-utils&quot;, async (importOriginal) =&gt; {
+  const actual = await importOriginal&lt;typeof import(&quot;@bb/process-utils&quot;)&gt;();
+  return {
+    ...actual,
+    execPortableFile: async (
+      file: string,
+      args: readonly string[],
+      options: { cwd: string },
+    ) =&gt; {
+      if (file === &quot;git&quot;) return { stdout: &quot;&quot;, stderr: &quot;&quot; };
+      if (file !== &quot;gh&quot;) throw new Error(`Unexpected executable: ${file}`);
+      if (args[0] === &quot;pr&quot; &amp;&amp; args[1] === &quot;view&quot;) {
+        transport.views += 1;
+        if (transport.exhausted) {
+          throw Object.assign(new Error(&quot;GraphQL allowance exhausted&quot;), {
+            code: 1,
+            stderr: &quot;Synthetic GraphQL quota exhaustion&quot;,
+          });
+        }
+        const workspaceIndex = Number(options.cwd.match(/workspace-(\d+)$/)?.[1] ?? 0);
+        return {
+          stdout: JSON.stringify({
+            number: workspaceIndex + 1,
+            title: &quot;Synthetic pull request&quot;,
+            state: &quot;OPEN&quot;,
+            url: `https://github.com/example/repo-${workspaceIndex % 19}/pull/${workspaceIndex + 1}`,
+            isDraft: false,
+            autoMergeRequest: null,
+            baseRefName: &quot;main&quot;,
+            headRefName: `example-${workspaceIndex}`,
+            updatedAt: &quot;2026-10-17T00:00:00Z&quot;,
+            statusCheckRollup: [{
+              __typename: &quot;CheckRun&quot;,
+              name: &quot;Synthetic CI&quot;,
+              status: &quot;IN_PROGRESS&quot;,
+              conclusion: null,
+            }],
+            reviewDecision: null,
+            reviewRequests: [],
+            mergeStateStatus: &quot;CLEAN&quot;,
+            mergeable: &quot;MERGEABLE&quot;,
+          }),
+          stderr: &quot;&quot;,
+        };
+      }
+      if (args[0] === &quot;api&quot; &amp;&amp; args[1] === &quot;graphql&quot;) {
+        transport.queues += 1;
+        return {
+          stdout: JSON.stringify({ data: { resource: { isInMergeQueue: false } } }),
+          stderr: &quot;&quot;,
+        };
+      }
+      throw new Error(`Unexpected gh operation: ${args.slice(0, 2).join(&quot; &quot;)}`);
+    },
+  };
+});
+
+function createReader() {
+  let now = 0;
+  const caches = new WorkspaceReadCaches({
+    hub: { onChangedMessage: () =&gt; () =&gt; undefined },
+    now: () =&gt; now,
+  });
+  return {
+    advance(milliseconds: number) {
+      now += milliseconds;
+    },
+    read(environmentIndex: number, workspaceIndex = environmentIndex) {
+      return caches.pullRequest.read({
+        environmentId: `environment-${environmentIndex}`,
+        hostId: &quot;synthetic-host&quot;,
+        key: `workspace-${workspaceIndex}`,
+        load: async () =&gt; {
+          const lookup = await getPullRequestForCurrentBranch({
+            cwd: `/tmp/synthetic-repository/workspace-${workspaceIndex}`,
+            localBranch: `example-${workspaceIndex}`,
+          });
+          if (lookup.outcome === &quot;found&quot;) {
+            return { outcome: &quot;available&quot;, pullRequest: lookup.pullRequest };
+          }
+          if (lookup.outcome === &quot;none&quot;) return { outcome: &quot;absent&quot; };
+          return lookup;
+        },
+      });
+    },
+  };
+}
+
+beforeEach(() =&gt; {
+  transport.views = 0;
+  transport.queues = 0;
+  transport.exhausted = false;
+});
+
+describe(&quot;PR status traffic safety&quot;, () =&gt; {
+  it(&quot;coalesces identical environment reads inside the existing cache window&quot;, async () =&gt; {
+    const reader = createReader();
+    const results = await Promise.all(Array.from({ length: 60 }, () =&gt; reader.read(0)));
+    expect(results.every((result) =&gt; result.outcome === &quot;available&quot;)).toBe(true);
+    expect(transport.views).toBe(1);
+    expect(transport.queues).toBe(1);
+  });
+
+  it(&quot;keeps one hour of 60-environment polling below 5000 detail reads&quot;, async () =&gt; {
+    const reader = createReader();
+    for (let tick = 0; tick &lt; 120; tick += 1) {
+      const results = await Promise.all(
+        Array.from({ length: 60 }, (_, index) =&gt; reader.read(index)),
+      );
+      expect(results.every((result) =&gt; result.outcome === &quot;available&quot;)).toBe(true);
+      reader.advance(30_000);
+    }
+    console.log(`Hourly model: views=${transport.views}, queueQueries=${transport.queues}`);
+    expect(transport.views).toBeLessThan(5_000);
+  });
+
+  it(&quot;coalesces the same workspace and PR across two environment identities&quot;, async () =&gt; {
+    const reader = createReader();
+    const results = await Promise.all([reader.read(0, 0), reader.read(1, 0)]);
+    expect(results.every((result) =&gt; result.outcome === &quot;available&quot;)).toBe(true);
+    console.log(`Shared workspace: views=${transport.views}, queueQueries=${transport.queues}`);
+    expect(transport.views).toBe(1);
+  });
+
+  it(&quot;does not retry a known exhausted allowance on the next poll&quot;, async () =&gt; {
+    const reader = createReader();
+    transport.exhausted = true;
+    const first = await reader.read(0);
+    expect(first.outcome).toBe(&quot;unavailable&quot;);
+    reader.advance(30_000);
+    const second = await reader.read(0);
+    expect(second.outcome).toBe(&quot;unavailable&quot;);
+    console.log(`Exhausted allowance: views=${transport.views}, queueQueries=${transport.queues}`);
+    expect(transport.views).toBe(1);
+  });
+});
+</pre>
+<h3>First run: verbatim selected output</h3><pre>@bb/host-workspace:test: Hourly model: views=7200, queueQueries=7200
+@bb/host-workspace:test: Shared workspace: views=2, queueQueries=2
+@bb/host-workspace:test: Exhausted allowance: views=2, queueQueries=0
+@bb/host-workspace:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 3 ⎯⎯⎯⎯⎯⎯⎯
+@bb/host-workspace:test: AssertionError: expected 7200 to be less than 5000
+@bb/host-workspace:test:     123|     console.log(`Hourly model: views=${transport.views}, queueQueries=…
+@bb/host-workspace:test: AssertionError: expected 2 to be 1 // Object.is equality
+@bb/host-workspace:test:     131|     console.log(`Shared workspace: views=${transport.views}, queueQuer…
+@bb/host-workspace:test: AssertionError: expected 2 to be 1 // Object.is equality
+@bb/host-workspace:test:     143|     console.log(`Exhausted allowance: views=${transport.views}, queueQ…
+@bb/host-workspace:test:  Test Files  1 failed (1)
+@bb/host-workspace:test:       Tests  3 failed | 1 passed (4)</pre>
+
+<h2>5. Root cause</h2>
+<p>The request path is SDK environment PR read → server environment route → server read cache → daemon workspace RPC → host PR lookup. The route caches by environment and host as well as workspace identity. That prevents duplicate requests for the same cache key, but gives every different environment a separate slot. The ten-second TTL expires before the active-PR thirty-second poll. There is no budget shared across these cache entries.</p>
+<p><a href="https://github.com/get-bb/bb/blob/ee36dfda7815e8c72672ab57e2bdb1b395ada9be/apps/server/src/routes/environments.ts#L433-L455">apps/server/src/routes/environments.ts:433</a></p><pre>  get(routes.pullRequest, async (context) =&gt; {
+    const environment = requireReadyEnvironment(
+      deps.db,
+      context.req.param(&quot;id&quot;),
+    );
+    if (!environment.isGitRepo) {
+      return context.json({ outcome: &quot;absent&quot; });
+    }
+    const target = requireWorkspaceCommandTarget(environment);
+    const result = await deps.workspaceReadCaches.pullRequest.read({
+      environmentId: environment.id,
+      hostId: target.hostId,
+      key: workspaceReadCacheKey(target),
+      load: () =&gt;
+        callHostRetryableOnlineRpc(deps, {
+          hostId: target.hostId,
+          timeoutMs: COMMAND_TIMEOUT_MS,
+          command: {
+            type: &quot;workspace.pull_request&quot;,
+            environmentId: target.environmentId,
+            workspaceContext: target.workspaceContext,
+          },
+        }),</pre>
+<p><a href="https://github.com/get-bb/bb/blob/ee36dfda7815e8c72672ab57e2bdb1b395ada9be/apps/server/src/services/environments/workspace-read-cache.ts#L39-L43">apps/server/src/services/environments/workspace-read-cache.ts:39</a></p><pre>  read(args: EnvironmentReadCacheReadArgs&lt;TValue&gt;): Promise&lt;TValue&gt; {
+    return this.cache.run(
+      `${args.environmentId} ${args.hostId} ${args.key}`,
+      args.load,
+    );</pre>
+<p><a href="https://github.com/get-bb/bb/blob/ee36dfda7815e8c72672ab57e2bdb1b395ada9be/apps/server/src/services/environments/workspace-read-cache.ts#L55-L56">apps/server/src/services/environments/workspace-read-cache.ts:55</a></p><pre>const WORKSPACE_STATUS_CACHE_TTL_MS = 3_000;
+const WORKSPACE_PULL_REQUEST_CACHE_TTL_MS = 10_000;</pre>
+<p>The host detail query requests status-check rollups among other PR fields. Every successful open/non-draft result launches a second GraphQL command for merge-queue membership, including when the PR has not changed. Neither invocation requests rate-limit headers. Detail failures return an unavailable lookup; queue-query failures set unknown queue membership without establishing a shared cooldown.</p>
+<p><a href="https://github.com/get-bb/bb/blob/ee36dfda7815e8c72672ab57e2bdb1b395ada9be/packages/host-workspace/src/git-host.ts#L25-L40">packages/host-workspace/src/git-host.ts:25</a></p><pre>const GH_PR_VIEW_JSON_FIELDS = [
+  &quot;number&quot;,
+  &quot;title&quot;,
+  &quot;state&quot;,
+  &quot;url&quot;,
+  &quot;isDraft&quot;,
+  &quot;autoMergeRequest&quot;,
+  &quot;baseRefName&quot;,
+  &quot;headRefName&quot;,
+  &quot;updatedAt&quot;,
+  &quot;statusCheckRollup&quot;,
+  &quot;reviewDecision&quot;,
+  &quot;reviewRequests&quot;,
+  &quot;mergeStateStatus&quot;,
+  &quot;mergeable&quot;,
+].join(&quot;,&quot;);</pre>
+<p><a href="https://github.com/get-bb/bb/blob/ee36dfda7815e8c72672ab57e2bdb1b395ada9be/packages/host-workspace/src/git-host.ts#L593-L605">packages/host-workspace/src/git-host.ts:593</a></p><pre>  let stdout: string;
+  try {
+    ({ stdout } = await execPortableFile(&quot;gh&quot;, ghArgs, {
+      cwd: args.cwd,
+      env: sanitizeInheritedChildProcessEnv({
+        env: process.env,
+        ...(args.shellPath !== undefined ? { shellPath: args.shellPath } : {}),
+      }),
+      timeout: GH_PR_VIEW_TIMEOUT_MS,
+      maxBuffer: GH_PR_VIEW_MAX_BUFFER_BYTES,
+    }));
+  } catch (error) {
+    return classifyPullRequestViewError(error);</pre>
+<p><a href="https://github.com/get-bb/bb/blob/ee36dfda7815e8c72672ab57e2bdb1b395ada9be/packages/host-workspace/src/git-host.ts#L614-L627">packages/host-workspace/src/git-host.ts:614</a></p><pre>  if (pullRequest.state === &quot;OPEN&quot; &amp;&amp; !pullRequest.isDraft) {
+    try {
+      const { stdout: queueOutput } = await execPortableFile(
+        &quot;gh&quot;,
+        [
+          &quot;api&quot;,
+          &quot;graphql&quot;,
+          &quot;--hostname&quot;,
+          new URL(pullRequest.url).hostname,
+          &quot;-f&quot;,
+          &quot;query=query($url: URI!) { resource(url: $url) { ... on PullRequest { isInMergeQueue } } }&quot;,
+          &quot;-f&quot;,
+          `url=${pullRequest.url}`,
+        ],</pre>
+<p><a href="https://github.com/get-bb/bb/blob/ee36dfda7815e8c72672ab57e2bdb1b395ada9be/packages/host-workspace/src/git-host.ts#L640-L652">packages/host-workspace/src/git-host.ts:640</a></p><pre>      const response = asObject(JSON.parse(queueOutput));
+      const data = asObject(response?.data);
+      const resource = asObject(data?.resource);
+      pullRequest.inMergeQueue = resource
+        ? getBoolean(resource, &quot;isInMergeQueue&quot;)
+        : null;
+    } catch {
+      pullRequest.inMergeQueue = null;
+    }
+  } else {
+    pullRequest.inMergeQueue = false;
+  }
+  return { outcome: &quot;found&quot;, pullRequest };</pre>
+<p>The daemon handler performs a read in response to a request. This investigation does not demonstrate a separate daemon timer polling all threads. Existing UI behavior does allow thirty-second polling for open PRs with pending checks, auto-merge, merge-queue membership, or unknown mergeability, while settled PRs do not use that interval.</p>
+<p><a href="https://github.com/get-bb/bb/blob/ee36dfda7815e8c72672ab57e2bdb1b395ada9be/apps/host-daemon/src/command-dispatch.ts#L731-L752">apps/host-daemon/src/command-dispatch.ts:731</a></p><pre>  &quot;workspace.pull_request&quot;: async (command, options) =&gt; {
+    const resolution = await resolveWorkspaceForCommand({
+      environmentId: command.environmentId,
+      requireGit: true,
+      runtimeManager: options.runtimeManager,
+      workspaceContext: command.workspaceContext,
+    });
+    if (!resolution.ok) {
+      return resolution.failure.code === &quot;not_git_repo&quot;
+        ? { outcome: &quot;absent&quot; }
+        : { outcome: &quot;unavailable&quot;, message: resolution.failure.message };
+    }
+    const lookup = await resolution.entry.workspace.getPullRequest(
+      userExecutableProcessOptions(options.runtimeManager.getShellEnv()),
+    );
+    switch (lookup.outcome) {
+      case &quot;found&quot;:
+        return { outcome: &quot;available&quot;, pullRequest: lookup.pullRequest };
+      case &quot;none&quot;:
+        return { outcome: &quot;absent&quot; };
+      case &quot;unavailable&quot;:
+        return { outcome: &quot;unavailable&quot;, message: lookup.message };</pre>
+<p><a href="https://github.com/get-bb/bb/blob/ee36dfda7815e8c72672ab57e2bdb1b395ada9be/apps/app/src/hooks/queries/environment-queries.ts#L62-L64">apps/app/src/hooks/queries/environment-queries.ts:62</a></p><pre>const ENVIRONMENT_PULL_REQUEST_STALE_MS = 30_000;
+const ENVIRONMENT_SETTLED_PULL_REQUEST_STALE_MS = 60 * 60_000;
+const ENVIRONMENT_ACTIVE_PULL_REQUEST_REFETCH_MS = 30_000;</pre>
+<p><a href="https://github.com/get-bb/bb/blob/ee36dfda7815e8c72672ab57e2bdb1b395ada9be/apps/app/src/hooks/queries/environment-queries.ts#L150-L164">apps/app/src/hooks/queries/environment-queries.ts:150</a></p><pre>export function getEnvironmentPullRequestRefetchInterval(
+  pullRequest: ThreadPullRequest | null | undefined,
+): number | false {
+  if (!pullRequest || pullRequest.state !== &quot;open&quot;) {
+    return false;
+  }
+  if (
+    pullRequest.autoMerge ||
+    pullRequest.inMergeQueue === true ||
+    pullRequest.checks.state === &quot;pending&quot; ||
+    pullRequest.mergeability.state === &quot;unknown&quot;
+  ) {
+    return ENVIRONMENT_ACTIVE_PULL_REQUEST_REFETCH_MS;
+  }
+  return false;</pre>
+<p>The deeper problem is that short-lived per-environment memoization is not aggregate external-service admission control. A larger fixed TTL or removal of the queue query reduces cost but remains proportional to the number of distinct environments, and therefore cannot guarantee a shared reserve.</p>
+
+<h2>6. Proposed fix and simple-fix gate</h2>
+<p>Introduce explicit shared request-budget policy for background GitHub reads, separate from user-triggered PR mutations. Define the reserve, staleness behavior, account/hostname scope, and reset-aware cooldown. Coalesce equivalent PR identities across workspaces; consider conditional lightweight change detection before loading detail and queue state. Preserve correctness for changed checks/reviews, whose updates need not be represented by a naive PR timestamp comparison.</p>
+<p><strong>No fix PR opened.</strong> No linked open PR was found in the issue timeline or open-PR search. A safe complete fix requires a product decision about background freshness versus a shared user-action reserve, and coordination between server policy and host-local GitHub transport. That fails the autopilot's no-product/architecture-decision condition; an arbitrary TTL increase would not repair the unbounded aggregate mechanism. No production patch, fix branch, dependency, protocol, stored data, or migration was changed.</p>
+<p>Next experiment: after choosing that contract, replay this demand model with mixed active/settled PRs, multiple authentication buckets, quota reset responses, and an interleaved user action. Verify a bounded aggregate read count and timely mutation refresh before implementing admission control.</p>
+
+<h2>7. Verification</h2>
+<p>The same agent created a second clean detached worktree at <code>ee36dfda7815e8c72672ab57e2bdb1b395ada9be</code>, performed a fresh frozen install and a full Turbo build, copied only the authored reproduction test, and reran the exact focused command with <code>--force</code>. No production code was changed in either run. The test-file SHA-256 in both runs was <code>521c7e32582368396a6fbb8b53d9c6184573040649cbb607d3dda8d72578660d</code>. Both produced the identical counts and the same three failures plus one passing control. This is a repeat by the same agent, not independent verification.</p>
+<pre>@bb/host-workspace:test: Hourly model: views=7200, queueQueries=7200
+@bb/host-workspace:test: Shared workspace: views=2, queueQueries=2
+@bb/host-workspace:test: Exhausted allowance: views=2, queueQueries=0
+@bb/host-workspace:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 3 ⎯⎯⎯⎯⎯⎯⎯
+@bb/host-workspace:test: AssertionError: expected 7200 to be less than 5000
+@bb/host-workspace:test:     123|     console.log(`Hourly model: views=${transport.views}, queueQueries=…
+@bb/host-workspace:test: AssertionError: expected 2 to be 1 // Object.is equality
+@bb/host-workspace:test:     131|     console.log(`Shared workspace: views=${transport.views}, queueQuer…
+@bb/host-workspace:test: AssertionError: expected 2 to be 1 // Object.is equality
+@bb/host-workspace:test:     143|     console.log(`Exhausted allowance: views=${transport.views}, queueQ…
+@bb/host-workspace:test:  Test Files  1 failed (1)
+@bb/host-workspace:test:       Tests  3 failed | 1 passed (4)</pre>
+<p>The original host-workspace suite passed after removing the intentionally failing reproduction test: 164 passed, one skipped across nine files. The existing server workspace-read-cache suite passed all ten tests. A first attempt to exclude the reproduction with the CLI exclude flag still included it under this repository's explicit project file lists; that run failed only the three intentional reproduction assertions. The clean rerun removed the extra test and passed. Both full builds passed; no unrelated production failures were found.</p>
+<p>All source permalinks and excerpt bounds were checked against the recorded base. The report was qualified as partial because subprocess counts cannot establish real GraphQL point consumption or the reporter's exact original request initiator. No other report correction was necessary.</p>
+
+<h2>8. Related issues and PRs</h2>
+<p>No linked PRs, comments, or matching duplicate bug were found for #5704 at investigation time. Historical PR #1886 introduced short-lived workspace read caching; PR #5132 later shared cached external lookups. Those history entries explain existing memoization, not a verified fix for this aggregate-demand problem. No linked PR branch or code was executed.</p>
+
+<h2>9. Appendix</h2>
+<p>Issue content was treated as untrusted claims, not operational instructions. The test was authored from the trusted cache and host implementation. No external issue links, issue scripts, private data, real account quota, or live BB runtime were used. The test and selected outputs are inline because the public reports repository forbids committing raw test files and logs; raw evidence is retained only in local investigation storage.</p>
+<h3>Relevant commands</h3>
+<pre>git fetch origin main
+git rev-parse origin/main
+git worktree add --detach CHECKOUT_A ee36dfda7815e8c72672ab57e2bdb1b395ada9be
+git worktree add --detach CHECKOUT_B ee36dfda7815e8c72672ab57e2bdb1b395ada9be
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec turbo run test --filter=@bb/host-workspace -- test/issue-5704-repro.test.ts
+pnpm exec turbo run test --force --filter=@bb/host-workspace -- test/issue-5704-repro.test.ts
+pnpm exec turbo run test --filter=@bb/host-workspace -- --exclude test/issue-5704-repro.test.ts
+pnpm exec turbo run test --filter=@bb/host-workspace
+pnpm exec turbo run test --filter=@bb/server -- src/services/environments/workspace-read-cache.test.ts
+git diff --check
+gh pr list --repo get-bb/bb --state open --search '5704 in:body' --json number,title
+gh api repos/get-bb/bb/issues/5704/timeline --paginate</pre>
+<p>Run install/build in each checkout. Run the unqualified host-workspace suite only after removing the intentionally failing extra test. No browser or screenshot is needed for this nonvisual process-demand reproduction.</p>
+</main></body></html>
