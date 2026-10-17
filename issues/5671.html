@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #5671 Completed replies rejected by terminal-turn projection</title>
+<style>
+:root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --ok:#0e8a16; }
+body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+main { max-width:960px; margin:0 auto; padding:40px 24px 80px; }
+h1 { font-size:26px; line-height:1.25; } h2 { font-size:19px; margin:32px 0 10px; padding-top:18px; border-top:1px solid var(--line); }
+.meta { color:var(--muted); font-size:14px; } .pill { display:inline-block; padding:1px 8px; border:1px solid var(--line); border-radius:999px; }
+table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:white; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; } a { color:var(--accent); } .verdict { color:var(--ok); font-weight:600; }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#5671 · Completed replies rejected by terminal-turn projection</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: Medium</span> <span class="pill">Effort: Low</span> <span class="pill">threads</span> <span class="pill">confirmed-repro</span></p>
+<p class="meta"><a href="https://github.com/get-bb/bb/issues/5671">GitHub issue</a> · 2026-10-17 · trusted base <code>6a639cfc0d66e0c789a1bd7309266973228d1a80</code></p>
+<p class="verdict">Verdict: REPRODUCED · Root-cause confidence: high</p>
+
+<h2>1. TL;DR</h2>
+<p>The shared timeline projector discards a completed assistant reply if its first accepted text arrives after the turn is stopped. The Stop event marks the turn closed, and the text projector then rejects both streaming deltas and authoritative completed messages. A fresh regression test on current trusted main returns no assistant message where one completed reply is expected. The same agent repeated that failure in a second clean checkout. This establishes a deterministic projection defect; the original live provider timing and saved provider history were not accessed or reproduced.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>A completed assistant item arriving after manual Stop disappears.</td><td>Verified at projection boundary</td><td>The regression fails with an empty assistant-message array in two trusted-base checkouts.</td></tr>
+<tr><td>The closed-turn guard rejects the completion, rather than a display filter hiding it.</td><td>Verified</td><td>The test fails before row rendering because projected assistant messages are empty. Code rejects closed turns before inspecting the final-update mode.</td></tr>
+<tr><td>The original provider retained a response after a real Stop.</td><td>Unverified here</td><td>No live user instance, private thread, provider session, or runtime store was read.</td></tr>
+<tr><td>A linked contribution safely fixes the issue.</td><td>Only partially supported by static review</td><td>The contribution admits final updates, but reopens the closed turn, permitting other late deltas. It also includes unrelated provider changes.</td></tr>
+</table>
+
+<h2>3. Environment</h2>
+<ul><li>Repository: public <code>get-bb/bb</code>, trusted <code>origin/main</code> at the full commit above; package version 0.46.1.</li>
+<li>Linux x86_64; Node 22.19.0; pnpm 9.15.0; frozen workspace install.</li>
+<li>The primary checkout completed <code>pnpm exec turbo run build</code>: 67 successful tasks.</li>
+<li>The second checkout was detached at the identical base commit, with its own frozen install and separate workspace files.</li>
+<li>No HTTP server, browser, provider process, database, port, or runtime data directory was needed. This is a data-projection defect, not a CSS/layout defect; no screenshot is claimed.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol><li>Use a clean clone of the target repository and check out the trusted base:
+<pre>git clone https://github.com/get-bb/bb.git bb-5671
+cd bb-5671
+git checkout --detach 6a639cfc0d66e0c789a1bd7309266973228d1a80
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build</pre></li>
+<li>Replace <code>packages/thread-view/test/timeline-interruption.test.ts</code> with the complete test file in the expandable section below. The existing cases are retained; the new first case is the reproduction.</li>
+<li>Run the focused test:
+<pre>pnpm exec turbo run test --filter=@bb/thread-view -- test/timeline-interruption.test.ts -t 'renders a completed reply after Stop'</pre></li>
+<li>The test starts a turn, stops it, and feeds a late delta. It checks that delta is ignored. It then supplies a completed reply, another item's late delta, a duplicate completion, and an interrupted turn completion. The expected result is exactly one completed reply in the projected messages and an assistant conversation row. Current main instead produces no assistant reply.</li></ol>
+<p>Expected: the test passes, one completed message contains <code>Persisted reply.</code>, and neither late deltas nor a duplicate final alter it.</p>
+<p>Actual on both trusted-base runs (verbatim assertion excerpt):</p>
+<pre>AssertionError: expected [] to deeply equal [ ObjectContaining{…} ]
+
+- Expected
++ Received
+
+- [
+-   ObjectContaining {
+-     "status": "completed",
+-     "text": "Persisted reply.",
+-   },
+- ]
++ []</pre>
+<details><summary>Complete reproduction test file (copy into the path above)</summary><pre>import { describe, expect, it } from "vitest";
+import type { ThreadEventRow } from "@bb/domain";
+import type { TimelineRow } from "@bb/server-contract";
+import {
+  createTimelineEventFactory,
+  flattenTimelineRows,
+  renderTimelineFixture,
+} from "./timeline-test-harness.js";
+
+type TimelineWorkRow = Extract&lt;TimelineRow, { kind: "work" }&gt;;
+type TimelineSystemRow = Extract&lt;TimelineRow, { kind: "system" }&gt;;
+
+function getOnlyWorkRowByCallId(
+  rows: readonly TimelineRow[],
+  callId: string,
+): TimelineWorkRow {
+  const matches = flattenTimelineRows(rows).filter(
+    (row): row is TimelineWorkRow =&gt;
+      row.kind === "work" &amp;&amp; "callId" in row &amp;&amp; row.callId === callId,
+  );
+  expect(matches).toHaveLength(1);
+  const row = matches[0];
+  if (!row) {
+    throw new Error(`Expected work row for ${callId}`);
+  }
+  return row;
+}
+
+function getTopLevelSystemRows(
+  rows: readonly TimelineRow[],
+): TimelineSystemRow[] {
+  return rows.filter((row): row is TimelineSystemRow =&gt; row.kind === "system");
+}
+
+function renderIdleTimeline(events: ThreadEventRow[]) {
+  return renderTimelineFixture({
+    events,
+    projectionOptions: {
+      threadStatus: "idle",
+      turnMessageDetail: "full",
+    },
+  });
+}
+
+describe("timeline interruption projection", () =&gt; {
+  it("renders a completed reply after Stop without accepting late deltas", () =&gt; {
+    const event = createTimelineEventFactory({ threadId: "thread-1" });
+    const stoppedEvents = [
+      event.turnStarted({ createdAt: 0 }),
+      event.systemThreadInterrupted({ createdAt: 1_000 }),
+      event.assistantDelta({
+        itemId: "reply-after-stop",
+        delta: "Discard this unfinished text.",
+        createdAt: 2_000,
+      }),
+    ];
+
+    expect(
+      renderIdleTimeline(stoppedEvents).messages.filter(
+        (message) =&gt; message.kind === "assistant-text",
+      ),
+    ).toEqual([]);
+
+    const timeline = renderIdleTimeline([
+      ...stoppedEvents,
+      event.assistantCompleted({
+        itemId: "reply-after-stop",
+        text: "Persisted reply.",
+        createdAt: 3_000,
+      }),
+      event.assistantDelta({
+        itemId: "another-late-reply",
+        delta: "This must not reopen the stopped turn.",
+        createdAt: 4_000,
+      }),
+      event.assistantCompleted({
+        itemId: "reply-after-stop",
+        text: "Duplicate completion must not replace the reply.",
+        createdAt: 5_000,
+      }),
+      event.turnCompleted({ status: "interrupted", createdAt: 6_000 }),
+    ]);
+
+    expect(
+      timeline.messages.filter((message) =&gt; message.kind === "assistant-text"),
+    ).toEqual([
+      expect.objectContaining({
+        text: "Persisted reply.",
+        status: "completed",
+      }),
+    ]);
+    expect(flattenTimelineRows(timeline.rows)).toContainEqual(
+      expect.objectContaining({
+        kind: "conversation",
+        role: "assistant",
+        text: "Persisted reply.",
+      }),
+    );
+  });
+
+  it("keeps post-turn automatic compaction pending while the thread is idle", () =&gt; {
+    const event = createTimelineEventFactory({ threadId: "thread-1" });
+    const events = [
+      event.turnStarted({ createdAt: 0 }),
+      event.turnCompleted({ createdAt: 1_000 }),
+      event.contextCompactionStarted({ createdAt: 2_000 }),
+    ];
+    const timeline = renderIdleTimeline(events);
+
+    expect(timeline.messages).toContainEqual(
+      expect.objectContaining({
+        kind: "operation",
+        opType: "compaction",
+        status: "pending",
+        title: "Compacting context",
+        completedAt: null,
+      }),
+    );
+
+    const completedTimeline = renderIdleTimeline([
+      ...events,
+      event.threadCompacted({ createdAt: 3_000 }),
+    ]);
+    expect(completedTimeline.messages).toContainEqual(
+      expect.objectContaining({
+        kind: "operation",
+        opType: "compaction",
+        status: "completed",
+        title: "Context compacted",
+        completedAt: 3_000,
+      }),
+    );
+  });
+
+  it("settles a skipped manual compaction from the provider warning", () =&gt; {
+    const event = createTimelineEventFactory({ threadId: "thread-1" });
+    const timeline = renderIdleTimeline([
+      event.turnStarted({ createdAt: 0 }),
+      event.contextCompactionStarted({ createdAt: 1_000 }),
+      event.providerWarning({
+        category: "compaction-skipped",
+        summary: "Context compaction skipped",
+        details: "Compaction failed: Nothing to compact (session too small)",
+        createdAt: 2_000,
+      }),
+      event.turnCompleted({ createdAt: 3_000 }),
+    ]);
+
+    expect(timeline.messages).toContainEqual(
+      expect.objectContaining({
+        kind: "operation",
+        opType: "compaction",
+        status: "completed",
+        title: "Context compaction skipped",
+        detail: "Compaction failed: Nothing to compact (session too small)",
+        completedAt: 2_000,
+      }),
+    );
+    expect(
+      timeline.messages.some(
+        (message) =&gt;
+          message.kind === "operation" &amp;&amp; message.opType === "warning",
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps a pending compaction and renders an unrelated warning in the same turn", () =&gt; {
+    const event = createTimelineEventFactory({ threadId: "thread-1" });
+    const timeline = renderTimelineFixture({
+      events: [
+        event.turnStarted({ createdAt: 0 }),
+        event.contextCompactionStarted({ createdAt: 1_000 }),
+        event.providerWarning({
+          summary: "Model fallback",
+          details: "Requested model unavailable; using a fallback.",
+          createdAt: 2_000,
+        }),
+      ],
+      projectionOptions: {
+        threadStatus: "active",
+        turnMessageDetail: "full",
+      },
+    });
+
+    expect(timeline.messages).toContainEqual(
+      expect.objectContaining({
+        kind: "operation",
+        opType: "compaction",
+        status: "pending",
+        title: "Compacting context",
+        completedAt: null,
+      }),
+    );
+    expect(timeline.messages).toContainEqual(
+      expect.objectContaining({
+        kind: "operation",
+        opType: "warning",
+        title: "Model fallback",
+        detail: "Requested model unavailable; using a fallback.",
+      }),
+    );
+  });
+
+  it("interrupts post-turn compaction when the thread is explicitly interrupted", () =&gt; {
+    const event = createTimelineEventFactory({ threadId: "thread-1" });
+    const timeline = renderIdleTimeline([
+      event.turnStarted({ createdAt: 0 }),
+      event.turnCompleted({ createdAt: 1_000 }),
+      event.contextCompactionStarted({ createdAt: 2_000 }),
+      event.systemThreadInterrupted({ createdAt: 3_000 }),
+    ]);
+
+    expect(timeline.messages).toContainEqual(
+      expect.objectContaining({
+        kind: "operation",
+        opType: "compaction",
+        status: "interrupted",
+        title: "Context compaction interrupted",
+        completedAt: 3_000,
+      }),
+    );
+  });
+
+  it("does not apply an old thread interruption to a later compaction", () =&gt; {
+    const event = createTimelineEventFactory({ threadId: "thread-1" });
+    const timeline = renderIdleTimeline([
+      event.turnStarted({ turnId: "turn-a", createdAt: 0 }),
+      event.turnCompleted({
+        turnId: "turn-a",
+        status: "interrupted",
+        createdAt: 1_000,
+      }),
+      event.systemThreadInterrupted({ createdAt: 1_100 }),
+      event.turnStarted({ turnId: "turn-b", createdAt: 2_000 }),
+      event.turnCompleted({ turnId: "turn-b", createdAt: 3_000 }),
+      event.contextCompactionStarted({
+        turnId: "turn-b",
+        createdAt: 4_000,
+      }),
+    ]);
+
+    expect(timeline.messages).toContainEqual(
+      expect.objectContaining({
+        kind: "operation",
+        opType: "compaction",
+        status: "pending",
+        title: "Compacting context",
+        completedAt: null,
+      }),
+    );
+  });
+
+  it("uses interrupted turn completion time for pending command and tool rows", () =&gt; {
+    const event = createTimelineEventFactory({ threadId: "thread-1" });
+    const timeline = renderIdleTimeline([
+      event.turnStarted({ createdAt: 0 }),
+      event.commandStarted({
+        itemId: "cmd-1",
+        command: "pnpm test",
+        createdAt: 1_000,
+      }),
+      event.toolCallStarted({
+        itemId: "tool-1",
+        tool: "LookupTool",
+        arguments: { query: "select:TodoWrite" },
+        createdAt: 2_000,
+      }),
+      event.turnCompleted({
+        status: "interrupted",
+        createdAt: 6_000,
+      }),
+    ]);
+
+    const commandRow = getOnlyWorkRowByCallId(timeline.rows, "cmd-1");
+    const toolRow = getOnlyWorkRowByCallId(timeline.rows, "tool-1");
+
+    expect(commandRow).toMatchObject({
+      workKind: "command",
+      status: "interrupted",
+      startedAt: 1_000,
+      completedAt: 6_000,
+    });
+    expect(toolRow).toMatchObject({
+      workKind: "tool",
+      status: "interrupted",
+      startedAt: 2_000,
+      completedAt: 6_000,
+    });
+  });
+
+  it("uses system interruption time for pending command and web rows", () =&gt; {
+    const event = createTimelineEventFactory({ threadId: "thread-1" });
+    const timeline = renderIdleTimeline([
+      event.turnStarted({ createdAt: 0 }),
+      event.commandStarted({
+        itemId: "cmd-1",
+        command: "pnpm test",
+        createdAt: 1_000,
+      }),
+      event.webSearchStarted({
+        itemId: "web-1",
+        queries: ["timeline renderer"],
+        createdAt: 2_000,
+      }),
+      event.systemThreadInterrupted({ createdAt: 5_000 }),
+    ]);
+
+    const commandRow = getOnlyWorkRowByCallId(timeline.rows, "cmd-1");
+    const webRow = getOnlyWorkRowByCallId(timeline.rows, "web-1");
+
+    expect(commandRow).toMatchObject({
+      workKind: "command",
+      status: "interrupted",
+      startedAt: 1_000,
+      completedAt: 5_000,
+    });
+    expect(webRow).toMatchObject({
+      workKind: "web-search",
+      status: "interrupted",
+      startedAt: 2_000,
+      completedAt: 5_000,
+    });
+  });
+
+  it("omits an interruption operation row when the preceding error already explains the failed turn", () =&gt; {
+    const event = createTimelineEventFactory({ threadId: "thread-1" });
+    const timeline = renderIdleTimeline([
+      event.turnStarted({ createdAt: 0 }),
+      event.commandStarted({
+        itemId: "cmd-1",
+        command: "pnpm test",
+        createdAt: 1_000,
+      }),
+      event.turnCompleted({
+        status: "interrupted",
+        createdAt: 6_000,
+      }),
+      event.systemError({
+        code: "thread_command_failed",
+        message: "Thread interrupted because the host daemon disconnected",
+        detail: "Please retry the thread to continue.",
+        createdAt: 6_000,
+      }),
+      event.systemThreadInterrupted({
+        reason: "host-daemon-restarted",
+        createdAt: 6_000,
+      }),
+    ]);
+
+    expect(getTopLevelSystemRows(timeline.rows)).toEqual([
+      expect.objectContaining({
+        systemKind: "error",
+        title: "Thread interrupted because the host daemon disconnected",
+        detail: "Please retry the thread to continue.",
+      }),
+    ]);
+  });
+});</pre></details>
+<p>All reproduction code is inline so this page is sufficient to repeat the check. Raw local logs and test copies are not published, in accordance with the reports repository policy.</p>
+
+<h2>5. Root cause</h2>
+<p>The terminal-event handling in <a href="https://github.com/get-bb/bb/blob/6a639cfc0d66e0c789a1bd7309266973228d1a80/packages/thread-view/src/build-event-projection.ts#L670-L693">build-event-projection.ts:670–693</a> calls <code>onThreadInterrupted</code> for the thread interruption event. That handler calls <code>closeOpenTurns</code>, adding active turn IDs to <code>closedTurnIds</code> and clearing <code>openTurnIds</code> (<a href="https://github.com/get-bb/bb/blob/6a639cfc0d66e0c789a1bd7309266973228d1a80/packages/thread-view/src/event-projection-state.ts#L126-L173">event-projection-state.ts:126–173</a>).</p>
+<p>The shared assistant text resolver then rejects any item from a closed turn before creating a message. Its argument type even omits <code>mode</code>, so it cannot distinguish a transient delta from an authoritative final update (<a href="https://github.com/get-bb/bb/blob/6a639cfc0d66e0c789a1bd7309266973228d1a80/packages/thread-view/src/buffered-text-projection.ts#L46-L83">buffered-text-projection.ts:46–83</a>):</p>
+<pre>const messageKey = createBufferedTextInstanceKey(args.identity);
+if (args.state.closedTurnIds.has(args.identity.turnId)) {
+  return null;
+}
+if (args.refs.finalizedKeys.has(messageKey)) {
+  return null;
+}</pre>
+<p>Both assistant delta and completed-item paths use that resolver, passing different modes (<a href="https://github.com/get-bb/bb/blob/6a639cfc0d66e0c789a1bd7309266973228d1a80/packages/thread-view/src/assistant-event-projection.ts#L87-L137">assistant-event-projection.ts:87–137</a>). Thus the final text never reaches projection storage or the timeline renderer. The guard is shared rather than Codex-specific; this test does not establish how frequently any provider produces this event order.</p>
+
+<h2>6. Proposed fix and focused validation</h2>
+<p>Pass the existing update mode to the resolver. For a closed turn, reject deltas but allow a not-yet-finalized completed item. Keep the turn closed; do not add it back to the open-turn set. Keep the item-level finalized-key check so duplicate completions remain ignored. No provider protocol, API, schema, persisted data, dependency, or packaging change is required.</p>
+<p>A local implementation passes the regression and all 486 tests in the 31-file thread-view suite; the package typecheck also passes. The initial full trusted-base build passed. Formatting and <code>git diff --check</code> pass. The package has no lint script, so its Turbo lint invocation executes no tasks and is not claimed as a lint pass.</p>
+<pre>pnpm exec oxfmt packages/thread-view/src/buffered-text-projection.ts packages/thread-view/test/timeline-interruption.test.ts
+pnpm exec turbo run test --filter=@bb/thread-view -- test/timeline-interruption.test.ts -t 'renders a completed reply after Stop'
+pnpm exec turbo run test typecheck --filter=@bb/thread-view
+git diff --check
+
+Focused: 1 passed, 8 skipped
+Suite: 31 files passed, 486 tests passed
+Typecheck: passed</pre>
+<p>The patch is confined to the existing thread-view subsystem: two files, 61 additions plus 6 deletions = 67 changed text lines. Existing interrupted-item finalization behavior is otherwise unchanged. This reproduction specifically concerns a completed item that was not already finalized before Stop; it does not claim to repair every possible partial-message sequence.</p>
+
+<h2>7. Linked PR review (static only)</h2>
+<p><a href="https://github.com/get-bb/bb/pull/5646">PR #5646</a> is closed; its metadata and diff were read as untrusted evidence, never checked out or executed. The timeline portion supplies mode to the resolver and admits final updates, which addresses the reproduced rejection. However, it deletes the turn ID from the closed set and adds it to the open set.</p>
+<p><strong>Medium risk:</strong> in its <code>packages/thread-view/src/buffered-text-projection.ts</code> hunk, reopening the whole turn permits a later delta for a different, unfinalized item. The regression in this report explicitly includes that sequence. The original contribution's test does not cover it. Other hunks change Codex steering and question titles, outside this report's scope. Verdict: useful evidence of the rejection, but do not adopt the entire contribution or reopen the turn. No linked-branch tests were run.</p>
+
+<h2>8. Related issues and duplicate check</h2>
+<p>The issue's cross-reference timeline and open-PR search were checked. No open pull request linking to #5671 was present during investigation. Other issue metadata did not establish a duplicate of this particular projection defect. Only #5671 was investigated.</p>
+
+<h2>9. Verification: second clean checkout</h2>
+<p>The same agent created a separate detached worktree at the recorded trusted base. It had no production changes, and only the new regression test was applied. A fresh frozen install completed. The focused test again exited 1 with exactly the empty-array assertion above, before any row-rendering assertion. This is a repeat check by the same investigator, not independent verification.</p>
+<pre>VERIFY="$(mktemp -d)/checkout"
+git worktree add --detach "$VERIFY" 6a639cfc0d66e0c789a1bd7309266973228d1a80
+cd "$VERIFY"
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+# Apply the inline reproduction test to the same test-file path.
+pnpm exec turbo run test --filter=@bb/thread-view -- test/timeline-interruption.test.ts -t 'renders a completed reply after Stop'
+
+Test Files: 1 failed
+Tests: 1 failed, 8 skipped
+Exit: 1</pre>
+<p>The actual second run installed first, attempted a package-scoped build (no build task is defined for thread-view), and reproduced the failure. A full-workspace build was also requested afterward to satisfy the normal build prerequisite. That full build passed: 67 successful tasks (59 cached). No root-cause claim changed between runs. An early draft had the wrong row-kind expectation in the last assertion; it was corrected to the repository's conversation/assistant contract, and both baseline runs were repeated before applying the production fix.</p>
+
+<h2>10. Appendix: scope and evidence</h2>
+<ul><li>Classification: built-in Type Bug, Priority Medium, Effort Low; area threads. All were initially absent and were filled without replacing existing values.</li>
+<li>Reproduction label: confirmed-repro. Confidence is high for the deterministic projection root cause, not for unobserved provider timing.</li>
+<li>UI Stop, provider persistence, browser rendering, and real provider end-to-end checks: not run. The shared projector and emitted conversation row are covered by executable tests, not a claimed live UI session.</li>
+<li>The verification-skill inventory check reports pre-existing unmapped CLI-family drift. It was not modified; this unrelated inventory result does not affect the reproduced projection failure.</li>
+<li>Untrusted-data handling: issue text, comments, and the linked contribution were treated only as hypotheses. No linked branch, supplied patch, issue script, private user store, external issue-supplied URL, or provider credential was executed or read. The regression and fix were authored from trusted repository code.</li>
+<li>Local checks also include a source diff review, a binary-change rejection check, and <code>git diff --numstat origin/main</code>. No production service or QA instance was started, so no ports or runtime data need cleanup.</li></ul>
+</main></body></html>
