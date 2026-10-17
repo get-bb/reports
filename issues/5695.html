@@ -1,0 +1,640 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #5695 Plugin HTTP disconnect lifecycle</title>
+<style>
+:root{--canvas:#fafaf8;--ink:#1a1a1a;--muted:#666;--line:#e2e2de;--accent:#0052cc}
+body{margin:0;background:var(--canvas);color:var(--ink);font:16px/1.55 system-ui,sans-serif}main{max-width:1000px;margin:auto;padding:40px 24px 80px}h1{font-size:26px;line-height:1.25}h2{font-size:18px;margin-top:36px;padding-top:20px;border-top:1px solid var(--line)}.meta{color:var(--muted);font-size:14px}.pill{display:inline-block;padding:1px 8px;border:1px solid var(--line);border-radius:999px;font-size:12px}table{border-collapse:collapse;width:100%;font-size:14px}td,th{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);vertical-align:top}code,pre{font:13px ui-monospace,monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:white;border:1px solid var(--line);border-radius:6px;padding:12px}a{color:var(--accent)}
+</style></head><body><main>
+<p><a href="../">← reports</a></p>
+<h1>#5695 · Plugin HTTP disconnect lifecycle</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: Medium</span> <span class="pill">Effort: Low</span> <span class="pill">plugins</span> · <a href="https://github.com/get-bb/bb/issues/5695">GitHub issue</a> · October 17, 2026</p>
+<p class="meta">Trusted base: <code>6a639cfc0d66e0c789a1bd7309266973228d1a80</code></p>
+<p><strong>Verdict: REPRODUCED · Root-cause confidence: high · Reproduction label: confirmed-repro</strong></p>
+<h2>1. TL;DR</h2>
+<p>A plugin can keep resources allocated after its HTTP client disconnects while the handler is awaiting work. BB forwards the request without materializing the adapter's lazy abort signal, so reading the signal after the disconnect can report a live request. Independently, a response stream returned after the connection has already closed never receives cancellation. A regression using the real BB app, plugin installation/runtime, migrated SQLite, and a real loopback HTTP socket reproduces both failures. The same agent repeated the test in a second clean checkout at the trusted base; no issue-supplied code or external links were executed or fetched.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Reading the signal only after disconnect can miss the abort.</td><td>Verified</td><td>The late-access case observes <code>aborted: false</code> after the server response's close event.</td></tr>
+<tr><td>Reading the signal before disconnect works, but does not cancel a late response.</td><td>Verified</td><td>The early-access case passes the abort assertion and fails only cancellation.</td></tr>
+<tr><td>The returned body is not cancelled when the client is already gone.</td><td>Verified</td><td>Both cases fail the <code>cancelled: true</code> assertion in two clean-base runs.</td></tr>
+<tr><td>This affects BB plugin routes, not just a standalone dependency demo.</td><td>Verified</td><td>The test installs a fixture with <code>bb.http.route</code>, dispatches through BB's actual plugin route, and disconnects a real Node HTTP client.</td></tr>
+<tr><td>Account Pooler can retain a slot when its response body is abandoned.</td><td>Supported by source; production duration unverified</td><td>Its abort callback only aborts the upstream controller; its stream cleanup releases on completion, error, or cancellation. No real provider account or private production data was used.</td></tr>
+<tr><td>Upgrading the adapter to 2.x repairs only the signal.</td><td>Unverified here</td><td>No dependencies were added or upgraded. All execution uses the frozen repository lockfile.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Public target: <code>get-bb/bb</code>; trusted <code>origin/main</code> fetched and resolved to the full base SHA above.</li>
+<li>Linux x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li>
+<li>Installed server dependencies: <code>@hono/node-server 1.19.14</code>, <code>hono 4.11.9</code>. Versions verified from the frozen lockfile and installed package metadata.</li>
+<li>First checkout: <code>$WORK/source</code>. Second clean checkout: <code>$WORK/verify</code>. Each test uses a new ephemeral loopback port and a new temporary harness data directory containing a real migrated SQLite database.</li>
+<li>No desktop app, browser, provider, enrolled host, real user data, or production service is required. Visual and provider-account smoke journeys were not run.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Fetch the trusted repository and check out the recorded base, then install and build:
+<pre>git clone https://github.com/get-bb/bb.git bb-disconnect-repro
+cd bb-disconnect-repro
+git checkout --detach 6a639cfc0d66e0c789a1bd7309266973228d1a80
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build</pre></li>
+<li>Copy the full independently authored regression test embedded below into <code>apps/server/test/services/plugins/plugin-http-disconnect.test.ts</code>.</li>
+<li>Run:
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-http-disconnect.test.ts</pre></li>
+<li>The fixture waits on an explicit gate. The test confirms the route has entered, destroys its HTTP client, waits for the server response close event, and only then releases the handler. There is no guessed disconnect timing.</li></ol>
+<p><strong>Expected:</strong> both cases observe an aborted request and the unconsumable response body's cancellation callback runs. <strong>Actual:</strong> both fail cancellation; only late access additionally fails the signal assertion. Verbatim excerpts from the first run:</p>
+<pre>@bb/server:test:      × aborts the signal and cancels a late response when first accessed before disconnect 1228ms
+@bb/server:test:      × aborts the signal and cancels a late response when first accessed after disconnect 1166ms
+@bb/server:test:  FAIL  |@bb/server| test/services/plugins/plugin-http-disconnect.test.ts &gt; plugin HTTP disconnect cleanup &gt; aborts the signal and cancels a late response when first accessed before disconnect
+@bb/server:test:  FAIL  |@bb/server| test/services/plugins/plugin-http-disconnect.test.ts &gt; plugin HTTP disconnect cleanup &gt; aborts the signal and cancels a late response when first accessed after disconnect
+@bb/server:test: AssertionError: expected { entered: true, returned: true, …(2) } to match object { cancelled: true }
+@bb/server:test: -   &quot;cancelled&quot;: true,
+@bb/server:test: +   &quot;cancelled&quot;: false,
+@bb/server:test:      94|             .toMatchObject({ cancelled: true });
+@bb/server:test:  FAIL  |@bb/server| test/services/plugins/plugin-http-disconnect.test.ts &gt; plugin HTTP disconnect cleanup &gt; aborts the signal and cancels a late response when first accessed after disconnect
+@bb/server:test: AssertionError: expected { entered: true, returned: true, …(2) } to match object { aborted: true }
+@bb/server:test: -   &quot;aborted&quot;: true,
+@bb/server:test: +   &quot;aborted&quot;: false,
+@bb/server:test:      91|           expect.soft(await readState()).toMatchObject({ aborted: true…
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  2 failed (2)</pre>
+<p>Complete sanitized logs from both base runs are embedded in the appendix. Raw evidence stays in the local report backup; only this self-contained HTML is published.</p>
+<details><summary>Full regression test</summary><pre>import { once } from &quot;node:events&quot;;
+import { mkdir, writeFile } from &quot;node:fs/promises&quot;;
+import { createServer, request } from &quot;node:http&quot;;
+import { join } from &quot;node:path&quot;;
+import { getRequestListener } from &quot;@hono/node-server&quot;;
+import { describe, expect, it } from &quot;vitest&quot;;
+import { createTestAppHarness } from &quot;../../helpers/test-app.js&quot;;
+
+describe(&quot;plugin HTTP disconnect cleanup&quot;, () =&gt; {
+  it.each([&quot;before&quot;, &quot;after&quot;])(
+    &quot;aborts the signal and cancels a late response when first accessed %s disconnect&quot;,
+    async (access) =&gt; {
+      const harness = await createTestAppHarness();
+      const server = createServer(getRequestListener(harness.app.fetch));
+      const root = join(harness.config.dataDir, &quot;disconnect-plugin&quot;);
+      await mkdir(root);
+      await writeFile(
+        join(root, &quot;package.json&quot;),
+        JSON.stringify({
+          name: &quot;bb-plugin-disconnect&quot;,
+          version: &quot;0.1.0&quot;,
+          bb: {
+            name: &quot;Disconnect fixture&quot;,
+            description: &quot;Exercises HTTP disconnect cleanup.&quot;,
+            branding: { icon: &quot;Zap&quot; },
+            server: &quot;./server.ts&quot;,
+          },
+        }),
+      );
+      await writeFile(
+        join(root, &quot;server.ts&quot;),
+        `export default function plugin(bb) {
+          const state = { entered: false, returned: false, aborted: null, cancelled: false };
+          let finish;
+          const pending = new Promise(resolve =&gt; { finish = resolve; });
+          bb.http.route(&quot;GET&quot;, &quot;/stream&quot;, async context =&gt; {
+            state.entered = true;
+            if (context.req.query(&quot;access&quot;) === &quot;before&quot;) void context.req.raw.signal;
+            await pending;
+            state.aborted = context.req.raw.signal.aborted;
+            state.returned = true;
+            return new Response(new ReadableStream({
+              start(controller) { controller.enqueue(new TextEncoder().encode(&quot;first&quot;)); },
+              cancel() { state.cancelled = true; },
+            }), { headers: { &quot;content-type&quot;: &quot;text/event-stream&quot; } });
+          });
+          bb.http.route(&quot;GET&quot;, &quot;/state&quot;, context =&gt; context.json(state));
+          bb.http.route(&quot;GET&quot;, &quot;/finish&quot;, context =&gt; {
+            finish();
+            return context.text(&quot;released&quot;);
+          });
+        }`,
+      );
+
+      const readState = async () =&gt; {
+        const response = await harness.app.request(
+          &quot;http://127.0.0.1/api/v1/plugins/disconnect/http/state&quot;,
+        );
+        return response.json();
+      };
+      const finish = async () =&gt; {
+        await harness.app.request(
+          &quot;http://127.0.0.1/api/v1/plugins/disconnect/http/finish&quot;,
+        );
+      };
+
+      try {
+        const entry = await harness.pluginService.installPath(root);
+        expect(entry.status).toBe(&quot;running&quot;);
+        server.listen(0, &quot;127.0.0.1&quot;);
+        await once(server, &quot;listening&quot;);
+        const address = server.address();
+        if (address === null || typeof address === &quot;string&quot;) {
+          throw new Error(&quot;Expected a listening TCP server&quot;);
+        }
+        harness.config.serverPort = address.port;
+        const disconnected = new Promise&lt;void&gt;((resolve) =&gt; {
+          server.once(&quot;request&quot;, (_incoming, outgoing) =&gt; {
+            outgoing.once(&quot;close&quot;, resolve);
+          });
+        });
+        const client = request(
+          `http://127.0.0.1:${address.port}/api/v1/plugins/disconnect/http/stream?access=${access}`,
+        );
+        client.on(&quot;error&quot;, () =&gt; undefined);
+        client.end();
+        try {
+          await expect.poll(readState).toMatchObject({ entered: true });
+          client.destroy();
+          await disconnected;
+          await finish();
+          await expect.poll(readState).toMatchObject({ returned: true });
+          expect.soft(await readState()).toMatchObject({ aborted: true });
+          await expect
+            .poll(readState, { timeout: 1_000 })
+            .toMatchObject({ cancelled: true });
+        } finally {
+          client.destroy();
+        }
+      } finally {
+        await finish();
+        server.closeAllConnections();
+        await new Promise&lt;void&gt;((resolve) =&gt; server.close(() =&gt; resolve()));
+        await harness.cleanup();
+      }
+    },
+  );
+});
+</pre></details>
+<h2>5. Root cause</h2>
+<p>The <a href="https://github.com/get-bb/bb/blob/6a639cfc0d66e0c789a1bd7309266973228d1a80/apps/server/src/routes/plugins.ts#L883-L925">HTTP dispatcher</a> does not access the request signal before authentication or plugin execution, and returns the plugin's response directly:</p>
+<pre>app.all("/plugins/:id/http/*", async (context) =&gt; {
+  const id = context.req.param("id");
+  ...
+  return plugins.invokeHttpRoute(id, fresh.value, context);
+});</pre>
+<p><a href="https://github.com/get-bb/bb/blob/6a639cfc0d66e0c789a1bd7309266973228d1a80/apps/server/src/services/plugins/plugin-service.ts#L2090-L2108">invokeHttpRoute</a> awaits the real handler and adopts its response, but adds no disconnect cleanup. Response adoption <a href="https://github.com/get-bb/bb/blob/6a639cfc0d66e0c789a1bd7309266973228d1a80/packages/plugin-sdk/src/internal/host-policy.ts#L2194-L2240">preserves streaming and forwards cancellation</a> when cancellation is actually requested.</p>
+<p>The <a href="https://github.com/get-bb/bb/blob/6a639cfc0d66e0c789a1bd7309266973228d1a80/pnpm-lock.yaml#L7757">pinned adapter</a> lazily creates its AbortController. In its installed <code>dist/request.mjs</code>, <code>getRequestCache</code> constructs the controller on first signal/body access. In <code>dist/index.mjs</code>, the response close listener only aborts a controller that already exists. A controller created after that event misses it permanently.</p>
+<p>The adapter's installed <code>dist/index.mjs</code> also returns immediately from <code>writeFromReadableStream</code> when its writable is destroyed, before attaching the stream reader's cancellation listeners. If the close event predates response creation, there is no later event to clean up the abandoned stream. This explains why eager signal access alone is insufficient.</p>
+<p>Account Pooler's <a href="https://github.com/get-bb/bb/blob/6a639cfc0d66e0c789a1bd7309266973228d1a80/plugins/account-pool/src/hub.ts#L220-L243">request tracking</a> forwards abort to the upstream controller, while <a href="https://github.com/get-bb/bb/blob/6a639cfc0d66e0c789a1bd7309266973228d1a80/plugins/account-pool/src/hub.ts#L1207-L1267">its response wrapper</a> performs release from body completion, error, or cancellation. A dropped body skips these cleanup paths; the reported six-hour account incident was not independently observed.</p>
+<h2>6. Proposed fix</h2>
+<p>At the existing plugin HTTP dispatcher boundary, materialize the incoming signal before the first await. Await the plugin response; if the captured signal is already aborted, cancel its body with the abort reason before returning it to the adapter. Leave active-response streaming and all existing authentication/reload checks unchanged. This needs no adapter upgrade, public API, wire change, or Account Pooler policy change.</p>
+<p>The local fix changes two files and <strong>115 total text lines</strong> (114 additions + 1 deletion), including the regression. The focused regression fails on base and passes with the fix. The existing plugin wire suite covers normal requests, authentication, error paths, cross-realm streaming, RPC, reloads, and WebSockets; its 26 tests pass, alongside the two new cases. Server typechecking passes.</p>
+<p>Production change:</p>
+<pre>const signal = context.req.raw.signal;
+...
+const response = await plugins.invokeHttpRoute(id, fresh.value, context);
+if (signal.aborted) {
+  await response.body?.cancel(signal.reason);
+}
+return response;</pre>
+<p>The passing test and typecheck logs are embedded in the appendix. No linked open pull request was found at investigation time.</p>
+<h2>7. Verification</h2>
+<p>The same agent created a second clean detached worktree at the full base SHA, performed a frozen install and Turbo server build, copied only this agent-authored test, and reran exactly the command in section 4. Production code remained unchanged there. Both tests failed again with the same intended assertions. A fresh temporary database and fresh ephemeral port were allocated for every case; all sockets were closed and fixture directories removed by the harness. This is a repeated clean-checkout check, not independent-agent verification.</p>
+<p>The final formatted test was rerun on the unchanged second checkout and again failed both cases. No root-cause corrections were necessary. No dependency-upgrade claims or private production incident details were upgraded to verified findings.</p>
+<h2>8. Related issues</h2>
+<p><a href="https://github.com/get-bb/bb/issues/4941">#4941</a> concerns an RPC timeout without a handler cancellation signal. This report directly exercises the distinct HTTP transport/response lifecycle.</p>
+<h2>9. Appendix</h2>
+<p>The original report's embedded commands, scripts, and external links were treated as untrusted evidence and were not executed or fetched. The regression was authored from the trusted repository's plugin test harness and route implementation.</p>
+<p>Executed verification commands (logs linked above):</p>
+<pre>git fetch origin main
+git worktree add -b slopcop/issue-5695 "$WORK/source" origin/main
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-http-disconnect.test.ts
+git worktree add --detach "$WORK/verify" 6a639cfc0d66e0c789a1bd7309266973228d1a80
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/server
+pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-http-disconnect.test.ts
+pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-http-disconnect.test.ts test/services/plugins/plugin-wire.test.ts
+pnpm exec turbo run typecheck --filter=@bb/server
+pnpm exec oxfmt apps/server/src/routes/plugins.ts apps/server/test/services/plugins/plugin-http-disconnect.test.ts
+git diff --check
+git diff --numstat origin/main</pre>
+<details><summary>First base run: verbatim output, local paths redacted</summary><pre>• turbo 2.10.12
+
+   • Packages in scope: @bb/server
+   • Running test in 1 packages
+   • Remote caching disabled, using shared worktree cache
+
+//:ensure-native-modules: cache bypass, force executing 75a375370d678a14
+@bb/server:generate:bb-official-marketplace: cache miss, executing 6a8ce4d0361ddc74
+@bb/templates:generate:plugin-scaffold: cache miss, executing a5f8f54a57d3413f
+@bb/plugin-build:generate: cache miss, executing 25318f41c7bbc248
+@bb/templates:generate:templates: cache miss, executing 1b4913e2a4ced550
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: &gt; @bb/plugin-build@0.0.1 generate &lt;first-checkout&gt;/packages/plugin-build
+@bb/plugin-build:generate: &gt; node ./scripts/generate-plugin-theme.mjs &amp;&amp; node ./scripts/generate-runtime-export-manifest.mjs
+@bb/plugin-build:generate: 
+@bb/server:generate:bb-official-marketplace: 
+@bb/server:generate:bb-official-marketplace: &gt; @bb/server@0.0.1 generate:bb-official-marketplace &lt;first-checkout&gt;/apps/server
+@bb/server:generate:bb-official-marketplace: &gt; node --conditions=source --import tsx scripts/generate-bb-official-marketplace.ts
+@bb/server:generate:bb-official-marketplace: 
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates &lt;first-checkout&gt;/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold &lt;first-checkout&gt;/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules &lt;first-checkout&gt;
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+@bb/plugin-build:generate: plugin-theme.generated.ts up to date
+//:ensure-native-modules: [ensure-native-modules] Detached hardlinked better-sqlite3 binary before verification
+@get-bb/plugin-sdk:build:types: cache miss, executing 2971f8c686b6dec6
+@get-bb/plugin-sdk:build: cache miss, executing b865bcca1b7685d6
+@bb/plugin-build:generate: wrote &lt;first-checkout&gt;/packages/plugin-build/src/generated/runtime-export-manifest.generated.ts (react@19.2.4)
+@bb/agent-runtime:generate:test-bridges: cache miss, executing b2c55b004cbfc9c9
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build: &gt; @get-bb/plugin-sdk@0.6.54 build &lt;first-checkout&gt;/packages/plugin-sdk
+@get-bb/plugin-sdk:build: &gt; node scripts/build-runtime.mjs
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build:types: 
+@get-bb/plugin-sdk:build:types: &gt; @get-bb/plugin-sdk@0.6.54 build:types &lt;first-checkout&gt;/packages/plugin-sdk
+@get-bb/plugin-sdk:build:types: &gt; node scripts/build-bundled-dts.mjs
+@get-bb/plugin-sdk:build:types: 
+@bb/agent-runtime:generate:test-bridges: 
+@bb/agent-runtime:generate:test-bridges: &gt; @bb/agent-runtime@0.0.1 generate:test-bridges &lt;first-checkout&gt;/packages/agent-runtime
+@bb/agent-runtime:generate:test-bridges: &gt; node ./scripts/build-test-bridges.mjs
+@bb/agent-runtime:generate:test-bridges: 
+@get-bb/plugin-sdk:build: Built 20 @get-bb/plugin-sdk runtime entries.
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp-next.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-environment-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-machine-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-customization-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-handle.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-view.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-file-navigation-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-host-policy.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-plugin-app-collector.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-host.d.ts
+@bb/server:test: cache miss, executing 19c10a676cfb7067
+@bb/server:test: 
+@bb/server:test: &gt; @bb/server@0.0.1 test &lt;first-checkout&gt;/apps/server
+@bb/server:test: &gt; vitest run --config vitest.config.ts &quot;test/services/plugins/plugin-http-disconnect.test.ts&quot;
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  RUN  v4.1.1 &lt;first-checkout&gt;/apps/server
+@bb/server:test: 
+@bb/server:test: (node:7286) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test:  ❯ |@bb/server| test/services/plugins/plugin-http-disconnect.test.ts (2 tests | 2 failed) 2909ms
+@bb/server:test:      × aborts the signal and cancels a late response when first accessed before disconnect 1228ms
+@bb/server:test:      × aborts the signal and cancels a late response when first accessed after disconnect 1166ms
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server| test/services/plugins/plugin-http-disconnect.test.ts &gt; plugin HTTP disconnect cleanup &gt; aborts the signal and cancels a late response when first accessed before disconnect
+@bb/server:test:  FAIL  |@bb/server| test/services/plugins/plugin-http-disconnect.test.ts &gt; plugin HTTP disconnect cleanup &gt; aborts the signal and cancels a late response when first accessed after disconnect
+@bb/server:test: AssertionError: expected { entered: true, returned: true, …(2) } to match object { cancelled: true }
+@bb/server:test: (3 matching properties omitted from actual)
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test:   {
+@bb/server:test: -   &quot;cancelled&quot;: true,
+@bb/server:test: +   &quot;cancelled&quot;: false,
+@bb/server:test:   }
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/plugins/plugin-http-disconnect.test.ts:94:14
+@bb/server:test:      92|           await expect
+@bb/server:test:      93|             .poll(readState, { timeout: 1_000 })
+@bb/server:test:      94|             .toMatchObject({ cancelled: true });
+@bb/server:test:        |              ^
+@bb/server:test:      95|         } finally {
+@bb/server:test:      96|           client.destroy();
+@bb/server:test: 
+@bb/server:test: Caused by: Error: Matcher did not succeed in time.
+@bb/server:test:  ❯ test/services/plugins/plugin-http-disconnect.test.ts:92:11
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/3]⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server| test/services/plugins/plugin-http-disconnect.test.ts &gt; plugin HTTP disconnect cleanup &gt; aborts the signal and cancels a late response when first accessed after disconnect
+@bb/server:test: AssertionError: expected { entered: true, returned: true, …(2) } to match object { aborted: true }
+@bb/server:test: (3 matching properties omitted from actual)
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test:   {
+@bb/server:test: -   &quot;aborted&quot;: true,
+@bb/server:test: +   &quot;aborted&quot;: false,
+@bb/server:test:   }
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/plugins/plugin-http-disconnect.test.ts:91:42
+@bb/server:test:      89|           await finish();
+@bb/server:test:      90|           await expect.poll(readState).toMatchObject({ returned: true …
+@bb/server:test:      91|           expect.soft(await readState()).toMatchObject({ aborted: true…
+@bb/server:test:        |                                          ^
+@bb/server:test:      92|           await expect
+@bb/server:test:      93|             .poll(readState, { timeout: 1_000 })
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/3]⎯
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  2 failed (2)
+@bb/server:test:    Start at  12:12:50
+@bb/server:test:    Duration  10.96s (transform 4.78s, setup 1.48s, import 4.77s, tests 2.91s, environment 0ms)
+@bb/server:test: 
+@bb/server:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/server#test:  ERROR  command (&lt;first-checkout&gt;/apps/server) /usr/local/bin/pnpm run test test/services/plugins/plugin-http-disconnect.test.ts exited (1)
+
+ Tasks:    8 successful, 9 total
+Cached:    0 cached, 9 total
+  Time:    43.727s 
+Failed:    @bb/server#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details>
+<details><summary>Second clean base run: verbatim output, local paths redacted</summary><pre>• turbo 2.10.12
+
+   • Packages in scope: @bb/server
+   • Running test in 1 packages
+   • Remote caching disabled, using shared worktree cache
+
+//:ensure-native-modules: cache bypass, force executing 75a375370d678a14
+@bb/templates:generate:templates: cache hit, replaying logs 1b4913e2a4ced550
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates &lt;first-checkout&gt;/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/server:generate:bb-official-marketplace: cache hit, replaying logs 6a8ce4d0361ddc74
+@bb/plugin-build:generate: cache hit, replaying logs 25318f41c7bbc248
+@bb/server:generate:bb-official-marketplace: 
+@bb/server:generate:bb-official-marketplace: &gt; @bb/server@0.0.1 generate:bb-official-marketplace &lt;first-checkout&gt;/apps/server
+@bb/server:generate:bb-official-marketplace: &gt; node --conditions=source --import tsx scripts/generate-bb-official-marketplace.ts
+@bb/server:generate:bb-official-marketplace: 
+@bb/templates:generate:plugin-scaffold: cache hit, replaying logs a5f8f54a57d3413f
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: &gt; @bb/plugin-build@0.0.1 generate &lt;first-checkout&gt;/packages/plugin-build
+@bb/plugin-build:generate: &gt; node ./scripts/generate-plugin-theme.mjs &amp;&amp; node ./scripts/generate-runtime-export-manifest.mjs
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: plugin-theme.generated.ts up to date
+@bb/plugin-build:generate: wrote &lt;first-checkout&gt;/packages/plugin-build/src/generated/runtime-export-manifest.generated.ts (react@19.2.4)
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold &lt;first-checkout&gt;/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/agent-runtime:generate:test-bridges: cache hit, replaying logs b2c55b004cbfc9c9
+@bb/agent-runtime:generate:test-bridges: 
+@bb/agent-runtime:generate:test-bridges: &gt; @bb/agent-runtime@0.0.1 generate:test-bridges &lt;first-checkout&gt;/packages/agent-runtime
+@bb/agent-runtime:generate:test-bridges: &gt; node ./scripts/build-test-bridges.mjs
+@bb/agent-runtime:generate:test-bridges: 
+@get-bb/plugin-sdk:build: cache hit, replaying logs b865bcca1b7685d6
+@get-bb/plugin-sdk:build:types: cache hit, replaying logs 2971f8c686b6dec6
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build: &gt; @get-bb/plugin-sdk@0.6.54 build &lt;first-checkout&gt;/packages/plugin-sdk
+@get-bb/plugin-sdk:build: &gt; node scripts/build-runtime.mjs
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build: Built 20 @get-bb/plugin-sdk runtime entries.
+@get-bb/plugin-sdk:build:types: 
+@get-bb/plugin-sdk:build:types: &gt; @get-bb/plugin-sdk@0.6.54 build:types &lt;first-checkout&gt;/packages/plugin-sdk
+@get-bb/plugin-sdk:build:types: &gt; node scripts/build-bundled-dts.mjs
+@get-bb/plugin-sdk:build:types: 
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp-next.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-environment-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-machine-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-customization-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-handle.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-view.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-file-navigation-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-host-policy.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-plugin-app-collector.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-host.d.ts
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules &lt;second-checkout&gt;
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+@bb/server:test: cache miss, executing e9cd72b928208b15
+@bb/server:test: 
+@bb/server:test: &gt; @bb/server@0.0.1 test &lt;second-checkout&gt;/apps/server
+@bb/server:test: &gt; vitest run --config vitest.config.ts &quot;test/services/plugins/plugin-http-disconnect.test.ts&quot;
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  RUN  v4.1.1 &lt;second-checkout&gt;/apps/server
+@bb/server:test: 
+@bb/server:test: (node:8571) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test:  ❯ |@bb/server| test/services/plugins/plugin-http-disconnect.test.ts (2 tests | 2 failed) 2994ms
+@bb/server:test:      × aborts the signal and cancels a late response when first accessed before disconnect 1235ms
+@bb/server:test:      × aborts the signal and cancels a late response when first accessed after disconnect 1153ms
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server| test/services/plugins/plugin-http-disconnect.test.ts &gt; plugin HTTP disconnect cleanup &gt; aborts the signal and cancels a late response when first accessed before disconnect
+@bb/server:test:  FAIL  |@bb/server| test/services/plugins/plugin-http-disconnect.test.ts &gt; plugin HTTP disconnect cleanup &gt; aborts the signal and cancels a late response when first accessed after disconnect
+@bb/server:test: AssertionError: expected { entered: true, returned: true, …(2) } to match object { cancelled: true }
+@bb/server:test: (3 matching properties omitted from actual)
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test:   {
+@bb/server:test: -   &quot;cancelled&quot;: true,
+@bb/server:test: +   &quot;cancelled&quot;: false,
+@bb/server:test:   }
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/plugins/plugin-http-disconnect.test.ts:96:14
+@bb/server:test:      94|           await expect
+@bb/server:test:      95|             .poll(readState, { timeout: 1_000 })
+@bb/server:test:      96|             .toMatchObject({ cancelled: true });
+@bb/server:test:        |              ^
+@bb/server:test:      97|         } finally {
+@bb/server:test:      98|           client.destroy();
+@bb/server:test: 
+@bb/server:test: Caused by: Error: Matcher did not succeed in time.
+@bb/server:test:  ❯ test/services/plugins/plugin-http-disconnect.test.ts:94:11
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/3]⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server| test/services/plugins/plugin-http-disconnect.test.ts &gt; plugin HTTP disconnect cleanup &gt; aborts the signal and cancels a late response when first accessed after disconnect
+@bb/server:test: AssertionError: expected { entered: true, returned: true, …(2) } to match object { aborted: true }
+@bb/server:test: (3 matching properties omitted from actual)
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test:   {
+@bb/server:test: -   &quot;aborted&quot;: true,
+@bb/server:test: +   &quot;aborted&quot;: false,
+@bb/server:test:   }
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/plugins/plugin-http-disconnect.test.ts:93:42
+@bb/server:test:      91|           await finish();
+@bb/server:test:      92|           await expect.poll(readState).toMatchObject({ returned: true …
+@bb/server:test:      93|           expect.soft(await readState()).toMatchObject({ aborted: true…
+@bb/server:test:        |                                          ^
+@bb/server:test:      94|           await expect
+@bb/server:test:      95|             .poll(readState, { timeout: 1_000 })
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/3]⎯
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  2 failed (2)
+@bb/server:test:    Start at  12:14:11
+@bb/server:test:    Duration  11.42s (transform 4.94s, setup 1.53s, import 4.98s, tests 2.99s, environment 0ms)
+@bb/server:test: 
+@bb/server:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/server#test:  ERROR  command (&lt;second-checkout&gt;/apps/server) /usr/local/bin/pnpm run test test/services/plugins/plugin-http-disconnect.test.ts exited (1)
+
+ Tasks:    8 successful, 9 total
+Cached:    7 cached, 9 total
+  Time:    13.681s 
+Failed:    @bb/server#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details>
+<details><summary>Fixed regression and existing wire suite: 28 passing tests</summary><pre>• turbo 2.10.12
+
+   • Packages in scope: @bb/server
+   • Running test in 1 packages
+   • Remote caching disabled, using shared worktree cache
+
+@bb/templates:generate:templates: cache miss, executing 4cfe3aac40aafb15
+@bb/templates:generate:plugin-scaffold: cache miss, executing 7dd6488c35f8ec6a
+@bb/server:generate:bb-official-marketplace: cache miss, executing d518c3f8e38c9ac7
+//:ensure-native-modules: cache bypass, force executing 23ee6ae2f06c6f8a
+@bb/plugin-build:generate: cache miss, executing f2fde3ba316946d1
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates &lt;first-checkout&gt;/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold &lt;first-checkout&gt;/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/server:generate:bb-official-marketplace: 
+@bb/server:generate:bb-official-marketplace: &gt; @bb/server@0.0.1 generate:bb-official-marketplace &lt;first-checkout&gt;/apps/server
+@bb/server:generate:bb-official-marketplace: &gt; node --conditions=source --import tsx scripts/generate-bb-official-marketplace.ts
+@bb/server:generate:bb-official-marketplace: 
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules &lt;first-checkout&gt;
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: &gt; @bb/plugin-build@0.0.1 generate &lt;first-checkout&gt;/packages/plugin-build
+@bb/plugin-build:generate: &gt; node ./scripts/generate-plugin-theme.mjs &amp;&amp; node ./scripts/generate-runtime-export-manifest.mjs
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: plugin-theme.generated.ts up to date
+@get-bb/plugin-sdk:build: cache miss, executing 863fca7129dc4c2a
+@get-bb/plugin-sdk:build:types: cache miss, executing b11da95598bfa132
+@bb/plugin-build:generate: wrote &lt;first-checkout&gt;/packages/plugin-build/src/generated/runtime-export-manifest.generated.ts (react@19.2.4)
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build: &gt; @get-bb/plugin-sdk@0.6.54 build &lt;first-checkout&gt;/packages/plugin-sdk
+@get-bb/plugin-sdk:build: &gt; node scripts/build-runtime.mjs
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build:types: 
+@get-bb/plugin-sdk:build:types: &gt; @get-bb/plugin-sdk@0.6.54 build:types &lt;first-checkout&gt;/packages/plugin-sdk
+@get-bb/plugin-sdk:build:types: &gt; node scripts/build-bundled-dts.mjs
+@get-bb/plugin-sdk:build:types: 
+@bb/agent-runtime:generate:test-bridges: cache miss, executing c3beb2aa96ca287e
+@bb/agent-runtime:generate:test-bridges: 
+@bb/agent-runtime:generate:test-bridges: &gt; @bb/agent-runtime@0.0.1 generate:test-bridges &lt;first-checkout&gt;/packages/agent-runtime
+@bb/agent-runtime:generate:test-bridges: &gt; node ./scripts/build-test-bridges.mjs
+@bb/agent-runtime:generate:test-bridges: 
+@get-bb/plugin-sdk:build: Built 20 @get-bb/plugin-sdk runtime entries.
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp-next.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-environment-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-machine-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-customization-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-handle.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-view.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-file-navigation-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-host-policy.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-plugin-app-collector.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-host.d.ts
+@bb/server:test: cache miss, executing b75209097901c3d5
+@bb/server:test: 
+@bb/server:test: &gt; @bb/server@0.0.1 test &lt;first-checkout&gt;/apps/server
+@bb/server:test: &gt; vitest run --config vitest.config.ts &quot;test/services/plugins/plugin-http-disconnect.test.ts&quot; &quot;test/services/plugins/plugin-wire.test.ts&quot;
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  RUN  v4.1.1 &lt;first-checkout&gt;/apps/server
+@bb/server:test: 
+@bb/server:test: (node:8579) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test: (node:8578) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test:  ✓ |@bb/server| test/services/plugins/plugin-http-disconnect.test.ts (2 tests) 968ms
+@bb/server:test:  ✓ |@bb/server:isolated| test/services/plugins/plugin-wire.test.ts (26 tests) 4963ms
+@bb/server:test:      ✓ rpc resolves the handler after the body arrives, so a reload during the body read never runs a stale handler  326ms
+@bb/server:test:      ✓ isolates factory and message-handler failures  315ms
+@bb/server:test: 
+@bb/server:test:  Test Files  2 passed (2)
+@bb/server:test:       Tests  28 passed (28)
+@bb/server:test:    Start at  12:14:12
+@bb/server:test:    Duration  16.32s (transform 13.53s, setup 3.85s, import 13.87s, tests 5.93s, environment 0ms)
+@bb/server:test: 
+
+ Tasks:    9 successful, 9 total
+Cached:    0 cached, 9 total
+  Time:    47.834s 
+
+</pre></details>
+<details><summary>Server typecheck</summary><pre>• turbo 2.10.12
+
+   • Packages in scope: @bb/server
+   • Running typecheck in 1 packages
+   • Remote caching disabled, using shared worktree cache
+
+@bb/templates:generate:plugin-scaffold: cache hit, replaying logs b099233e58b91427
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold &lt;local-path&gt;
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/plugin-build:generate: cache hit, replaying logs 6bff34a2bbad0aaa
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: &gt; @bb/plugin-build@0.0.1 generate &lt;local-path&gt;
+@bb/plugin-build:generate: &gt; node ./scripts/generate-plugin-theme.mjs &amp;&amp; node ./scripts/generate-runtime-export-manifest.mjs
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: wrote packages/plugin-build/src/generated/plugin-theme.generated.ts
+@bb/plugin-build:generate: wrote &lt;local-path&gt; (react@19.2.4)
+@bb/templates:generate:templates: cache hit, replaying logs 20ae257455e4f66d
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates &lt;local-path&gt;
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/server:generate:bb-official-marketplace: cache hit, replaying logs 0ef246d98ddb8ddb
+@bb/server:generate:bb-official-marketplace: 
+@bb/server:generate:bb-official-marketplace: &gt; @bb/server@0.0.1 generate:bb-official-marketplace &lt;local-path&gt;
+@bb/server:generate:bb-official-marketplace: &gt; node --conditions=source --import tsx scripts/generate-bb-official-marketplace.ts
+@bb/server:generate:bb-official-marketplace: 
+@bb/server:typecheck: cache miss, executing dd8f9cdbf70b6b5f
+@bb/server:typecheck: 
+@bb/server:typecheck: &gt; @bb/server@0.0.1 typecheck &lt;first-checkout&gt;/apps/server
+@bb/server:typecheck: &gt; tsc --noEmit
+@bb/server:typecheck: 
+
+ Tasks:    5 successful, 5 total
+Cached:    4 cached, 5 total
+  Time:    5.074s 
+
+</pre></details>
+</main></body></html>
