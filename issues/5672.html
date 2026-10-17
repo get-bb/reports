@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #5672 Resumed child lifecycles lose delegation correlation</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p><h1>#5672 · Resumed child lifecycles lose delegation correlation</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Low</span><span class="pill">providers</span><span class="pill">provider-codex</span><a href="https://github.com/get-bb/bb/issues/5672">Issue</a><span>2026-10-17 · base <code>6a639cfc0d66e0c789a1bd7309266973228d1a80</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> (translator lifecycle defect) · <strong>Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>A resumed Codex child can be mistaken for the main conversation when its turn-start notification arrives before its follow-up activity notification. After the first child turn ends, the translator clears active parent links but still knows the child's identity; it does not consult that identity when the next turn starts. The resulting start lacks a parent marker, which the runtime uses to distinguish a child from a root turn. A second mapping defect prevents the resumed delegation from closing correctly after the late activity arrives. A new regression reproduces the lifecycle failure in two clean trusted checkouts; no real account, user thread, or live Codex process was used.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>A known resumed child can emit an unparented turn start.</td><td>Verified</td><td>The late-activity case fails in both clean checkouts: the assembled turn/started event lacks parentToolCallId.</td></tr>
+<tr><td>A new activity must own the already-started resumed turn.</td><td>Verified</td><td>After adding only the identity fallback, completion still resolves to the old call unless the turn mapping is rebound; the final regression also requires the new delegation's completed item.</td></tr>
+<tr><td>This can overwrite runtime root-turn state and disrupt steering.</td><td>Supported by code</td><td>RuntimeTurnState ignores only starts with parentToolCallId; all others replace active-turn state. The steer path compares against that state and forwards expectedTurnId to Codex.</td></tr>
+<tr><td>A particular production thread failed with particular turn identifiers.</td><td>Unverified</td><td>No personal runtime data was accessed. The exact live incident, frequency, and provider notification timing were not independently observed.</td></tr>
+</table>
+<h2>3. Environment</h2>
+<ul><li>Public get-bb/bb origin/main: <code>6a639cfc0d66e0c789a1bd7309266973228d1a80</code>, fetched again before the fix; unchanged.</li><li>Linux 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li><li>Real Codex translator and SDK delta assembler; synthetic typed protocol notifications. External Codex binary/version: not used.</li><li>Two separate detached Git worktrees at the same trusted commit, each with a frozen installation and scoped Turbo build.</li><li>No development server, application data directory, browser, network listener, credentials, or real provider session needed.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Start the root turn, spawn a child, start and complete its first turn on a distinct provider thread.</li><li>Emit a raw followup_task intent for that child.</li><li>Start the child's next turn before its activity notification, then deliver that activity and complete the child.</li><li>Require a parented child start and a completed item for the new delegation. Compare against the control where activity arrives before turn start.</li></ol>
+<p>The following commands contain the complete newly authored patch. It extends the existing owning translator tests and reuses only trusted-main helpers. Expected: both ordering cases pass. Actual on the base: the early-activity control passes; the late-activity case fails because the child start has no parent.</p>
+<pre>git clone https://github.com/get-bb/bb.git bb-5672
+cd bb-5672
+git checkout --detach 6a639cfc0d66e0c789a1bd7309266973228d1a80
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=bb-plugin-provider-codex
+git apply - &lt;&lt;&#x27;PATCH&#x27;
+diff --git a/plugins/provider-codex/src/translator.test.ts b/plugins/provider-codex/src/translator.test.ts
+index 808d52ec5..34919492e 100644
+--- a/plugins/provider-codex/src/translator.test.ts
++++ b/plugins/provider-codex/src/translator.test.ts
+@@ -876,6 +876,66 @@ describe(&quot;codex subagent activity correlation&quot;, () =&gt; {
+     ]);
+   });
+ 
++  it.each([&quot;before&quot;, &quot;after&quot;] as const)(
++    &quot;keeps a resumed child nested when follow-up activity arrives %s its turn start&quot;,
++    (activityOrder) =&gt; {
++      const harness = createHarness();
++      const childThreadId = &quot;agent-thread-1&quot;;
++      harness.translate(childTurnStarted(&quot;parent-turn&quot;));
++      harness.translate(
++        subAgentActivity({ id: &quot;subagent-call-1&quot;, kind: &quot;started&quot; }),
++      );
++      harness.translate(childTurnStarted(&quot;child-turn-1&quot;, childThreadId));
++      harness.translate(childTurnCompleted(&quot;child-turn-1&quot;, childThreadId));
++      harness.translate(
++        rawCollaborationCall({ callId: &quot;resume-call&quot;, name: &quot;followup_task&quot; }),
++      );
++
++      const activity = subAgentActivity({
++        id: &quot;resume-call&quot;,
++        kind: &quot;interacted&quot;,
++      });
++      if (activityOrder === &quot;before&quot;) {
++        harness.translate(activity);
++      }
++      const started = harness.translate(
++        childTurnStarted(&quot;child-turn-2&quot;, childThreadId),
++      );
++      const activityEvents =
++        activityOrder === &quot;after&quot; ? harness.translate(activity) : [];
++      const completed = harness.translate(
++        childTurnCompleted(&quot;child-turn-2&quot;, childThreadId),
++      );
++
++      expect(started).toContainEqual(
++        expect.objectContaining({
++          type: &quot;turn/started&quot;,
++          scope: turnScope(harness.turnId(&quot;child-turn-2&quot;)),
++          parentToolCallId: expect.any(String),
++        }),
++      );
++      expect(completed).toEqual([
++        expect.objectContaining({
++          type: &quot;turn/completed&quot;,
++          scope: turnScope(harness.turnId(&quot;child-turn-2&quot;)),
++        }),
++        expect.objectContaining({
++          type: &quot;item/completed&quot;,
++          item: expect.objectContaining({
++            type: &quot;delegation&quot;,
++            id: harness.itemId(&quot;resume-call&quot;),
++            status: &quot;completed&quot;,
++          }),
++        }),
++      ]);
++      expect(
++        [...started, ...activityEvents, ...completed].filter(
++          (event) =&gt; event.type === &quot;turn/started&quot; &amp;&amp; !event.parentToolCallId,
++        ),
++      ).toEqual([]);
++    },
++  );
++
+   it(&quot;links an unknown resumed subagent from the raw followup intent after translator restart&quot;, () =&gt; {
+     const harness = createHarness();
+PATCH
+pnpm exec turbo run test --filter=bb-plugin-provider-codex -- src/translator.test.ts -t &#x27;keeps a resumed child nested&#x27;
+</pre>
+<h3>Regression test</h3><pre>  it.each([&quot;before&quot;, &quot;after&quot;] as const)(
+    &quot;keeps a resumed child nested when follow-up activity arrives %s its turn start&quot;,
+    (activityOrder) =&gt; {
+      const harness = createHarness();
+      const childThreadId = &quot;agent-thread-1&quot;;
+      harness.translate(childTurnStarted(&quot;parent-turn&quot;));
+      harness.translate(
+        subAgentActivity({ id: &quot;subagent-call-1&quot;, kind: &quot;started&quot; }),
+      );
+      harness.translate(childTurnStarted(&quot;child-turn-1&quot;, childThreadId));
+      harness.translate(childTurnCompleted(&quot;child-turn-1&quot;, childThreadId));
+      harness.translate(
+        rawCollaborationCall({ callId: &quot;resume-call&quot;, name: &quot;followup_task&quot; }),
+      );
+
+      const activity = subAgentActivity({
+        id: &quot;resume-call&quot;,
+        kind: &quot;interacted&quot;,
+      });
+      if (activityOrder === &quot;before&quot;) {
+        harness.translate(activity);
+      }
+      const started = harness.translate(
+        childTurnStarted(&quot;child-turn-2&quot;, childThreadId),
+      );
+      const activityEvents =
+        activityOrder === &quot;after&quot; ? harness.translate(activity) : [];
+      const completed = harness.translate(
+        childTurnCompleted(&quot;child-turn-2&quot;, childThreadId),
+      );
+
+      expect(started).toContainEqual(
+        expect.objectContaining({
+          type: &quot;turn/started&quot;,
+          scope: turnScope(harness.turnId(&quot;child-turn-2&quot;)),
+          parentToolCallId: expect.any(String),
+        }),
+      );
+      expect(completed).toEqual([
+        expect.objectContaining({
+          type: &quot;turn/completed&quot;,
+          scope: turnScope(harness.turnId(&quot;child-turn-2&quot;)),
+        }),
+        expect.objectContaining({
+          type: &quot;item/completed&quot;,
+          item: expect.objectContaining({
+            type: &quot;delegation&quot;,
+            id: harness.itemId(&quot;resume-call&quot;),
+            status: &quot;completed&quot;,
+          }),
+        }),
+      ]);
+      expect(
+        [...started, ...activityEvents, ...completed].filter(
+          (event) =&gt; event.type === &quot;turn/started&quot; &amp;&amp; !event.parentToolCallId,
+        ),
+      ).toEqual([]);
+    },
+  );</pre>
+<h3>Actual base failure</h3><p>Verbatim assertion output; checkout paths have been replaced with neutral names.</p><pre>  FAIL  |bb-plugin-provider-codex| src/translator.test.ts &gt; codex subagent activity correlation &gt; keeps a resumed child nested when follow-up activity arrives after its turn start
+bb-plugin-provider-codex:test: AssertionError: expected [ { type: &#x27;turn/started&#x27;, …(3) } ] to deep equally contain ObjectContaining{…}
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test: - Expected:
+bb-plugin-provider-codex:test: ObjectContaining {
+bb-plugin-provider-codex:test:   &quot;parentToolCallId&quot;: Any&lt;String&gt;,
+bb-plugin-provider-codex:test:   &quot;scope&quot;: {
+bb-plugin-provider-codex:test:     &quot;kind&quot;: &quot;turn&quot;,
+bb-plugin-provider-codex:test:     &quot;turnId&quot;: &quot;cxt-test-t3&quot;,
+bb-plugin-provider-codex:test:   },
+bb-plugin-provider-codex:test:   &quot;type&quot;: &quot;turn/started&quot;,
+bb-plugin-provider-codex:test: }
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test: + Received:
+bb-plugin-provider-codex:test: [
+bb-plugin-provider-codex:test:   {
+bb-plugin-provider-codex:test:     &quot;providerThreadId&quot;: &quot;&quot;,
+bb-plugin-provider-codex:test:     &quot;scope&quot;: {
+bb-plugin-provider-codex:test:       &quot;kind&quot;: &quot;turn&quot;,
+bb-plugin-provider-codex:test:       &quot;turnId&quot;: &quot;cxt-test-t3&quot;,
+bb-plugin-provider-codex:test:     },
+bb-plugin-provider-codex:test:     &quot;threadId&quot;: &quot;&quot;,
+bb-plugin-provider-codex:test:     &quot;type&quot;: &quot;turn/started&quot;,
+bb-plugin-provider-codex:test:   },
+bb-plugin-provider-codex:test: ]
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test:  ❯ src/translator.test.ts:910:23
+bb-plugin-provider-codex:test:     908|       );
+bb-plugin-provider-codex:test:     909|
+bb-plugin-provider-codex:test:     910|       expect(started).toContainEqual(
+bb-plugin-provider-codex:test:        |                       ^
+bb-plugin-provider-codex:test:     911|         expect.objectContaining({
+bb-plugin-provider-codex:test:     912|           type: &quot;turn/started&quot;,
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test:</pre>
+<h2>5. Root cause</h2>
+<p>Completion removes transient provider-thread and turn-to-call links but retains the tracked child identity. When the same child's next turn arrives before follow-up activity, attachCodexDelegationParentLink checks only the cleared transient links. The pending root-thread queue is not a substitute for the distinct child-thread identity, so it emits turn.open without parentRef.</p>
+<p><a href="https://github.com/get-bb/bb/blob/6a639cfc0d66e0c789a1bd7309266973228d1a80/plugins/provider-codex/src/translator.ts#L890-L909">Completion cleanup clears transient links</a></p><pre>  function clearTrackedSubAgentLinks(tracked: CodexTrackedSubAgent): void {
+    removePendingDelegationCall(tracked.callId);
+    if (
+      delegationParentToolCallIdsByProviderThreadId.get(
+        tracked.agentThreadId,
+      ) === tracked.callId
+    ) {
+      delegationParentToolCallIdsByProviderThreadId.delete(
+        tracked.agentThreadId,
+      );
+    }
+    for (const [
+      turnId,
+      parentToolCallId,
+    ] of delegationParentToolCallIdsByTurnId) {
+      if (parentToolCallId === tracked.callId) {
+        delegationParentToolCallIdsByTurnId.delete(turnId);
+      }
+    }
+  }</pre>
+<p><a href="https://github.com/get-bb/bb/blob/6a639cfc0d66e0c789a1bd7309266973228d1a80/plugins/provider-codex/src/translator.ts#L949-L998">Turn-start correlation only consults transient mappings</a></p><pre>    providerThreadId: string | undefined,
+  ): ThreadDelta {
+    const turnId = getDeltaProviderTurnId(delta);
+    let parentToolCallId =
+      getDeltaParentRef(delta) ??
+      (turnId ? delegationParentToolCallIdsByTurnId.get(turnId) : undefined);
+
+    if (
+      !parentToolCallId &amp;&amp;
+      delta.kind === &quot;turn.open&quot; &amp;&amp;
+      delta.providerTurnId !== undefined
+    ) {
+      const startedTurnId = delta.providerTurnId;
+      const mappedFromProviderThread = providerThreadId
+        ? delegationParentToolCallIdsByProviderThreadId.get(providerThreadId)
+        : undefined;
+      if (mappedFromProviderThread) {
+        parentToolCallId = mappedFromProviderThread;
+        removePendingDelegationCall(mappedFromProviderThread);
+      } else if (
+        !providerThreadId ||
+        !hasPendingNativeTurnStart(providerThreadId)
+      ) {
+        parentToolCallId = consumePendingDelegationTurnLink({
+          providerThreadId,
+          turnId: startedTurnId,
+        });
+      }
+    }
+
+    if (!parentToolCallId &amp;&amp; providerThreadId) {
+      parentToolCallId =
+        delegationParentToolCallIdsByProviderThreadId.get(providerThreadId);
+    }
+
+    if (
+      delta.kind === &quot;turn.open&quot; &amp;&amp;
+      delta.providerTurnId !== undefined &amp;&amp;
+      parentToolCallId
+    ) {
+      delegationParentToolCallIdsByTurnId.set(
+        delta.providerTurnId,
+        parentToolCallId,
+      );
+    }
+
+    return parentToolCallId
+      ? withDeltaParentRef(delta, parentToolCallId)
+      : delta;
+  }</pre>
+<p>The translator already has findTrackedSubAgentByAgentThreadId and a retained agent-thread-to-call map. Reusing that identity can keep the early start nested, but by itself it is insufficient: when activity later opens a fresh delegation, the existing turn-to-call entry must move from the previous call to the new one. Otherwise completeFinishedCodexSubAgentTurns finds the already-terminal old record and never closes the new delegation.</p>
+<p>A separate local experiment applied only the newly authored identity fallback in checkout B. The late-start case then failed at the delegation-completion assertion rather than the parent-marker assertion, confirming that both repairs are necessary. Checkout B's production file was subsequently restored to the trusted base.</p>
+<pre>  FAIL  |bb-plugin-provider-codex| src/translator.test.ts &gt; codex subagent activity correlation &gt; keeps a resumed child nested when follow-up activity arrives after its turn start
+bb-plugin-provider-codex:test: AssertionError: expected [ { type: &#x27;turn/completed&#x27;, …(5) } ] to deeply equal [ ObjectContaining{…}, …(1) ]
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test: - Expected
+bb-plugin-provider-codex:test: + Received
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test: @@ -8,14 +8,6 @@
+bb-plugin-provider-codex:test:       },
+bb-plugin-provider-codex:test:       &quot;status&quot;: &quot;completed&quot;,
+bb-plugin-provider-codex:test:       &quot;threadId&quot;: &quot;&quot;,
+bb-plugin-provider-codex:test:       &quot;type&quot;: &quot;turn/completed&quot;,
+bb-plugin-provider-codex:test:     },
+bb-plugin-provider-codex:test: -   ObjectContaining {
+bb-plugin-provider-codex:test: -     &quot;item&quot;: ObjectContaining {
+bb-plugin-provider-codex:test: -       &quot;id&quot;: &quot;cxt-test-i2&quot;,
+bb-plugin-provider-codex:test: -       &quot;status&quot;: &quot;completed&quot;,
+bb-plugin-provider-codex:test: -       &quot;type&quot;: &quot;delegation&quot;,
+bb-plugin-provider-codex:test: -     },
+bb-plugin-provider-codex:test: -     &quot;type&quot;: &quot;item/completed&quot;,
+bb-plugin-provider-codex:test: -   },
+bb-plugin-provider-codex:test:   ]
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test:  ❯ src/translator.test.ts:917:25
+bb-plugin-provider-codex:test:     915|         }),
+bb-plugin-provider-codex:test:     916|       );
+bb-plugin-provider-codex:test:     917|       expect(completed).toEqual([
+bb-plugin-provider-codex:test:        |                         ^
+bb-plugin-provider-codex:test:     918|         expect.objectContaining({</pre>
+<p><a href="https://github.com/get-bb/bb/blob/6a639cfc0d66e0c789a1bd7309266973228d1a80/plugins/provider-codex/src/translator.ts#L1050-L1091">Retained identity and creation of a new tracked delegation</a></p><pre>  function findTrackedSubAgentByAgentThreadId(
+    agentThreadId: string,
+  ): CodexTrackedSubAgent | undefined {
+    const callId = trackedSubAgentCallIdsByAgentThreadId.get(agentThreadId);
+    if (!callId) {
+      return undefined;
+    }
+    return trackedSubAgentsByCallId.get(callId);
+  }
+
+  function beginCodexTrackedSubAgent(
+    activity: CodexSubAgentActivityEvent,
+  ): ThreadDelta[] {
+    const tracked: CodexTrackedSubAgent = {
+      agentPath: activity.item.agentPath,
+      agentThreadId: activity.item.agentThreadId,
+      callId: activity.item.id,
+      parentProviderThreadId: activity.providerThreadId,
+      parentTurnId: activity.turnId,
+      pendingFollowups: 0,
+      terminal: false,
+    };
+    trackedSubAgentsByCallId.set(tracked.callId, tracked);
+    trackedSubAgentCallIdsByAgentThreadId.set(
+      tracked.agentThreadId,
+      tracked.callId,
+    );
+
+    const [openDelta] = attachCodexDelegationParentLinks(
+      [buildCodexSubAgentOpenDelta(tracked)],
+      activity.providerThreadId,
+    );
+    if (openDelta?.kind === &quot;item.open&quot;) {
+      tracked.parentToolCallId = openDelta.key.parentRef;
+    }
+    enqueuePendingDelegationTurnLink({
+      callId: tracked.callId,
+      parentTurnId: tracked.parentTurnId,
+      providerThreadId: tracked.parentProviderThreadId,
+    });
+    return openDelta ? [openDelta] : [];
+  }</pre>
+<p><a href="https://github.com/get-bb/bb/blob/6a639cfc0d66e0c789a1bd7309266973228d1a80/plugins/provider-codex/src/translator.ts#L1371-L1400">Completion resolves the tracked delegation by the turn mapping</a></p><pre>  }
+
+  function completeFinishedCodexSubAgentTurns(
+    deltas: ThreadDelta[],
+  ): ThreadDelta[] {
+    const completedDeltas: ThreadDelta[] = [];
+    for (const delta of deltas) {
+      completedDeltas.push(delta);
+      if (
+        delta.kind !== &quot;turn.boundary&quot; ||
+        delta.providerTurnId === undefined
+      ) {
+        continue;
+      }
+      const callId = delegationParentToolCallIdsByTurnId.get(
+        delta.providerTurnId,
+      );
+      const tracked = callId ? trackedSubAgentsByCallId.get(callId) : undefined;
+      if (!tracked) {
+        continue;
+      }
+      const completed = completeCodexTrackedSubAgent({
+        tracked,
+        status: delta.status,
+      });
+      if (completed) {
+        completedDeltas.push(completed);
+      }
+    }
+    return completedDeltas;</pre>
+<p>The runtime distinguishes root starts using the parent marker, not a separate explicit root flag:</p>
+<p><a href="https://github.com/get-bb/bb/blob/6a639cfc0d66e0c789a1bd7309266973228d1a80/packages/agent-runtime/src/runtime-turn-state.ts#L66-L93">Unparented starts replace the active runtime turn</a></p><pre>  observe(event: ThreadEvent): void {
+    if (event.type === &quot;turn/started&quot;) {
+      if (event.parentToolCallId) {
+        return;
+      }
+      const turnId = requireThreadEventScopeTurnId({
+        type: event.type,
+        scope: event.scope,
+      });
+      this.activeTurnIdByThreadId.set(event.threadId, turnId);
+      this.resolveWaiters(event.threadId, turnId);
+      return;
+    }
+
+    if (event.type === &quot;turn/completed&quot;) {
+      const turnId = requireThreadEventScopeTurnId({
+        type: event.type,
+        scope: event.scope,
+      });
+      if (this.activeTurnIdByThreadId.get(event.threadId) === turnId) {
+        this.activeTurnIdByThreadId.delete(event.threadId);
+      }
+    }
+  }
+
+  private resolveWaiters(threadId: string, turnId: string | null): void {
+    const waiters = this.activeTurnWaitersByThreadId.get(threadId);
+    if (!waiters) {</pre>
+<p>Consequently the malformed child event can replace the active root turn, or its subsequent completion can clear active state. Depending on when steering occurs, the request can be rejected as stale or forwarded with a child turn id. This consequence is traced through trusted code, not claimed as a live end-to-end reproduction.</p>
+<p><a href="https://github.com/get-bb/bb/blob/6a639cfc0d66e0c789a1bd7309266973228d1a80/packages/agent-runtime/src/runtime.ts#L2086-L2116">Runtime stale-steer comparison</a> · <a href="https://github.com/get-bb/bb/blob/6a639cfc0d66e0c789a1bd7309266973228d1a80/plugins/provider-codex/src/bridge/bridge.ts#L2126-L2135">Codex expectedTurnId forwarding</a></p>
+<h2>6. Proposed fix and checked implementation</h2>
+<p>Use retained child identity as a fallback only for a distinct child provider thread, preserving normal root/native-start behavior. When starting a replacement delegation for that child, retarget existing turn associations from the previous call to the new call. Keep the change inside the Codex translator; no protocol, public API, schema, stored data, permission, or dependency change is needed.</p>
+<p>The locally authored implementation changes two files: 17 production additions + 1 production deletion, and 60 test additions: <strong>78 changed text lines total</strong>. Both ordering cases pass after the fix. All 371 Codex plugin tests across 35 files pass; lint and typecheck pass; git diff --check passes; no binary or generated changes.</p>
+<pre>bb-plugin-provider-codex:lint: Found 0 warnings and 0 errors.
+bb-plugin-provider-codex:test:  Test Files  35 passed (35)
+bb-plugin-provider-codex:test:       Tests  371 passed (371)
+ Tasks:    9 successful, 9 total
+  Time:    32.453s </pre>
+<h2>7. Linked PR static review</h2>
+<h3><a href="https://github.com/get-bb/bb/pull/5646">#5646</a> — closed</h3>
+<p>Metadata and diff were read only as untrusted evidence after designing the regression from trusted source. No PR checkout, patch application, branch execution, or external author code was used. Its translator changes address both missing identity fallback and turn-to-call rebinding. The remaining diff also changes timeline text retention and question titles, which are separate concerns; those changes were not evaluated or executed here. Static verdict for the translator portion: consistent with the reproduced root cause; not a verification of that PR as a whole. No open PR was linked in issue timeline metadata or found by an open-PR search for this issue at investigation time.</p>
+<h2>8. Related issues</h2>
+<p><a href="https://github.com/get-bb/bb/issues/2538">#2538</a> concerns competing turn starts. This report instead demonstrates an existing child's missing parent correlation. A shared symptom does not establish the same cause.</p>
+<h2>9. Verification</h2>
+<p>The same investigator repeated the final regression in checkout B: a newly created clean detached worktree at <code>6a639cfc0d66e0c789a1bd7309266973228d1a80</code>. It had its own frozen install and scoped build; only the newly authored test patch was added, with production code unchanged. No ports or data directories were needed. Command:</p><pre>pnpm exec turbo run test --filter=bb-plugin-provider-codex -- src/translator.test.ts -t &#x27;keeps a resumed child nested&#x27;</pre>
+<pre>bb-plugin-provider-codex:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+bb-plugin-provider-codex:test:  FAIL  |bb-plugin-provider-codex| src/translator.test.ts &gt; codex subagent activity correlation &gt; keeps a resumed child nested when follow-up activity arrives after its turn start
+bb-plugin-provider-codex:test: AssertionError: expected [ { type: &#x27;turn/started&#x27;, …(3) } ] to deep equally contain ObjectContaining{…}
+bb-plugin-provider-codex:test:  Test Files  1 failed (1)
+bb-plugin-provider-codex:test:       Tests  1 failed | 1 passed | 42 skipped (44)</pre>
+<p>The second run agrees with checkout A: one control passed and one regression failed for the missing parent marker. This is a repeated clean reproduction by the same agent, not independent verification. During harness development an invalid completion-event assertion was removed because assembled turn/completed events do not expose parentToolCallId; both final base runs used the corrected test shown above. An initial patch-application attempt in checkout B selected no tests and is not counted as verification. The successful final patch application ran both cases.</p>
+<h2>10. Appendix and limitations</h2>
+<p>Existing subagent tests passed before adding the regression (17 passed, 25 skipped). They cover activity-before-start ordering, queued follow-ups, and native human turns but miss this child-first ordering on a distinct provider thread. Commands used after the fix:</p>
+<pre>pnpm exec oxfmt plugins/provider-codex/src/translator.ts plugins/provider-codex/src/translator.test.ts
+pnpm exec turbo run test --filter=bb-plugin-provider-codex -- src/translator.test.ts -t &#x27;keeps a resumed child nested&#x27;
+pnpm exec turbo run test lint typecheck --filter=bb-plugin-provider-codex
+git diff --check
+git diff --numstat origin/main</pre>
+<p>Issue text and linked material were treated as untrusted claims, never as execution instructions. No live incident logs or personal threads were accessed. The public report repository permits inline evidence but forbids committed raw logs, scripts, or diffs, so the complete test patch and relevant output are embedded in this HTML; raw local evidence stays outside the publication repository. No screenshots are needed for this nonvisual protocol-ordering defect.</p>
+</main></body></html>
