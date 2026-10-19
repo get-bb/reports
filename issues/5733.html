@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #5733 · Mutable plugin loads rewrite unchanged host artifacts</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p><h1>#5733 · Mutable plugin loads rewrite unchanged host artifacts</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Low</span><span class="pill">plugins · perf · confirmed-repro</span><a href="https://github.com/get-bb/bb/issues/5733">GitHub issue</a></p>
+<p class="meta">October 19, 2026 · trusted origin/main base <code>9937c46f5c7e369de3563eb864c8cbc4c3b9c231</code></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>A local plugin's host bundle is compiled again even when its sources and SDK have not changed. The plugin lifecycle loader unconditionally requests a host build for path plugins and source-built builtins. A regression test exercises the real plugin service, builds a temporary fixture, then reloads it or stops and starts the service. Both operations leave the bundle bytes identical but change its modification timestamp. The same two failures occur in a second clean checkout at the same trusted commit.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Unchanged host artifacts are rebuilt during mutable plugin loading.</td><td class="ok">Verified</td><td>Reload and stop/start tests both fail the unchanged-mtime assertion after the identical-bytes assertion passes, in both checkouts.</td></tr>
+<tr><td>Frontend loading already avoids fresh builds, unlike host loading.</td><td class="ok">Verified</td><td>The frontend checks metadata and source timestamps; the host branch directly calls the builder.</td></tr>
+<tr><td>Path plugins and source-built builtins share this path; packaged builtins are excluded.</td><td class="ok">Verified in source</td><td>The loader's eligibility condition explicitly names path and builtin kinds and excludes packaged builtin host entries. The dynamic reproduction uses a path fixture.</td></tr>
+<tr><td>Specific warm-build timing, CPU, or startup-speed numbers.</td><td class="unv">Not measured here</td><td>This investigation establishes actual redundant compilation/replacement, not whole-server startup latency or the reporter's benchmark figures.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Public repository: get-bb/bb; both checkouts at <code>9937c46f5c7e369de3563eb864c8cbc4c3b9c231</code>.</li><li>Linux x86_64; Node v22.19.0; pnpm workspace installation with frozen lockfile.</li><li>Full Turbo build succeeds in both checkouts: 67 tasks each.</li><li>Real migrated SQLite test databases; unique temporary fixture/data directories cleaned after each test; bundled plugins disabled in this fixture.</li><li>No live server, browser, provider turns, network listeners, or production runtime data used. No screenshot is applicable to this nonvisual bug.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the trusted repository and select the recorded base:</li></ol>
+<pre>git clone https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout 9937c46f5c7e369de3563eb864c8cbc4c3b9c231
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build</pre>
+<p>Save the following investigator-authored test as <code>apps/server/test/services/plugins/plugin-host-build-policy.test.ts</code>. It is reproduced inline so the public report needs no external script or private fixture.</p>
+<pre>import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from &quot;node:fs/promises&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { afterEach, beforeEach, describe, expect, it } from &quot;vitest&quot;;
+import { PLUGIN_SDK_VERSION } from &quot;@bb/domain&quot;;
+import { createMigratedConnection } from &quot;@bb/db/testing&quot;;
+import { createAiServiceRegistry } from &quot;../../../src/services/ai/ai-service-registry.js&quot;;
+import {
+  createPluginService,
+  type PluginService,
+} from &quot;../../../src/services/plugins/plugin-service.js&quot;;
+import { createNoopTelemetryService } from &quot;../../../src/services/system/telemetry.js&quot;;
+import { testLogger } from &quot;../../helpers/test-app.js&quot;;
+
+describe(&quot;mutable plugin host build policy&quot;, () =&gt; {
+  let service: PluginService;
+  let db: ReturnType&lt;typeof createMigratedConnection&gt;;
+  let workDir: string;
+  let rootDir: string;
+  let artifactPath: string;
+  let metaPath: string;
+
+  beforeEach(async () =&gt; {
+    db = createMigratedConnection();
+    workDir = await mkdtemp(join(tmpdir(), &quot;bb-host-build-policy-&quot;));
+    service = createPluginService({
+      db,
+      dataDir: join(workDir, &quot;data&quot;),
+      appVersion: &quot;0.9.0&quot;,
+      bundledPlugins: [],
+      aiServices: createAiServiceRegistry(),
+      telemetry: createNoopTelemetryService(),
+      logger: testLogger,
+      hub: {
+        getDaemonSessionIdForHost: () =&gt; null,
+        notifyPluginSignal: () =&gt; 0,
+        notifySystem: () =&gt; {},
+      },
+    });
+    rootDir = join(workDir, &quot;bb-plugin-host-policy&quot;);
+    artifactPath = join(rootDir, &quot;dist&quot;, &quot;host.js&quot;);
+    metaPath = join(rootDir, &quot;dist&quot;, &quot;host.meta.json&quot;);
+    await mkdir(rootDir, { recursive: true });
+    await writeFile(
+      join(rootDir, &quot;package.json&quot;),
+      JSON.stringify({
+        name: &quot;bb-plugin-host-policy&quot;,
+        version: &quot;0.1.0&quot;,
+        bb: {
+          name: &quot;Host policy fixture&quot;,
+          description: &quot;Host build lifecycle fixture.&quot;,
+          branding: { icon: &quot;Zap&quot; },
+          server: &quot;./server.ts&quot;,
+          host: &quot;./host.ts&quot;,
+        },
+      }),
+    );
+    await writeFile(
+      join(rootDir, &quot;server.ts&quot;),
+      &quot;export default function plugin() {}&quot;,
+    );
+    await writeFile(
+      join(rootDir, &quot;host.ts&quot;),
+      'export default { experimental_apiVersion: 1, value: &quot;initial&quot; };',
+    );
+    const installed = await service.installPath(rootDir);
+    expect(installed.status).toBe(&quot;running&quot;);
+  });
+
+  afterEach(async () =&gt; {
+    await service.stop();
+    db.$client.close();
+    await rm(workDir, { recursive: true, force: true });
+  });
+
+  it.each([&quot;reload&quot;, &quot;restart&quot;])(
+    &quot;reuses an unchanged host artifact on %s&quot;,
+    async (operation) =&gt; {
+      const before = await stat(artifactPath);
+      const bytes = await readFile(artifactPath);
+      if (operation === &quot;restart&quot;) {
+        await service.stop();
+        await service.start();
+      } else {
+        expect((await service.reload(&quot;host-policy&quot;)).ok).toBe(true);
+      }
+      expect(
+        service.list().find((entry) =&gt; entry.id === &quot;host-policy&quot;)?.status,
+      ).toBe(&quot;running&quot;);
+      expect(await readFile(artifactPath)).toEqual(bytes);
+      expect((await stat(artifactPath)).mtimeMs).toBe(before.mtimeMs);
+    },
+  );
+
+  it.each([&quot;source&quot;, &quot;artifact&quot;, &quot;metadata&quot;, &quot;invalid metadata&quot;, &quot;SDK&quot;])(
+    &quot;rebuilds when the %s changes or disappears&quot;,
+    async (target) =&gt; {
+      if (target === &quot;source&quot;) {
+        await writeFile(
+          join(rootDir, &quot;host.ts&quot;),
+          'export default { experimental_apiVersion: 1, value: &quot;updated&quot; };',
+        );
+      } else if (target === &quot;artifact&quot;) {
+        await rm(artifactPath);
+      } else if (target === &quot;metadata&quot;) {
+        await rm(metaPath);
+      } else {
+        await writeFile(
+          metaPath,
+          target === &quot;SDK&quot;
+            ? JSON.stringify({ sdkMajor: 0, sdkVersion: &quot;0.0.0-stale&quot; })
+            : &quot;not json&quot;,
+        );
+      }
+
+      expect((await service.reload(&quot;host-policy&quot;)).ok).toBe(true);
+      const metadata: unknown = JSON.parse(await readFile(metaPath, &quot;utf8&quot;));
+      expect(metadata).toMatchObject({ sdkVersion: PLUGIN_SDK_VERSION });
+      const artifact = await readFile(artifactPath, &quot;utf8&quot;);
+      expect(artifact).toContain(target === &quot;source&quot; ? &quot;updated&quot; : &quot;initial&quot;);
+    },
+  );
+});
+</pre>
+<p>Run from the repository root:</p><pre>pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-host-build-policy.test.ts</pre>
+<p><strong>Expected:</strong> all seven tests pass. Reloading or starting the plugin service preserves the bytes and modification timestamp of a fresh host artifact. Changes to source, missing output, missing/invalid metadata, or a stale SDK rebuild successfully.</p>
+<p><strong>Actual:</strong> two reuse tests fail at the mtime assertion, after byte equality succeeds; all five invalidation cases pass. Exit status is 1. The exact first-run output follows; checkout paths are redacted.</p>
+<pre>@bb/server:test:  RUN  v4.1.1 CHECKOUT/apps/server
+@bb/server:test: 
+@bb/server:test: (node:9022) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test:  ❯ |@bb/server| test/services/plugins/plugin-host-build-policy.test.ts (7 tests | 2 failed) 2556ms
+@bb/server:test:      × reuses an unchanged host artifact on reload 129ms
+@bb/server:test:      × reuses an unchanged host artifact on restart 52ms
+@bb/server:test:      ✓ rebuilds when the source changes or disappears 45ms
+@bb/server:test:      ✓ rebuilds when the artifact changes or disappears 44ms
+@bb/server:test:      ✓ rebuilds when the metadata changes or disappears 41ms
+@bb/server:test:      ✓ rebuilds when the invalid metadata changes or disappears 41ms
+@bb/server:test:      ✓ rebuilds when the SDK changes or disappears 39ms
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server| test/services/plugins/plugin-host-build-policy.test.ts &gt; mutable plugin host build policy &gt; reuses an unchanged host artifact on reload
+@bb/server:test: AssertionError: expected 1792371110595.0032 to be 1792371110564.0503 // Object.is equality
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test: - 1792371110564.0503
+@bb/server:test: + 1792371110595.0032
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/plugins/plugin-host-build-policy.test.ts:98:50
+@bb/server:test:      96|       ).toBe(&quot;running&quot;);
+@bb/server:test:      97|       expect(await readFile(artifactPath)).toEqual(bytes);
+@bb/server:test:      98|       expect((await stat(artifactPath)).mtimeMs).toBe(before.mtimeMs);
+@bb/server:test:        |                                                  ^
+@bb/server:test:      99|     },
+@bb/server:test:     100|   );
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server| test/services/plugins/plugin-host-build-policy.test.ts &gt; mutable plugin host build policy &gt; reuses an unchanged host artifact on restart
+@bb/server:test: AssertionError: expected 1792371110652.4846 to be 1792371110633.379 // Object.is equality
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test: - 1792371110633.379
+@bb/server:test: + 1792371110652.4846
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/plugins/plugin-host-build-policy.test.ts:98:50
+@bb/server:test:      96|       ).toBe(&quot;running&quot;);
+@bb/server:test:      97|       expect(await readFile(artifactPath)).toEqual(bytes);
+@bb/server:test:      98|       expect((await stat(artifactPath)).mtimeMs).toBe(before.mtimeMs);
+@bb/server:test:        |                                                  ^
+@bb/server:test:      99|     },
+@bb/server:test:     100|   );
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  2 failed | 5 passed (7)
+@bb/server:test:    Start at  00:51:11
+@bb/server:test:    Duration  39.65s (transform 32.11s, setup 4.87s, import 26.73s, tests 2.56s, environment 0ms)
+@bb/server:test: 
+@bb/server:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/server#test:  ERROR  command (CHECKOUT/apps/server) /usr/local/bin/pnpm run test test/services/plugins/plugin-host-build-policy.test.ts exited (1)
+
+ Tasks:    8 successful, 9 total
+Cached:    7 cached, 9 total
+  Time:    41.324s 
+Failed:    @bb/server#test
+
+ ERROR  run failed: command  exited (1)
+</pre>
+<h2>5. Root cause</h2>
+<p>The mutable host loader invokes the host builder on every load without checking SDK metadata or source freshness; the builder recompiles and replaces the artifact. The host artifact is still checked for size, metadata validity, and digest after building, but these checks happen too late to avoid compiling it. Frontend loading already has the freshness guard missing here.</p>
+<ul><li><a href="https://github.com/get-bb/bb/blob/9937c46f5c7e369de3563eb864c8cbc4c3b9c231/apps/server/src/services/plugins/plugin-runtime.ts#L1275-L1306">Host loader and unconditional build, lines 1275–1306</a>.</li><li><a href="https://github.com/get-bb/bb/blob/9937c46f5c7e369de3563eb864c8cbc4c3b9c231/apps/server/src/services/plugins/plugin-runtime.ts#L1068-L1108">Existing frontend source/directory timestamp walk, lines 1068–1108</a>.</li><li><a href="https://github.com/get-bb/bb/blob/9937c46f5c7e369de3563eb864c8cbc4c3b9c231/apps/server/src/services/plugins/plugin-runtime.ts#L1220-L1258">Frontend SDK/freshness guard, lines 1220–1258</a>.</li><li><a href="https://github.com/get-bb/bb/blob/9937c46f5c7e369de3563eb864c8cbc4c3b9c231/packages/plugin-build/src/build-plugin-host.ts#L332-L370">Host builder directly invokes esbuild, lines 332–370</a>.</li></ul>
+<pre>if ((kind === "path" || kind === "builtin") &amp;&amp; !isPackagedBuiltinEntry(...)) {
+  await buildPluginHost(...);
+  setDevBuildProblem(row.id, "host", null);
+}</pre>
+<p>The runtime test, rather than a direct builder benchmark, proves the redundant call happens at the actual plugin lifecycle boundary. Static inspection shows the builder has no reuse shortcut. Identical bytes plus changed mtime are therefore an externally observable effect of the needless build, not an assumption based only on code shape.</p>
+<h2>6. Proposed fix</h2>
+<p>Reuse the existing mutable-artifact freshness walk with an app/host target. In the mutable host loader, parse existing metadata and build only when it is absent/invalid, its SDK differs, the output is missing, or plugin sources/directories are newer. Keep packaged-builtin eligibility, digest validation, artifact size limits, and explicit build commands unchanged. Preserve the current ignored directories (dist, node_modules, .git) rather than changing dependency or packaging policy.</p>
+<p>The focused test intentionally covers both reload and startup, plus five invalidation cases. Existing frontend, prebuilt-server, host artifact serving, and build-problem tests are relevant compatibility checks.</p>
+<h2>7. Verification</h2>
+<p>The same investigator created a second clean detached worktree at the full base commit, performed a separate frozen installation and full Turbo build, copied only this investigator-authored test, and ran the identical Turbo test command. No production patch was present in either baseline run. This is a repeat by the same agent, not an independent review. The second run again has exactly two mtime failures and five passing invalidation cases. No correction to the final root-cause claim was needed.</p>
+<pre>@bb/server:test:  RUN  v4.1.1 VERIFY_CHECKOUT/apps/server
+@bb/server:test: 
+@bb/server:test: (node:9233) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test:  ❯ |@bb/server| test/services/plugins/plugin-host-build-policy.test.ts (7 tests | 2 failed) 2163ms
+@bb/server:test:      × reuses an unchanged host artifact on reload 152ms
+@bb/server:test:      × reuses an unchanged host artifact on restart 52ms
+@bb/server:test:      ✓ rebuilds when the source changes or disappears 45ms
+@bb/server:test:      ✓ rebuilds when the artifact changes or disappears 43ms
+@bb/server:test:      ✓ rebuilds when the metadata changes or disappears 42ms
+@bb/server:test:      ✓ rebuilds when the invalid metadata changes or disappears 39ms
+@bb/server:test:      ✓ rebuilds when the SDK changes or disappears 38ms
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server| test/services/plugins/plugin-host-build-policy.test.ts &gt; mutable plugin host build policy &gt; reuses an unchanged host artifact on reload
+@bb/server:test: AssertionError: expected 1792371118146.8315 to be 1792371118115.7004 // Object.is equality
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test: - 1792371118115.7004
+@bb/server:test: + 1792371118146.8315
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/plugins/plugin-host-build-policy.test.ts:98:50
+@bb/server:test:      96|       ).toBe(&quot;running&quot;);
+@bb/server:test:      97|       expect(await readFile(artifactPath)).toEqual(bytes);
+@bb/server:test:      98|       expect((await stat(artifactPath)).mtimeMs).toBe(before.mtimeMs);
+@bb/server:test:        |                                                  ^
+@bb/server:test:      99|     },
+@bb/server:test:     100|   );
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server| test/services/plugins/plugin-host-build-policy.test.ts &gt; mutable plugin host build policy &gt; reuses an unchanged host artifact on restart
+@bb/server:test: AssertionError: expected 1792371118204.0789 to be 1792371118183.7742 // Object.is equality
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test: - 1792371118183.7742
+@bb/server:test: + 1792371118204.0789
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/plugins/plugin-host-build-policy.test.ts:98:50
+@bb/server:test:      96|       ).toBe(&quot;running&quot;);
+@bb/server:test:      97|       expect(await readFile(artifactPath)).toEqual(bytes);
+@bb/server:test:      98|       expect((await stat(artifactPath)).mtimeMs).toBe(before.mtimeMs);
+@bb/server:test:        |                                                  ^
+@bb/server:test:      99|     },
+@bb/server:test:     100|   );
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  2 failed | 5 passed (7)
+@bb/server:test:    Start at  00:51:22
+@bb/server:test:    Duration  35.95s (transform 28.91s, setup 4.64s, import 24.14s, tests 2.16s, environment 0ms)
+@bb/server:test: 
+@bb/server:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/server#test:  ERROR  command (VERIFY_CHECKOUT/apps/server) /usr/local/bin/pnpm run test test/services/plugins/plugin-host-build-policy.test.ts exited (1)
+
+ Tasks:    8 successful, 9 total
+Cached:    7 cached, 9 total
+  Time:    37.529s 
+Failed:    @bb/server#test
+
+ ERROR  run failed: command  exited (1)
+</pre>
+<h3>Fix verification</h3>
+<p>A local fix adds the freshness guard without changing artifact validation or packaging behavior. After the production change, all seven focused cases pass. The relevant existing frontend build-policy, host artifact route, build-problem, and prebuilt-server tests also pass: 33 tests across five files. Server Turbo typecheck passes (five tasks). The broader verification inventory has pre-existing unmapped browser-CLI drift; it was not changed, and no browser/UI verification is claimed.</p>
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-host-build-policy.test.ts test/services/plugins/plugin-app-bundle.test.ts test/internal/internal-plugin-host-artifacts.test.ts test/services/plugins/plugin-dev-build-problems.test.ts test/services/plugins/prebuilt-server-loading.test.ts
+Test Files  5 passed (5)
+Tests       33 passed (33)
+
+pnpm exec turbo run typecheck --filter=@bb/server
+Tasks:      5 successful, 5 total</pre>
+<h2>8. Related issues</h2>
+<p><a href="https://github.com/get-bb/bb/issues/5729">#5729</a> concerns managed server-bundle caching, not this mutable host-loader branch. GitHub issue metadata and the repository's separate server-cache implementation distinguish the two. There were no linked or matching open pull requests for #5733 when checked; no pull-request branch or patch was run.</p>
+<h2>9. Appendix and trust boundary</h2>
+<p>The issue body was treated as untrusted claims, including its embedded reproduction and suggested edits; neither was executed or copied. The test was designed from trusted origin/main code and existing repository test conventions. All linked source locations were checked against the recorded trusted commit. The report does not validate specific performance savings, an OS-level server restart, or a dynamic source-built-builtin fixture.</p>
+<p>Commands used: GitHub read-only metadata queries; fetch trusted main; create a detached worktree; frozen installs; full Turbo builds; the exact focused test command above in both checkouts; targeted source inspection. Initial fixture setup was refined before the two final baseline runs to supply the required server entry and isolate builtin/provider state. Public output omits local checkout identifiers, home paths, and unrelated logs.</p>
+</main></body></html>
