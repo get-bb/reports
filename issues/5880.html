@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #5880 Connect transport continuity</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#5880 · Connect transport continuity after tunnel loss</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Medium priority</span><span class="pill">Medium effort</span><span class="pill">remote · connect · partial-repro</span><a href="https://github.com/get-bb/bb/issues/5880">GitHub issue</a></p>
+<p class="meta">2026-10-20 · trusted base <code>bd93d18896bab97c950c4fa3451b621c1e0569c1</code></p>
+<p><strong>Verdict: PARTIALLY REPRODUCED.</strong> <strong>Root-cause confidence: low for spontaneous idle loss; high for downstream stream teardown.</strong></p>
+<h2>1. TL;DR</h2>
+<p>The reported recurring idle disconnects were not reproduced: this investigation cannot attribute them to ATL, TLS termination, Durable Object resets, deployment, or the local network. A real local Workers runtime does reproduce the consequence: when a tunnel closes, Connect immediately closes an established visitor WebSocket, and a replacement tunnel does not revive that socket. Even replacing a still-live tunnel closes the visitor. New visitor connections work after redial, so this demonstrates transport interruption, not logout or loss of authentication. Healthy heartbeat probes succeed, and the existing client heartbeat tests cover both normal idle operation and deliberate termination when acknowledgements are missing.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>Recurring spontaneous idle drops on macOS</td><td class="unv">Unverified</td><td>No affected Mac, long-duration affected route, or production telemetry was available. Five immediate local idle heartbeat probes pass; that is not a multi-day stability test.</td></tr>
+<tr><td>Missing heartbeat acknowledgements can initiate redial</td><td class="ok">Verified mechanism only</td><td>The existing heartbeat suite passes, including termination after a minute without acknowledgement, stall grace, and wake behavior. It does not explain why acknowledgements were absent in production.</td></tr>
+<tr><td>A brief tunnel interruption disrupts the remote connection</td><td class="ok">Verified at transport boundary</td><td>Established visitor closes with 1001 on an injected abnormal close and on live replacement, in two clean checkouts. Fresh visitors can exchange messages after redial.</td></tr>
+<tr><td>Phone loses an authenticated session or fails to recover</td><td class="unv">Unverified</td><td>The fixture bypasses the account gate and uses no phone browser. It tests WebSocket transport only. The app already has a reconnecting socket and subscription replay.</td></tr>
+<tr><td>Healthy origin, no sleep, clean network, small payloads rule out local causes</td><td class="unv">Unverified</td><td>Those are reporter observations, not measurements repeated here. Small local round trips and periodic reachability alone do not locate an intermittent transport failure.</td></tr>
+<tr><td>ATL edge resets or TLS stalls are the cause</td><td class="unv">Unverified</td><td>No stored edge records were read. A missing secureConnect milestone and an abnormal WebSocket close do not identify which participant or network hop failed.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Trusted public get-bb/bb main: <code>bd93d18896bab97c950c4fa3451b621c1e0569c1</code>, fetched and checked again after testing; no later main changes.</li>
+<li>Linux 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; Miniflare 4.20260701.0; esbuild 0.28.1.</li>
+<li>Two detached clean temporary source worktrees, named <code>first</code> and <code>second</code>. Both start at exactly the recorded commit; only the two diagnostic files are added. Production source remains unchanged.</li>
+<li>Frozen offline dependency install with lifecycle scripts disabled; Turbo runs its normal native-module preparation. Scoped build finds no build tasks for these source packages; the diagnostic bundles the actual TunnelDO and its imports with esbuild.</li>
+<li>Miniflare uses a fresh non-persistent local Workers runtime for every test, an isolated local D1 binding, and local analytics. No database is mocked. No external provider, account, production gate, default BB ports, or user data is used.</li>
+<li>No BB development server is needed. Runtimes use automatically allocated local ports and temporary storage, and every runtime is disposed in afterEach.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Save <a href="#diagnostic">the inline diagnostic test</a> as <code>issue-5880.test.ts</code> and <a href="#fixture">its inline fixture</a> as <code>issue-5880-fixture.ts</code> in a common parent directory, then follow <a href="#commands">the command transcript</a>. Offline installation assumes the existing package store is populated; otherwise use the same frozen install without <code>--offline</code>.</li>
+<li>Open a local tunnel and visitor WebSocket. Exchange a message to prove that the established visitor works. Inject close code 1011 on the tunnel, then reconnect. Repeat separately by opening a replacement without first closing the old tunnel.</li>
+<li>Observe that the old visitor closes immediately, while a newly opened visitor on the new tunnel successfully exchanges a message.</li></ol>
+<pre id="commands">git clone https://github.com/get-bb/bb.git bb-5880-first
+cd bb-5880-first
+git checkout --detach bd93d18896bab97c950c4fa3451b621c1e0569c1
+pnpm install --frozen-lockfile --offline --ignore-scripts
+pnpm exec turbo run build --filter=@bb/connect --filter=@bb/tunnel-client
+cp ../issue-5880.test.ts apps/connect/src/issue-5880.test.ts
+cp ../issue-5880-fixture.ts apps/connect/test/issue-5880-fixture.ts
+pnpm exec turbo run test --force --filter=@bb/connect -- src/issue-5880.test.ts
+
+git clone https://github.com/get-bb/bb.git ../bb-5880-second
+cd ../bb-5880-second
+git checkout --detach bd93d18896bab97c950c4fa3451b621c1e0569c1
+git status --porcelain
+pnpm install --frozen-lockfile --offline --ignore-scripts
+cp ../issue-5880.test.ts apps/connect/src/issue-5880.test.ts
+cp ../issue-5880-fixture.ts apps/connect/test/issue-5880-fixture.ts
+pnpm exec turbo run build --filter=@bb/connect --filter=@bb/tunnel-client
+pnpm exec turbo run test --force --filter=@bb/connect -- src/issue-5880.test.ts src/worker.test.ts
+pnpm exec turbo run test --filter=@bb/tunnel-client</pre>
+<p><strong>Continuity expectation requested by the report:</strong> a short outage should recover without a visible interruption. <strong>Observed current behavior:</strong> existing streams close and new transport connections must be opened. The diagnostic asserts the observed behavior to establish the mechanism; it is not a failing regression test for the unexplained idle trigger.</p>
+<pre>idle control: 5 heartbeat acknowledgements; tunnel OPEN
+abnormal-close: established visitor closed 1001 tunnel disconnected
+abnormal-close: new tunnel and new visitor exchange messages successfully
+live-replacement: established visitor closed 1001 tunnel reconnected
+live-replacement: new tunnel and new visitor exchange messages successfully</pre>
+<p>The injected fault is an explicit local 1011 close, not a spontaneous network 1006 event. The idle control sends five immediate heartbeats rather than simulating hours or days. The fixture uses the real TunnelDO and real workerd sockets, but a minimal routing entry point instead of the authenticated public gate.</p>
+<details id="diagnostic"><summary>Diagnostic test source</summary><pre>import { fileURLToPath } from &quot;node:url&quot;;
+import { build } from &quot;esbuild&quot;;
+import { Miniflare } from &quot;miniflare&quot;;
+import { afterEach, describe, expect, it } from &quot;vitest&quot;;
+import {
+  HEARTBEAT_REQUEST,
+  HEARTBEAT_RESPONSE,
+  decodeFrame,
+  encodeFrame,
+} from &quot;@bb/tunnel-contract&quot;;
+
+type ClientWebSocket = NonNullable&lt;
+  Awaited&lt;ReturnType&lt;Miniflare[&quot;dispatchFetch&quot;]&gt;&gt;[&quot;webSocket&quot;]
+&gt;;
+
+let runtime: Miniflare | undefined;
+
+afterEach(async () =&gt; {
+  await runtime?.dispose();
+  runtime = undefined;
+});
+
+async function startRuntime(): Promise&lt;Miniflare&gt; {
+  const bundle = await build({
+    entryPoints: [
+      fileURLToPath(new URL(&quot;../test/issue-5880-fixture.ts&quot;, import.meta.url)),
+    ],
+    bundle: true,
+    format: &quot;esm&quot;,
+    target: &quot;esnext&quot;,
+    conditions: [&quot;workerd&quot;, &quot;worker&quot;, &quot;browser&quot;],
+    write: false,
+  });
+  runtime = new Miniflare({
+    modules: [
+      {
+        type: &quot;ESModule&quot;,
+        path: &quot;/fixture.js&quot;,
+        contents: bundle.outputFiles[0].text,
+      },
+    ],
+    modulesRoot: &quot;/&quot;,
+    scriptPath: &quot;/fixture.js&quot;,
+    compatibilityDate: &quot;2026-06-11&quot;,
+    compatibilityFlags: [&quot;nodejs_compat&quot;],
+    durableObjects: { TUNNEL_DO: &quot;TunnelDO&quot; },
+    d1Databases: { DB: &quot;issue-5880-local&quot; },
+    analyticsEngineDatasets: { GATE_EVENTS: { dataset: &quot;issue-5880-local&quot; } },
+    bindings: {
+      BASE_DOMAIN: &quot;relay.test&quot;,
+      BETTER_AUTH_SECRET: &quot;local-fixture-only&quot;,
+    },
+  });
+  await runtime.ready;
+  return runtime;
+}
+
+async function upgrade(
+  runtime: Miniflare,
+  path: string,
+): Promise&lt;ClientWebSocket&gt; {
+  const response = await runtime.dispatchFetch(`https://relay.test${path}`, {
+    headers: { Upgrade: &quot;websocket&quot; },
+  });
+  if (!response.webSocket)
+    throw new Error(`upgrade failed: ${response.status}`);
+  response.webSocket.accept();
+  return response.webSocket;
+}
+
+function nextMessage(socket: ClientWebSocket): Promise&lt;string | ArrayBuffer&gt; {
+  return new Promise((resolve) =&gt; {
+    socket.addEventListener(&quot;message&quot;, (event) =&gt; resolve(event.data), {
+      once: true,
+    });
+  });
+}
+
+function nextClose(
+  socket: ClientWebSocket,
+): Promise&lt;{ code: number; reason: string }&gt; {
+  return new Promise((resolve) =&gt; {
+    socket.addEventListener(
+      &quot;close&quot;,
+      (event) =&gt; resolve({ code: event.code, reason: event.reason }),
+      { once: true },
+    );
+  });
+}
+
+function echoVisitorMessages(tunnel: ClientWebSocket): void {
+  tunnel.addEventListener(&quot;message&quot;, (event) =&gt; {
+    if (typeof event.data === &quot;string&quot;) return;
+    const frame = decodeFrame(event.data);
+    if (frame.type === &quot;ws-data&quot;) tunnel.send(encodeFrame(frame));
+  });
+}
+
+describe(&quot;issue 5880 transport continuity diagnostic&quot;, () =&gt; {
+  it(&quot;answers idle heartbeats without closing the tunnel&quot;, async () =&gt; {
+    const runtime = await startRuntime();
+    const tunnel = await upgrade(runtime, &quot;/__tunnel?v=1&quot;);
+    for (let beat = 0; beat &lt; 5; beat += 1) {
+      const reply = nextMessage(tunnel);
+      tunnel.send(HEARTBEAT_REQUEST);
+      expect(await reply).toBe(HEARTBEAT_RESPONSE);
+    }
+    expect(tunnel.readyState).toBe(1);
+    console.log(&quot;idle control: 5 heartbeat acknowledgements; tunnel OPEN&quot;);
+    tunnel.close();
+  }, 60_000);
+
+  it.each([&quot;abnormal-close&quot;, &quot;live-replacement&quot;] as const)(
+    &quot;closes an established visitor on %s and permits a new visitor after redial&quot;,
+    async (fault) =&gt; {
+      const runtime = await startRuntime();
+      const tunnel = await upgrade(runtime, &quot;/__tunnel?v=1&quot;);
+      echoVisitorMessages(tunnel);
+      const visitor = await upgrade(runtime, &quot;/events&quot;);
+      const before = nextMessage(visitor);
+      visitor.send(&quot;before&quot;);
+      expect(await before).toBe(&quot;before&quot;);
+      const closed = nextClose(visitor);
+      let replacement: ClientWebSocket;
+      if (fault === &quot;abnormal-close&quot;) {
+        tunnel.close(1011, &quot;local fault injection&quot;);
+        const observed = await closed;
+        expect(observed).toEqual({ code: 1001, reason: &quot;tunnel disconnected&quot; });
+        console.log(
+          `${fault}: established visitor closed ${observed.code} ${observed.reason}`,
+        );
+        replacement = await upgrade(runtime, &quot;/__tunnel?v=1&quot;);
+      } else {
+        replacement = await upgrade(runtime, &quot;/__tunnel?v=1&quot;);
+        const observed = await closed;
+        expect(observed).toEqual({ code: 1001, reason: &quot;tunnel reconnected&quot; });
+        console.log(
+          `${fault}: established visitor closed ${observed.code} ${observed.reason}`,
+        );
+      }
+      expect(visitor.readyState).not.toBe(1);
+      echoVisitorMessages(replacement);
+      const freshVisitor = await upgrade(runtime, &quot;/events&quot;);
+      const after = nextMessage(freshVisitor);
+      freshVisitor.send(&quot;after&quot;);
+      expect(await after).toBe(&quot;after&quot;);
+      console.log(
+        `${fault}: new tunnel and new visitor exchange messages successfully`,
+      );
+      freshVisitor.close();
+      replacement.close();
+    },
+    60_000,
+  );
+});
+</pre></details>
+<details id="fixture"><summary>Minimal routing fixture</summary><pre>export { TunnelDO } from &quot;../src/tunnel-do.js&quot;;
+
+interface FixtureEnv {
+  TUNNEL_DO: DurableObjectNamespace;
+}
+
+export default {
+  fetch(request: Request, env: FixtureEnv): Promise&lt;Response&gt; {
+    return env.TUNNEL_DO.get(env.TUNNEL_DO.idFromName(&quot;issue-5880&quot;)).fetch(
+      request,
+    );
+  },
+};
+</pre></details>
+<h2>5. Root cause</h2>
+<p><strong>Unknown for the primary reported defect.</strong> This evidence does not establish the cause of recurring idle drops. It establishes why an actual tunnel drop is visible downstream: TunnelDO calls <code>abandonStreams</code> on loss, and also during every new tunnel admission, so an already accepted visitor cannot remain attached across redial.</p>
+<p><a href="https://github.com/get-bb/bb/blob/bd93d18896bab97c950c4fa3451b621c1e0569c1/apps/connect/src/tunnel-do.ts#L879-L895">apps/connect/src/tunnel-do.ts:879</a></p><pre>  webSocketClose(ws: WebSocket, code: number, reason: string): void {
+    const tags = this.state.getTags(ws);
+    if (tags.includes(TUNNEL_TAG)) {
+      if (this.tunnelSocket() !== null) return;
+      const now = Date.now();
+      void this.state.storage.put(TUNNEL_CLOSED_AT_KEY, now);
+      if (code === CLEAN_CLOSE_CODE) {
+        void this.state.storage.delete(TUNNEL_LOST_AT_KEY);
+      } else {
+        void this.state.storage.put(TUNNEL_LOST_AT_KEY, now);
+      }
+      if (presenceWritesOnChange(this.env)) void this.markPresence();
+      this.abandonStreams(
+        &quot;tunnel disconnected mid-request&quot;,
+        &quot;tunnel disconnected&quot;,
+      );
+      return;</pre>
+<p><a href="https://github.com/get-bb/bb/blob/bd93d18896bab97c950c4fa3451b621c1e0569c1/apps/connect/src/tunnel-do.ts#L375-L386">apps/connect/src/tunnel-do.ts:375</a></p><pre>    await this.restartIfTunnelVanished();
+    const now = Date.now();
+    const replacingLive = this.tunnelSocket() !== null;
+    if (!replacingLive) {
+      await this.recordTunnelGap(new URL(request.url).host, now);
+    }
+    for (const existing of this.state.getWebSockets(TUNNEL_TAG)) {
+      try {
+        existing.close(CLEAN_CLOSE_CODE, TUNNEL_REPLACED_CLOSE_REASON);
+      } catch {}
+    }
+    this.abandonStreams(&quot;tunnel reconnected mid-request&quot;, &quot;tunnel reconnected&quot;);</pre>
+<p><a href="https://github.com/get-bb/bb/blob/bd93d18896bab97c950c4fa3451b621c1e0569c1/apps/connect/src/tunnel-do.ts#L682-L697">apps/connect/src/tunnel-do.ts:682</a></p><pre>  private abandonStreams(httpReason: string, wsReason: string): void {
+    for (const streamId of [...this.pendingHttp.keys()]) {
+      this.failHttpStream(streamId, 502, httpReason);
+    }
+    for (const socket of this.state.getWebSockets()) {
+      const tags = this.state.getTags(socket);
+      if (tags.includes(TUNNEL_TAG)) continue;
+      if (tags.some((tag) =&gt; tag.startsWith(RELAY_TAG_PREFIX))) {
+        this.finishRelay(socket, RELAY_FAILED_CLOSE_CODE, httpReason);
+        continue;
+      }
+      try {
+        socket.close(1001, wsReason);
+      } catch {}
+    }
+  }</pre>
+<p>The local client also destroys its origin-side streams on close. Keeping only a visitor socket open at the gate would therefore not preserve the original end-to-end stream; a continuation design would have to account for both ends.</p>
+<p><a href="https://github.com/get-bb/bb/blob/bd93d18896bab97c950c4fa3451b621c1e0569c1/packages/tunnel-client/src/session.ts#L223-L235">packages/tunnel-client/src/session.ts:223</a></p><pre>    tunnel.on(&quot;close&quot;, () =&gt; this.dispose());
+  }
+
+  dispose(): void {
+    if (this.heartbeat) clearInterval(this.heartbeat);
+    for (const s of this.httpStreams.values()) s.abort.abort();
+    for (const s of this.wsStreams.values())
+      s.socket.close(1001, &quot;tunnel closed&quot;);
+    this.refusedOrigins.clear();
+    this.httpStreams.clear();
+    this.wsStreams.clear();
+    this.setRemoteClients(0);
+  }</pre>
+<p>Idle heartbeats are configured through the Workers auto-response API. The client sends every 20 seconds and terminates after the acknowledgement age exceeds 60 seconds; with ordinary timer cadence the first such check occurs at 80 seconds. This is a consequence of lost acknowledgements, not an explanation of why they were lost. Closures with a much fresher acknowledgement cannot be attributed to that normal deadline check alone.</p>
+<p><a href="https://github.com/get-bb/bb/blob/bd93d18896bab97c950c4fa3451b621c1e0569c1/apps/connect/src/tunnel-do.ts#L130-L133">apps/connect/src/tunnel-do.ts:130</a></p><pre>    this.nextStreamId = maxSeen + 1;
+    this.state.setWebSocketAutoResponse(
+      new WebSocketRequestResponsePair(HEARTBEAT_REQUEST, HEARTBEAT_RESPONSE),
+    );</pre>
+<p><a href="https://github.com/get-bb/bb/blob/bd93d18896bab97c950c4fa3451b621c1e0569c1/packages/tunnel-client/src/session.ts#L183-L204">packages/tunnel-client/src/session.ts:183</a></p><pre>    const monotonicNow = this.options.monotonicNow ?? (() =&gt; performance.now());
+    this.lastAck = Date.now();
+    this.lastReceivedAckAt = null;
+    this.lastHeartbeatTickAt = monotonicNow();
+    this.heartbeat = setInterval(() =&gt; {
+      const tickAt = monotonicNow();
+      const tickGapMs = tickAt - this.lastHeartbeatTickAt;
+      this.lastHeartbeatTickAt = tickAt;
+      const now = Date.now();
+      if (tickGapMs &gt; HEARTBEAT_LATE_TICK_MS &amp;&amp; !this.stallGraceSinceAck) {
+        this.options.log.warn(
+          `event loop stalled for ${Math.round(tickGapMs / 1000)}s; restarting the tunnel heartbeat deadline`,
+        );
+        this.lastAck = now;
+        this.stallGraceSinceAck = true;
+      } else if (now - this.lastAck &gt; HEARTBEAT_DEADLINE_MS) {
+        this.options.log.warn(&quot;tunnel heartbeat missed; reconnecting&quot;);
+        tunnel.terminate();
+        return;
+      }
+      this.sendRaw(HEARTBEAT_REQUEST, Buffer.byteLength(HEARTBEAT_REQUEST));
+    }, HEARTBEAT_INTERVAL_MS);</pre>
+<p>Dial diagnostics record cumulative elapsed times from dial start, not separate phase durations. A null <code>tlsMs</code> means no secureConnect milestone was observed; it does not prove an edge TLS defect. Likewise, <code>transportError</code> records an error event if one arrives; its absence is not proof of an edge reset.</p>
+<p><a href="https://github.com/get-bb/bb/blob/bd93d18896bab97c950c4fa3451b621c1e0569c1/plugins/connect/src/tunnel.ts#L603-L611">plugins/connect/src/tunnel.ts:603</a></p><pre>    socket.once(&quot;lookup&quot;, () =&gt; {
+      diagnostics.lookupMs = Date.now() - startedAt;
+    });
+    socket.once(&quot;connect&quot;, () =&gt; {
+      diagnostics.connectMs = Date.now() - startedAt;
+    });
+    socket.once(&quot;secureConnect&quot;, () =&gt; {
+      diagnostics.tlsMs = Date.now() - startedAt;
+    });</pre>
+<p>Do not interpret this as absence of client reconnect support: the browser constructs a reconnecting socket with unlimited retries and replays subscriptions on open. This report does not reproduce a failure of that recovery path, an expired session, or a phone logout.</p>
+<p><a href="https://github.com/get-bb/bb/blob/bd93d18896bab97c950c4fa3451b621c1e0569c1/apps/app/src/lib/ws.ts#L115-L147">apps/app/src/lib/ws.ts:115</a></p><pre>    const socket = new ReconnectingWebSocket(url, undefined, {
+      minReconnectionDelay: this.minReconnectionDelay,
+      maxReconnectionDelay: 30000,
+      reconnectionDelayGrowFactor: 2,
+      connectionTimeout: 10000,
+      maxRetries: Infinity,
+    });
+    this.socket = socket;
+
+    socket.onopen = () =&gt; {
+      const disconnectedAt = this.disconnectedAt;
+      this.disconnectedAt = null;
+      this.lastServerActivityAt = Date.now();
+      const reconnected = this.hasConnected;
+      this.hasConnected = true;
+      this.setConnectionState(&quot;connected&quot;);
+      this.startPingLoop();
+      if (this.subscriptions.size &gt; 0)
+        this.sendMessage({
+          type: &quot;subscribe&quot;,
+          targets: [...this.subscriptions.values()].map(
+            (subscription) =&gt; subscription.target,
+          ),
+        });
+      const event: WebSocketConnectedEvent = reconnected
+        ? { reconnected, disconnectedAt: disconnectedAt ?? Date.now() }
+        : { reconnected };
+      for (const callback of this.connectedCallbacks) {
+        callback(event);
+      }
+    };
+
+    socket.onmessage = (event: MessageEvent) =&gt; {</pre>
+<h2>6. Proposed fix / next experiment</h2>
+<p>No root-cause patch is justified yet. Correlate the reported timestamps and request IDs with stored Workers Logs, Durable Object invocation outcomes, deployment history, and transport/TLS telemetry. Never attach a production real-time tail: that itself resets tunnel objects. Then run a long-duration authenticated staging tunnel with timestamped heartbeat send/ack and event-loop measurements, and a phone browser, to distinguish transport loss from authentication or UI recovery.</p>
+<p>If the desired product behavior is transparent recovery, first specify whether to reconnect and restore application state or introduce resumable tunneled streams. The latter changes stream lifecycle and potentially protocol and identity guarantees; it is not a safe contained patch. Existing HTTP redial grace does not imply resumability for already-open WebSockets.</p>
+<p><strong>Simple-fix decision:</strong> skipped. The spontaneous idle trigger was not reproduced on trusted main, and transport continuation is not a verified sub-500-line repair within the existing contract. No linked open pull request was found in the issue timeline or the numeric PR search. No fix branch or product pull request was created.</p>
+<h2>7. Verification</h2>
+<p>The same agent repeated the reproduction in a second clean detached worktree at the exact base commit, with a new frozen install and fresh Miniflare instances. The clean tracked tree was checked before adding the diagnostic. This is a second clean run, not independent verification.</p>
+<table><tr><th>Run</th><th>Command / result</th></tr>
+<tr><td>First</td><td><code>pnpm exec turbo run test --filter=@bb/connect -- src/issue-5880.test.ts</code> — 3/3 passed, all observed output above.</td></tr>
+<tr><td>Second (cache bypass)</td><td><code>pnpm exec turbo run test --force --filter=@bb/connect -- src/issue-5880.test.ts src/worker.test.ts</code> — 156/156 passed: 3 diagnostic cases plus 153 existing gate/DO tests.</td></tr>
+<tr><td>Client controls</td><td><code>pnpm exec turbo run test --filter=@bb/tunnel-client</code> — 26/26 passed across heartbeat, reconnect, traffic, origin failures/requests, and backpressure.</td></tr></table>
+<p>No report correction was needed: both clean runs produced the same closure codes and successful fresh connections. Verification supports the restricted partial verdict, not the unobserved production cause. The test protects an owner-boundary lifecycle observation using real transport; it adds no production seam and does not duplicate a mock implementing the closure policy.</p>
+<h2>8. Related issues</h2>
+<ul><li><a href="https://github.com/get-bb/bb/issues/4314">#4314</a> remains open and describes slow-download buffering. This diagnostic transfers tiny WebSocket messages and requires no large HTTP response; it does not establish that the two production incidents share a cause.</li>
+<li><a href="https://github.com/get-bb/bb/issues/4880">#4880</a> is closed and concerned a server-move freeze. No server move was involved in this reproduction; it is not evidence for the reported spontaneous drop.</li></ul>
+<h2>9. Appendix</h2>
+<p>The reports repository permits HTML reports but forbids publishing raw logs and reproduction directories. The complete diagnostic and fixture are therefore embedded above, with copy-paste commands. Raw logs remain in local thread storage. These verbatim excerpts retain the relevant observed stdout and suite totals.</p>
+<h3>First run</h3><pre>@bb/connect:test: idle control: 5 heartbeat acknowledgements; tunnel OPEN
+@bb/connect:test: abnormal-close: established visitor closed 1001 tunnel disconnected
+@bb/connect:test: abnormal-close: new tunnel and new visitor exchange messages successfully
+@bb/connect:test: live-replacement: established visitor closed 1001 tunnel reconnected
+@bb/connect:test: live-replacement: new tunnel and new visitor exchange messages successfully
+@bb/connect:test:  ✓ |@bb/connect| src/issue-5880.test.ts (3 tests) 480ms
+@bb/connect:test:  Test Files  1 passed (1)
+@bb/connect:test:       Tests  3 passed (3)</pre>
+<h3>Second clean run</h3><pre>@bb/connect:test: idle control: 5 heartbeat acknowledgements; tunnel OPEN
+@bb/connect:test: abnormal-close: established visitor closed 1001 tunnel disconnected
+@bb/connect:test: abnormal-close: new tunnel and new visitor exchange messages successfully
+@bb/connect:test: live-replacement: established visitor closed 1001 tunnel reconnected
+@bb/connect:test: live-replacement: new tunnel and new visitor exchange messages successfully
+@bb/connect:test:  ✓ |@bb/connect| src/issue-5880.test.ts (3 tests) 479ms
+@bb/connect:test:  ✓ |@bb/connect:isolated| src/worker.test.ts (153 tests) 762ms
+@bb/connect:test:  Test Files  2 passed (2)
+@bb/connect:test:       Tests  156 passed (156)</pre>
+<h3>Client controls</h3><pre>@bb/tunnel-client:test:  ✓ test/heartbeat.test.ts (6 tests) 12ms
+@bb/tunnel-client:test:  Test Files  6 passed (6)
+@bb/tunnel-client:test:       Tests  26 passed (26)</pre>
+<p>Read-only investigation used repository Type/field/label metadata, all issue comments (none at review time), cross-references, an open-PR numeric search, current main source and history, and the two related issue states. Missing Type, Priority, Effort, remote and connect were filled; none had an existing value to preserve. Medium priority reflects intermittent recoverable remote interruption; Medium effort reflects the unresolved reproduction and several lifecycle paths.</p>
+<p>Issue text and logs were treated only as untrusted claims. No issue-provided commands, links, scripts, branches, or patches were executed or fetched. No credentials, user runtime data, production logs, or private repository content were read. No production tunnel was contacted or tailed. Runtime teardown is performed after each test.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
