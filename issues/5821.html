@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #5821 Unbounded append-only service capture files</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --ok:#0e8a16; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+  pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#5821 · Unbounded append-only service capture files</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Medium</span><span class="pill">host</span><a href="https://github.com/get-bb/bb/issues/5821">GitHub issue</a><span>2026-10-20</span></p>
+<p>Trusted base: <a href="https://github.com/get-bb/bb/commit/7e4232ef241b5cdfb7d272cee044fe6f82702c70"><code>7e4232ef241b5cdfb7d272cee044fe6f82702c70</code></a></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · Reproduction label: <code>confirmed-repro</code></p>
+
+<h2>1. TL;DR</h2>
+<p>The launcher captures each service's stdout and stderr in a separate append-only file. Unlike the structured application logs, these capture files have no size check, rotation, or restart retention limit. Using the exact production helper, a real child grew each service capture to 48 MiB while running and 64 MiB after one restart, with no backup files created. A second clean checkout produced identical results. The issue affects both server and host-daemon captures and does not require multiple servers or a particular warning message.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Reported claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Service capture grows without rotation, including across restarts.</td><td>Verified</td><td>Both real-child runs: 16 → 32 → 48 MiB while running; 64 MiB after restart; only one file per service.</td></tr>
+<tr><td>Application logs rotate separately.</td><td>Verified configuration</td><td>The logger configures pino-roll with a daily frequency, a 10m size option, and a count limit of five. The capture helper does not use that transport.</td></tr>
+<tr><td>A particular Mac capture reached approximately 437 MB.</td><td>Unverified historical measurement</td><td>No access to the reporter's files; the mechanism is reproduced, not that exact disk state.</td></tr>
+<tr><td>Thousands of older files accumulated in the same directory.</td><td>Unverified; not explained by this capture helper</td><td>This helper opens one fixed path per service and creates no rotated files. A separate inventory/retention investigation would be needed.</td></tr>
+<tr><td>A repeating warning caused the growth.</td><td>Warning-specific claim unverified</td><td>The capture layer accepts all stdout/stderr bytes. Reproduction uses deterministic writes to isolate storage behavior rather than the warning source.</td></tr>
+<tr><td>Deleting the pathname is a complete workaround.</td><td>Unsafe to assume for a live process</td><td>The child keeps the open descriptor. The rename probe continued writing to the original inode and left the replacement empty. Removing a live file can leave its disk blocks held until the service closes that descriptor.</td></tr>
+</table>
+
+<h2>3. Environment</h2>
+<ul>
+<li>Public target repository: <code>get-bb/bb</code>; base commit recorded above, fetched from the trusted upstream main branch.</li>
+<li>Linux x64; Node <code>v22.19.0</code>. No macOS or desktop-session verification was performed.</li>
+<li>Two separate clean detached checkouts at the same base, each with a frozen pnpm install and normal Turbo build.</li>
+<li>No provider session, server, host enrollment, or real user data was used. No ports were opened.</li>
+<li>Each invocation created a new temporary directory and deleted it after closing all test children.</li>
+<li>Both full builds passed: 67 tasks each. Existing capture suite passed: five tests.</li>
+</ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol>
+<li>Prepare the trusted checkout and dependencies:
+<pre>git clone https://github.com/get-bb/bb.git bb-capture-check
+cd bb-capture-check
+git checkout --detach 7e4232ef241b5cdfb7d272cee044fe6f82702c70
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build</pre></li>
+<li>Save the complete script below as <code>capture-growth.mjs</code> in the checkout. It calls the production helper without modifying it, checks that both child descriptors are regular files, writes 8 MiB per stream per batch, and measures the file before stopping the child.</li>
+<li>Run:
+<pre>node --import tsx capture-growth.mjs .
+pnpm exec turbo run test --filter=bb-app -- test/logged-process.test.ts</pre></li>
+</ol>
+<p><strong>Expected storage property:</strong> an explicitly bounded retention policy should eventually stop one active capture from retaining every byte indefinitely, while preserving useful recent diagnostics. This report does not invent a new numeric product limit.</p>
+<p><strong>Actual:</strong> every batch is appended intact, the same capture remains after restarting, and no retention machinery runs. Each capture retained all 67,108,864 bytes. Finite execution alone cannot prove infinite growth; the absence of any limiting branch in the actual write path explains why these observations continue.</p>
+<h3>Complete repeatable evidence script</h3>
+<pre id="repro-source">import assert from "node:assert/strict";
+import { once } from "node:events";
+import { mkdtempSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+
+const checkout = resolve(process.argv[2] ?? ".");
+const { spawnLoggedProcess } = await import(pathToFileURL(join(checkout, "packages/bb-app/src/logged-process.ts")));
+const scratch = mkdtempSync(join(tmpdir(), "bb-capture-growth-"));
+const children = new Set();
+const batchBytes = 16 * 1024 * 1024;
+const childSource = `
+  const assert = require("node:assert/strict");
+  const { fstatSync, writeSync } = require("node:fs");
+  assert(fstatSync(1).isFile());
+  assert(fstatSync(2).isFile());
+  const chunk = Buffer.alloc(1024 * 1024, 120);
+  process.on("message", (message) =&gt; {
+    if (message === "stop") {
+      process.disconnect();
+      return;
+    }
+    for (const descriptor of [1, 2]) {
+      for (let index = 0; index &lt; 8; index++) {
+        let offset = 0;
+        while (offset &lt; chunk.length) {
+          offset += writeSync(descriptor, chunk, offset, chunk.length - offset);
+        }
+      }
+    }
+    process.send("written");
+  });
+  process.send("ready");
+`;
+
+async function start(logDir, logName) {
+  const child = spawnLoggedProcess({
+    command: process.execPath,
+    args: ["-e", childSource],
+    env: {},
+    ipc: true,
+    logDir,
+    logName,
+  });
+  children.add(child);
+  assert.deepEqual(await once(child, "message"), ["ready", undefined]);
+  return child;
+}
+
+async function writeBatch(child) {
+  const message = once(child, "message");
+  child.send("write");
+  assert.equal((await message)[0], "written");
+}
+
+async function stop(child) {
+  const closed = once(child, "close");
+  child.send("stop");
+  assert.deepEqual(await closed, [0, null]);
+  children.delete(child);
+}
+
+const timeout = setTimeout(() =&gt; {
+  for (const child of children) child.kill("SIGKILL");
+  process.exitCode = 1;
+}, 30_000);
+
+try {
+  console.log(`environment: ${process.platform} ${process.arch} node ${process.version}`);
+  for (const logName of ["host-daemon", "server"]) {
+    const logDir = join(scratch, logName);
+    const logPath = join(logDir, `${logName}-stdio.log`);
+    const child = await start(logDir, logName);
+    for (let batch = 1; batch &lt;= 3; batch++) {
+      await writeBatch(child);
+      const size = statSync(logPath).size;
+      assert.equal(size, batch * batchBytes);
+      console.log(`${logName} running batch ${batch}: ${size} bytes`);
+    }
+    await stop(child);
+    const restarted = await start(logDir, logName);
+    await writeBatch(restarted);
+    await stop(restarted);
+    assert.equal(statSync(logPath).size, 4 * batchBytes);
+    assert.deepEqual(readdirSync(logDir), [`${logName}-stdio.log`]);
+    console.log(`${logName} after restart: ${statSync(logPath).size} bytes; files: ${readdirSync(logDir).join(", ")}`);
+  }
+
+  const logDir = join(scratch, "rename-probe");
+  const logPath = join(logDir, "host-daemon-stdio.log");
+  const child = await start(logDir, "host-daemon");
+  await writeBatch(child);
+  renameSync(logPath, `${logPath}.1`);
+  writeFileSync(logPath, "");
+  await writeBatch(child);
+  await stop(child);
+  assert.equal(statSync(`${logPath}.1`).size, 2 * batchBytes);
+  assert.equal(statSync(logPath).size, 0);
+  console.log(`rename probe: renamed file ${statSync(`${logPath}.1`).size} bytes; replacement ${statSync(logPath).size} bytes`);
+  console.log("RESULT: both capture files grow without rotation while running and across restarts; rename alone does not redirect the child descriptors.");
+} finally {
+  clearTimeout(timeout);
+  for (const child of children) {
+    const closed = once(child, "close");
+    child.kill("SIGKILL");
+    await closed;
+  }
+  rmSync(scratch, { recursive: true, force: true });
+}
+</pre>
+<h3>Verbatim output from both runs</h3>
+<pre>environment: linux x64 node v22.19.0
+host-daemon running batch 1: 16777216 bytes
+host-daemon running batch 2: 33554432 bytes
+host-daemon running batch 3: 50331648 bytes
+host-daemon after restart: 67108864 bytes; files: host-daemon-stdio.log
+server running batch 1: 16777216 bytes
+server running batch 2: 33554432 bytes
+server running batch 3: 50331648 bytes
+server after restart: 67108864 bytes; files: server-stdio.log
+rename probe: renamed file 33554432 bytes; replacement 0 bytes
+RESULT: both capture files grow without rotation while running and across restarts; rename alone does not redirect the child descriptors.</pre>
+<p>Both invocations exited zero. These assertions validate the observed defect mechanism; they are not a passing regression test for a fix.</p>
+
+<h2>5. Root cause</h2>
+<p>The service launcher calls <a href="https://github.com/get-bb/bb/blob/7e4232ef241b5cdfb7d272cee044fe6f82702c70/packages/bb-app/src/launcher.ts#L2424-L2441"><code>spawnLoggedProcess</code> for managed services</a>. That helper opens one capture path in append mode and hands the descriptor directly to the child's two output streams:</p>
+<pre>const fd = openSync(
+  join(args.logDir, `${args.logName}-stdio.log`),
+  "a",
+  0o600,
+);
+try {
+  return spawn(args.command, args.args, {
+    cwd: process.cwd(),
+    env: args.env,
+    stdio: args.ipc === true ? ["ignore", fd, fd, "ipc"] : ["ignore", fd, fd],
+  });
+} finally {
+  closeSync(fd);
+}</pre>
+<p><a href="https://github.com/get-bb/bb/blob/7e4232ef241b5cdfb7d272cee044fe6f82702c70/packages/bb-app/src/logged-process.ts#L14-L30">Complete helper at the trusted base</a>. The parent closes its copy after spawning; the child's copies remain open. There is no size check before opening, no live accounting, and no reopen or rotation hook. Restarting opens the same pathname with append semantics.</p>
+<p>Structured logging is a separate sink: <a href="https://github.com/get-bb/bb/blob/7e4232ef241b5cdfb7d272cee044fe6f82702c70/packages/logger/src/index.ts#L42-L68">pino-roll receives the application file while pino-pretty also emits console output</a>. Rotation in that transport does not rotate the launcher's stdout/stderr descriptor.</p>
+<p>The direct-file design was intentional: <a href="https://github.com/get-bb/bb/commit/126888fad62ea4250b9f8c19de5aaf314ede4d65">the earlier backpressure repair</a> removed parent/terminal forwarding to prevent service freezes. The current <a href="https://github.com/get-bb/bb/blob/7e4232ef241b5cdfb7d272cee044fe6f82702c70/packages/bb-app/test/logged-process.test.ts#L45-L95">capture tests</a> protect direct regular-file descriptors and output retention across restarts; they do not check a storage bound. <a href="https://github.com/get-bb/bb/blob/7e4232ef241b5cdfb7d272cee044fe6f82702c70/docs/debugging-and-qa.md#L10-L11">Debugging guidance</a> accurately documents the append-across-restarts behavior.</p>
+
+<h2>6. Proposed fix and simple-fix gate</h2>
+<p>Introduce bounded capture retention for the shared helper, with explicit handling of a continuously running child, restart retention, diagnostics on capture failure, and shutdown. Preserve the property that terminal or parent-output backpressure cannot block a service. Add a failing-before/passing-after regression at the real-child boundary once the retention contract is selected.</p>
+<p>A rename at startup cannot bound a long-lived writer. A periodic rename and fresh pathname also cannot redirect the already-open child descriptors: the probe leaves the new file at zero bytes while the renamed file grows to 32 MiB. Routing through a parent stream would remove the direct-file protection; truncating in place discards retained diagnostics and needs an explicit loss/retention policy. These are design choices, not a safe mechanical patch.</p>
+<p><strong>No pull request:</strong> the rule forbids fixes requiring a product or architecture decision. Safe live capture rotation requires a retention/reopen design that preserves the existing backpressure guarantee. No production change or fix branch was made, so no red/green fix claim is made. No open pull request linked to this issue was found in cross-reference metadata or an open-PR search at investigation time.</p>
+
+<h2>7. Related issues</h2>
+<p><a href="https://github.com/get-bb/bb/issues/5822">#5822</a> concerns recurring host-daemon warnings and was found through the repository's host-label issue listing. Warning frequency is a separate amplifier, not necessary for this capture-layer reproduction. Fixing one warning would not impose a capture storage bound.</p>
+
+<h2>8. Verification</h2>
+<p>The same investigator repeated the complete script in a second newly created detached checkout at <code>7e4232ef241b5cdfb7d272cee044fe6f82702c70</code>, after a separate frozen install and normal build. This is a second clean run, not an independent review. The verification checkout was clean before and after the script. The same script source was used, but it created new children and a fresh temporary log directory.</p>
+<pre>pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+node --import tsx /path/to/capture-growth.mjs .
+pnpm exec turbo run test --filter=bb-app -- test/logged-process.test.ts</pre>
+<p>Both capture names again grew 16 → 32 → 48 → 64 MiB, with identical verbatim output above. The descriptor-renaming probe again wrote to the old inode. Existing capture tests passed, including the no-parent-reader contract. No report conclusion required correction. The historical Mac measurements remain explicitly unverified.</p>
+
+<h2>9. Appendix</h2>
+<h3>Relevant check results</h3>
+<pre>First trusted checkout build:
+Tasks: 67 successful, 67 total
+Cached: 4 cached, 67 total
+
+Second clean checkout build:
+Tasks: 67 successful, 67 total
+Cached: 65 cached, 67 total
+
+Existing capture suite:
+✓ |bb-app| test/logged-process.test.ts (5 tests)
+Test Files 1 passed (1)
+Tests 5 passed (5)</pre>
+<p>Frozen installs emitted missing local-bin warnings before build outputs existed; both installs and both full builds succeeded. This is a unit-level reproduction at the actual production spawn boundary, not a reproduction of an entire macOS desktop enrollment or the original warning source.</p>
+<h3>Investigation commands</h3>
+<pre>git fetch https://github.com/get-bb/bb.git main:refs/remotes/origin/main
+git rev-parse origin/main
+git worktree add --detach /path/to/base-checkout 7e4232ef241b5cdfb7d272cee044fe6f82702c70
+git worktree add --detach /path/to/verification-checkout 7e4232ef241b5cdfb7d272cee044fe6f82702c70
+git log origin/main -- packages/bb-app/src/logged-process.ts
+git show 126888fad62ea4250b9f8c19de5aaf314ede4d65 -- packages/bb-app/src/logged-process.ts packages/bb-app/test/logged-process.test.ts
+gh pr list --repo get-bb/bb --state open --search '5821 in:body' --json number,title,url
+git status --short</pre>
+<p>GitHub GraphQL reads checked repository visibility, issue properties, comments, and cross-referenced PR metadata. The issue had no comments. Issue data was used only as untrusted claims; no supplied command, external issue link, or linked branch was executed. All runtime source came from the trusted base. No application or database was started, and the reproduction cleaned up every temporary child and log directory.</p>
+<p>The complete script and outputs are inline because this public reports repository forbids separately committed scripts, logs, and per-issue artifact directories.</p>
+</main></body></html>
