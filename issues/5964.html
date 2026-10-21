@@ -1,0 +1,360 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Report · #5964 Plugin continuation containment</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#5964 · Plugin continuation errors escape process containment</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High</span><span class="pill">Effort: Medium</span><span class="pill">plugins</span><a href="https://github.com/get-bb/bb/issues/5964">GitHub issue</a></p>
+<p>2026-10-21 · trusted main commit <code>06ae8f039a7198a6aad2b9b6e030efb88f8dd923</code></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>A plugin CLI invocation can leave asynchronous work running after the invocation returns or its instance reloads. If that work touches its old API, the runtime throws a stale-context error. The process-level containment hook recognizes background service contexts only, so it declines the error and the server's fallback exits with code 1. An isolated child-process reproduction exits the same way for both a thrown exception and an unhandled rejected promise; the same test fails again in a second clean checkout. Ordinary detached CLI errors also escape containment even without a reload.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Using an old realtime handle after reload can terminate the process.</td><td class="ok">Verified</td><td>Both reload cases produce PluginContextStaleError and child exit 1 in both clean runs.</td></tr>
+<tr><td>Rejected promises have the same failure.</td><td class="ok">Verified</td><td>Node's default unhandled-rejection escalation reaches the same uncaught-exception dispatch; rejection case exits 1.</td></tr>
+<tr><td>Only background-service work has asynchronous attribution.</td><td class="ok">Verified</td><td>serviceContext.run wraps service start; the common invocation wrapper has no plugin asynchronous context.</td></tr>
+<tr><td>Any awaited CLI failure crashes the server.</td><td>Qualified</td><td>The common wrapper already catches returned/awaited failures. This reproduction deliberately schedules detached callbacks from the pending CLI continuation.</td></tr>
+<tr><td>Two specific production incidents and launcher restart timings.</td><td class="unv">Unverified</td><td>No production logs, user data, or running user instance were accessed.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Linux x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li><li>Target repository is public. Both checkouts use the full trusted base SHA above.</li><li>Real migrated SQLite via createMigratedConnection; no database mocks and no new dependencies.</li><li>No HTTP listeners, browser sessions, provider sessions, or production runtime were needed. Each child gets a fresh mkdtemp directory and explicitly sets BB_DATA_DIR to it, then the parent removes it.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Prepare a clean checkout and prerequisites:</li></ol><pre>git clone https://github.com/get-bb/bb.git bb-5964
+cd bb-5964
+git checkout 06ae8f039a7198a6aad2b9b6e030efb88f8dd923
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=@bb/server
+# Save the test below as apps/server/test/services/plugins/plugin-uncaught.test.ts
+pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-uncaught.test.ts</pre>
+<p>The initial unfiltered monorepo build encountered an SDK/plugin build-order race; retrying the unchanged build succeeded (67 tasks). The targeted SDK-first build order above avoids that prerequisite race. The second checkout's server build passed.</p>
+<p>The test loads a real, author-created plugin. Its CLI handler waits for a temporary gate file. Reload times out draining that invocation, disposes the old handle, then the test releases the gate. The resumed handler schedules either a timer throw or a detached rejected promise that publishes through its captured old API. A child uses the actual plugin-service containment method and the same contain-or-exit decision as the server. This is not a full HTTP server boot.</p>
+<p><strong>Expected:</strong> child exit 0, <code>SURVIVED status=running</code> after reload, and one plugin-attributed warning despite two stale attempts. For a live plugin's detached error, expect survival and degraded status. <strong>Actual on base:</strong></p>
+<pre>PluginContextStaleError: plugin "containment" used a stale API handle — it was reloaded or disabled; re-entry happens via a fresh factory call
+expected child exit: 0
+actual child exit: 1
+Test Files  1 failed (1)
+Tests  4 failed (4)</pre>
+<p>The same failure occurs in the rejected-promise case. The two non-reload controls exit 1 with <code>Error: detached CLI failure</code>. All four cases fail for the intended containment assertion, not fixture setup.</p>
+<details><summary>Complete reproduction test (save at the path in the command)</summary><pre>import { spawn } from &quot;node:child_process&quot;;
+import { mkdtemp, rm } from &quot;node:fs/promises&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { fileURLToPath } from &quot;node:url&quot;;
+import { expect, it } from &quot;vitest&quot;;
+
+const serverDir = fileURLToPath(new URL(&quot;../../../&quot;, import.meta.url));
+
+const pluginSource = String.raw`
+import { existsSync } from &quot;node:fs&quot;;
+import { setTimeout as delay } from &quot;node:timers/promises&quot;;
+export default function plugin(bb) {
+  bb.cli.register({
+    name: &quot;containment&quot;,
+    summary: &quot;Exercise containment&quot;,
+    async run([gate, kind, lifecycle]) {
+      while (!existsSync(gate)) await delay(5);
+      const fail = () =&gt; {
+        if (lifecycle === &quot;reload&quot;) bb.realtime.publish(&quot;changed&quot;, {});
+        else throw new Error(&quot;detached CLI failure&quot;);
+      };
+      for (let attempt = 0; attempt &lt; 2; attempt += 1) {
+        setTimeout(() =&gt; {
+          if (kind === &quot;rejection&quot;) void Promise.resolve().then(fail);
+          else fail();
+        }, attempt * 20);
+      }
+      return { exitCode: 0 };
+    },
+  });
+}
+`;
+
+const runner = String.raw`
+import { mkdir, writeFile } from &quot;node:fs/promises&quot;;
+import { join } from &quot;node:path&quot;;
+import { setTimeout as delay } from &quot;node:timers/promises&quot;;
+import pino from &quot;pino&quot;;
+import { createMigratedConnection } from &quot;@bb/db/testing&quot;;
+import { createAiServiceRegistry } from &quot;./src/services/ai/ai-service-registry.ts&quot;;
+import { createPluginService } from &quot;./src/services/plugins/plugin-service.ts&quot;;
+import { createNoopTelemetryService } from &quot;./src/services/system/telemetry.ts&quot;;
+
+const [workDir, kind, lifecycle, pluginSource] = process.argv.slice(1);
+const db = createMigratedConnection();
+const service = createPluginService({
+  aiServices: createAiServiceRegistry(),
+  telemetry: createNoopTelemetryService(),
+  db,
+  logger: pino({ level: &quot;warn&quot; }),
+  dataDir: join(workDir, &quot;data&quot;),
+  appVersion: &quot;0.9.0&quot;,
+  serviceStopTimeoutMs: 10,
+  hub: {
+    getDaemonSessionIdForHost: () =&gt; null,
+    notifyPluginChanged: () =&gt; {},
+    notifyPluginSignal: () =&gt; 0,
+    notifySystem: () =&gt; {},
+  },
+});
+process.on(&quot;uncaughtException&quot;, (error) =&gt; {
+  if (service.handleUncaughtException(error)) return;
+  process.stderr.write(error.name + &quot;: &quot; + error.message + &quot;\n&quot;);
+  process.exit(1);
+});
+const rootDir = join(workDir, &quot;bb-plugin-containment&quot;);
+await mkdir(rootDir);
+await writeFile(join(rootDir, &quot;package.json&quot;), JSON.stringify({
+  name: &quot;bb-plugin-containment&quot;,
+  version: &quot;0.1.0&quot;,
+  bb: {
+    name: &quot;Containment fixture&quot;,
+    description: &quot;Exercises detached CLI continuations&quot;,
+    branding: { icon: &quot;Zap&quot; },
+    server: &quot;./server.ts&quot;,
+  },
+}));
+await writeFile(join(rootDir, &quot;server.ts&quot;), pluginSource);
+try {
+  const installed = await service.installPath(rootDir);
+  if (installed.status !== &quot;running&quot;) throw new Error(JSON.stringify(installed));
+  const gate = join(workDir, &quot;release&quot;);
+  const pending = service.runCliCommand(&quot;containment&quot;, [gate, kind, lifecycle], {});
+  if (lifecycle === &quot;reload&quot;) await service.reload(&quot;containment&quot;);
+  await writeFile(gate, &quot;ready&quot;);
+  await pending;
+  await delay(150);
+  const current = service.list().find((plugin) =&gt; plugin.id === &quot;containment&quot;);
+  process.stdout.write(&quot;SURVIVED status=&quot; + current.status + &quot;\n&quot;);
+} finally {
+  await service.stop();
+  db.$client.close();
+}
+`;
+
+it.each([
+  [&quot;exception&quot;, &quot;reload&quot;, &quot;running&quot;],
+  [&quot;rejection&quot;, &quot;reload&quot;, &quot;running&quot;],
+  [&quot;exception&quot;, &quot;live&quot;, &quot;degraded&quot;],
+  [&quot;rejection&quot;, &quot;live&quot;, &quot;degraded&quot;],
+])(&quot;contains a detached CLI %s after %s&quot;, async (kind, lifecycle, status) =&gt; {
+  const workDir = await mkdtemp(join(tmpdir(), &quot;bb-plugin-uncaught-&quot;));
+  try {
+    const result = await new Promise&lt;{
+      code: number | null;
+      stdout: string;
+      stderr: string;
+    }&gt;((resolve, reject) =&gt; {
+      const child = spawn(process.execPath, [
+        &quot;--conditions=source&quot;,
+        &quot;--import&quot;, &quot;tsx&quot;,
+        &quot;--input-type=module&quot;,
+        &quot;--eval&quot;, runner,
+        workDir, kind, lifecycle, pluginSource,
+      ], {
+        cwd: serverDir,
+        env: { ...process.env, BB_DATA_DIR: workDir },
+        timeout: 12_000,
+      });
+      let stdout = &quot;&quot;;
+      let stderr = &quot;&quot;;
+      child.stdout.on(&quot;data&quot;, (chunk) =&gt; { stdout += chunk; });
+      child.stderr.on(&quot;data&quot;, (chunk) =&gt; { stderr += chunk; });
+      child.on(&quot;error&quot;, reject);
+      child.on(&quot;close&quot;, (code) =&gt; resolve({ code, stdout, stderr }));
+    });
+    expect(result, result.stderr).toMatchObject({ code: 0 });
+    expect(result.stdout).toContain(&quot;SURVIVED status=&quot; + status);
+    const warnings = result.stdout.split(&quot;\n&quot;).filter((line) =&gt; {
+      if (!line.startsWith(&quot;{&quot;)) return false;
+      const record = JSON.parse(line);
+      return record.level === 40 &amp;&amp; record.msg.includes(&quot;[plugin:containment]&quot;);
+    });
+    expect(warnings).toHaveLength(1);
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
+  }
+});
+</pre></details>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/06ae8f039a7198a6aad2b9b6e030efb88f8dd923/apps/server/src/services/plugins/plugin-api.ts#L151-L159">PluginContextStaleError</a> is generated by <a href="https://github.com/get-bb/bb/blob/06ae8f039a7198a6aad2b9b6e030efb88f8dd923/apps/server/src/services/plugins/plugin-api.ts#L640-L642">assertLive</a> and <a href="https://github.com/get-bb/bb/blob/06ae8f039a7198a6aad2b9b6e030efb88f8dd923/apps/server/src/services/plugins/plugin-api.ts#L864-L869">realtime.publish</a> uses that guard. The exception therefore originates in real API lifetime enforcement, not the fixture.</p>
+<p><a href="https://github.com/get-bb/bb/blob/06ae8f039a7198a6aad2b9b6e030efb88f8dd923/apps/server/src/services/plugins/plugin-runtime.ts#L529-L543">Service attribution</a> wraps only background-service starts. <a href="https://github.com/get-bb/bb/blob/06ae8f039a7198a6aad2b9b6e030efb88f8dd923/apps/server/src/services/plugins/plugin-runtime.ts#L562-L574">handleUncaughtException</a> begins:</p>
+<pre>const instance = serviceContext.getStore();
+if (instance === undefined) return false;</pre>
+<p>There is no stale-error special case. <a href="https://github.com/get-bb/bb/blob/06ae8f039a7198a6aad2b9b6e030efb88f8dd923/apps/server/src/services/plugins/plugin-runtime.ts#L824-L866">invokeWrapped</a> catches awaited exceptions but does not preserve plugin attribution into detached asynchronous descendants. <a href="https://github.com/get-bb/bb/blob/06ae8f039a7198a6aad2b9b6e030efb88f8dd923/apps/server/src/services/plugins/plugin-service.ts#L2227-L2255">CLI dispatch</a> uses that common wrapper, as do HTTP, RPC and event invocations.</p>
+<p><a href="https://github.com/get-bb/bb/blob/06ae8f039a7198a6aad2b9b6e030efb88f8dd923/apps/server/src/start-server.ts#L526-L531">The server fallback</a> calls <code>process.exit(1)</code> when containment declines. With no unhandled-rejection listener, Node's default escalation reaches this same hook. The lifetime guard is correct; the missing attribution and containment at the process-error boundary cause the crash.</p>
+<h2>6. Proposed fix</h2>
+<p>Attach internal plugin and instance identity to the stale error, recognize it before service-context lookup, and deduplicate warnings weakly per disposed instance. Run the existing shared invocation wrapper in AsyncLocalStorage carrying the exact API handle and invocation label. Contain detached errors, mark only the still-current matching instance degraded, and do not degrade a replacement instance. Keep service restart/abort supervision unchanged and continue declining unrelated core errors.</p>
+<p>An independently authored local candidate in the existing server plugin subsystem passed all seven final regression cases and 58 existing tests (65 total across nine files), plus the server typecheck. Coverage includes context-free stale errors and unrelated core errors. No SDK contract, wire protocol, dependency, persisted data, or packaging change was required. Candidate work stopped without a push when an open linked pull request appeared; no duplicate pull request was opened. In-flight request cancellation was not part of the candidate.</p>
+<h2>7. Linked pull request: static review</h2>
+<p><a href="https://github.com/get-bb/bb/pull/5967">PR #5967</a> was found open and in draft during the final duplicate check (reviewed head <code>e074fe4ec05eb39ea94d30fcfc2c09cfcbf69e43</code>). Only its metadata and diff were read as untrusted data; its branch and tests were never checked out or executed.</p>
+<p>The diff caches a typed stale error per API instance, deduplicates those errors, adds handler context to the common invocation wrapper, checks instance identity before degrading, and routes both exception and rejection events through the same server handler. Its tests cover stale CLI continuations and detached CLI/route/RPC/event work. These changes address the verified root-cause mechanisms. Static verdict: directionally addresses the bug; no confirmed blocking defect found in this bounded review. Runtime correctness and CI for that PR remain unverified here. The local candidate's passing results do not apply to the PR.</p>
+<h2>8. Verification</h2>
+<p>The same agent repeated the test in a second freshly created, detached worktree at <code>06ae8f039a7198a6aad2b9b6e030efb88f8dd923</code>, with a frozen install and a successful targeted server build. Only the author-created reproduction test was copied; no production changes were present. A new temporary data directory was created for every child, and no ports were opened.</p>
+<pre>pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/server
+pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-uncaught.test.ts
+Result: 1 failed test file; 4 failed tests; child exit 1 in each case.</pre>
+<p>The second run supports the final verdict without correction. It is a repeat by the same agent, not independent verification. Runtime HTTP/RPC/event entry points were inspected but the direct crash reproducer uses CLI. Production incident timing and launcher behavior remain outside this test.</p>
+<h2>9. Related issues and pull requests</h2>
+<p>The initial duplicate check found no linked open pull request. A final timeline check found PR #5967, so the automation stopped its separate fix and did not push or open another pull request. Issue #2286 concerns CLI handler error reporting rather than process-level exception containment; it is not treated as this bug's fix. A later trusted-main fetch advanced to <code>04bdce811</code> with no changes in the affected plugin subsystem.</p>
+<h2>10. Appendix</h2>
+<p>Issue content was treated only as untrusted claims. No issue-provided script, branch, attachment, or external URL was executed or fetched. Evidence is embedded inline in accordance with the reports repository policy; local raw artifacts are not published. Checkout paths in the outputs below are anonymized.</p>
+<details><summary>First run: exact assertion and test output</summary><pre>@bb/server:test:  ❯ |@bb/server| test/services/plugins/plugin-uncaught.test.ts (4 tests | 4 failed) 9033ms
+@bb/server:test:    × contains a detached CLI exception after reload 2768ms
+@bb/server:test:    × contains a detached CLI rejection after reload 2276ms
+@bb/server:test:    × contains a detached CLI exception after live 1992ms
+@bb/server:test:    × contains a detached CLI rejection after live 1995ms
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 4 ⎯⎯⎯⎯⎯⎯⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server| test/services/plugins/plugin-uncaught.test.ts &gt; contains a detached CLI exception after reload
+@bb/server:test:  FAIL  |@bb/server| test/services/plugins/plugin-uncaught.test.ts &gt; contains a detached CLI rejection after reload
+@bb/server:test: AssertionError: PluginContextStaleError: plugin &quot;containment&quot; used a stale API handle — it was reloaded or disabled; re-entry happens via a fresh factory call
+@bb/server:test: : expected { code: 1, …(2) } to match object { code: +0 }
+@bb/server:test: (2 matching properties omitted from actual)
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test:   {
+@bb/server:test: -   &quot;code&quot;: 0,
+@bb/server:test: +   &quot;code&quot;: 1,
+@bb/server:test:   }
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/plugins/plugin-uncaught.test.ts:128:35
+@bb/server:test:     126|       child.on(&quot;close&quot;, (code) =&gt; resolve({ code, stdout, stderr }));
+@bb/server:test:     127|     });
+@bb/server:test:     128|     expect(result, result.stderr).toMatchObject({ code: 0 });
+@bb/server:test:        |                                   ^
+@bb/server:test:     129|     expect(result.stdout).toContain(&quot;SURVIVED status=&quot; + status);
+@bb/server:test:     130|     const warnings = result.stdout.split(&quot;\n&quot;).filter((line) =&gt; {
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/4]⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server| test/services/plugins/plugin-uncaught.test.ts &gt; contains a detached CLI exception after live
+@bb/server:test:  FAIL  |@bb/server| test/services/plugins/plugin-uncaught.test.ts &gt; contains a detached CLI rejection after live
+@bb/server:test: AssertionError: Error: detached CLI failure
+@bb/server:test: : expected { code: 1, stdout: '', …(1) } to match object { code: +0 }
+@bb/server:test: (2 matching properties omitted from actual)
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test:   {
+@bb/server:test: -   &quot;code&quot;: 0,
+@bb/server:test: +   &quot;code&quot;: 1,
+@bb/server:test:   }
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/plugins/plugin-uncaught.test.ts:128:35
+@bb/server:test:     126|       child.on(&quot;close&quot;, (code) =&gt; resolve({ code, stdout, stderr }));
+@bb/server:test:     127|     });
+@bb/server:test:     128|     expect(result, result.stderr).toMatchObject({ code: 0 });
+@bb/server:test:        |                                   ^
+@bb/server:test:     129|     expect(result.stdout).toContain(&quot;SURVIVED status=&quot; + status);
+@bb/server:test:     130|     const warnings = result.stdout.split(&quot;\n&quot;).filter((line) =&gt; {
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/4]⎯
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  4 failed (4)
+@bb/server:test:    Start at  03:42:59
+@bb/server:test:    Duration  12.89s (transform 918ms, setup 1.65s, import 8ms, tests 9.03s, environment 0ms)
+@bb/server:test: 
+@bb/server:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/server#test:  ERROR  command (CHECKOUT) /usr/local/bin/pnpm run test test/services/plugins/plugin-uncaught.test.ts exited (1)
+
+ Tasks:    9 successful, 10 total
+Cached:    0 cached, 10 total
+  Time:    47.788s 
+Failed:    @bb/server#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details>
+<details><summary>Second clean run: exact assertion and test output</summary><pre>@bb/server:test:  ❯ |@bb/server| test/services/plugins/plugin-uncaught.test.ts (4 tests | 4 failed) 7978ms
+@bb/server:test:    × contains a detached CLI exception after reload 2281ms
+@bb/server:test:    × contains a detached CLI rejection after reload 1920ms
+@bb/server:test:    × contains a detached CLI exception after live 1869ms
+@bb/server:test:    × contains a detached CLI rejection after live 1905ms
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 4 ⎯⎯⎯⎯⎯⎯⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server| test/services/plugins/plugin-uncaught.test.ts &gt; contains a detached CLI exception after reload
+@bb/server:test:  FAIL  |@bb/server| test/services/plugins/plugin-uncaught.test.ts &gt; contains a detached CLI rejection after reload
+@bb/server:test: AssertionError: PluginContextStaleError: plugin &quot;containment&quot; used a stale API handle — it was reloaded or disabled; re-entry happens via a fresh factory call
+@bb/server:test: : expected { code: 1, …(2) } to match object { code: +0 }
+@bb/server:test: (2 matching properties omitted from actual)
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test:   {
+@bb/server:test: -   &quot;code&quot;: 0,
+@bb/server:test: +   &quot;code&quot;: 1,
+@bb/server:test:   }
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/plugins/plugin-uncaught.test.ts:128:35
+@bb/server:test:     126|       child.on(&quot;close&quot;, (code) =&gt; resolve({ code, stdout, stderr }));
+@bb/server:test:     127|     });
+@bb/server:test:     128|     expect(result, result.stderr).toMatchObject({ code: 0 });
+@bb/server:test:        |                                   ^
+@bb/server:test:     129|     expect(result.stdout).toContain(&quot;SURVIVED status=&quot; + status);
+@bb/server:test:     130|     const warnings = result.stdout.split(&quot;\n&quot;).filter((line) =&gt; {
+@bb/server:test: 
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test: 
+@bb/server:test:       Tests  4 failed (4)
+@bb/server:test:    Start at  03:43:08
+@bb/server:test:    Duration  11.50s (transform 940ms, setup 1.60s, import 10ms, tests 7.98s, environment 0ms)
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/4]⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server| test/services/plugins/plugin-uncaught.test.ts &gt; contains a detached CLI exception after live
+@bb/server:test:  FAIL  |@bb/server| test/services/plugins/plugin-uncaught.test.ts &gt; contains a detached CLI rejection after live
+@bb/server:test: AssertionError: Error: detached CLI failure
+@bb/server:test: : expected { code: 1, stdout: '', …(1) } to match object { code: +0 }
+@bb/server:test: (2 matching properties omitted from actual)
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test:   {
+@bb/server:test: -   &quot;code&quot;: 0,
+@bb/server:test: +   &quot;code&quot;: 1,
+@bb/server:test:   }
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/plugins/plugin-uncaught.test.ts:128:35
+@bb/server:test:     126|       child.on(&quot;close&quot;, (code) =&gt; resolve({ code, stdout, stderr }));
+@bb/server:test:     127|     });
+@bb/server:test:     128|     expect(result, result.stderr).toMatchObject({ code: 0 });
+@bb/server:test:        |                                   ^
+@bb/server:test:     129|     expect(result.stdout).toContain(&quot;SURVIVED status=&quot; + status);
+@bb/server:test:     130|     const warnings = result.stdout.split(&quot;\n&quot;).filter((line) =&gt; {
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/4]⎯
+@bb/server:test: 
+@bb/server:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/server#test:  ERROR  command (CLEAN_CHECKOUT/apps/server) /usr/local/bin/pnpm run test test/services/plugins/plugin-uncaught.test.ts exited (1)
+
+ Tasks:    9 successful, 10 total
+Cached:    8 cached, 10 total
+  Time:    13.846s 
+Failed:    @bb/server#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details>
+</main></body></html>
