@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Report · #5963 Redundant skill-tree reads</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#5963 · Redundant skill-tree reads during catalog resolution</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Medium priority</span><span class="pill">Low effort</span><span class="pill">threads · perf</span><a href="https://github.com/get-bb/bb/issues/5963">GitHub issue</a><span>2026-10-21 · base <code>06ae8f039a7198a6aad2b9b6e030efb88f8dd923</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · reproduction label: <code>confirmed-repro</code>.</p>
+<h2>1. TL;DR</h2>
+<p>Resolving an unchanged skill catalog still reads the skill files and hashes their full contents synchronously. A two-file synthetic skill triggers three synchronous content reads on its second catalog resolution, even though the returned catalog is unchanged. The registry remembers where each tree hash lives, but does not remember the file metadata or parsed catalog candidate that produced it. The turn-runtime configuration path calls this catalog resolver, so repeated turn starts repeat this work. This report proves the redundant I/O, not a particular production latency or slowdown.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Unchanged catalogs reread file contents</td><td class="ok">Verified</td><td>The regression fails twice on trusted main: 3 calls on the second resolution; catalog equality passes.</td></tr>
+<tr><td>Full tree contents are synchronously rehashed</td><td class="ok">Verified</td><td>The resolver unconditionally calls the manifest reader, which reads each regular file and invokes SHA-256.</td></tr>
+<tr><td>Runtime configuration uses this path</td><td class="ok">Verified statically</td><td>The runtime configuration builder calls resolveSkillCatalog, which delegates to resolveSkillCatalogEntries.</td></tr>
+<tr><td>The specific workload has hundreds of reads and a particular millisecond cost</td><td class="unv">Not remeasured</td><td>No real user skill roots or production instance were accessed. The isolated two-file fixture is sufficient to prove the mechanism.</td></tr>
+<tr><td>Tree-size limits should also change</td><td class="unv">Outside this reproduction</td><td>No byte-limit policy change is proposed or tested here.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Public target: get-bb/bb; trusted origin/main commit <code>06ae8f039a7198a6aad2b9b6e030efb88f8dd923</code>.</li><li>Linux x86_64, Node v22.19.0, pnpm 9.15.0, repository Vitest 4.1.1.</li><li>Two separate source checkouts, each frozen-installed and built; the second is detached at the same base commit. Only the agent-authored regression file was added.</li><li>Only temporary synthetic skill directories created by makeTempDir were used. No live BB instance, ports, account data, or providers were needed.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the trusted repository and select the recorded main commit:<pre>git clone https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout 06ae8f039a7198a6aad2b9b6e030efb88f8dd923
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build</pre></li>
+<li>Create <code>apps/server/test/skills/skill-catalog-cache.test.ts</code> with the test below. It was written from repository code, not copied from issue-supplied code.</li>
+<li>Run:<pre>pnpm exec turbo run test --filter=@bb/server -- test/skills/skill-catalog-cache.test.ts</pre></li></ol>
+<p><strong>Expected:</strong> the second catalog equals the first and makes zero content reads. <strong>Actual:</strong> equality passes, but there are three reads: SKILL.md for frontmatter, SKILL.md for the tree, and the nested reference file. The other six baseline cases pass.</p>
+<details open><summary>Complete baseline reproduction test</summary><pre>import fs from &quot;node:fs&quot;;
+import path from &quot;node:path&quot;;
+import { makeTempDir } from &quot;@bb/test-helpers&quot;;
+import { describe, expect, it, vi } from &quot;vitest&quot;;
+import {
+  readSkillTreeManifest,
+  resolveSkillCatalogEntries,
+  SkillTreeRegistry,
+} from &quot;../../src/services/skills/injected-skills.js&quot;;
+import type { ServerLogger } from &quot;../../src/types.js&quot;;
+
+async function createCatalog() {
+  const temp = await makeTempDir();
+  const rootPath = path.join(temp, &quot;skills&quot;, &quot;cache-example&quot;);
+  fs.mkdirSync(path.join(rootPath, &quot;references&quot;), { recursive: true });
+  fs.writeFileSync(
+    path.join(rootPath, &quot;SKILL.md&quot;),
+    &quot;---\nname: cache-example\ndescription: Original description\n---\n# Example\n&quot;,
+  );
+  const referencePath = path.join(rootPath, &quot;references&quot;, &quot;example.txt&quot;);
+  fs.writeFileSync(referencePath, &quot;original\n&quot;);
+  const logger: ServerLogger = {
+    debug: () =&gt; undefined,
+    error: () =&gt; undefined,
+    info: () =&gt; undefined,
+    warn: () =&gt; undefined,
+  };
+  const skillTreeRegistry = new SkillTreeRegistry();
+  return {
+    rootPath,
+    referencePath,
+    resolve: () =&gt;
+      resolveSkillCatalogEntries(logger, {
+        dataDir: temp,
+        skillTreeRegistry,
+      }),
+  };
+}
+
+describe(&quot;skill catalog freshness&quot;, () =&gt; {
+  it(&quot;reuses an unchanged tree without reading any file contents&quot;, async () =&gt; {
+    const catalog = await createCatalog();
+    const reads = vi.spyOn(fs, &quot;readFileSync&quot;);
+    try {
+      const first = catalog.resolve();
+      expect(first).toHaveLength(1);
+      expect(reads.mock.calls.length).toBeGreaterThan(0);
+      reads.mockClear();
+      expect(catalog.resolve()).toEqual(first);
+      expect(reads).not.toHaveBeenCalled();
+    } finally {
+      reads.mockRestore();
+    }
+  });
+
+  it.each([&quot;content&quot;, &quot;rename&quot;, &quot;mode&quot;, &quot;addition&quot;, &quot;removal&quot;])(
+    &quot;invalidates cached hashes after a file %s change&quot;,
+    async (change) =&gt; {
+      const catalog = await createCatalog();
+      const first = catalog.resolve();
+      if (change === &quot;content&quot;) {
+        const original = fs.statSync(catalog.referencePath);
+        fs.writeFileSync(catalog.referencePath, &quot;modified\n&quot;);
+        fs.utimesSync(catalog.referencePath, original.atime, original.mtime);
+      } else if (change === &quot;rename&quot;) {
+        fs.renameSync(
+          catalog.referencePath,
+          path.join(catalog.rootPath, &quot;references&quot;, &quot;renamed.txt&quot;),
+        );
+      } else if (change === &quot;mode&quot;) {
+        fs.chmodSync(catalog.referencePath, 0o700);
+      } else if (change === &quot;addition&quot;) {
+        fs.writeFileSync(path.join(catalog.rootPath, &quot;added.txt&quot;), &quot;new\n&quot;);
+      } else {
+        fs.rmSync(catalog.referencePath);
+      }
+      const updated = catalog.resolve();
+      expect(updated).toHaveLength(1);
+      expect(updated).not.toEqual(first);
+      expect(updated[0]?.runtimeSource).toMatchObject({
+        treeHash: readSkillTreeManifest(catalog.rootPath).treeHash,
+      });
+    },
+  );
+
+  it(&quot;refreshes frontmatter and rejects invalid trees after caching&quot;, async () =&gt; {
+    const catalog = await createCatalog();
+    catalog.resolve();
+    fs.writeFileSync(
+      path.join(catalog.rootPath, &quot;SKILL.md&quot;),
+      &quot;---\nname: cache-example\ndescription: Updated description\n---\n&quot;,
+    );
+    expect(catalog.resolve()[0]?.runtimeSource.description).toBe(
+      &quot;Updated description&quot;,
+    );
+    fs.rmSync(catalog.referencePath);
+    fs.symlinkSync(&quot;missing.txt&quot;, catalog.referencePath);
+    expect(catalog.resolve()).toEqual([]);
+    fs.rmSync(catalog.referencePath);
+    fs.writeFileSync(catalog.referencePath, &quot;recovered\n&quot;);
+    expect(catalog.resolve()[0]?.runtimeSource).toMatchObject({
+      treeHash: readSkillTreeManifest(catalog.rootPath).treeHash,
+    });
+    fs.rmSync(catalog.rootPath, { recursive: true });
+    expect(catalog.resolve()).toEqual([]);
+  });
+});
+</pre></details>
+<details><summary>First trusted-checkout failure, verbatim except redacted temporary paths</summary><pre>@bb/server:test:  FAIL  |@bb/server| test/skills/skill-catalog-cache.test.ts &gt; skill catalog freshness &gt; reuses an unchanged tree without reading any file contents
+@bb/server:test: AssertionError: expected &quot;readFileSync&quot; to not be called at all, but actually been called 3 times
+@bb/server:test: 
+@bb/server:test: Received:
+@bb/server:test: 
+@bb/server:test:   1st readFileSync call:
+@bb/server:test: 
+@bb/server:test:     Array [
+@bb/server:test:       &quot;TEMP_DATA/skills/cache-example/SKILL.md&quot;,
+@bb/server:test:       &quot;utf8&quot;,
+@bb/server:test:     ]
+@bb/server:test: 
+@bb/server:test:   2nd readFileSync call:
+@bb/server:test: 
+@bb/server:test:     Array [
+@bb/server:test:       &quot;TEMP_DATA/skills/cache-example/SKILL.md&quot;,
+@bb/server:test:     ]
+@bb/server:test: 
+@bb/server:test:   3rd readFileSync call:
+@bb/server:test: 
+@bb/server:test:     Array [
+@bb/server:test:       &quot;TEMP_DATA/skills/cache-example/references/example.txt&quot;,
+@bb/server:test:     ]
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test: Number of calls: 3
+@bb/server:test: 
+@bb/server:test:  ❯ test/skills/skill-catalog-cache.test.ts:50:25
+@bb/server:test:      48|       reads.mockClear();
+@bb/server:test:      49|       expect(catalog.resolve()).toEqual(first);
+@bb/server:test:      50|       expect(reads).not.toHaveBeenCalled();
+@bb/server:test:        |                         ^
+@bb/server:test:      51|     } finally {
+@bb/server:test:      52|       reads.mockRestore();
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  1 failed | 6 passed (7)
+@bb/server:test:    Start at  03:32:10
+@bb/server:test:    Duration  3.72s (transform 1.05s, setup 1.64s, import 116ms, tests 50ms, environment 0ms)
+@bb/server:test: 
+@bb/server:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/server#test:  ERROR  command (CHECKOUT_ROOT/base/apps/server) /usr/local/bin/pnpm run test test/skills/skill-catalog-cache.test.ts exited (1)
+
+ Tasks:    9 successful, 10 total
+Cached:    8 cached, 10 total
+  Time:    6.147s 
+Failed:    @bb/server#test
+
+ ERROR  run failed: command  exited (1)
+    38.643s 
+Failed:    @bb/server#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/06ae8f039a7198a6aad2b9b6e030efb88f8dd923/apps/server/src/services/skills/injected-skills.ts#L218-L275">Tree collection and manifest hashing</a> traverse and read every regular file and compute the tree hash without a freshness check:</p>
+<pre>entries.push({
+  bytes: fs.readFileSync(entryPath),
+  mode: stat.mode &amp; 0o777,
+  path: normalizeRelativePath(path.relative(rootPath, entryPath)),
+});
+
+const entries = collectSkillTreeEntries(rootPath);
+return { entries, treeHash: hashSkillTreeEntries(entries) };</pre>
+<p><a href="https://github.com/get-bb/bb/blob/06ae8f039a7198a6aad2b9b6e030efb88f8dd923/apps/server/src/services/skills/injected-skills.ts#L287-L380">Candidate resolution</a> also reads SKILL.md to parse frontmatter before asking for a fresh manifest. It then registers only the hash-to-root mapping and returns catalog metadata; the buffers are not retained for future catalog calls. <a href="https://github.com/get-bb/bb/blob/06ae8f039a7198a6aad2b9b6e030efb88f8dd923/apps/server/src/services/skills/injected-skills.ts#L117-L127">SkillTreeRegistry</a> has no candidate freshness cache.</p>
+<p>The caller chain is <a href="https://github.com/get-bb/bb/blob/06ae8f039a7198a6aad2b9b6e030efb88f8dd923/apps/server/src/services/threads/thread-runtime-config.ts#L203-L208">thread runtime configuration</a> → <a href="https://github.com/get-bb/bb/blob/06ae8f039a7198a6aad2b9b6e030efb88f8dd923/apps/server/src/services/skills/skill-catalog.ts#L17-L38">resolveSkillCatalog</a> → <a href="https://github.com/get-bb/bb/blob/06ae8f039a7198a6aad2b9b6e030efb88f8dd923/apps/server/src/services/skills/injected-skills.ts#L608-L664">resolveSkillCatalogEntries</a>. A registry is allocated once by <a href="https://github.com/get-bb/bb/blob/06ae8f039a7198a6aad2b9b6e030efb88f8dd923/apps/server/src/start-server.ts#L239">server startup</a>, so its lifetime is suitable for cache reuse across turn configurations.</p>
+<h2>6. Proposed fix</h2>
+<p>Keep candidate metadata and the tree hash in the existing server-owned SkillTreeRegistry, keyed by candidate root and an ordered fingerprint of relative file names, modes, sizes, device/inode, mtime and ctime. Continue reading directory listings and lstat metadata on every scan; reject symlinks and non-regular files as before. An unchanged fingerprint can reuse frontmatter and tree hash without reading contents. Changed metadata or a failed rebuild must discard the cached candidate and retry parsing/hashing. Retain no content buffers in the cache.</p>
+<p>The transfer endpoint must continue reading a full current manifest and verifying the requested hash; its uncached reader remains unchanged in purpose. There are no protocol, schema, permission, public API, or dependency changes. The optimization still pays traversal/stat cost, and metadata-based freshness relies on the filesystem reporting content changes through its timestamps or identity.</p>
+<h2>7. Related issues and pull requests</h2>
+<p>Issue search found other skill-discovery and catalog-presentation reports, but no duplicate covering this measured redundant-content-read regression. At investigation time, an open-PR search for 5963 and the issue cross-reference timeline found no linked open pull request. No pull-request branch or issue-supplied program was run.</p>
+<h2>8. Verification</h2>
+<p>The same agent repeated the original regression in a second clean checkout at <code>06ae8f039a7198a6aad2b9b6e030efb88f8dd923</code>, with a new temporary skill directory generated by the test. The exact command was the Turbo test command in section 4. It again failed only the zero-read assertion with <strong>3 readFileSync calls</strong>, while <strong>6 tests passed</strong>. This is a repeated verification, not an independent investigator. No report correction was needed.</p>
+<details><summary>Second clean-checkout output, verbatim except redacted temporary paths</summary><pre>@bb/server:test:  FAIL  |@bb/server| test/skills/skill-catalog-cache.test.ts &gt; skill catalog freshness &gt; reuses an unchanged tree without reading any file contents
+@bb/server:test: AssertionError: expected &quot;readFileSync&quot; to not be called at all, but actually been called 3 times
+@bb/server:test: 
+@bb/server:test: Received:
+@bb/server:test: 
+@bb/server:test:   1st readFileSync call:
+@bb/server:test: 
+@bb/server:test:     Array [
+@bb/server:test:       &quot;TEMP_DATA/skills/cache-example/SKILL.md&quot;,
+@bb/server:test:       &quot;utf8&quot;,
+@bb/server:test:     ]
+@bb/server:test: 
+@bb/server:test:   2nd readFileSync call:
+@bb/server:test: 
+@bb/server:test:     Array [
+@bb/server:test:       &quot;TEMP_DATA/skills/cache-example/SKILL.md&quot;,
+@bb/server:test:     ]
+@bb/server:test: 
+@bb/server:test:   3rd readFileSync call:
+@bb/server:test: 
+@bb/server:test:     Array [
+@bb/server:test:       &quot;TEMP_DATA/skills/cache-example/references/example.txt&quot;,
+@bb/server:test:     ]
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test: Number of calls: 3
+@bb/server:test: 
+@bb/server:test:  ❯ test/skills/skill-catalog-cache.test.ts:50:25
+@bb/server:test:      48|       reads.mockClear();
+@bb/server:test:      49|       expect(catalog.resolve()).toEqual(first);
+@bb/server:test:      50|       expect(reads).not.toHaveBeenCalled();
+@bb/server:test:        |                         ^
+@bb/server:test:      51|     } finally {
+@bb/server:test:      52|       reads.mockRestore();
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  1 failed | 6 passed (7)
+@bb/server:test:    Start at  03:33:25
+@bb/server:test:    Duration  3.53s (transform 973ms, setup 1.52s, import 119ms, tests 45ms, environment 0ms)
+@bb/server:test: 
+@bb/server:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/server#test:  ERROR  command (CHECKOUT_ROOT/verify/apps/server) /usr/local/bin/pnpm run test test/skills/skill-catalog-cache.test.ts exited (1)
+
+ Tasks:    9 successful, 10 total
+Cached:    0 cached, 10 total
+  Time:    36.758s 
+Failed:    @bb/server#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details>
+<h2>9. Appendix and limits</h2>
+<p>The local fix passes all 168 targeted tests in 11 files, including the nine cache regressions, skill discovery/listing/installation, the internal tree-transfer endpoint, public project-skill routes and thread runtime configuration. Server typechecking passes. The regression suite covers a same-size content rewrite with restored mtime, file replacement, rename, mode change, addition/removal, changed frontmatter, failed-read retry, symlink rejection and directory removal. The first broader test run exposed an existing provenance-file permission expectation under the host's umask 0077; rerunning the relevant suites under umask 022 passes without changing the unrelated installer.</p>
+<pre>umask 022
+pnpm exec turbo run test --filter=@bb/server -- test/skills test/internal/internal-skill-trees.test.ts test/threads/thread-runtime-config.test.ts test/public/public-project-skills.test.ts
+Test Files  11 passed (11)
+Tests       168 passed (168)
+
+pnpm exec turbo run typecheck --filter=@bb/server
+Tasks: 6 successful, 6 total</pre>
+<p>Each checkout used a frozen pnpm install and the repository Turbo build. The first broad build hit a missing plugin-SDK runtime artifact during concurrent plugin building; a subsequent build succeeded with 67 successful tasks. In the second checkout, the SDK build was run first and the broad build succeeded with 67 tasks. No source or dependency changes were made to address that setup issue.</p>
+<p>Issue text, comments and embedded code were treated as untrusted claims. No issue-supplied instructions, scripts, patches, links or branches were executed. This nonvisual bug does not require screenshots. Raw logs and reproduction files remain outside the reports repository; the complete test and sanitized observed output are inline here, as required by that repository's publication policy.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
