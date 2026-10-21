@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #6010 Cold-start signal wait expires before valid worker readiness</title>
+<style>
+:root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; }
+body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+main { max-width:1000px; margin:0 auto; padding:40px 24px 80px; }
+h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+.meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+.pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#6010 · Cold-start signal wait expires before valid worker readiness</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Low</span><span class="pill">Effort: Low</span><span class="pill">host</span><a href="https://github.com/get-bb/bb/issues/6010">GitHub issue</a><span>2026-10-21</span></p>
+<p>Trusted base: <a href="https://github.com/get-bb/bb/commit/b143a22860944a96bf183605dfb0ffe58b1de283"><code>b143a22860944a96bf183605dfb0ffe58b1de283</code></a>.</p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · Reproduction label: <code>confirmed-repro</code>.</p>
+
+<h2>1. TL;DR</h2>
+<p>The environment-overlap tests wait for a handler-start signal using a one-second polling timeout, even though the real worker is allowed ten seconds to become ready. The first call must start a new process and import the plugin before that signal can exist. A regression extending the existing overlap test with a real 1.5-second plugin initialization reproduces the zero-signal assertion in two separate clean checkouts, without changing production code. Giving the fixture's signal wait an explicit ten-second budget makes the same delayed case pass. This proves the test-harness timing defect; the original downstream CI logs and its natural load profile were not independently verified.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>The fixture uses the default start-signal timeout.</td><td>Verified</td><td>Base test lines 310–311 omit options; installed Vitest 4.1.1 implements <code>timeout = 1e3</code>.</td></tr>
+<tr><td>The overlapping-call tests include cold startup in that wait.</td><td>Verified</td><td>Base test lines 386–389 and 410–413 issue a first call and immediately wait for its signal. Manager dispatch awaits <code>worker.ready</code>; worker readiness follows plugin import.</td></tr>
+<tr><td>A startup longer than one second can produce the reported assertion.</td><td>Verified with controlled latency</td><td>The 0ms case passes and the 1500ms case fails with zero signal calls in both clean runs. The plugin delay runs in the actual child process, not a mocked manager.</td></tr>
+<tr><td>The original CI failure rate and cache behavior explain the observed frequency.</td><td>Unverified</td><td>No original downstream runner or execution logs were accessed. No claim is made about failure frequency on upstream CI.</td></tr>
+<tr><td>This indicates a production-worker regression.</td><td>Not supported</td><td>Production code is unchanged in the reproduction and explicitly permits a ten-second startup. The defect is the narrower test wait.</td></tr>
+</table>
+
+<h2>3. Environment</h2>
+<ul>
+<li>Public repository <code>get-bb/bb</code>; both clean worktrees start at the trusted base above, fetched from main.</li>
+<li>Linux x86_64, kernel 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li>
+<li>Each checkout received its own frozen dependency install and the host-daemon Turbo build. The second build used shared build cache; the failing test itself executed, rather than replaying cached test output.</li>
+<li>No provider, user instance, browser, database, or network listener was needed. The existing fixture creates fresh temporary daemon data per test and cleans it after each test.</li>
+</ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol>
+<li>Create a fresh checkout of the trusted public base and build the owning subsystem:
+<pre>git clone https://github.com/get-bb/bb.git bb-6010-repro
+cd bb-6010-repro
+git checkout --detach b143a22860944a96bf183605dfb0ffe58b1de283
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/host-daemon</pre></li>
+<li>Save the complete regression patch below as <code>slow-start.patch</code>, then apply it. It extends the existing owner-boundary test rather than inventing a second manager implementation. Only the test artifact receives a delay; all manager, worker, cancellation, and environment handling remain real.
+<pre>git apply slow-start.patch
+pnpm exec turbo run test --filter=@bb/host-daemon -- src/plugin-host-manager.test.ts -t 'keeps the first values'</pre></li>
+<li>Expected: both 0ms and 1500ms initialization cases pass; 1.5 seconds is within the existing ten-second worker startup and fifteen-second fixture call budgets. Actual: the delayed case fails in the shared start-signal wait:
+<pre>✓ keeps the first values until every overlapping call finishes with 0ms startup 224ms
+× keeps the first values until every overlapping call finishes with 1500ms startup 1617ms
+
+AssertionError: expected "vi.fn()" to be called with arguments: [ ObjectContaining{…} ]
+Number of calls: 0
+❯ src/plugin-host-manager.test.ts:325:43
+
+Test Files  1 failed (1)
+Tests  1 failed | 1 passed | 31 skipped (33)</pre>
+The approximately 1.6-second test duration includes cleanup while the child finishes initialization; the signal assertion itself has the one-second deadline.</li>
+</ol>
+<h3>Complete regression patch</h3>
+<pre>diff --git a/apps/host-daemon/src/plugin-host-manager.test.ts b/apps/host-daemon/src/plugin-host-manager.test.ts
+index 2cde2411c..fe2ee5cfc 100644
+--- a/apps/host-daemon/src/plugin-host-manager.test.ts
++++ b/apps/host-daemon/src/plugin-host-manager.test.ts
+@@ -273,17 +273,31 @@ describe("PluginHostManager", () =&gt; {
+   });
+ 
+   describe("environment reuse across active calls", () =&gt; {
+-    async function fixture() {
++    async function fixture(startupDelayMs = 0) {
++      const source =
++        startupDelayMs === 0
++          ? artifactSource
++          : Buffer.concat([
++              Buffer.from(
++                `await new Promise((resolve) =&gt; setTimeout(resolve, ${startupDelayMs}));\n`,
++              ),
++              artifactSource,
++            ]);
+       const onSignal = vi.fn();
+       const onWorkerExit = vi.fn();
+       const manager = await createManager({
+         shellEnv: () =&gt; ({ GATE_VALUE: "base" }),
+         onSignal,
+         onWorkerExit,
++        fetchArtifact: vi.fn(async () =&gt; source),
+       });
+       const command = (id: string, value: string, delay = 0) =&gt;
+         callCommand({
+           callId: id,
++          artifact: {
++            digest: createHash("sha256").update(source).digest("hex"),
++            byteLength: source.byteLength,
++          },
+           method: "environment",
+           input: { id, delay },
+           timeoutMs: 15_000,
+@@ -383,29 +397,35 @@ describe("PluginHostManager", () =&gt; {
+       },
+     );
+ 
+-    it("keeps the first values until every overlapping call finishes", async () =&gt; {
+-      const { manager, command, cancel, waitForStart } = await fixture();
+-      const a = manager
+-        .call(command("a", "first", 10_000))
+-        .catch((error: unknown) =&gt; error);
+-      await waitForStart("a");
+-      const b = manager
+-        .call(command("b", "second", 10_000))
+-        .catch((error: unknown) =&gt; error);
+-      await waitForStart("b");
+-      cancel("a");
+-      await expect(a).resolves.toMatchObject({ name: "AbortError" });
+-      await expect(manager.call(command("c", "third"))).resolves.toMatchObject({
+-        output: { before: "first", after: "first" },
+-      });
+-      cancel("b");
+-      await expect(b).resolves.toMatchObject({ name: "AbortError" });
+-      await expect(manager.call(command("d", "fourth"))).resolves.toMatchObject(
+-        {
++    it.each([0, 1_500])(
++      "keeps the first values until every overlapping call finishes with %ims startup",
++      async (startupDelayMs) =&gt; {
++        const { manager, command, cancel, waitForStart } =
++          await fixture(startupDelayMs);
++        const a = manager
++          .call(command("a", "first", 10_000))
++          .catch((error: unknown) =&gt; error);
++        await waitForStart("a");
++        const b = manager
++          .call(command("b", "second", 10_000))
++          .catch((error: unknown) =&gt; error);
++        await waitForStart("b");
++        cancel("a");
++        await expect(a).resolves.toMatchObject({ name: "AbortError" });
++        await expect(
++          manager.call(command("c", "third")),
++        ).resolves.toMatchObject({
++          output: { before: "first", after: "first" },
++        });
++        cancel("b");
++        await expect(b).resolves.toMatchObject({ name: "AbortError" });
++        await expect(
++          manager.call(command("d", "fourth")),
++        ).resolves.toMatchObject({
+           output: { before: "fourth", after: "fourth" },
+-        },
+-      );
+-    });
++        });
++      },
++    );
+ 
+     it("disposes with overlapping calls and starts a fresh generation", async () =&gt; {
+       const { manager, command, waitForStart } = await fixture();
+</pre>
+
+<h2>5. Root cause</h2>
+<p>The <a href="https://github.com/get-bb/bb/blob/b143a22860944a96bf183605dfb0ffe58b1de283/apps/host-daemon/src/plugin-host-manager.test.ts#L275-L319">test fixture</a> has fifteen-second commands but leaves <code>vi.waitFor</code> at its one-second default:</p>
+<pre>const waitForStart = (id: string) =&gt;
+  vi.waitFor(() =&gt; expect(onSignal).toHaveBeenCalledWith(started(id)));</pre>
+<p>The <a href="https://github.com/get-bb/bb/blob/b143a22860944a96bf183605dfb0ffe58b1de283/apps/host-daemon/src/plugin-host-manager.test.ts#L386-L435">two cold overlap tests</a> start waiting immediately after their first <code>manager.call</code>. <a href="https://github.com/get-bb/bb/blob/b143a22860944a96bf183605dfb0ffe58b1de283/apps/host-daemon/src/plugin-host-manager.ts#L242-L264">Manager dispatch awaits worker readiness</a>, after artifact preparation and the child-process fork. The <a href="https://github.com/get-bb/bb/blob/b143a22860944a96bf183605dfb0ffe58b1de283/apps/host-daemon/src/plugin-host-worker.ts#L608-L637">worker imports the plugin before sending ready</a>. Only afterward can the environment handler emit its start signal. Therefore any valid initialization longer than a second exhausts the test's wait before the handler can run.</p>
+<p>The manager's <a href="https://github.com/get-bb/bb/blob/b143a22860944a96bf183605dfb0ffe58b1de283/apps/host-daemon/src/plugin-host-manager.ts#L115-L116">ten-second startup limit</a> is enforced by its <a href="https://github.com/get-bb/bb/blob/b143a22860944a96bf183605dfb0ffe58b1de283/apps/host-daemon/src/plugin-host-manager.ts#L542-L547">startup timer</a>. This is a mismatch in test timing, not evidence for changing the production timeout, protocol, or cancellation policy.</p>
+
+<h2>6. Proposed fix</h2>
+<p>Give this fixture's shared start-signal wait an explicit ten-second timeout, consistent with the worker's existing startup allowance and below the fixture's fifteen-second call deadline. Retain the table-driven 0ms/1500ms overlap case as the regression: it exercises the real child-process import and continues checking environment retention through overlapping cancellation. No production seam, dependency, or runtime behavior needs to change.</p>
+<pre>const waitForStart = (id: string) =&gt;
+  vi.waitFor(() =&gt; expect(onSignal).toHaveBeenCalledWith(started(id)), {
+    timeout: 10_000,
+  });</pre>
+<p>A local candidate with exactly this wait change passed both focused cases after the two red runs. Broader validation is required before opening a fix PR.</p>
+
+<h2>7. Verification</h2>
+<p>The same agent repeated the reproduction in a second new, initially clean temporary worktree at the recorded base commit. It used a separate frozen install, build, and fixture-generated temporary data. No live instance or ports were used in either run. The regression patches were byte-identical. The second run executed the tests and failed for the same assertion; this is a repeated clean check, not independent verification by another agent.</p>
+<table><tr><th>Run</th><th>Command / changes</th><th>Result</th></tr>
+<tr><td>Pristine baseline</td><td><code>pnpm exec turbo run test --filter=@bb/host-daemon -- src/plugin-host-manager.test.ts -t 'environment reuse across active calls'</code></td><td>7 passed, 25 skipped; no natural flake in this run.</td></tr>
+<tr><td>First clean reproduction</td><td>Only regression patch; focused command from section 4</td><td>0ms passed (224ms); 1500ms failed (1617ms); 1 failed / 1 passed / 31 skipped.</td></tr>
+<tr><td>Second clean reproduction</td><td>Same regression patch and command in the second checkout</td><td>0ms passed (232ms); 1500ms failed (1620ms); same zero-signal assertion; 1 failed / 1 passed / 31 skipped.</td></tr>
+<tr><td>Candidate fix probe</td><td>Regression patch plus explicit ten-second shared wait</td><td>2 passed, 31 skipped; no production edits.</td></tr>
+</table>
+<p>No report correction was needed after the second run. Confidence is high for the causal wait-budget mismatch, not for reconstructing the original runner's exact scheduling or frequency.</p>
+
+<h2>8. Related issues and PRs</h2>
+<p>GitHub issue timeline cross-reference metadata and the open-PR search for this issue showed no linked open PR at investigation time. The targeted issue search found no other report for this specific cold-start wait. No linked PR branch or external issue URL was fetched or executed.</p>
+
+<h2>9. Appendix and trust boundary</h2>
+<p>Issue prose, suggested remedies, commands, and links were treated as untrusted claims, not execution instructions. The regression was authored from the trusted main-branch fixture and worker lifecycle. Only target-repository code plus these locally authored test changes ran. No external dependency was added.</p>
+<p>Primary output excerpt from the second clean run:</p>
+<pre>FAIL src/plugin-host-manager.test.ts &gt; PluginHostManager &gt; environment reuse across active calls &gt; keeps the first values until every overlapping call finishes with 1500ms startup
+AssertionError: expected "vi.fn()" to be called with arguments: [ ObjectContaining{…} ]
+Number of calls: 0
+❯ src/plugin-host-manager.test.ts:325:43
+Test Files  1 failed (1)
+Tests  1 failed | 1 passed | 31 skipped (33)
+Duration  5.43s (transform 3.16s, setup 0ms, import 3.43s, tests 1.85s, environment 0ms)</pre>
+<p>Investigation commands: <code>git fetch origin main</code>, <code>git worktree add --detach</code> at the recorded base twice, clean-status checks, frozen install and scoped build in each checkout, the baseline and focused Turbo commands above, repository source/history inspection, <code>pnpm exec oxfmt apps/host-daemon/src/plugin-host-manager.test.ts</code>, and <code>git diff --check</code>. GitHub reads checked classifications, repository visibility, similar issues, and PR metadata. Test artifacts remain local; the complete patch and relevant output are embedded here so this report is self-contained.</p>
+</main></body></html>
