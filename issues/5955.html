@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>#5955 · Unix provider updates bypass current-directory PATH entries</title>
+<style>
+:root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; }
+body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,sans-serif; }
+main { max-width:960px; margin:auto; padding:40px 24px 80px; }
+h1 { font-size:26px; line-height:1.25; } h2 { font-size:19px; margin-top:36px; border-top:1px solid var(--line); padding-top:20px; }
+.meta { color:var(--muted); font-size:14px; } .pill { border:1px solid var(--line); border-radius:999px; padding:2px 8px; }
+table { border-collapse:collapse; width:100%; } td,th { text-align:left; padding:8px; border-bottom:1px solid var(--line); vertical-align:top; }
+code,pre { font:13px/1.5 ui-monospace,monospace; } pre { background:white; border:1px solid var(--line); border-radius:6px; padding:14px; overflow:auto; }
+a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<p><a href="../">← reports</a></p>
+<h1>#5955 · Unix provider updates bypass current-directory PATH entries</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Medium priority</span> <span class="pill">Low effort</span> <span class="pill">providers</span> · 2026-10-21 · <a href="https://github.com/get-bb/bb/issues/5955">GitHub issue</a></p>
+<p>Trusted base: <code>405592c0b71b1655a6ab2e1cc7498b5beeb78caa</code> (<code>origin/main</code>).</p>
+<p><strong>Verdict: REPRODUCED · Root-cause confidence: high · Reproduction label: confirmed-repro</strong></p>
+
+<h2>1. TL;DR</h2>
+<p>On Linux, provider installation can silently run a different executable, or report that an executable is missing, when PATH contains an empty component. The real host-daemon installation stream reproduces both outcomes with disposable shell executables. Its new unconditional command resolver drops empty PATH components, whereas Unix process lookup treats them as the working directory. The first and a second clean trusted checkout both fail three focused regression cases. Limiting installer pre-resolution to Windows restores the Unix process lookup without changing the shared portable execution helper.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Empty Unix PATH components stop locating a working-directory executable.</td><td>Verified on Linux</td><td>The trailing-component case emits a missing-command event. An explicit-directory control runs the same executable.</td></tr>
+<tr><td>A later installation can be selected instead.</td><td>Verified</td><td>Leading and middle components run the fallback fixture and report success.</td></tr>
+<tr><td>The new installer pre-resolution causes the regression.</td><td>Verified</td><td>The same stream and fixtures pass after changing only the platform guard in the spawner.</td></tr>
+<tr><td>The behavior also affects macOS.</td><td>Runtime unverified</td><td>Source uses the same unconditional resolver. No macOS execution was available.</td></tr>
+<tr><td>Windows executable and command-shim support must remain intact.</td><td>Preserved in source; runtime unverified</td><td>The Windows resolution branch and existing .exe/.cmd tests remain present. These two tests are skipped on Linux.</td></tr>
+</table>
+
+<h2>3. Environment</h2>
+<ul>
+<li>Public target repository: get-bb/bb; trusted base recorded above, fetched directly from its main branch.</li>
+<li>Linux 4.19.0-gvisor x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li>
+<li>Pinned dependencies: node-pty 1.2.0-beta.15 and which-command 0.1.0.</li>
+<li>Only disposable executable fixtures; no vendor CLI, provider credentials, production daemon, network installation, ports, or runtime data store.</li>
+<li>Both checkouts use frozen dependency installation and normal Turbo builds. The first full build encountered a missing SDK build output; an unchanged rerun succeeded, 67 tasks. The second clean build succeeded, 67 tasks.</li>
+</ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol>
+<li>Clone the public target and check out the recorded main commit in a disposable directory:
+<pre>git clone https://github.com/get-bb/bb.git bb-path-repro
+cd bb-path-repro
+git checkout --detach 405592c0b71b1655a6ab2e1cc7498b5beeb78caa
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build</pre>
+If the initial parallel build reports that the installed plugin SDK dist is not yet built, rerun that same build after its SDK task completes.</li>
+<li>Save the following independently authored reproduction as <code>repro.mjs</code> at the checkout root. It calls the real exported host-daemon installation stream, not a model of its failure branch.
+<pre>import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const checkout = process.cwd();
+const { streamProviderInstallation } = await import(
+  pathToFileURL(path.join(checkout, "apps/host-daemon/src/provider-installation.ts")).href
+);
+const root = await fs.mkdtemp(path.join(os.tmpdir(), "bb-path-lookup-"));
+const fallback = path.join(root, "fallback");
+const missing = path.join(root, "absent");
+const command = "bb-path-order-fixture";
+try {
+  await fs.mkdir(fallback);
+  for (const [directory, marker] of [[root, "local-install"], [fallback, "other-install"]]) {
+    await fs.writeFile(path.join(directory, command),
+      `#!/bin/sh\nprintf '${marker}:%s\\n' "$1"\n`, { mode: 0o755 });
+  }
+  process.chdir(root);
+  for (const [name, directories] of [
+    ["control", [root, fallback]],
+    ["leading", ["", fallback]],
+    ["middle", [missing, "", fallback]],
+    ["trailing", [missing, ""]],
+  ]) {
+    const stream = streamProviderInstallation({
+      providerId: "path-lookup-fixture",
+      plan: { command, args: ["update"], displayCommand: `${command} update` },
+      env: { ...process.env, PATH: directories.join(path.delimiter) },
+    });
+    const events = (await new Response(stream).text()).trim().split("\n").map(JSON.parse);
+    const output = events.filter(event =&gt; event.type === "output").map(event =&gt; event.text).join("").trim();
+    console.log(JSON.stringify({ name, output, final: events.at(-1) }));
+  }
+} finally {
+  process.chdir(checkout);
+  await fs.rm(root, { recursive: true, force: true });
+}</pre></li>
+<li>Run <code>node --conditions=source --import tsx ./repro.mjs</code>. Expected: all four cases print <code>local-install:update</code>, exitCode 0, success true. Actual on trusted main:
+<pre>{"name":"control","output":"local-install:update","final":{"type":"completed","provider":"path-lookup-fixture","exitCode":0,"signal":null,"success":true}}
+{"name":"leading","output":"other-install:update","final":{"type":"completed","provider":"path-lookup-fixture","exitCode":0,"signal":null,"success":true}}
+{"name":"middle","output":"other-install:update","final":{"type":"completed","provider":"path-lookup-fixture","exitCode":0,"signal":null,"success":true}}
+{"name":"trailing","output":"","final":{"type":"error","provider":"path-lookup-fixture","message":"Command not found: bb-path-order-fixture"}}</pre></li>
+</ol>
+<p>The regression test added to the existing host-daemon test owner exercises leading, middle, and trailing empty entries with real node-pty children. Leading/middle cases also install a competing executable later on PATH. It asserts local output, excludes fallback output, and requires a successful completion. Its working-directory mutation is restored in finally and automatically places the file in an isolated Vitest worker.</p>
+
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/405592c0b71b1655a6ab2e1cc7498b5beeb78caa/apps/host-daemon/src/provider-installation.ts#L49-L67">The installer spawner resolves every command before spawning node-pty</a>:</p>
+<pre>const command = resolvePortableCommand(args.command, { cwd, env });
+if (command === undefined) {
+  throw new Error(`Command not found: ${args.command}`);
+}
+const pty = spawnPty(command, args.args, { ... });</pre>
+<p><a href="https://github.com/get-bb/bb/blob/405592c0b71b1655a6ab2e1cc7498b5beeb78caa/packages/process-utils/src/exec-portable-file.ts#L25-L41">resolvePortableCommand passes the supplied PATH to whichCommandSync</a>. The installed which-command dependency deliberately skips empty components in its candidatePaths implementation. Thus a bare Unix command no longer reaches execvp lookup: the spawner either rejects it first or supplies an already selected fallback absolute path.</p>
+<p>Dependency inspection confirms that Linux node-pty calls execvp after changing to its supplied cwd. Its macOS spawn helper also calls execvp, but that platform was not run. The helper's stricter lookup may be intentional for other consumers; the installer is the inappropriate cross-platform caller. No change to execPortableFile is needed.</p>
+
+<h2>6. Proposed fix and verification</h2>
+<p>Keep pre-resolution on Windows, where executable extensions matter, and pass the original command to node-pty on Unix:</p>
+<pre>const command =
+  process.platform === "win32"
+    ? resolvePortableCommand(args.command, { cwd, env })
+    : args.command;</pre>
+<p>The local fix changes only the existing host-daemon spawner and its tests: 2 files, 62 changed text lines (56 additions + 6 deletions). No dependency, lockfile, generated output, stored data, public schema, protocol, packaging, or permission changes. A genuinely absent Unix command again terminates through node-pty with an unsuccessful completion; the existing missing-command test now checks that platform-specific behavior. Windows keeps its resolver-generated error.</p>
+<pre>Before production fix:
+pnpm exec turbo run test --filter=@bb/host-daemon -- provider-installation.test.ts
+3 failed | 4 passed | 2 skipped
+leading/middle: expected 'other-install:update\r\n' to contain 'local-install:update'
+trailing: expected '' to contain 'local-install:update'
+
+After production fix:
+pnpm exec turbo run test --filter=@bb/host-daemon -- provider-installation.test.ts provider-installation-gate.test.ts
+2 files passed; 20 tests passed | 2 Windows-only tests skipped
+
+pnpm exec turbo run typecheck --filter=@bb/host-daemon --filter=@bb/process-utils
+6 successful tasks
+
+pnpm exec turbo run test typecheck --filter=@bb/host-daemon --filter=@bb/process-utils
+process-utils: 14 files passed | 1 skipped; 87 tests passed | 10 skipped
+host-daemon: 70 files passed | 2 failed; 797 tests passed | 2 failed | 7 skipped</pre>
+<p>The broader host suite has two unrelated environmental failures: a server-move unit-file mode check observes 0600 instead of 0644, and server-move inspection obtains null diskFreeBytes. Both fail identically on the second checkout's unchanged production code when running <code>pnpm exec turbo run test --filter=@bb/host-daemon -- src/server-move</code> (81 passed, 2 failed). They are not repaired here. Relevant installer tests and the complete process-utils suite pass. Native Windows/macOS verification remains unperformed.</p>
+
+<h2>7. Verification — second clean checkout</h2>
+<p>The same agent created a separate detached worktree at the recorded base. Frozen installation and Turbo build completed there. Only the newly authored regression-test patch was applied; production files remained byte-identical to trusted main. No service or port was started, and every test created fresh temporary fixture directories.</p>
+<pre>pnpm exec turbo run test --filter=@bb/host-daemon -- provider-installation.test.ts
+Test Files  1 failed
+Tests       3 failed | 4 passed | 2 skipped
+leading and middle: other-install:update
+trailing: no process output
+
+node --conditions=source --import tsx /path/to/repro.mjs
+control: local-install:update; completed success=true
+leading: other-install:update; completed success=true
+middle: other-install:update; completed success=true
+trailing: Command not found: bb-path-order-fixture</pre>
+<p>The exact standalone-script JSON is in section 4. On the fixed first checkout, all four script cases print local-install:update with successful completion. No correction to the Linux findings was required by the second run. This is a repeated reproduction by the same agent, not independent verification.</p>
+
+<h2>8. Related issues</h2>
+<p>The earlier Windows installer-resolution defect is tracked in <a href="https://github.com/get-bb/bb/issues/5428">#5428</a>. That issue's platform is different; the present evidence covers a Unix lookup regression. No open pull request linking #5955 was found in its timeline, open-PR search, or open-PR closing-reference metadata during investigation. No linked PR code was checked out or executed.</p>
+
+<h2>9. Appendix and trust handling</h2>
+<p>The issue's scripts and requested implementation were treated as untrusted claims and not executed or copied. All execution used trusted origin/main, independently authored fixtures/tests, and the small local fix. Repository visibility was verified public before publication. Raw command logs and local reproduction artifacts stay outside this public report repository; reproducible code and relevant output are embedded above. No screenshots are needed for this nonvisual process-lookup bug.</p>
+<p>Additional checks: refreshed origin/main still matched the recorded base; reviewed git history for the installer; read the pinned resolver and node-pty source; git diff --check passed; git diff --numstat origin/main reported 52 additions/5 deletions in the test and 4 additions/1 deletion in production, with no binary changes.</p>
+</main></body></html>
