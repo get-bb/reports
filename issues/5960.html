@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #5960 Unknown hook cancellation stalls cleanup</title>
+<style>
+:root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+main { max-width:1000px; margin:auto; padding:40px 24px 80px; } h1 { font-size:26px; line-height:1.25; } h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+a { color:var(--accent); } .meta { color:var(--muted); font-size:14px; } .pill { display:inline-block; padding:1px 8px; border:1px solid var(--line); border-radius:999px; font-size:12px; }
+table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:8px; border-bottom:1px solid var(--line); vertical-align:top; }
+code,pre { font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; } .verdict { color:var(--high); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#5960 · Unknown hook cancellation leaves cleanup retrying without progress</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: Medium</span> <span class="pill">Effort: High</span> <span class="pill">workspaces</span> · <a href="https://github.com/get-bb/bb/issues/5960">GitHub issue</a> · October 21, 2026</p>
+<p class="meta">Trusted main commit: <code>405592c0b71b1655a6ab2e1cc7498b5beeb78caa</code></p>
+<p class="verdict">Verdict: REPRODUCED · Root-cause confidence: high · Reproduction label: confirmed-repro</p>
+<h2>1. TL;DR</h2>
+<p>An interrupted environment hook can leave a durable record that the current daemon cannot reconcile. Cancellation then returns an ambiguous outcome, and the server refuses deletion without finishing that record. Teardown failure schedules another attempt after 60 seconds, but that attempt receives no new evidence and takes the same path. Explicit cleanup accepts the request without resolving the ambiguity. The defect was reproduced using real migrated SQLite and the actual server lifecycle code in two clean trusted-main checkouts; the affected production machine was not accessed.</p>
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>Lost hook state permanently blocks progress.</td><td>Verified at source boundary</td><td>Three unchanged teardown failures leave finishedAt null and provider removal uncalled. A separate setup-hook test repeats the same cancellation rejection three times.</td></tr>
+<tr><td>Failure re-enters on a one-minute schedule.</td><td>Verified</td><td>Each recorded attempt sets a new 60,000 ms delay. Source has no retry cap or special manual-recovery outcome. The test advances eligibility by resetting retireAt rather than waiting real minutes.</td></tr>
+<tr><td>Cleanup reports acceptance without repairing the hook record.</td><td>Verified</td><td>cleanupEnvironment returns true, causes a fourth identical cancellation, and leaves removal blocked. The public route translates acceptance into {ok:true}.</td></tr>
+<tr><td>The reported machine accumulated thousands of retries, including after manual workspace removal.</td><td>Unverified</td><td>No real machine, worktree, production database, historical counters, or manually removed path was inspected. Those details are unnecessary to reproduce the source defect.</td></tr>
+<tr><td>A new daemon instance proves the old hook is no longer running.</td><td>Not a safe inference</td><td>The runtime map is not process-liveness evidence. The existing daemon memory-loss test creates a new runtime while the first hook is still active. Hook subprocesses are launched detached where supported.</td></tr>
+<tr><td>Unverified process termination must remain a cleanup block.</td><td>Verified safety distinction</td><td>The existing termination-unverified test returns unknown too. Treating every unknown reply as permission to remove would discard this safeguard.</td></tr>
+<tr><td>Inode sharing explains production-process observations.</td><td>Not investigated</td><td>No production process or package store was examined. This investigation does not use inode identity as process-liveness evidence.</td></tr>
+</tbody></table>
+<h2>3. Environment</h2>
+<ul><li>Public repository get-bb/bb; both detached worktrees start at 405592c0b71b1655a6ab2e1cc7498b5beeb78caa with unchanged production source.</li><li>Linux 4.19.0-gvisor x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li><li>Each checkout received its own frozen install and normal Turbo build. The first full build initially encountered an unbuilt plugin SDK runtime; building the existing SDK first and rerunning completed all 67 build tasks. No dependency was added.</li><li>No live BB app, real agent provider, external account, persistent development data directory, or network listener was needed. Tests use isolated harness state and real migrated SQLite; the RPC responder deterministically supplies the daemon outcomes. The nonexistent workspace fixture path is never touched by a removal command.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Create a clean trusted checkout and install/build existing dependencies:
+<pre>git clone https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout --detach 405592c0b71b1655a6ab2e1cc7498b5beeb78caa
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build</pre></li>
+<li>Copy the complete investigator-authored reproduction test shown below into <code>apps/server/test/services/environments/issue-5960-repro.test.ts</code>. The report is self-contained; no separate test download is required.</li>
+<li>Run the actual server owner-boundary test:
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/services/environments/issue-5960-repro.test.ts</pre></li>
+<li>Inspect the three failed attempts, a fourth requested via cleanup, and the still-pending durable operation. The terminated control successfully removes the environment, while the setup control demonstrates the same persistent block.</li></ol>
+<p><strong>Expected:</strong> once an outcome requires manual recovery, unchanged ambiguous evidence should not cause unbounded automatic RPC retries. A repair may pause immediately or implement bounded backoff; the diagnostic assertion models the immediate-pause variant, not a mandated final retry policy.</p>
+<p><strong>Actual, verbatim in both runs:</strong></p><pre>{&quot;cancelStatus&quot;:&quot;unknown&quot;,&quot;attempts&quot;:[{&quot;status&quot;:&quot;failed&quot;,&quot;attempt&quot;:1,&quot;finishedAt&quot;:null,&quot;retryDelayMs&quot;:60000},{&quot;status&quot;:&quot;failed&quot;,&quot;attempt&quot;:2,&quot;finishedAt&quot;:null,&quot;retryDelayMs&quot;:60000},{&quot;status&quot;:&quot;failed&quot;,&quot;attempt&quot;:3,&quot;finishedAt&quot;:null,&quot;retryDelayMs&quot;:60000}],&quot;cleanupAccepted&quot;:true,&quot;removals&quot;:0,&quot;cancellations&quot;:4}
+AssertionError: expected 4 to be less than or equal to 1
+Tests  1 failed | 2 passed (3)</pre>
+<p>The expected failing assertion is evidence of repeated non-progress, not an unrelated setup failure. The provider.remove control succeeds when cancellation confirms termination. No claim is made that an unknown outcome is safe to delete automatically.</p>
+<details><summary>Complete reproduction test</summary><pre>import {
+  environmentHookOperations,
+  environments,
+  getEnvironment,
+} from &quot;@bb/db&quot;;
+import { validatePluginEnvironmentProviderDeclaration } from &quot;@get-bb/plugin-sdk/internal/host-policy&quot;;
+import { eq } from &quot;drizzle-orm&quot;;
+import { expect, it } from &quot;vitest&quot;;
+import { cancelPendingEnvironmentHook } from &quot;../../../src/services/environments/environment-hooks.js&quot;;
+import {
+  cleanupEnvironment,
+  sweepProviderEnvironment,
+} from &quot;../../../src/services/environments/environment-engine.js&quot;;
+import { setPluginEnvironmentProviderBridge } from &quot;../../../src/services/plugins/plugin-environment-provider-registry.js&quot;;
+import { registerHostRpcResponder } from &quot;../../helpers/host-rpc.js&quot;;
+import {
+  seedEnvironment,
+  seedHostSession,
+  seedProjectWithSource,
+} from &quot;../../helpers/seed.js&quot;;
+import { withTestHarness } from &quot;../../helpers/test-app.js&quot;;
+
+it.each([&quot;unknown&quot;, &quot;terminated&quot;] as const)(
+  &quot;does not retry unchanged blocked teardown indefinitely: %s&quot;,
+  async (cancelStatus) =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      const { host, session } = seedHostSession(harness.deps);
+      const { project } = seedProjectWithSource(harness.deps, {
+        hostId: host.id,
+      });
+      let removals = 0;
+      const provider = validatePluginEnvironmentProviderDeclaration({
+        id: &quot;repro-provider&quot;,
+        displayName: &quot;Repro&quot;,
+        description: &quot;Reproduction fixture&quot;,
+        icon: &quot;Folder&quot;,
+        policy: { retireGraceMs: 0 },
+        create: async () =&gt; ({ status: &quot;failed&quot;, message: &quot;Not used&quot; }),
+        remove: async () =&gt; {
+          removals += 1;
+          return { status: &quot;removed&quot; };
+        },
+      });
+      const record = { pluginId: &quot;repro-plugin&quot;, provider };
+      setPluginEnvironmentProviderBridge({
+        listEnvironmentProviders: () =&gt; [record],
+        getEnvironmentProvider: (id) =&gt;
+          id === provider.id ? record : undefined,
+        invokeProvider: async (_pluginId, _label, run) =&gt; ({
+          ok: true,
+          value: await run(),
+        }),
+        decisionTimeoutMs: 10000,
+      });
+      const environment = seedEnvironment(harness.deps, {
+        hostId: host.id,
+        projectId: project.id,
+        path: &quot;/tmp/repro-workspace-not-created&quot;,
+        status: &quot;error&quot;,
+        environmentProviderId: provider.id,
+        environmentProviderPluginId: record.pluginId,
+        environmentProviderInstanceKey: &quot;repro-instance&quot;,
+        providerOwnsPath: true,
+      });
+      const operationId = `environment:${environment.id}:repro-instance:teardown`;
+      harness.db
+        .insert(environmentHookOperations)
+        .values({
+          id: operationId,
+          operationId,
+          hostId: host.id,
+          path: environment.path!,
+          kind: &quot;teardown&quot;,
+          startedAt: 1,
+        })
+        .run();
+      let cancellations = 0;
+      registerHostRpcResponder(harness, {
+        hostId: host.id,
+        sessionId: session.id,
+        handle: async (request) =&gt; {
+          if (request.command.type === &quot;environment.hook.run&quot;)
+            return {
+              ok: false,
+              errorCode: &quot;command_failed&quot;,
+              errorMessage:
+                &quot;Environment hook outcome is unknown after daemon restart&quot;,
+            };
+          if (request.command.type === &quot;environment.hook.cancel&quot;) {
+            cancellations += 1;
+            return { ok: true, result: { status: cancelStatus } };
+          }
+          throw new Error(`Unexpected RPC: ${request.command.type}`);
+        },
+      });
+      const attempts: unknown[] = [];
+      try {
+        for (let attempt = 0; attempt &lt; 3; attempt += 1) {
+          await sweepProviderEnvironment(harness.deps, environment.id);
+          const current = getEnvironment(harness.db, environment.id)!;
+          const operation = harness.db
+            .select()
+            .from(environmentHookOperations)
+            .where(eq(environmentHookOperations.id, operationId))
+            .get()!;
+          attempts.push({
+            status: current.teardownStatus,
+            attempt: current.teardownAttempt,
+            finishedAt: operation.finishedAt,
+            retryDelayMs:
+              current.retireAt === null
+                ? null
+                : Math.round((current.retireAt - Date.now()) / 1000) * 1000,
+          });
+          if (current.teardownStatus === &quot;removed&quot;) break;
+          harness.db
+            .update(environments)
+            .set({ retireAt: 0 })
+            .where(eq(environments.id, environment.id))
+            .run();
+        }
+        const accepted = cleanupEnvironment(harness.deps, environment.id);
+        await sweepProviderEnvironment(harness.deps, environment.id);
+        console.info(
+          JSON.stringify({
+            cancelStatus,
+            attempts,
+            cleanupAccepted: accepted,
+            removals,
+            cancellations,
+          }),
+        );
+        if (cancelStatus === &quot;terminated&quot;) {
+          expect(
+            getEnvironment(harness.db, environment.id)?.teardownStatus,
+          ).toBe(&quot;removed&quot;);
+          expect(removals).toBe(1);
+        } else {
+          expect(
+            getEnvironment(harness.db, environment.id)?.teardownStatus,
+          ).toBe(&quot;failed&quot;);
+          expect(removals).toBe(0);
+          expect(cancellations).toBeLessThanOrEqual(1);
+        }
+      } finally {
+        setPluginEnvironmentProviderBridge(undefined);
+      }
+    });
+  },
+);
+
+it(&quot;leaves interrupted setup pending after every unknown cancellation&quot;, async () =&gt; {
+  await withTestHarness(async (harness) =&gt; {
+    const { host, session } = seedHostSession(harness.deps);
+    const operationId = &quot;repro-interrupted-setup&quot;;
+    harness.db
+      .insert(environmentHookOperations)
+      .values({
+        id: operationId,
+        operationId,
+        hostId: host.id,
+        path: &quot;/tmp/repro-workspace-not-created&quot;,
+        kind: &quot;setup&quot;,
+        startedAt: 1,
+      })
+      .run();
+    registerHostRpcResponder(harness, {
+      hostId: host.id,
+      sessionId: session.id,
+      handle: async (request) =&gt; {
+        if (request.command.type !== &quot;environment.hook.cancel&quot;)
+          throw new Error(&quot;Unexpected RPC&quot;);
+        return { ok: true, result: { status: &quot;unknown&quot; } };
+      },
+    });
+    for (let attempt = 0; attempt &lt; 3; attempt += 1) {
+      await expect(
+        cancelPendingEnvironmentHook(harness.deps, {
+          id: operationId,
+          hostId: host.id,
+        }),
+      ).rejects.toThrow(&quot;Automatic cleanup is blocked&quot;);
+      expect(
+        harness.db
+          .select()
+          .from(environmentHookOperations)
+          .where(eq(environmentHookOperations.id, operationId))
+          .get()?.finishedAt,
+      ).toBeNull();
+    }
+  });
+});
+</pre></details>
+<h2>5. Root cause</h2>
+<ol><li><a href="https://github.com/get-bb/bb/blob/405592c0b71b1655a6ab2e1cc7498b5beeb78caa/apps/host-daemon/src/command-handlers/environment-hook.ts#L17-L35">The daemon tracks hook operations only in a runtime-manager-keyed in-memory map</a>. <a href="https://github.com/get-bb/bb/blob/405592c0b71b1655a6ab2e1cc7498b5beeb78caa/apps/host-daemon/src/command-handlers/environment-hook.ts#L99-L115">cancelEnvironmentHook</a> returns the same unknown status for an absent/cancelled operation and for terminationUnverified. The reply cannot distinguish these reasons.</li>
+<li><a href="https://github.com/get-bb/bb/blob/405592c0b71b1655a6ab2e1cc7498b5beeb78caa/apps/server/src/services/environments/environment-hooks.ts#L149-L184">cancelPendingEnvironmentHook</a> throws before setting finishedAt when status is unknown:
+<pre>if (result.status === "unknown")
+  throw new Error(
+    "Environment hook outcome is unknown after interruption. Automatic cleanup is blocked; inspect the workspace before recovering it.",
+  );</pre>
+The persisted operation remains pending, so another request cannot make new progress from that record alone.</li>
+<li><a href="https://github.com/get-bb/bb/blob/405592c0b71b1655a6ab2e1cc7498b5beeb78caa/apps/server/src/services/environments/environment-engine.ts#L893-L898">Cancelled preparation invokes the same setup-hook cancellation guard</a>. That guard can reject before runRemove. Separately, <a href="https://github.com/get-bb/bb/blob/405592c0b71b1655a6ab2e1cc7498b5beeb78caa/apps/server/src/services/environments/environment-hooks.ts#L130-L142">the teardown-hook catch awaits cancellation before continuing removal</a>, so an unknown reply escapes the intended continue-removal path.</li>
+<li><a href="https://github.com/get-bb/bb/blob/405592c0b71b1655a6ab2e1cc7498b5beeb78caa/apps/server/src/services/environments/environment-engine.ts#L767-L787">runRemove catches failure and schedules retry</a> records failed status and a fixed delay:
+<pre>teardownStatus: "failed",
+teardownMessage: message,
+retireAt: Date.now() + REMOVE_RETRY_MS</pre>
+<a href="https://github.com/get-bb/bb/blob/405592c0b71b1655a6ab2e1cc7498b5beeb78caa/apps/server/src/services/environments/environment-engine.ts#L308-L308">REMOVE_RETRY_MS is 60,000</a>. <a href="https://github.com/get-bb/bb/blob/405592c0b71b1655a6ab2e1cc7498b5beeb78caa/apps/server/src/services/environments/environment-engine.ts#L900-L926">Eligible teardown increments the attempt counter and calls the same removal code</a>. There is no progress-dependent stop condition for this ambiguity.</li>
+<li><a href="https://github.com/get-bb/bb/blob/405592c0b71b1655a6ab2e1cc7498b5beeb78caa/apps/server/src/services/environments/environment-engine.ts#L929-L947">cleanupEnvironment only resets eligibility and asynchronously sweeps</a>; <a href="https://github.com/get-bb/bb/blob/405592c0b71b1655a6ab2e1cc7498b5beeb78caa/apps/server/src/routes/environments.ts#L320-L340">the API returns acceptance rather than completed cleanup</a>. <a href="https://github.com/get-bb/bb/blob/405592c0b71b1655a6ab2e1cc7498b5beeb78caa/apps/cli/src/commands/environment.ts#L373-L390">The environment cleanup command has no recovery option</a>. No supported environment action in this path resolves the hook outcome.</li></ol>
+<p><strong>Safety boundary:</strong> <a href="https://github.com/get-bb/bb/blob/405592c0b71b1655a6ab2e1cc7498b5beeb78caa/apps/host-daemon/src/environment-lifecycle-script.ts#L211-L217">hook processes use detached process groups where supported</a>. A newer in-memory registry does not prove that a former process group exited. The existing <a href="https://github.com/get-bb/bb/blob/405592c0b71b1655a6ab2e1cc7498b5beeb78caa/apps/host-daemon/test/command/environment-hook.test.ts#L123-L181">daemon memory-loss test</a> exercises a new runtime alongside the old hook; the <a href="https://github.com/get-bb/bb/blob/405592c0b71b1655a6ab2e1cc7498b5beeb78caa/apps/host-daemon/test/command/environment-hook-unverified-stop.test.ts#L1-L57">unverified-stop test</a> exercises the other ambiguous reply reason. Both passed in each checkout.</p>
+<h2>6. Proposed fix and automation safety</h2>
+<p>Represent reconciliation evidence separately from the generic unknown outcome, preserve process-liveness safeguards, stop or bound retries that cannot gather new evidence, and provide an explicit inspection-based recovery action through both CLI and SDK. Recovery must not infer that detached descendants exited merely because a daemon restarted. The <a href="https://github.com/get-bb/bb/blob/405592c0b71b1655a6ab2e1cc7498b5beeb78caa/packages/host-daemon-contract/src/commands.ts#L1793-L1800">current cancellation response contract</a> contains only unknown/terminated; safely extending its meaning or fields requires protocol compatibility work. A recovery operation also needs product policy and durable-state semantics.</p>
+<p><strong>No automatic production fix:</strong> an open linked PR already exists, and a complete root-cause repair exceeds the rule's no-protocol/no-policy-change simple-fix boundary. No fix branch was pushed and no duplicate PR was created. The new reproduction file remains a report artifact only.</p>
+<h2>7. Linked PR review</h2>
+<p><a href="https://github.com/get-bb/bb/pull/5961">PR #5961</a> was OPEN against main and linked to this issue when checked during the investigation. The inspected diff only adds server regression coverage; no production implementation is present in that snapshot. Its direction covers bounded ambiguous setup retries and recovery signaling, but the root-cause repair cannot be verified from a tests-only diff. The diff and metadata were treated as untrusted evidence: no branch was checked out and none of its code or tests was executed. This is a point-in-time static review, not a merge recommendation.</p>
+<h2>8. Related issues</h2>
+<p><a href="https://github.com/get-bb/bb/issues/4158">#4158</a> is an existing open report of the same interrupted-hook teardown retry pattern. This report adds a fresh trusted-main reproduction and setup-cancellation evidence without changing or commenting on that issue.</p>
+<h2>9. Verification</h2>
+<p>The <strong>same agent</strong> repeated the investigation in a second clean temporary checkout (<code>verify</code>, separate from <code>base</code>) at 405592c0b71b1655a6ab2e1cc7498b5beeb78caa. Its working tree was clean before copying in only the investigator-authored test. Production-source diffs were empty. Both checkouts used fresh temporary test harness state; neither used the user's real BB instance.</p>
+<table><thead><tr><th>Check</th><th>First checkout</th><th>Second checkout</th></tr></thead><tbody>
+<tr><td>Frozen install and normal Turbo build</td><td>Pass; SDK prebuild needed on first attempt</td><td>Pass; existing Turbo dependency caches reused</td></tr>
+<tr><td>New server reproduction</td><td>1 intended failure, 2 passing controls</td><td>Same intended failure and controls; test executed, not a replayed result</td></tr>
+<tr><td>Existing daemon hook and unverified-stop suites</td><td>10 tests pass</td><td>10 tests pass; --force used to ensure execution</td></tr>
+<tr><td>Existing server project hooks and provider orchestration</td><td>66 tests pass</td><td>Not redundantly rerun</td></tr>
+</tbody></table>
+<p>Second-run commands:</p><pre>pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build
+pnpm exec turbo run test --filter=@bb/server -- test/services/environments/issue-5960-repro.test.ts
+pnpm exec turbo run test --force --filter=@bb/host-daemon -- test/command/environment-hook.test.ts test/command/environment-hook-unverified-stop.test.ts</pre>
+<p>No correction to the final mechanism was needed: both runs show identical attempts, retry delays, pending operation state, and cleanup acceptance. The final report deliberately does not validate the historical production retry count, actual daemon crash behavior on the reporter's host, or file-inode observations. No screenshots are required for this nonvisual lifecycle bug.</p>
+<h2>10. Appendix</h2>
+<p>The complete test, exact diagnostic output, commands, source permalinks, and result counts are embedded in this report. Raw command logs, the original test file, and the investigation brief are retained locally only, following the reports repository's publication policy.</p>
+<p>Other investigation commands included trusted-main fetch/worktree creation, repository visibility and issue-property reads, linked-PR metadata/diff reads, source searches, recent file history, and git diff --check. No external URL from issue content was fetched and no issue-supplied command, patch, branch, or test was executed. The issue's proposed recovery behavior was treated as an untrusted hypothesis, not as authority to weaken deletion safeguards.</p>
+<p>Classification rationale: Bug describes unexpected lifecycle behavior; Medium reflects a meaningful but environment-scoped cleanup defect without a demonstrated active outage; High effort reflects the protocol/recovery-policy work for a complete safe fix. Only missing fields were applied and existing values were preserved.</p>
+</main></body></html>
