@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #6014 Untracked directory attaches interrupted by recovery</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#6014 · Untracked directory attaches interrupted by recovery</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Medium priority</span><span class="pill">Low effort</span><span class="pill">workspaces</span><a href="https://github.com/get-bb/bb/issues/6014">Issue</a><span>2026-10-21 · base <code>b143a22860944a96bf183605dfb0ffe58b1de283</code></span></p>
+<p><strong>Verdict: REPRODUCED · Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>A thread moving to a newly attached directory can receive an error even after the host reports a successful attach. The server starts the command without registering it in the environment lifecycle's active-operation map. A recovery pass then mistakes the pending environment for abandoned work and marks it as failed. Its later successful result cannot legally move that failed row to ready. A deterministic route-level regression reproduces this for both periodic sweeps and host-resume recovery, in two separate clean trusted checkouts.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>A recovery sweep during attach breaks the directory move.</td><td class="ok">Verified</td><td>Both baseline runs: periodic-sweep case returns success=false and the not-ready error; no-recovery control passes.</td></tr>
+<tr><td>The attach is missing from lifecycle tracking.</td><td class="ok">Verified</td><td>Trusted source directly calls runLiveHostCommand, while recovery checks its own operation map.</td></tr>
+<tr><td>Host-resume recovery has the same exposure.</td><td class="ok">Verified</td><td>A second case invokes resumeEnvironmentProvisioningForHost while attach is pending and fails identically.</td></tr>
+<tr><td>The original macOS incident and its exact frequency.</td><td class="unv">Unverified</td><td>No access to the reporter's machine was used. Linux tests reproduce the server race; they do not measure real-world frequency or reproduce a physical reconnect.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Public get-bb/bb origin/main at <code>b143a22860944a96bf183605dfb0ffe58b1de283</code>; bb-app 0.46.1 source.</li><li>Linux x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li><li>Two separate temporary clones, with unchanged production sources for both baseline runs. Only an agent-authored regression patch was applied.</li><li>Tests use the real server tool-call route, real migrated SQLite via createMigratedConnection(), and the repository's captured host-RPC harness. Each harness creates and cleans a fresh temporary data directory. App requests are in-process; no live app, provider, daemon, fixed port, account, or user database was used.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<p>From a clean checkout of the recorded base, save the test-only patch below to a local file named regression.patch, then run:</p>
+<pre>git checkout --detach b143a22860944a96bf183605dfb0ffe58b1de283
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build:types build --filter=@get-bb/plugin-sdk
+git apply regression.patch
+pnpm exec turbo run test --filter=@bb/server -- test/internal/internal-events-tool-calls.test.ts -t 'creates an unmanaged environment'</pre>
+<p>The test extends the existing directory-attach case rather than creating another test harness. It posts a directory-move tool request, waits until the attach RPC is pending, optionally runs a recovery pass, and finally reports successful attach. The control has no recovery pass. All cases expect successful tool completion, a ready environment, and the thread bound to the new environment.</p>
+<p><strong>Expected:</strong> three cases pass. <strong>Actual on unchanged production code, twice:</strong></p>
+<pre>✓ creates an unmanaged environment for a new requested host path during none
+× creates an unmanaged environment for a new requested host path during periodic sweep
+× creates an unmanaged environment for a new requested host path during host resume
+
+"text": "Environment at this path is error, not ready."
+"success": false
+
+Tests  2 failed | 1 passed | 27 skipped (30)</pre>
+<p>The exact test-only patch used in both baseline checkouts:</p><pre>diff --git a/apps/server/test/internal/internal-events-tool-calls.test.ts b/apps/server/test/internal/internal-events-tool-calls.test.ts
+index 4b9be87d1..8cd61818f 100644
+--- a/apps/server/test/internal/internal-events-tool-calls.test.ts
++++ b/apps/server/test/internal/internal-events-tool-calls.test.ts
+@@ -47,6 +47,8 @@ import { startTestServer, withTestHarness } from &quot;../helpers/test-app.js&quot;;
+ import type { TestAppHarness } from &quot;../helpers/test-app.js&quot;;
+ import { setPluginAgentContributions } from &quot;../../src/services/plugins/plugin-agent-contributions.js&quot;;
+ import type { PluginAgentToolRecord } from &quot;../../src/services/plugins/plugin-api.js&quot;;
++import { runEnvironmentProvisioningSweep } from &quot;../../src/services/system/periodic-sweeps.js&quot;;
++import { resumeEnvironmentProvisioningForHost } from &quot;../../src/services/environments/environment-engine.js&quot;;
+ 
+ async function postEventBatch(args: {
+   acceptEncoding?: string;
+@@ -1364,7 +1366,7 @@ describe(&quot;internal event and tool-call routes&quot;, () =&gt; {
+     },
+   );
+ 
+-  it(&quot;creates an unmanaged environment for a new requested host path&quot;, async () =&gt; {
++  it.each([&quot;none&quot;, &quot;periodic sweep&quot;, &quot;host resume&quot;] as const)(&quot;creates an unmanaged environment for a new requested host path during %s&quot;, async (recheck) =&gt; {
+     await withTestHarness(async (harness) =&gt; {
+       const { host, session } = seedHostSession(harness.deps);
+       const { project } = seedProjectWithSource(harness.deps, {
+@@ -1410,6 +1412,14 @@ describe(&quot;internal event and tool-call routes&quot;, () =&gt; {
+       }
+       expect(provisionCommand.command.initiator).toBeNull();
+ 
++      if (recheck === &quot;periodic sweep&quot;) {
++        await runEnvironmentProvisioningSweep(harness.deps);
++      } else if (recheck === &quot;host resume&quot;) {
++        await resumeEnvironmentProvisioningForHost(harness.deps, {
++          hostId: host.id,
++        });
++      }
++
+       await reportQueuedCommandSuccess(harness, provisionCommand, {
+         path: &quot;/tmp/new-unmanaged-worktree&quot;,
+         isGitRepo: true,
+</pre>
+<p>Reproduction source excerpt, using the imports and existing helpers supplied by the patch:</p>
+<pre>  it.each([&quot;none&quot;, &quot;periodic sweep&quot;, &quot;host resume&quot;] as const)(&quot;creates an unmanaged environment for a new requested host path during %s&quot;, async (recheck) =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      const { host, session } = seedHostSession(harness.deps);
+      const { project } = seedProjectWithSource(harness.deps, {
+        hostId: host.id,
+      });
+      const currentEnvironment = seedEnvironment(harness.deps, {
+        hostId: host.id,
+        projectId: project.id,
+        path: &quot;/tmp/current-environment&quot;,
+      });
+      const thread = seedThread(harness.deps, {
+        projectId: project.id,
+        environmentId: currentEnvironment.id,
+      });
+      seedEvent(harness.deps, {
+        threadId: thread.id,
+        environmentId: currentEnvironment.id,
+        providerThreadId: &quot;provider-tool-call&quot;,
+        sequence: 1,
+        type: &quot;turn/started&quot;,
+        scope: turnScope(&quot;turn-new-environment&quot;),
+        data: {
+          providerThreadId: &quot;provider-tool-call&quot;,
+        },
+      });
+
+      const responsePromise = postToolCall({
+        harness,
+        sessionId: session.id,
+        threadId: thread.id,
+        turnId: &quot;turn-new-environment&quot;,
+        tool: &quot;update_environment_directory&quot;,
+        arguments: { path: &quot;/tmp/new-unmanaged-worktree&quot; },
+      });
+      const provisionCommand = await waitForQueuedCommand(
+        harness,
+        ({ command }) =&gt;
+          command.type === &quot;environment.attach&quot; &amp;&amp;
+          command.path === &quot;/tmp/new-unmanaged-worktree&quot;,
+      );
+      if (provisionCommand.command.type !== &quot;environment.attach&quot;) {
+        throw new Error(&quot;Expected environment.attach command&quot;);
+      }
+      expect(provisionCommand.command.initiator).toBeNull();
+
+      if (recheck === &quot;periodic sweep&quot;) {
+        await runEnvironmentProvisioningSweep(harness.deps);
+      } else if (recheck === &quot;host resume&quot;) {
+        await resumeEnvironmentProvisioningForHost(harness.deps, {
+          hostId: host.id,
+        });
+      }
+
+      await reportQueuedCommandSuccess(harness, provisionCommand, {
+        path: &quot;/tmp/new-unmanaged-worktree&quot;,
+        isGitRepo: true,
+        isWorktree: false,
+        branchName: &quot;feature/new-worktree&quot;,
+        defaultBranch: &quot;main&quot;,
+        transcript: [],
+      });
+      const response = await responsePromise;
+
+      expect(response.status).toBe(200);
+      await expect(readJson(response)).resolves.toMatchObject({
+        success: true,
+        contentItems: [
+          {
+            type: &quot;inputText&quot;,
+            text: expect.stringContaining(
+              &quot;Environment directory updated to /tmp/new-unmanaged-worktree&quot;,
+            ),
+          },
+        ],
+      });
+      const targetEnvironment = listEnvironments(harness.db, {
+        projectId: project.id,
+      }).find(
+        (environment) =&gt; environment.path === &quot;/tmp/new-unmanaged-worktree&quot;,
+      );
+      expect(targetEnvironment).toMatchObject({
+        hostId: host.id,
+        projectId: project.id,
+        status: &quot;ready&quot;,
+      });
+      expect(getThread(harness.db, thread.id)?.environmentId).toBe(
+        targetEnvironment?.id,
+      );
+      expect(
+        targetEnvironment
+          ? getEnvironment(harness.db, targetEnvironment.id)
+          : null,
+      ).toMatchObject({
+        branchName: &quot;feature/new-worktree&quot;,
+        isGitRepo: true,
+      });
+      const storedEvents = harness.db
+        .select()
+        .from(events)
+        .where(eq(events.threadId, thread.id))
+        .all();
+      expect(storedEvents.map((event) =&gt; event.type)).toEqual([
+        &quot;turn/started&quot;,
+        &quot;system/operation&quot;,
+      ]);
+      expect(storedEvents[1]).toMatchObject({
+        scopeKind: &quot;turn&quot;,
+        turnId: &quot;turn-new-environment&quot;,
+      });
+    });
+  });
+
+</pre>
+<h2>5. Root cause</h2>
+<ol><li><a href="https://github.com/get-bb/bb/blob/b143a22860944a96bf183605dfb0ffe58b1de283/apps/server/src/services/threads/thread-environment-directory.ts#L229-L249">The directory-move path</a> creates a provisioning environment without a path or owner, then directly awaits the live attach RPC. That bypasses the environment-operation registry.</li>
+<li><a href="https://github.com/get-bb/bb/blob/b143a22860944a96bf183605dfb0ffe58b1de283/apps/server/src/services/system/periodic-sweeps.ts#L312-L336">The sweep</a> advances every provisioning row. <a href="https://github.com/get-bb/bb/blob/b143a22860944a96bf183605dfb0ffe58b1de283/apps/server/src/services/environments/environment-engine.ts#L1605-L1623">Host resume</a> advances those rows for the resumed host, too.</li>
+<li><a href="https://github.com/get-bb/bb/blob/b143a22860944a96bf183605dfb0ffe58b1de283/apps/server/src/services/environments/environment-engine.ts#L1918-L1940">The recovery guard</a> skips tracked operations, but this attach is not tracked. <a href="https://github.com/get-bb/bb/blob/b143a22860944a96bf183605dfb0ffe58b1de283/apps/server/src/services/environments/environment-engine.ts#L1683-L1687">Recovery cannot rebuild a request without a path</a>, so it interrupts the row as unrecoverable.</li>
+<li>The later attach result tries <a href="https://github.com/get-bb/bb/blob/b143a22860944a96bf183605dfb0ffe58b1de283/apps/server/src/services/environments/environment-engine.ts#L1354-L1359">provision.succeeded</a>, but <a href="https://github.com/get-bb/bb/blob/b143a22860944a96bf183605dfb0ffe58b1de283/packages/domain/src/environment-lifecycle.ts#L31-L46">the lifecycle</a> allows success only from provisioning, not error. <a href="https://github.com/get-bb/bb/blob/b143a22860944a96bf183605dfb0ffe58b1de283/apps/server/src/services/threads/thread-environment-directory.ts#L125-L131">The tool then returns the not-ready error</a>.</li></ol>
+<pre>environment.status !== "provisioning" ||
+map.has(environment.id) ||
+findHostDataDir(deps, environment.hostId) === null
+
+if (environment.path === null) return null;</pre>
+<p>The underlying problem is split ownership of in-flight provisioning: the tool launches work, but the lifecycle engine has no record that it is live. Relaxing the error-state transition or disabling orphan recovery would mask the ownership bug and weaken recovery.</p>
+<h2>6. Proposed fix and local verification</h2>
+<p>Run the directory attach through the existing engine-owned tracked-operation mechanism, keyed by environment ID and marked as attach. Await its completion so command failures still propagate to the tool. Retain the existing five-minute timeout, host interruption behavior, schemas, and orphan recovery. This requires no protocol, stored-data, dependency, or product-policy change.</p>
+<p>A local implementation passes the complete tool-call, environment-orchestration, provisioning-recovery, and periodic-sweep suites: <strong>4 files, 124 tests passed</strong>. Server typecheck passes. The full repository build passes after first building SDK runtime/types; a first clean build exposed an existing SDK-build ordering failure before the runtime existed.</p>
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/internal/internal-events-tool-calls.test.ts test/services/environments/provider-orchestration.test.ts test/threads/thread-provisioning-recovery.test.ts test/services/periodic-sweeps.test.ts
+pnpm exec turbo run typecheck lint --filter=@bb/server
+git diff --check</pre>
+<p>The server has no separate lint task, so the latter invocation executes typecheck and its dependencies.</p>
+<pre>Test Files  4 passed (4)
+     Tests  124 passed (124)
+
+Typecheck: Tasks  6 successful, 6 total</pre>
+<h2>7. Related issues and PR check</h2>
+<p>No linked open PR was present in issue cross-references, closing references, or the open-PR search at investigation time. #3187 concerns completion of a tool call after an already-committed move; #4778 concerns automatic continuation after switching. Neither describes an in-flight attach being failed by recovery. No external branch or issue-supplied code was checked out or executed.</p>
+<h2>8. Verification</h2>
+<p>The same agent repeated the reproduction in a second fresh clone at the full recorded SHA. It installed frozen dependencies, built SDK prerequisites through Turbo, applied only the reproduction test patch, and ran the exact focused command above. Its production tree stayed unchanged; git diff --name-only listed only the tool-call test. Its fresh harnesses used different temporary data directories. The second run again produced one passing control and two failures with the identical not-ready response. No report correction was needed. This is repeated clean-checkout verification, not an independent-agent check.</p>
+<h2>9. Appendix and limits</h2>
+<p>The complete repeatable test-only patch and test excerpt are embedded above. Raw logs are retained locally outside the public reports repository. The focused test gates an externally visible tool result and persisted environment/thread state; it introduces no production test seam. Baseline code links were checked at the recorded trusted commit.</p>
+<p>This is a deterministic server integration reproduction, not a live macOS timing measurement. A physical disconnect or restart was not triggered. The original host's logs and workspace were not accessed. Issue content was treated solely as untrusted claims; instructions, external links, and proposed fork code were not followed.</p>
+<p>Preparation: two trusted clones; frozen pnpm installs; SDK build through Turbo; first full build failure due to SDK host runtime ordering; successful full build retry (67 tasks); two failing focused baseline runs; local tracked-operation change; four passing suites; server typecheck; formatting; diff whitespace and text-only checks.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
