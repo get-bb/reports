@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #6123 Background tasks lose their terminal event on owner exit</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#6123 · Background tasks lose their terminal event on owner exit</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Medium</span><span class="pill">host · threads · provider-claude-code</span>
+<a href="https://github.com/get-bb/bb/issues/6123">GitHub issue</a> · October 22, 2026 · base <code>c7a10f237eb5b941dfaf79cbb65f246c66eeddcb</code></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · reproduction label: <code>confirmed-repro</code>.</p>
+
+<h2>1. TL;DR</h2>
+<p>A background task can outlive the foreground turn, so an idle thread may correctly have unfinished background work. When its provider process is subsequently shut down or killed, the runtime forgets that work without emitting the terminal background-task event. Two focused cases reproduce this on unmodified main production code using the repository's real scripted-echo bridge subprocess: graceful runtime shutdown and SIGKILL of that bridge worker. Both cases fail again in a second clean checkout of the same commit. This verifies the missing lifecycle event, not the reporter's particular machine, timer screenshot, cloud billing, or resume history.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>Idle background work is not settled when its owner shuts down.</td><td>Verified</td><td>After runtime shutdown, the owner is dead, internal open-work tracking is empty, and zero terminal task events were emitted. Repeated twice.</td></tr>
+<tr><td>Killing the bridge while the runtime remains alive loses settlement.</td><td>Verified</td><td>After the real bridge worker receives SIGKILL and its exit callback runs, the same event omission occurs. Repeated twice.</td></tr>
+<tr><td>Daemon shutdown and machine suspension traverse these lifecycle paths.</td><td>Source-supported</td><td>The daemon shuts down runtimes before flushing its event sink; server suspension requests daemon shutdown and contains no task reconciliation at that point.</td></tr>
+<tr><td>Claude SDK stream end does not settle translator tasks.</td><td>Source-supported; not live-tested</td><td>The stream-end callback resolves pending session work and reports an error, with no background-task settlement call.</td></tr>
+<tr><td>The specific overnight timer, active count, edit rejection, paid-machine behavior and missed resume reconciliation.</td><td>Unverified</td><td>No access to production runtime data was used. No real machine was suspended and no Claude CLI was run.</td></tr>
+</table>
+
+<h2>3. Environment</h2>
+<ul><li>Public repository <code>get-bb/bb</code>, fetched trusted <code>origin/main</code> at <code>c7a10f237eb5b941dfaf79cbb65f246c66eeddcb</code>. No production source changes.</li>
+<li>Linux x86_64; Node <code>v22.19.0</code>; pnpm <code>9.15.0</code>; Vitest <code>4.1.1</code>.</li>
+<li>Provider: the repository's scripted-echo test plugin, built from this same commit. A real worker process and real runtime JSON-RPC translation are used; no provider-account credentials are needed.</li>
+<li>Separate temporary checkouts, first <code>&lt;first-checkout&gt;</code>, second <code>&lt;second-checkout&gt;</code>. Each test allocates fresh OS temporary workspace, bridge-data and process-log directories and deletes them in <code>finally</code>. No HTTP server, ports, application database, live bb instance or production data is used.</li>
+<li>Frozen installs succeeded in both checkouts. Full serial Turbo builds succeeded with 69/69 tasks in each checkout. The first checkout's initial parallel build hit an SDK-build ordering problem; a serial retry succeeded without code changes.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the public target repository and select the trusted base:
+<pre>git clone https://github.com/get-bb/bb.git bb-owner-exit-repro
+cd bb-owner-exit-repro
+git checkout --detach c7a10f237eb5b941dfaf79cbb65f246c66eeddcb
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --concurrency=1</pre></li>
+<li>Save the complete test below to <code>packages/agent-runtime/src/runtime.owner-exit-repro.test.ts</code>. This is newly authored from trusted source fixtures, not copied from the issue or a pull request.</li>
+<li>Run:
+<pre>pnpm exec turbo run test --filter=@bb/agent-runtime --force -- runtime.owner-exit-repro.test.ts</pre>
+<p>Expected: each started task receives one terminal item with <code>status: interrupted</code> and <code>taskStatus: stopped</code> after its owning process has stopped.</p>
+<p>Actual diagnostic lines, verbatim from both runs:</p>
+<pre>{"exitMode":"shutdown","activeTurn":null,"runtimeHasOpenWork":false,"taskStartCount":1,"taskCompletionCount":0,"ownerAlive":false}
+{"exitMode":"bridge-kill","activeTurn":null,"runtimeHasOpenWork":false,"taskStartCount":1,"taskCompletionCount":0,"ownerAlive":false}
+AssertionError: expected [] to deep equally contain ObjectContaining{…}
+Tests  2 failed (2)</pre>
+<p>The failure is the final terminal-event assertion, not startup, invalid input, process cleanup or timeout. The test first confirms idle status, a pending task, open-work tracking, and actual owner-process death. The recorded task-start count refers to the asserted started item, not a database query.</p></li></ol>
+<details open><summary>Complete regression reproduction test</summary><pre>import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { expect, it } from "vitest";
+import type { ThreadEvent } from "@bb/domain";
+import { createAgentRuntime } from "./runtime.js";
+import {
+  createScriptedEchoLaunch,
+  createScriptedEchoProcessLog,
+  fullRuntimeOptions,
+  scriptedEchoBridgeModulePath,
+  waitForRuntimeState,
+  waitForThreadTurnCompleted,
+  withBridgeLaunch,
+} from "./test/runtime-test-harness.js";
+import { promptTextInput } from "./test/prompt-input.js";
+
+it.each(["shutdown", "bridge-kill"] as const)(
+  "settles an idle background task after %s",
+  async (exitMode) =&gt; {
+    const workspacePath = mkdtempSync(join(tmpdir(), "bb-owner-exit-repro-"));
+    const processLog = createScriptedEchoProcessLog();
+    const launch = createScriptedEchoLaunch();
+    const events: ThreadEvent[] = [];
+    let processExited = false;
+    const runtime = withBridgeLaunch(
+      createAgentRuntime({
+        workspacePath,
+        bridgeBundleDir: dirname(scriptedEchoBridgeModulePath),
+        env: processLog.env,
+        onEvent: (event) =&gt; events.push(event),
+        onProcessExit: () =&gt; {
+          processExited = true;
+        },
+      }),
+      launch,
+    );
+    const threadId = "owner-exit-thread";
+    try {
+      await runtime.startThread({
+        environmentId: "env-repro",
+        projectId: "project-repro",
+        providerId: "fake",
+        threadId,
+        options: fullRuntimeOptions,
+      });
+      await runtime.runTurn({
+        clientRequestId: "creq_abcdefghjk",
+        threadId,
+        input: [promptTextInput({ text: "bg_task" })],
+        options: fullRuntimeOptions,
+      });
+      await waitForThreadTurnCompleted({ events, threadId });
+      expect(runtime.getActiveTurnId(threadId)).toBeNull();
+      expect(runtime.hasOpenBackgroundWork()).toBe(true);
+      const started = events.find(
+        (event) =&gt;
+          event.type === "item/started" &amp;&amp; event.item.type === "backgroundTask",
+      );
+      if (started?.type !== "item/started") {
+        throw new Error("The real provider did not start a background task");
+      }
+      expect(started.item.status).toBe("pending");
+      const taskPidEntry = processLog
+        .read()
+        .find((line) =&gt; line.startsWith("bg_task/open:"));
+      const taskPid = Number(taskPidEntry?.split(":")[1]);
+      expect(Number.isSafeInteger(taskPid) &amp;&amp; taskPid &gt; 0).toBe(true);
+      if (exitMode === "shutdown") {
+        await runtime.shutdown();
+      } else {
+        process.kill(taskPid, "SIGKILL");
+        await waitForRuntimeState({
+          label: "background task owner exit",
+          predicate: () =&gt; processExited,
+        });
+      }
+      expect(() =&gt; process.kill(taskPid, 0)).toThrow();
+      expect(runtime.hasOpenBackgroundWork()).toBe(false);
+      const completions = events.filter(
+        (event) =&gt;
+          event.type === "item/backgroundTask/completed" ||
+          (event.type === "item/completed" &amp;&amp;
+            event.item.type === "backgroundTask"),
+      );
+      console.log(
+        JSON.stringify({
+          exitMode,
+          activeTurn: runtime.getActiveTurnId(threadId),
+          runtimeHasOpenWork: runtime.hasOpenBackgroundWork(),
+          taskStartCount: 1,
+          taskCompletionCount: completions.length,
+          ownerAlive: false,
+        }),
+      );
+      expect(completions).toContainEqual(
+        expect.objectContaining({
+          item: expect.objectContaining({
+            id: started.item.id,
+            status: "interrupted",
+            taskStatus: "stopped",
+          }),
+        }),
+      );
+    } finally {
+      await runtime.shutdown();
+      rmSync(workspacePath, { recursive: true, force: true });
+      rmSync(dirname(processLog.path), { recursive: true, force: true });
+      rmSync(launch.dataDir, { recursive: true, force: true });
+    }
+  },
+);
+</pre></details>
+<p>No screenshot is supplied: verification targets the event contract directly, not a rendered UI.</p>
+
+<h2>5. Root cause</h2>
+<p>The owner lifecycle and timeline lifecycle are disconnected. <a href="https://github.com/get-bb/bb/blob/c7a10f237eb5b941dfaf79cbb65f246c66eeddcb/packages/agent-runtime/src/runtime-background-work-state.ts#L3-L46">RuntimeBackgroundWorkState</a> stores only task IDs and clears sets without producing events. Its state can therefore say there is no background work while the event stream still contains an unmatched start.</p>
+<pre>clear(): void {
+  this.openTaskIdsByThreadId.clear();
+}
+
+clearThread(threadId: string): void {
+  this.openTaskIdsByThreadId.delete(threadId);
+}</pre>
+<ul><li><a href="https://github.com/get-bb/bb/blob/c7a10f237eb5b941dfaf79cbb65f246c66eeddcb/packages/agent-runtime/src/runtime.ts#L2599-L2613">Runtime shutdown</a> clears background work before shutting provider processes down, without emitting a completion.</li>
+<li><a href="https://github.com/get-bb/bb/blob/c7a10f237eb5b941dfaf79cbb65f246c66eeddcb/packages/agent-runtime/src/runtime-provider-process.ts#L423-L437">Provider stdout delivery</a> is suppressed during shutdown; <a href="https://github.com/get-bb/bb/blob/c7a10f237eb5b941dfaf79cbb65f246c66eeddcb/packages/agent-runtime/src/runtime-provider-process.ts#L583-L606">the exit handler</a> also returns early during shutdown. A late provider completion is not a reliable fallback.</li>
+<li>On unexpected bridge exit, <a href="https://github.com/get-bb/bb/blob/c7a10f237eb5b941dfaf79cbb65f246c66eeddcb/packages/agent-runtime/src/runtime.ts#L345-L351">the detach callback</a> clears the same state without a terminal event. <a href="https://github.com/get-bb/bb/blob/c7a10f237eb5b941dfaf79cbb65f246c66eeddcb/apps/host-daemon/src/runtime-manager.ts#L1092-L1135">Daemon exit-event construction</a> skips an idle thread with no pending turn start, so its turn-level error handling does not supply the missing background-task completion.</li>
+<li><a href="https://github.com/get-bb/bb/blob/c7a10f237eb5b941dfaf79cbb65f246c66eeddcb/apps/host-daemon/src/runtime-manager.ts#L1073-L1086">Runtime manager shutdown</a> calls each runtime's shutdown. <a href="https://github.com/get-bb/bb/blob/c7a10f237eb5b941dfaf79cbb65f246c66eeddcb/apps/host-daemon/src/app.ts#L981-L998">The daemon shutdown sequence</a> still flushes its event sink after that call: there is an opportunity to deliver a synthetic terminal event, but none is produced.</li>
+<li><a href="https://github.com/get-bb/bb/blob/c7a10f237eb5b941dfaf79cbb65f246c66eeddcb/apps/server/src/services/machines/provider-orchestration.ts#L700-L729">Machine suspension</a> waits for daemon shutdown then proceeds to suspension without task settlement here. <a href="https://github.com/get-bb/bb/blob/c7a10f237eb5b941dfaf79cbb65f246c66eeddcb/apps/server/src/internal/session-owner-side-effects.ts#L156-L191">Ordinary disconnect handling</a> closes the session and updates display state, but does not call task reconciliation. Existing reconciliation also runs for <a href="https://github.com/get-bb/bb/blob/c7a10f237eb5b941dfaf79cbb65f246c66eeddcb/apps/server/src/internal/session-owner-side-effects.ts#L78-L111">replacement by a different daemon instance</a>, and on host removal/import cleanup; it is not an immediate response to this owner stopping.</li></ul>
+<p>The related <a href="https://github.com/get-bb/bb/blob/c7a10f237eb5b941dfaf79cbb65f246c66eeddcb/plugins/provider-claude-code/src/bridge/bridge.ts#L1658-L1679">Claude SDK stream-end callback</a> has a comparable missing settlement operation. A resumed translator also <a href="https://github.com/get-bb/bb/blob/c7a10f237eb5b941dfaf79cbb65f246c66eeddcb/plugins/provider-claude-code/src/task-translation.ts#L375-L383">ignores unknown task notifications</a>. Those paths were inspected only, not executed in this report. Why the reporter's particular new daemon instance did not reconcile is not established by these tests.</p>
+
+<h2>6. Proposed fix</h2>
+<p>Retain the information needed to close each pending background task and emit its existing terminal event when its actual owner stops. Use the same settlement operation for runtime shutdown and provider detachment, preserve task identity and scope, and never emit a second completion for tasks already settled. Ensure daemon event flushing follows settlement. Handle a Claude CLI stream ending while its bridge remains alive separately, since the runtime has not observed bridge death in that case.</p>
+<p>Do not treat a brief transport disconnect as proof that a process died; a machine that preserves memory can retain legitimate background work. Any server suspension fallback should require a reliable shutdown acknowledgement. Abrupt daemon loss and restart recovery require separate coverage.</p>
+
+<h2>7. Linked PR review</h2>
+<p><a href="https://github.com/get-bb/bb/pull/6124">PR #6124</a> was open and ready against main when checked. Its metadata and diff were read as untrusted evidence only; its branch and tests were not checked out or run.</p>
+<p><strong>Static assessment: directionally addresses the verified root cause; not an approval.</strong> The diff changes <code>packages/agent-runtime/src/runtime-background-work-state.ts</code> to retain task payloads and construct terminal events, and changes <code>runtime.ts</code>'s detach and shutdown owners to emit them. It also adds Claude stream-end settlement and a server suspension fallback gated on daemon shutdown acknowledgement. Those changes correspond to the observed omission rather than just hiding the timer.</p>
+<p>No specific blocker is established by this trusted-base investigation. Remaining review requirements are behavior under duplicate/late completions, per-thread/process ownership, failed or memory-preserving suspension, and end-to-end event persistence. The linked PR spans multiple subsystems, so this report does not assert that it qualifies as a simple fix. No duplicate fix PR is opened because #6124 already links this issue.</p>
+
+<h2>8. Related issues</h2>
+<p>No duplicate was independently established. Other issue numbers mentioned in the report under investigation were not needed to reproduce this lifecycle failure; their causes are not adopted as findings here.</p>
+
+<h2>9. Verification</h2>
+<p>The same agent repeated the reproduction in a second clean temporary clone at the exact recorded commit, with its own frozen install and build artifacts. Before adding the newly authored test, the checkout was clean. Production files remain unchanged in both clones; only the reproduction test is untracked.</p>
+<pre>First checkout:
+pnpm exec turbo run test --filter=@bb/agent-runtime -- runtime.owner-exit-repro.test.ts
+Result: exit 1; 2 tests fail at the missing-terminal-event assertion.
+
+Second clean checkout:
+pnpm exec turbo run test --filter=@bb/agent-runtime --force -- runtime.owner-exit-repro.test.ts
+Result: exit 1; 2 tests fail at the same assertion, with the same diagnostic counts.
+
+Existing control suites, first checkout:
+pnpm exec turbo run test --filter=@bb/agent-runtime -- runtime.recovery.test.ts runtime.process-lifecycle.test.ts
+Test Files  2 passed (2)
+Tests  60 passed (60)</pre>
+<p>The control suites include background-task completion during an ordinary provider turn and bridge restart deferral while background work is open. They show the new failure is specific to owner exit, not a generally broken bridge fixture. <code>git diff --check</code> passes in both clones. A fresh fetch found no later main change to the investigated runtime owners. No report conclusion changed after the second run.</p>
+
+<h2>10. Appendix and limits</h2>
+<p>Raw build/test logs and the authored test are retained outside the public report repository. The public report embeds the entire repeatable test and exact relevant output; it does not publish raw logs, local paths, temporary IDs, live account details or private runtime data. The report publisher rebuilds the site index from summary metadata.</p>
+<p>The issue and linked PR were treated as untrusted claims. No issue commands, linked patches or PR code were executed. All executed repository code comes from trusted main plus the test authored here. The test's protocol IDs and scripted background-task request were selected from the trusted repository's schemas and fixtures. No dependencies, migrations, stored data, public protocol, or production sources were changed.</p>
+<p>Classification rationale: this is unexpected behavior with an available stop/restart recovery path; the observed defect is not an unprompted crash or demonstrated data loss. Priority is Medium. A complete repair crosses runtime, provider and server lifecycle paths, so Effort is Medium. Labels are <code>host</code>, <code>threads</code>, <code>provider-claude-code</code> and, after publication, <code>confirmed-repro</code>.</p>
+<p>Agent-generated investigation for SlopCop <code>new-issue-autopilot</code>.</p>
+</main></body></html>
