@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #6172 Pool recovery leaves retry decisions stale</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:1000px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#6172 · Pool recovery leaves retry decisions stale</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: High</span><span class="pill">providers · threads · provider-retry</span><a href="https://github.com/get-bb/bb/issues/6172">GitHub issue</a><span>2026-10-23</span></p>
+<p>Base: <code>1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5</code>, trusted <code>origin/main</code>.</p>
+<p><strong>Verdict: REPRODUCED · Root-cause confidence: high.</strong> The same agent repeated the reproduction in a second clean trusted checkout. This is not an independent review.</p>
+
+<h2>1. TL;DR</h2>
+<p>Account Pooler can become usable while an automatic retry still waits for an old quota reset. The real Provider Retry entry point queries the real pool once, when the turn fails, then records either a fixed queue schedule or a decline. Enabling a previously disabled reserve account changes the pool's answer to <code>ready</code>, but neither pending nor declined decisions are revisited. A plugin reload also leaves that decision unchanged. Four focused integration scenarios reproduce this on current main with a real migrated core database, real pool storage, and no live provider accounts.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Enabling a usable account does not advance an existing pooled retry.</td><td>Verified dynamically</td><td>Both runs: actual account.enable RPC changes availability to ready; a two-hour row retains its identical sendAt after one minute.</td></tr>
+<tr><td>A pool-unavailable decline is not reconsidered after recovery.</td><td>Verified dynamically</td><td>No enabled accounts initially; enabling the reserve makes the pool ready. The original decline remains and no row is created.</td></tr>
+<tr><td>A beyond-maximum-wait decline is not reconsidered.</td><td>Verified dynamically</td><td>Seven-hour recovery exceeds the default six-hour wait. Enabling the reserve leaves the decline unchanged.</td></tr>
+<tr><td>Restarting Provider Retry does not refresh pending rows.</td><td>Verified for plugin reload</td><td>The SDK harness reload preserves settings and diagnostic storage; the real core queue remains untouched. No additional pool query occurs. A full server process restart was not performed.</td></tr>
+<tr><td>Pool changes are announced to clients, not consumed by Provider Retry.</td><td>Verified by source</td><td>Pool callbacks publish realtime client signals; Provider Retry registers only the failure listener, diagnostic RPC, settings, and CLI.</td></tr>
+<tr><td>Account addition, threshold changes, OAuth error recovery, parent pools, and early quota resets have the same gap.</td><td>Source supports the shared missing refresh path; individual triggers not exercised</td><td>The retry entry has no change subscription, startup reconciliation, dispatch hook, or fallback poll. Only account enable was driven end to end here.</td></tr>
+<tr><td>A superseded request may later dispatch an obsolete continuation.</td><td>Not dynamically reproduced in this report</td><td>The latest-failed-request check exists at creation; the inspected drain path forwards its stored retry reference. This separate safety claim needs its own execution test.</td></tr>
+<tr><td>The reported historical production incidents occurred exactly as described.</td><td>Unverified</td><td>No production data, personal logs, or real provider accounts were accessed.</td></tr>
+</table>
+
+<h2>3. Environment and isolation</h2>
+<ul>
+<li>Public repository <code>get-bb/bb</code>; base and refreshed origin/main both at <code>1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5</code>.</li>
+<li>Linux x86_64; Node <code>v22.19.0</code>; pnpm <code>9.15.0</code>; Vitest <code>4.1.1</code>; Account Pooler and Provider Retry package versions <code>0.1.0</code>.</li>
+<li>Two separately installed temporary checkouts, referred to here as <code>WORK/base</code> and <code>WORK/verify</code>. Both began clean at the same trusted commit; only the local reproduction test was added.</li>
+<li>The server test harness uses <code>createMigratedConnection()</code>; pool accounts and quota observations use the SDK harness's real SQLite storage and a fresh temporary pool data directory per scenario. Pool routing and both plugin entry points are real; cross-plugin SDK transport and upstream HTTP are test adapters.</li>
+<li>No external development server or browser was started. No listening ports, enrolled hosts, real provider binaries, credentials, or production data were used. Fresh per-test data directories are removed in finally blocks; fake timers are restored.</li>
+</ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol>
+<li>Clone the trusted target and select the recorded base:<pre>git clone https://github.com/get-bb/bb.git bb-6172
+cd bb-6172
+git checkout --detach 1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build</pre></li>
+<li>Save the complete test below as <code>apps/server/test/threads/issue-6172.test.ts</code>. Run:<pre>pnpm exec turbo run test --force --filter=@bb/server -- test/threads/issue-6172.test.ts test/threads/turn-failed-retry.test.ts</pre></li>
+<li>The table-driven fixture creates an active thread, two actual pool accounts, and a real upstream-429 quota observation. The reserve starts disabled. Depending on the scenario it schedules a two-hour row, declines for no enabled accounts, or declines for a seven-hour reset. It enables the reserve, verifies the pool itself now answers <code>ready</code>, optionally reloads Provider Retry, then advances fake time by one minute.</li>
+<li><strong>Expected:</strong> the recovery is observed; a still-current failed request is scheduled promptly rather than waiting for the old two-hour reset, and recoverable declines gain a retry. <strong>Actual:</strong> every scenario still has exactly one Provider Retry availability query in total. The pending rows retain their old timestamps; declined cases have zero rows. The diagnostic remains the initial decision.</li>
+</ol>
+<p>Exact diagnostic output from the first run, with no private paths or real account data:</p>
+<pre>{"scenario":"pending","poolAfterEnable":"ready","availabilityReads":1,"rowCount":1,"originalSendAt":1792764027596,"currentSendAt":1792764027596,"now":1792756860000,"diagnostic":{"requestId":"creq_2222222223","observedAt":1792756800000,"availability":{"kind":"blocked","retryAt":1792764000000},"decision":{"kind":"retry","reason":"Rate limited","sendAt":1792764027596}}}
+{"scenario":"unavailable","poolAfterEnable":"ready","availabilityReads":1,"rowCount":0,"originalSendAt":null,"currentSendAt":null,"now":1792756860000,"diagnostic":{"requestId":"creq_2222222223","observedAt":1792756800000,"availability":{"kind":"unavailable","reason":"no-enabled-account"},"decision":{"kind":"decline","reason":"pool-unavailable"}}}
+{"scenario":"beyond-maximum-wait","poolAfterEnable":"ready","availabilityReads":1,"rowCount":0,"originalSendAt":null,"currentSendAt":null,"now":1792756860000,"diagnostic":{"requestId":"creq_2222222223","observedAt":1792756800000,"availability":{"kind":"blocked","retryAt":1792782000000},"decision":{"kind":"decline","reason":"beyond-maximum-wait"}}}
+{"scenario":"restart","poolAfterEnable":"ready","availabilityReads":1,"rowCount":1,"originalSendAt":1792764037583,"currentSendAt":1792764037583,"now":1792756860000,"diagnostic":{"requestId":"creq_2222222223","observedAt":1792756800000,"availability":{"kind":"blocked","retryAt":1792764000000},"decision":{"kind":"retry","reason":"Rate limited","sendAt":1792764037583}}}</pre>
+<p>Key verbatim failures and second-run summary:</p>
+<pre>AssertionError: Provider Retry must re-query after recovery: expected 1 to be greater than 1
+AssertionError: The recovered error-state request must have a retry: expected [] to have a length of 1 but got +0
+AssertionError: The retry must no longer wait for the stale reset: expected 1792764032732 to be less than or equal to 1792756860000
+Test Files  1 failed | 1 passed (2)
+     Tests  4 failed | 13 passed (17)</pre>
+<p>The four failures are the intended behavioral assertions, not build, import, authentication, or harness setup failures. The existing pooled-429 scheduling control passes. This is nonvisual; screenshots add no evidence.</p>
+<details><summary>Complete reproduction test (copy into the path above)</summary><pre>import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { z } from "zod";
+import { expect, it, vi } from "vitest";
+import {
+  getLatestThreadSequence,
+  getThread,
+  listEvents,
+  listQueuedThreadMessages,
+} from "@bb/db";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import { createAccountPoolPlugin } from "../../../../plugins/account-pool/src/server.js";
+import providerRetryPlugin from "../../../../plugins/provider-retry/server.js";
+import {
+  retryAvailabilityMethod,
+  retryAvailabilitySchema,
+} from "../../../../plugins/provider-retry/src/retry-contract.js";
+import { retryDiagnosticSchema } from "../../../../plugins/provider-retry/src/diagnostics.js";
+import { applyLoggedThreadLifecycleEvent } from "../../src/services/threads/lifecycle-outcome.js";
+import { retryFailedTurn } from "../../src/services/threads/turn-retry.js";
+import { buildTurnFailedEvent } from "../../src/services/threads/turn-failed.js";
+import { toThreadQueuedMessage } from "../../src/services/threads/thread-queued-messages.js";
+import {
+  seedEnvironment,
+  seedEvent,
+  seedHostSession,
+  seedProjectWithSource,
+  seedThread,
+  seedThreadRuntimeState,
+} from "../helpers/seed.js";
+import { withTestHarness } from "../helpers/test-app.js";
+
+it.each(["pending", "unavailable", "beyond-maximum-wait", "restart"] as const)(
+  "issue 6172: %s observes actual pool recovery within one minute",
+  async (scenario) =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      const { host } = seedHostSession(harness.deps, {
+        id: "host-pool-recovery",
+      });
+      const { project } = seedProjectWithSource(harness.deps, {
+        hostId: host.id,
+        path: "/tmp/pool-recovery-project",
+      });
+      const environment = seedEnvironment(harness.deps, {
+        hostId: host.id,
+        projectId: project.id,
+        path: "/tmp/pool-recovery-project",
+      });
+      const thread = seedThread(harness.deps, {
+        environmentId: environment.id,
+        projectId: project.id,
+        status: "active",
+      });
+      seedThreadRuntimeState(harness.deps, {
+        environmentId: environment.id,
+        threadId: thread.id,
+        providerThreadId: "provider-recovery",
+        inputText: "Reply with ok",
+      });
+      const request = z
+        .object({
+          requestId: z.string(),
+          execution: z.object({ model: z.string() }),
+        })
+        .parse(
+          JSON.parse(
+            listEvents(harness.db, { threadId: thread.id }).find(
+              (event) =&gt; event.type === "client/turn/requested",
+            )!.data,
+          ),
+        );
+      const dataDir = await mkdtemp(path.join(tmpdir(), "bb-6172-pool-"));
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-10-23T12:00:00.000Z"));
+      const resetAt =
+        Date.now() + (scenario === "beyond-maximum-wait" ? 7 : 2) * 3_600_000;
+      let availabilityReads = 0;
+      const pool = createFakePluginHost({
+        pluginId: "account-pool",
+        dataDir,
+        sdk: {
+          hosts: { list: async () =&gt; [host] },
+          system: { providerStates: async () =&gt; ({ providers: [] }) },
+          threads: { events: { list: async () =&gt; [{ data: request }] } },
+        },
+      });
+      let retry = createFakePluginHost({
+        pluginId: "provider-retry",
+        sdk: {
+          plugins: {
+            experimental_discoverRpc: async () =&gt; [
+              {
+                pluginId: "account-pool",
+                displayName: "Account Pooler",
+                method: retryAvailabilityMethod,
+              },
+            ],
+            callRpc: async ({ method, input }) =&gt; {
+              availabilityReads += 1;
+              return retryAvailabilitySchema.parse(
+                await pool.harness.behavior.callRpc(method, input),
+              );
+            },
+          },
+          threads: {
+            queue: {
+              list: async () =&gt;
+                listQueuedThreadMessages(harness.db, thread.id).map(
+                  toThreadQueuedMessage,
+                ),
+            },
+            get: async () =&gt; getThread(harness.db, thread.id),
+            retry: async (input) =&gt; {
+              const current = getThread(harness.db, input.threadId);
+              if (current === null) throw new Error("Missing test thread");
+              return retryFailedTurn(harness.deps, {
+                thread: current,
+                request: {
+                  turnRequestId: input.turnRequestId ?? null,
+                  sendAt: input.sendAt ?? null,
+                  reason: input.reason ?? "Rate limited",
+                },
+              });
+            },
+          },
+        },
+      });
+      try {
+        await createAccountPoolPlugin({
+          now: () =&gt; Date.now(),
+          env: {},
+          fetch: async () =&gt;
+            Response.json(
+              {},
+              {
+                status: 429,
+                headers: {
+                  "anthropic-ratelimit-unified-5h-status": "rejected",
+                  "anthropic-ratelimit-unified-5h-reset": String(
+                    resetAt / 1000,
+                  ),
+                },
+              },
+            ),
+        })(pool.bb);
+        const accountSchema = z.object({ id: z.string() });
+        const primary = accountSchema.parse(
+          await pool.harness.behavior.callRpc("account.add", {
+            provider: "claude",
+            source: { kind: "api-key", apiKey: "test-primary" },
+            label: null,
+            priority: 1,
+          }),
+        );
+        const reserve = accountSchema.parse(
+          await pool.harness.behavior.callRpc("account.add", {
+            provider: "claude",
+            source: { kind: "api-key", apiKey: "test-reserve" },
+            label: null,
+            priority: 2,
+          }),
+        );
+        await pool.harness.behavior.callRpc("account.disable", {
+          id: reserve.id,
+        });
+        pool.harness.behavior.runService("hub");
+        const entries = await pool.harness.behavior.resolveProviderEnv(
+          "claude-code",
+          { threadId: thread.id, projectId: thread.projectId, hostId: host.id },
+        );
+        const token = entries.find(
+          (entry) =&gt; entry.name === "ANTHROPIC_AUTH_TOKEN",
+        )?.value;
+        if (typeof token !== "string")
+          throw new Error("Missing test pool route");
+        const response = await pool.harness.behavior.fetchHttp(
+          "POST",
+          "/v1/messages",
+          {
+            headers: { authorization: `Bearer ${token}` },
+            body: JSON.stringify({ model: "claude-opus-4-1", messages: [] }),
+          },
+        );
+        expect(response.status).toBe(429);
+        await response.text();
+        if (scenario === "unavailable")
+          await pool.harness.behavior.callRpc("account.disable", {
+            id: primary.id,
+          });
+        seedEvent(harness.deps, {
+          threadId: thread.id,
+          environmentId: environment.id,
+          sequence:
+            getLatestThreadSequence(harness.db, { threadId: thread.id }) + 1,
+          type: "provider/error",
+          scope: { kind: "thread" },
+          data: {
+            providerThreadId: "provider-recovery",
+            message: "Pool unavailable",
+            errorInfo: {
+              category: "rate-limit",
+              providerCode: null,
+              httpStatusCode: 429,
+            },
+          },
+        });
+        applyLoggedThreadLifecycleEvent(harness.deps, {
+          event: { type: "run.failed" },
+          threadId: thread.id,
+        });
+        const failed = buildTurnFailedEvent(harness.db, thread.id);
+        if (failed === null) throw new Error("Missing failure event");
+        await providerRetryPlugin(retry.bb);
+        expect(
+          (await retry.harness.behavior.emitThreadEvent("turn.failed", failed))
+            .errors,
+        ).toEqual([]);
+        const originalRows = listQueuedThreadMessages(harness.db, thread.id);
+        const declined =
+          scenario === "unavailable" || scenario === "beyond-maximum-wait";
+        expect(originalRows).toHaveLength(declined ? 0 : 1);
+        if (!declined)
+          expect(originalRows[0]!.sendAt).toBeGreaterThanOrEqual(
+            resetAt + 15_000,
+          );
+        const originalDiagnostic = retryDiagnosticSchema.parse(
+          await retry.harness.behavior.callRpc("decision.get", {
+            threadId: thread.id,
+          }),
+        );
+        expect(originalDiagnostic.decision).toMatchObject(
+          declined
+            ? {
+                kind: "decline",
+                reason:
+                  scenario === "unavailable"
+                    ? "pool-unavailable"
+                    : "beyond-maximum-wait",
+              }
+            : { kind: "retry" },
+        );
+        expect(availabilityReads).toBe(1);
+        await pool.harness.behavior.callRpc("account.enable", {
+          id: reserve.id,
+        });
+        expect(
+          await pool.harness.behavior.callRpc(retryAvailabilityMethod, {
+            threadId: thread.id,
+            requestId: request.requestId,
+          }),
+        ).toEqual({ kind: "ready" });
+        if (scenario === "restart")
+          retry = await retry.harness.reload(providerRetryPlugin);
+        await vi.advanceTimersByTimeAsync(60_000);
+        const rows = listQueuedThreadMessages(harness.db, thread.id);
+        const diagnostic = await retry.harness.behavior.callRpc(
+          "decision.get",
+          { threadId: thread.id },
+        );
+        console.log(
+          JSON.stringify({
+            scenario,
+            poolAfterEnable: "ready",
+            availabilityReads,
+            rowCount: rows.length,
+            originalSendAt: originalRows[0]?.sendAt ?? null,
+            currentSendAt: rows[0]?.sendAt ?? null,
+            now: Date.now(),
+            diagnostic,
+          }),
+        );
+        expect
+          .soft(
+            availabilityReads,
+            "Provider Retry must re-query after recovery",
+          )
+          .toBeGreaterThan(1);
+        expect
+          .soft(rows, "The recovered error-state request must have a retry")
+          .toHaveLength(1);
+        if (rows[0] !== undefined)
+          expect
+            .soft(
+              rows[0].sendAt,
+              "The retry must no longer wait for the stale reset",
+            )
+            .toBeLessThanOrEqual(Date.now());
+      } finally {
+        vi.useRealTimers();
+        await retry.harness.dispose();
+        await pool.harness.dispose();
+        await rm(dataDir, { recursive: true, force: true });
+      }
+    });
+  },
+);
+</pre></details>
+
+<h2>5. Root cause</h2>
+<h3>The decision has no refresh lifecycle</h3>
+<p><a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/plugins/provider-retry/server.ts#L52-L110">Provider Retry server entry, lines 52–110</a>, performs discovery and availability reads only inside <code>turn.failed</code>. It either returns after recording a decline or submits a fixed <code>sendAt</code> through <code>threads.retry</code>. There is no scheduler service, startup queue scan, account-change subscription, or message.dispatch hook in this entry.</p>
+<pre>bb.events.on("turn.failed", async (event) =&gt; {
+  ...
+  const decision = decideRetry({ availability, failure: event, ... });
+  ...
+  if (decision.kind === "decline") {
+    await recordDecision();
+    return;
+  }
+  await bb.sdk.threads.retry({
+    threadId: event.threadId,
+    turnRequestId: event.requestId,
+    sendAt: decision.sendAt,
+    reason: decision.reason,
+  });
+});</pre>
+<p><a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/plugins/provider-retry/src/retry-policy.ts#L53-L60">Retry policy, lines 53–60</a>, fixes the timestamp to the later of reset and now, plus a 15-second buffer and up to 30 seconds of jitter. <a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/plugins/provider-retry/src/retry-policy.ts#L126-L143">Lines 126–143</a> immediately decline unavailable sources and resets beyond maximumWait. The server stores only one diagnostic under a per-thread key, not a recovery-candidate lifecycle.</p>
+<h3>The pool recovers correctly, but the retry plugin never learns it</h3>
+<p><a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/plugins/account-pool/src/operations.ts#L171-L179">PoolOperations.enable</a> enables the account and clears its error and hold, then notifies its callbacks. <a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/plugins/account-pool/src/server.ts#L208-L221">The server callback wiring</a> publishes a realtime client signal and refreshes usage. <a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/packages/plugin-sdk/src/backend-contract.ts#L906-L914">PluginRealtime</a> is an ephemeral client-WebSocket broadcast, not a server plugin event subscription. Config changes similarly publish a client signal in <a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/plugins/account-pool/src/server.ts#L109-L121">config.set</a>.</p>
+<p><a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/plugins/account-pool/src/hub.ts#L1294-L1335">Account availability</a> correctly returns ready when any enabled, nonerrored account is usable. Both runs directly verified this after enable, ruling out a stale pool answer as the cause.</p>
+<h3>A complete repair crosses the queue boundary</h3>
+<p><a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/apps/server/src/services/threads/turn-retry.ts#L26-L84">Core retry creation</a> enforces one live row and the current failed request. <a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/packages/server-contract/src/api/threads.ts#L436-L439">Queued-message update</a> accepts a concurrency timestamp and prompt input, not a replacement schedule. Sending now is not an equivalent reschedule: <a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/apps/server/src/services/threads/dispatch-attempt.ts#L224-L230">its contract bypasses all plugin waits</a>. The <a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/apps/server/src/services/threads/queued-messages.ts#L708-L745">queue drain</a> forwards the stored retry reference; the separate stale-request dispatch concern was inspected but not dynamically exercised.</p>
+
+<h2>6. Proposed fix and simple-fix gate</h2>
+<p>A complete repair needs a cross-plugin availability-change path, Provider Retry reconciliation of still-current candidates at recovery and startup, and bounded missed-signal recovery. It must reschedule a live row without incrementing attempts or bypassing ordinary dispatch hooks. Candidate retention, original-failure maximum-wait accounting, jitter, later resets, and due-time request validity need explicit semantics and tests.</p>
+<p><strong>No automatic code PR is safe under this rule.</strong> The end-to-end repair spans Account Pooler, Provider Retry, and core queued retry behavior, and needs a rescheduling/notification contract decision. It fails the one-existing-subsystem and no-public-contract/product-decision gates. No production patch, fix branch, push, or code PR was attempted. GitHub issue timeline and open-PR search showed no linked open PR during this run. A narrow send-now workaround would violate plugin wait policies.</p>
+
+<h2>7. Verification</h2>
+<p>A second temporary clone was fetched directly from the trusted target, checked out at the exact base, and confirmed clean before applying only the reproduction test. It received its own frozen install and SDK/full builds; the full build completed with <code>71 successful</code> tasks. The same agent repeated the test with fresh migrated test databases and new per-scenario pool directories. No external server ports were needed.</p>
+<pre>git rev-parse HEAD
+1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5
+
+pnpm exec turbo run test --force --filter=@bb/server -- test/threads/issue-6172.test.ts test/threads/turn-failed-retry.test.ts
+Test Files  1 failed | 1 passed (2)
+     Tests  4 failed | 13 passed (17)</pre>
+<p>Both test copies have SHA-256 <code>a1d106fd823186b89b0d0157f564d869205cca6d374d24d268ea11a8e03ec43d</code>. Every scenario again observed ready pool availability with exactly one scheduler availability read. Jitter produced different initial sendAt values, but each row remained byte-for-byte unchanged within its run.</p>
+<pre>{"scenario":"pending","poolAfterEnable":"ready","availabilityReads":1,"rowCount":1,"originalSendAt":1792764032732,"currentSendAt":1792764032732,"now":1792756860000,"diagnostic":{"requestId":"creq_2222222223","observedAt":1792756800000,"availability":{"kind":"blocked","retryAt":1792764000000},"decision":{"kind":"retry","reason":"Rate limited","sendAt":1792764032732}}}
+{"scenario":"unavailable","poolAfterEnable":"ready","availabilityReads":1,"rowCount":0,"originalSendAt":null,"currentSendAt":null,"now":1792756860000,"diagnostic":{"requestId":"creq_2222222223","observedAt":1792756800000,"availability":{"kind":"unavailable","reason":"no-enabled-account"},"decision":{"kind":"decline","reason":"pool-unavailable"}}}
+{"scenario":"beyond-maximum-wait","poolAfterEnable":"ready","availabilityReads":1,"rowCount":0,"originalSendAt":null,"currentSendAt":null,"now":1792756860000,"diagnostic":{"requestId":"creq_2222222223","observedAt":1792756800000,"availability":{"kind":"blocked","retryAt":1792782000000},"decision":{"kind":"decline","reason":"beyond-maximum-wait"}}}
+{"scenario":"restart","poolAfterEnable":"ready","availabilityReads":1,"rowCount":1,"originalSendAt":1792764023756,"currentSendAt":1792764023756,"now":1792756860000,"diagnostic":{"requestId":"creq_2222222223","observedAt":1792756800000,"availability":{"kind":"blocked","retryAt":1792764000000},"decision":{"kind":"retry","reason":"Rate limited","sendAt":1792764023756}}}</pre>
+<p>No report correction was needed after the second run. Scope limits remain: plugin reload is not a whole-process restart; unavailable was exercised with disabled accounts, not a real OAuth error; full live dispatch, ten-thread staggering, parent pools, every recovery trigger, and superseded-request dispatch were not reproduced. This report establishes the central stale-decision bug rather than claiming all proposed acceptance cases were executed.</p>
+
+<h2>8. Related work</h2>
+<p>The trusted repository history includes <a href="https://github.com/get-bb/bb/commit/93ba274339e4debd858cb1b3177daced9750e32a">the pooled-retry availability change</a>. It supplies the initial pool-aware scheduling path used by the passing control; the present failure is the missing lifecycle after that initial decision. There was no linked open pull request to review.</p>
+
+<h2>9. Appendix and evidence hygiene</h2>
+<p>Initial checkout commands included a frozen install followed by the full Turbo build. The first full build stopped because the GitHub plugin could not resolve an unbuilt SDK host runtime. Building <code>@get-bb/plugin-sdk</code> and repeating the full build succeeded with <code>71 successful</code> tasks; no source or dependency changes were needed. The second checkout built SDK first and then passed the same full build.</p>
+<pre>pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build
+pnpm exec oxfmt apps/server/test/threads/issue-6172.test.ts
+pnpm exec turbo run test --filter=@bb/server -- test/threads/turn-failed-retry.test.ts -t 'pooled provider retry integration'
+pnpm exec turbo run test --filter=@bb/server -- test/threads/issue-6172.test.ts
+pnpm exec turbo run test --force --filter=@bb/server -- test/threads/issue-6172.test.ts test/threads/turn-failed-retry.test.ts
+git fetch origin main
+git log --oneline HEAD..origin/main -- plugins/provider-retry plugins/account-pool apps/server/src/services/threads
+git diff --check</pre>
+<p>The first control run passed one existing integration test; the second passed all 13 tests in that existing file. Refreshing origin/main showed no intervening changes. Classification was applied through the SlopCop GitHub wrapper and verified as Bug / Medium / High with providers, threads, and provider-retry labels; no existing classification was overwritten. Raw build/test logs remain outside the public reports repository. Per that repository's privacy rules, the complete reproduction and exact relevant output are embedded here, not committed as separate tests, logs, or artifacts.</p>
+</main></body></html>
