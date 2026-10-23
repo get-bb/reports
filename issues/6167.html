@@ -1,0 +1,854 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #6167 · Proactive OAuth rejection disables unexpired pool credentials</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#6167 · Proactive OAuth rejection disables unexpired pool credentials</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span>
+<span class="pill">Effort: Medium</span><span class="pill">providers</span>
+<a href="https://github.com/get-bb/bb/issues/6167">Issue #6167</a><span>2026-10-23</span></p>
+<p>Trusted base: <a href="https://github.com/get-bb/bb/commit/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5"><code>1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5</code></a>.</p>
+<p class="verdict">Verdict: REPRODUCED · Root-cause confidence: high · Reproduction label: confirmed-repro</p>
+
+<h2>1. TL;DR</h2>
+<p>An OAuth refresh failure does not necessarily mean the currently held access token has expired.
+The request path nevertheless permanently excludes an account after a proactive HTTP 400 refresh rejection,
+without trying its still-unexpired access token. The background path instead resends the rejected refresh
+credential on every eligible usage tick, including after access-token expiry, without recording an account error.
+Both behaviors reproduced through the real Account Pooler hub and provider adapters for Claude and Codex;
+replacing an errored account’s stored credential also failed to restore it on the next background refresh.
+The same eight-case reproduction produced six expected regression failures and two passing transient-failure controls
+in two separate clean checkouts.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>Proactive rejection removes an account while its access token is locally unexpired.</td><td class="ok">Verified</td>
+<td>Both providers returned 429 with 180 seconds left, saved an account error, and made zero upstream inference calls.</td></tr>
+<tr><td>Background usage refresh replays the same rejected refresh credential without setting an error.</td><td class="ok">Verified</td>
+<td>Three calls at logical minutes 7, 12, and 17 sent identical refresh bodies. Error remained null at minute 17, seven minutes after expiry.</td></tr>
+<tr><td>Replacing stored credentials does not automatically restore an errored account.</td><td class="ok">Verified</td>
+<td>A replacement token was written through AccountStore.writeSecret; the next normal background refresh made no new token request and retained the old error.</td></tr>
+<tr><td>Transient proactive failures retain the unexpired access token.</td><td class="ok">Verified</td>
+<td>HTTP 503 controls returned 200, sent one upstream inference request, and left error null for each provider.</td></tr>
+<tr><td>Error writes and successful-refresh error clears omit the accounts-changed callback.</td><td>Verified by source inspection only</td>
+<td>markError writes QuotaStore directly; freshSecret’s success branch also writes directly. No runtime notification assertion was added.</td></tr>
+<tr><td>The proactive rejection path does not recheck a concurrently replaced credential before recording the failure.</td><td>Verified by source inspection only</td>
+<td>The catch in forward calls markError directly, unlike the distinct upstream-rejection check.</td></tr>
+<tr><td>A real shared-grant race caused the reported long thread delays and repeated failures.</td><td class="unv">Not independently verified</td>
+<td>No reporter logs, runtime, accounts, or credentials were accessed. Production durations and race timing are not evidence produced by this report.</td></tr>
+<tr><td>The provider continues accepting the old access token after another holder refreshes.</td><td class="unv">Unverified</td>
+<td>The access token was locally unexpired; no live provider grant was exercised. The fake inference endpoint accepts it, but the failing path never contacts that endpoint.</td></tr>
+</tbody></table>
+
+<h2>3. Environment and isolation</h2>
+<ul><li>Target: public repository get-bb/bb; main and canonical remote main both resolved to the trusted base above.</li>
+<li>Linux 4.19.0-gvisor x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li>
+<li>Two detached clean worktrees named BASE_CHECKOUT and VERIFY_CHECKOUT, each installed with the frozen lockfile and separately built through Turbo.</li>
+<li>Only repository production code and an original test/configuration written for this investigation ran. No issue-supplied test, linked branch, external tool, or dependency was installed.</li>
+<li>The test invokes createHub, the real Claude/Codex adapters, AccountStore, HubTokenStore, QuotaStore, and PoolAffinityStore. The existing Plugin SDK test host supplies KV and real temporary on-disk SQLite; the real plugin migrations initialize that database. The database is not mocked.</li>
+<li>Only the network transport is synthetic. All destinations use reserved .invalid names and the injected fetch rejects unexpected destinations. There are no listening ports, real provider processes, real grants, or user runtime data.</li>
+<li>Each case creates a fresh temporary data directory and cleans it, its SQLite connection, and the background service. The second checkout creates separate data directories again.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol><li>Prepare a trusted checkout at the recorded commit. This does not use a pull-request branch.
+<pre>BASE=$(mktemp -d)
+git clone --single-branch --branch main https://github.com/get-bb/bb.git &quot;$BASE/source&quot;
+cd &quot;$BASE/source&quot;
+git checkout --detach 1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=bb-plugin-account-pool...
+cd plugins/account-pool</pre></li>
+<li>Create <code>plugins/account-pool/src/slopcop-6167.test.ts</code> with the complete test below,
+and <code>plugins/account-pool/vitest.slopcop-6167.config.ts</code> with the configuration below.</li>
+<li>From <code>plugins/account-pool</code>, run the focused test:
+<pre>pnpm exec vitest run --config vitest.slopcop-6167.config.ts</pre>
+<p>The direct Vitest invocation is deliberate investigation: the package test script hardcodes its existing config;
+passing a second --config through Turbo is rejected by Vitest. Prerequisite builds still use Turbo.</p></li>
+<li>Repeat in a second newly created clean checkout at the same commit, with a new frozen install/build and fresh temporary case directories.</li></ol>
+<h3>Expected and actual</h3>
+<table><thead><tr><th>Scenario, for each provider</th><th>Expected</th><th>Actual on unchanged production code</th></tr></thead><tbody>
+<tr><td>Proactive HTTP 400 at logical minute 7; expiry at minute 10</td><td>200; no account error; one inference request</td><td>429; OAuth rejection saved as error; zero inference requests</td></tr>
+<tr><td>Background refresh at minutes 7, 12, and 17</td><td>One attempt for the rejected refresh token; error recorded after expiry</td><td>Three identical rejected refresh requests; error remains null</td></tr>
+<tr><td>Replace the stored secret after the request path saved an error</td><td>Background refresh tries the changed credential and clears the error on success</td><td>No replacement refresh attempted; original error persists</td></tr>
+<tr><td>HTTP 503 control in the same proactive window</td><td>200 and no account error</td><td>Passes for both providers</td></tr>
+</tbody></table>
+<p>The failures are the intended regression assertions against unfixed code, not build failures.
+For each request case the observed JSON includes <code>remainingSeconds: 180</code>,
+<code>status: 429</code>, <code>refreshCalls: 1</code>, and <code>upstreamCalls: 0</code>.</p>
+<h3>Complete original regression test</h3><pre>import fs from &quot;node:fs/promises&quot;;
+import os from &quot;node:os&quot;;
+import path from &quot;node:path&quot;;
+import { createFakePluginHost } from &quot;@get-bb/plugin-sdk/testing&quot;;
+import { afterEach, describe, expect, it, vi } from &quot;vitest&quot;;
+import { accountPoolConfigSchema, type PoolProvider } from &quot;./contracts.js&quot;;
+import { createHub } from &quot;./hub.js&quot;;
+import {
+  AccountStore,
+  HubTokenStore,
+  PoolAffinityStore,
+  QUOTA_MIGRATIONS,
+  QuotaStore,
+} from &quot;./store.js&quot;;
+
+const cleanups: Array&lt;() =&gt; Promise&lt;void&gt;&gt; = [];
+
+afterEach(async () =&gt; {
+  while (cleanups.length &gt; 0) await cleanups.pop()?.();
+});
+
+async function fixture(provider: PoolProvider, rejectionStatus = 400) {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), &quot;pool-6167-&quot;));
+  const host = createFakePluginHost({ pluginId: &quot;account-pool&quot;, dataDir });
+  const database = host.bb.storage.database();
+  host.bb.storage.migrate(database, QUOTA_MIGRATIONS);
+  const accounts = new AccountStore(host.bb.storage.kv, path.join(dataDir, &quot;secrets&quot;));
+  await accounts.initialize();
+  let time = 1_800_000_000_000;
+  const now = () =&gt; time;
+  const hubTokens = new HubTokenStore(path.join(dataDir, &quot;hub-tokens&quot;), now);
+  const quotas = new QuotaStore(database);
+  const refreshBodies: string[] = [];
+  let upstreamCalls = 0;
+  let usageCalls = 0;
+  let replacementAccepted = false;
+  const account = await accounts.add(
+    {
+      provider,
+      kind: &quot;oauth&quot;,
+      label: &quot;Synthetic account&quot;,
+      email: null,
+      accountUuid: null,
+      ...(provider === &quot;codex&quot; ? { codexAccountId: &quot;synthetic-codex-account&quot; } : {}),
+      subscriptionType: null,
+      rateLimitTier: null,
+      enabled: true,
+      priority: 100,
+    },
+    {
+      kind: &quot;oauth&quot;,
+      accessToken: &quot;synthetic-access-original&quot;,
+      refreshToken: &quot;synthetic-refresh-original&quot;,
+      expiresAt: time + 10 * 60_000,
+    },
+  );
+  const transport: typeof fetch = async (input, init) =&gt; {
+    const url = String(input);
+    if (url === &quot;https://oauth.invalid/token&quot;) {
+      const body = String(init?.body);
+      refreshBodies.push(body);
+      if (replacementAccepted &amp;&amp; body.includes(&quot;synthetic-refresh-replacement&quot;)) {
+        return Response.json({
+          access_token: &quot;synthetic-access-renewed&quot;,
+          refresh_token: &quot;synthetic-refresh-renewed&quot;,
+          expires_in: 3600,
+        });
+      }
+      return Response.json({ error: &quot;invalid_grant&quot; }, { status: rejectionStatus });
+    }
+    if (url === &quot;https://usage.invalid/usage&quot;) {
+      usageCalls += 1;
+      return Response.json({});
+    }
+    if (url.startsWith(&quot;https://upstream.invalid/&quot;)) {
+      upstreamCalls += 1;
+      return Response.json({ id: &quot;synthetic-response&quot; });
+    }
+    throw new Error(&quot;Unexpected network destination in isolated reproduction.&quot;);
+  };
+  const hub = createHub({
+    accounts,
+    quotas,
+    affinity: new PoolAffinityStore(database),
+    hubTokens,
+    now,
+    fetch: transport,
+    getSettings: () =&gt; accountPoolConfigSchema.parse({
+      anthropicUpstreamBaseUrl: &quot;https://upstream.invalid&quot;,
+      codexUpstreamBaseUrl: &quot;https://upstream.invalid&quot;,
+    }),
+    refreshUrl: &quot;https://oauth.invalid/token&quot;,
+    codexRefreshUrl: &quot;https://oauth.invalid/token&quot;,
+    usageUrl: &quot;https://usage.invalid/usage&quot;,
+    codexUsageUrl: &quot;https://usage.invalid/usage&quot;,
+  });
+  const controller = new AbortController();
+  const running = hub.start(controller.signal);
+  cleanups.push(async () =&gt; {
+    controller.abort();
+    await running;
+    await host.harness.lifecycle.dispose();
+    await fs.rm(dataDir, { recursive: true, force: true });
+  });
+  await vi.waitFor(() =&gt; expect(usageCalls).toBe(1));
+  const token = await hubTokens.forHost(&quot;synthetic-host&quot;);
+  const request = async () =&gt; {
+    const route = provider === &quot;claude&quot; ? &quot;/v1/messages&quot; : &quot;/responses&quot;;
+    const response = await hub.handle(new Request(`https://hub.invalid${route}`, {
+      method: &quot;POST&quot;,
+      headers: {
+        authorization: `Bearer ${token}`,
+        &quot;content-type&quot;: &quot;application/json&quot;,
+      },
+      body: JSON.stringify(provider === &quot;claude&quot;
+        ? { model: &quot;claude-sonnet-4&quot;, max_tokens: 1, messages: [{ role: &quot;user&quot;, content: &quot;ok&quot; }] }
+        : { model: &quot;gpt-5&quot;, input: &quot;ok&quot; }),
+    }), provider, route);
+    await response.text();
+    return response.status;
+  };
+  return {
+    hub,
+    quotas,
+    account,
+    refreshBodies,
+    request,
+    advance: (milliseconds: number) =&gt; { time += milliseconds; },
+    upstreamCalls: () =&gt; upstreamCalls,
+    replaceSecret: async () =&gt; {
+      replacementAccepted = true;
+      await accounts.writeSecret(account.id, {
+        kind: &quot;oauth&quot;,
+        accessToken: &quot;synthetic-access-replacement&quot;,
+        refreshToken: &quot;synthetic-refresh-replacement&quot;,
+        expiresAt: time + 60_000,
+      });
+    },
+  };
+}
+
+describe.each([&quot;claude&quot;, &quot;codex&quot;] as const)(&quot;proactive rejection: %s&quot;, (provider) =&gt; {
+  it(&quot;keeps a locally unexpired access token available after proactive rejection&quot;, async () =&gt; {
+    const pool = await fixture(provider);
+    pool.advance(7 * 60_000);
+    const status = await pool.request();
+    const error = pool.quotas.get(pool.account.id).error;
+    console.log(JSON.stringify({ scenario: &quot;request&quot;, provider, status, error,
+      remainingSeconds: 180, refreshCalls: pool.refreshBodies.length, upstreamCalls: pool.upstreamCalls() }));
+    expect.soft(status).toBe(200);
+    expect.soft(error).toBeNull();
+    expect.soft(pool.upstreamCalls()).toBe(1);
+  });
+
+  it(&quot;does not replay a rejected refresh credential and records expiry in background&quot;, async () =&gt; {
+    const pool = await fixture(provider);
+    pool.advance(7 * 60_000);
+    await pool.hub.refreshUsage();
+    pool.advance(5 * 60_000);
+    await pool.hub.refreshUsage();
+    pool.advance(5 * 60_000);
+    await pool.hub.refreshUsage();
+    const error = pool.quotas.get(pool.account.id).error;
+    console.log(JSON.stringify({ scenario: &quot;background&quot;, provider,
+      refreshCalls: pool.refreshBodies.length,
+      identicalRefreshBodies: new Set(pool.refreshBodies).size === 1,
+      expiredSecondsAgo: 420, error }));
+    expect.soft(pool.refreshBodies).toHaveLength(1);
+    expect.soft(error).not.toBeNull();
+  });
+
+  it(&quot;recovers on a background tick when the stored refresh credential changes&quot;, async () =&gt; {
+    const pool = await fixture(provider);
+    pool.advance(7 * 60_000);
+    await pool.request();
+    pool.advance(5 * 60_000);
+    await pool.replaceSecret();
+    await pool.hub.refreshUsage();
+    const error = pool.quotas.get(pool.account.id).error;
+    console.log(JSON.stringify({ scenario: &quot;replacement&quot;, provider,
+      refreshCalls: pool.refreshBodies.length, error }));
+    expect.soft(pool.refreshBodies).toHaveLength(2);
+    expect.soft(error).toBeNull();
+  });
+
+  it(&quot;continues serving after a transient proactive refresh failure&quot;, async () =&gt; {
+    const pool = await fixture(provider, 503);
+    pool.advance(7 * 60_000);
+    expect(await pool.request()).toBe(200);
+    expect(pool.quotas.get(pool.account.id).error).toBeNull();
+    expect(pool.upstreamCalls()).toBe(1);
+  });
+});
+</pre>
+<h3>Focused test configuration</h3><pre>import { fileURLToPath } from &quot;node:url&quot;;
+import { defineConfig } from &quot;vitest/config&quot;;
+import { sharedWorkerProjects } from &quot;../../vitest.shared.js&quot;;
+
+export default defineConfig({
+  resolve: { tsconfigPaths: true },
+  test: {
+    projects: sharedWorkerProjects({
+      name: &quot;slopcop-6167&quot;,
+      pkgDir: fileURLToPath(new URL(&quot;.&quot;, import.meta.url)),
+      include: [&quot;src/slopcop-6167.test.ts&quot;],
+    }),
+  },
+});
+</pre>
+<p>The test and logs are embedded rather than attached as repository files, in accordance with the public reports repository policy.
+Raw local evidence remains outside the published repository.</p>
+
+<h2>5. Root cause</h2>
+<h3>One permanent refresh outcome is handled inconsistently by its callers</h3>
+<p>The adapter’s proactive refresh window is 300 seconds. HTTP 400/401 from the token endpoint produces OAuthRefreshError,
+not TransientOAuthRefreshError. The test exercises HTTP 400; HTTP 401 classification is established by source inspection.</p>
+<p><a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/plugins/account-pool/src/provider-adapter.ts#L121-L134">plugins/account-pool/src/provider-adapter.ts:121</a></p><pre>121: export function oauthSecretDueForRefresh(
+122:   context: AdapterSecretContext,
+123: ): Extract&lt;AccountSecret, { kind: &quot;oauth&quot; }&gt; | null {
+124:   const secret = context.secret;
+125:   if (
+126:     secret.kind !== &quot;oauth&quot; ||
+127:     (!context.forceRefresh &amp;&amp;
+128:       (secret.expiresAt === null ||
+129:         secret.expiresAt &gt; context.now() + OAUTH_REFRESH_WINDOW_MS))
+130:   ) {
+131:     return null;
+132:   }
+133:   return secret;
+134: }</pre>
+<p><a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/plugins/account-pool/src/provider-adapter.ts#L175-L186">plugins/account-pool/src/provider-adapter.ts:175</a></p><pre>175:     if (!response.ok) {
+176:       const retryAfterMs = retryAfterMilliseconds(
+177:         response.headers.get(&quot;retry-after&quot;),
+178:         context.now(),
+179:       );
+180:       const detail = await oauthRefreshErrorDetail(response, timedOut);
+181:       const message = `OAuth refresh failed with HTTP ${response.status}.${detail}`;
+182:       if (response.status === 400 || response.status === 401) {
+183:         throw new OAuthRefreshError(message);
+184:       }
+185:       throw new TransientOAuthRefreshError(message, retryAfterMs);
+186:     }</pre>
+<p>freshSecret only implements token-keyed backoff and access-token fallback for transient failures.
+A permanent rejection clears existing backoff and throws immediately, without remembering the rejected refresh-token identity.</p>
+<p><a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/plugins/account-pool/src/hub.ts#L1116-L1157">plugins/account-pool/src/hub.ts:1116</a></p><pre>1116:             } catch (error) {
+1117:               this.options.onOAuthRefresh(
+1118:                 account.provider,
+1119:                 account.id,
+1120:                 &quot;failed&quot;,
+1121:                 `${error instanceof OAuthRefreshError ? error.message : &quot;Stored credential refresh failed.&quot;} expiresAt=${secret.kind === &quot;oauth&quot; ? secret.expiresAt : null}, forced=${forceRefresh}.`,
+1122:               );
+1123:               if (
+1124:                 !(error instanceof TransientOAuthRefreshError) ||
+1125:                 secret.kind !== &quot;oauth&quot;
+1126:               ) {
+1127:                 this.refreshBackoffs.delete(account.id);
+1128:                 throw error;
+1129:               }
+1130:               const delayMs = Math.min(
+1131:                 MAX_REFRESH_BACKOFF_MS,
+1132:                 Math.max(
+1133:                   backoff === undefined ? 1_000 : backoff.delayMs * 2,
+1134:                   error.retryAfterMs,
+1135:                 ),
+1136:               );
+1137:               this.refreshBackoffs.delete(account.id);
+1138:               this.refreshBackoffs.set(account.id, {
+1139:                 kind: forceRefresh ? &quot;rejected&quot; : &quot;proactive&quot;,
+1140:                 accessToken: secret.accessToken,
+1141:                 retryAt: this.options.now() + delayMs,
+1142:                 delayMs,
+1143:                 error,
+1144:               });
+1145:               while (this.refreshBackoffs.size &gt; MAX_REFRESH_BACKOFFS) {
+1146:                 const oldest = this.refreshBackoffs.keys().next();
+1147:                 if (!oldest.done) this.refreshBackoffs.delete(oldest.value);
+1148:               }
+1149:               if (
+1150:                 !forceRefresh &amp;&amp;
+1151:                 secret.expiresAt !== null &amp;&amp;
+1152:                 secret.expiresAt &gt; this.options.now()
+1153:               ) {
+1154:                 return secret;
+1155:               }
+1156:               throw error;
+1157:             }</pre>
+<p>forward catches that permanent failure and records an error before any upstream inference request.
+Selection excludes errored accounts, so one failing account gives 429; other accounts can instead cause failover or a later reset estimate.</p>
+<p><a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/plugins/account-pool/src/hub.ts#L537-L548">plugins/account-pool/src/hub.ts:537</a></p><pre>537:         } catch (error) {
+538:           if (pacing !== null) {
+539:             this.releasePacing(selected.account.id, pacing);
+540:             pacing = null;
+541:           }
+542:           signal.throwIfAborted();
+543:           if (error instanceof TransientOAuthRefreshError) {
+544:             failure = { status: 503, message: error.message, headers: {} };
+545:           } else {
+546:             this.markError(selected.account.id, errorMessage(error));
+547:           }
+548:           continue;</pre>
+<p><a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/plugins/account-pool/src/hub.ts#L853-L866">plugins/account-pool/src/hub.ts:853</a></p><pre>853:     const available = accounts
+854:       .filter((account) =&gt; account.provider === provider &amp;&amp; account.enabled)
+855:       .map((account) =&gt; ({
+856:         account,
+857:         quota: this.options.quotas.get(account.id),
+858:       }))
+859:       .filter(
+860:         ({ quota }) =&gt; quota.error === null &amp;&amp; !isUsageRestricted(quota, now),
+861:       )
+862:       .filter(
+863:         ({ quota }) =&gt;
+864:           !isSharedQuotaExhausted(quota, threshold, now) ||
+865:           hasExtraUsage(quota),
+866:       );</pre>
+<p>The normal background path invokes the same freshSecret but marks an error only for an explicitly requested recovery.
+Its outer catch otherwise drops the exception. With no rejected-token memory, each future eligible tick sends the same refresh token again.</p>
+<p><a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/plugins/account-pool/src/hub.ts#L346-L369">plugins/account-pool/src/hub.ts:346</a></p><pre>346:     this.lastUsageRefreshAt.set(account.id, now);
+347:     const recover =
+348:       recoverError &amp;&amp; this.options.quotas.get(account.id).error !== null;
+349:     const refresh = adapter
+350:       .refreshUsage({
+351:         account,
+352:         freshSecret: () =&gt;
+353:           this.freshSecret(account, adapter, { kind: &quot;normal&quot; }, recover).catch(
+354:             (error: unknown) =&gt; {
+355:               if (recover &amp;&amp; !(error instanceof TransientOAuthRefreshError))
+356:                 this.markError(account.id, errorMessage(error));
+357:               throw error;
+358:             },
+359:           ),
+360:         accounts: this.options.accounts,
+361:         quotas: this.options.quotas,
+362:         fetch: this.options.fetch,
+363:         now: this.options.now,
+364:       })
+365:       .catch(() =&gt; undefined)
+366:       .finally(() =&gt; this.usageRefreshes.delete(account.id));
+367:     this.usageRefreshes.set(account.id, refresh);
+368:     return refresh;
+369:   }</pre>
+<p>The background loop’s five-minute schedule and public refreshUsage method select enabled OAuth accounts regardless of stored errors;
+our focused test directly invokes that same refreshUsage method with logical five-minute advances.</p>
+<p><a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/plugins/account-pool/src/hub.ts#L164-L178">plugins/account-pool/src/hub.ts:164</a></p><pre>164:   async start(signal: AbortSignal): Promise&lt;void&gt; {
+165:     this.affinityBindings = this.options.affinity.loadBindings(
+166:       this.options.now() - AFFINITY_IDLE_TTL_MS,
+167:       MAX_AFFINITY_BINDINGS,
+168:     );
+169:     this.activeAccounts = this.options.affinity.loadActiveAccounts();
+170:     this.pacingByAccount.clear();
+171:     this.stopped = new AbortController();
+172:     this.accepting = true;
+173:     while (!signal.aborted) {
+174:       await this.refreshUsage();
+175:       await waitForDelay(DEFAULT_USAGE_REFRESH_INTERVAL_MS, signal);
+176:     }
+177:     await this.stop();
+178:   }</pre>
+<p>Once a request saves an error, freshSecret does reread the secret file but rejects the account before invoking the adapter.
+That explains why writing a replacement file does not by itself cause recovery.</p>
+<p><a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/plugins/account-pool/src/hub.ts#L1074-L1076">plugins/account-pool/src/hub.ts:1074</a></p><pre>1074:             }
+1075:             const error = this.options.quotas.get(account.id).error;
+1076:             if (error !== null &amp;&amp; !recover) throw new Error(error);</pre>
+<p>Finally, error transitions are not published through the callback wired to the account-pool realtime event.
+The following writes contain no onAccountsChanged invocation; this is a static finding, not a separate runtime reproduction.</p>
+<p><a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/plugins/account-pool/src/hub.ts#L1105-L1114">plugins/account-pool/src/hub.ts:1105</a></p><pre>1105:               if (result.refreshed) {
+1106:                 this.options.onOAuthRefresh(
+1107:                   account.provider,
+1108:                   account.id,
+1109:                   &quot;succeeded&quot;,
+1110:                   `previousExpiresAt=${secret.kind === &quot;oauth&quot; ? secret.expiresAt : null}, expiresAt=${result.secret.kind === &quot;oauth&quot; ? result.secret.expiresAt : null}, forced=${forceRefresh}.`,
+1111:                 );
+1112:                 const quota = this.options.quotas.get(account.id);
+1113:                 this.options.quotas.put({ ...quota, error: null });
+1114:               }</pre>
+<p><a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/plugins/account-pool/src/hub.ts#L1381-L1384">plugins/account-pool/src/hub.ts:1381</a></p><pre>1381:   private markError(accountId: string, message: string): void {
+1382:     const quota = this.options.quotas.get(accountId);
+1383:     this.options.quotas.put({ ...quota, error: message.slice(0, 1_000) });
+1384:   }</pre>
+
+<h2>6. Proposed repair and automation safety gate</h2>
+<p>A reviewed repair should model rejected refresh credentials separately from access-token usability. Remember which refresh credential was rejected;
+do not retry it unchanged; keep non-forced use of a locally unexpired access token possible until expiry or actual upstream rejection.
+Before committing a terminal error, reread storage and reconcile a changed credential. A normal background tick should record terminal expiry consistently,
+and should only attempt recovery when storage now contains a different refresh credential. Publish account error transitions through the existing notification path.</p>
+<p>Keep forced-refresh behavior and upstream 401/403 handling fail-closed, retain the existing transient backoff,
+and test refresh single-flight races, changed-secret detection, restart semantics, and event delivery before shipping.
+A successful fake endpoint does not prove real providers accept an access token after refresh-token rotation.</p>
+<p><strong>No automatic fix or pull request:</strong> this repair changes OAuth credential rejection and authentication recovery behavior.
+The rule explicitly excludes authentication changes from its simple-fix allowance. No production files were changed, no fix branch was pushed,
+and no unverified patch was published. No open pull request was linked to this issue in the checked GitHub connection/cross-reference metadata or open-PR search.</p>
+
+<h2>7. Verification: second clean run by the same agent</h2>
+<p>A second detached worktree was created directly at <code>1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5</code>.
+Its working tree was clean before adding only the original reproduction test and config.
+It received its own <code>pnpm install --frozen-lockfile --prefer-offline</code> and
+<code>pnpm exec turbo run build --filter=bb-plugin-account-pool...</code>, then the exact focused command above.
+No application state or temporary case directory was reused. This is a repeated check by the same agent, not independent verification.</p>
+<p>Both runs exited 1 with <strong>6 failed | 2 passed (8)</strong>. All six scenario-observation JSON objects match exactly between runs.
+The two passing cases are the transient HTTP 503 controls. Both frozen installs and both scoped prerequisite builds succeeded.</p>
+<p>Reproduction correction before the final two runs: the initial Codex fixture omitted its required account identifier and never reached the usage endpoint;
+the fixture was corrected to include a synthetic codexAccountId. Those setup failures are not counted as reproductions.
+No production code correction was necessary, and the second final run did not require a report correction.</p>
+
+<h2>8. Related work and limits</h2>
+<p>Trusted main history includes <a href="https://github.com/get-bb/bb/commit/2726ab1ee542da44e4ed410680aa9f1d9a72ab74">the prior upstream-rejection repair</a>
+(merged PR #4385). That addresses inference endpoints rejecting freshly refreshed credentials, a different condition from the token endpoint’s permanent refresh rejection here.
+No linked pull-request code was checked out or executed. No external URLs supplied in the issue were fetched.</p>
+<p>Untrusted-data handling: the report treated issue prose, code blocks, logs, and suggestions as claims only.
+The reproduction was designed from trusted repository code and uses neither the issue’s suggested test command nor a copied test.</p>
+<p>Production race timing, the number and duration of past refresh replays, Provider Retry wake-up behavior,
+real provider access-token revocation semantics, and the exact three-thread delay were not reproduced.
+The verdict covers the independently observed pool behavior, not those unverified operational details.</p>
+
+<h2>9. Appendix: exact final focused-test output</h2>
+<p>Only checkout paths are normalized to BASE_CHECKOUT and VERIFY_CHECKOUT. No real credentials were used or printed.</p>
+<details><summary>First final run</summary><pre>
+ RUN  v4.1.1 BASE_CHECKOUT/plugins/account-pool
+
+stdout | src/slopcop-6167.test.ts &gt; proactive rejection: claude &gt; keeps a locally unexpired access token available after proactive rejection
+{&quot;scenario&quot;:&quot;request&quot;,&quot;provider&quot;:&quot;claude&quot;,&quot;status&quot;:429,&quot;error&quot;:&quot;OAuth refresh failed with HTTP 400. invalid_grant.&quot;,&quot;remainingSeconds&quot;:180,&quot;refreshCalls&quot;:1,&quot;upstreamCalls&quot;:0}
+
+stdout | src/slopcop-6167.test.ts &gt; proactive rejection: claude &gt; does not replay a rejected refresh credential and records expiry in background
+{&quot;scenario&quot;:&quot;background&quot;,&quot;provider&quot;:&quot;claude&quot;,&quot;refreshCalls&quot;:3,&quot;identicalRefreshBodies&quot;:true,&quot;expiredSecondsAgo&quot;:420,&quot;error&quot;:null}
+
+stdout | src/slopcop-6167.test.ts &gt; proactive rejection: claude &gt; recovers on a background tick when the stored refresh credential changes
+{&quot;scenario&quot;:&quot;replacement&quot;,&quot;provider&quot;:&quot;claude&quot;,&quot;refreshCalls&quot;:1,&quot;error&quot;:&quot;OAuth refresh failed with HTTP 400. invalid_grant.&quot;}
+
+stdout | src/slopcop-6167.test.ts &gt; proactive rejection: codex &gt; keeps a locally unexpired access token available after proactive rejection
+{&quot;scenario&quot;:&quot;request&quot;,&quot;provider&quot;:&quot;codex&quot;,&quot;status&quot;:429,&quot;error&quot;:&quot;OAuth refresh failed with HTTP 400. invalid_grant.&quot;,&quot;remainingSeconds&quot;:180,&quot;refreshCalls&quot;:1,&quot;upstreamCalls&quot;:0}
+
+stdout | src/slopcop-6167.test.ts &gt; proactive rejection: codex &gt; does not replay a rejected refresh credential and records expiry in background
+{&quot;scenario&quot;:&quot;background&quot;,&quot;provider&quot;:&quot;codex&quot;,&quot;refreshCalls&quot;:3,&quot;identicalRefreshBodies&quot;:true,&quot;expiredSecondsAgo&quot;:420,&quot;error&quot;:null}
+
+stdout | src/slopcop-6167.test.ts &gt; proactive rejection: codex &gt; recovers on a background tick when the stored refresh credential changes
+{&quot;scenario&quot;:&quot;replacement&quot;,&quot;provider&quot;:&quot;codex&quot;,&quot;refreshCalls&quot;:1,&quot;error&quot;:&quot;OAuth refresh failed with HTTP 400. invalid_grant.&quot;}
+
+ ❯ |slopcop-6167| src/slopcop-6167.test.ts (8 tests | 6 failed) 1844ms
+     × keeps a locally unexpired access token available after proactive rejection 293ms
+     × does not replay a rejected refresh credential and records expiry in background 275ms
+     × recovers on a background tick when the stored refresh credential changes 80ms
+     × keeps a locally unexpired access token available after proactive rejection 120ms
+     × does not replay a rejected refresh credential and records expiry in background 140ms
+     × recovers on a background tick when the stored refresh credential changes 407ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 6 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: claude &gt; keeps a locally unexpired access token available after proactive rejection
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: codex &gt; keeps a locally unexpired access token available after proactive rejection
+AssertionError: expected 429 to be 200 // Object.is equality
+
+- Expected
++ Received
+
+- 200
++ 429
+
+ ❯ src/slopcop-6167.test.ts:150:25
+    148|     console.log(JSON.stringify({ scenario: &quot;request&quot;, provider, status…
+    149|       remainingSeconds: 180, refreshCalls: pool.refreshBodies.length, …
+    150|     expect.soft(status).toBe(200);
+       |                         ^
+    151|     expect.soft(error).toBeNull();
+    152|     expect.soft(pool.upstreamCalls()).toBe(1);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/14]⎯
+
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: claude &gt; keeps a locally unexpired access token available after proactive rejection
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: codex &gt; keeps a locally unexpired access token available after proactive rejection
+AssertionError: expected &#x27;OAuth refresh failed with HTTP 400. i…&#x27; to be null
+
+- Expected:
+null
+
++ Received:
+&quot;OAuth refresh failed with HTTP 400. invalid_grant.&quot;
+
+ ❯ src/slopcop-6167.test.ts:151:24
+    149|       remainingSeconds: 180, refreshCalls: pool.refreshBodies.length, …
+    150|     expect.soft(status).toBe(200);
+    151|     expect.soft(error).toBeNull();
+       |                        ^
+    152|     expect.soft(pool.upstreamCalls()).toBe(1);
+    153|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/14]⎯
+
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: claude &gt; keeps a locally unexpired access token available after proactive rejection
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: codex &gt; keeps a locally unexpired access token available after proactive rejection
+AssertionError: expected +0 to be 1 // Object.is equality
+
+- Expected
++ Received
+
+- 1
++ 0
+
+ ❯ src/slopcop-6167.test.ts:152:39
+    150|     expect.soft(status).toBe(200);
+    151|     expect.soft(error).toBeNull();
+    152|     expect.soft(pool.upstreamCalls()).toBe(1);
+       |                                       ^
+    153|   });
+    154|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/14]⎯
+
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: claude &gt; does not replay a rejected refresh credential and records expiry in background
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: codex &gt; does not replay a rejected refresh credential and records expiry in background
+AssertionError: expected [ …(3) ] to have a length of 1 but got 3
+
+- Expected
++ Received
+
+- 1
++ 3
+
+ ❯ src/slopcop-6167.test.ts:168:37
+    166|       identicalRefreshBodies: new Set(pool.refreshBodies).size === 1,
+    167|       expiredSecondsAgo: 420, error }));
+    168|     expect.soft(pool.refreshBodies).toHaveLength(1);
+       |                                     ^
+    169|     expect.soft(error).not.toBeNull();
+    170|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/14]⎯
+
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: claude &gt; does not replay a rejected refresh credential and records expiry in background
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: codex &gt; does not replay a rejected refresh credential and records expiry in background
+AssertionError: expected null not to be null
+ ❯ src/slopcop-6167.test.ts:169:28
+    167|       expiredSecondsAgo: 420, error }));
+    168|     expect.soft(pool.refreshBodies).toHaveLength(1);
+    169|     expect.soft(error).not.toBeNull();
+       |                            ^
+    170|   });
+    171|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/14]⎯
+
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: claude &gt; recovers on a background tick when the stored refresh credential changes
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: codex &gt; recovers on a background tick when the stored refresh credential changes
+AssertionError: expected [ Array(1) ] to have a length of 2 but got 1
+
+- Expected
++ Received
+
+- 2
++ 1
+
+ ❯ src/slopcop-6167.test.ts:182:37
+    180|     console.log(JSON.stringify({ scenario: &quot;replacement&quot;, provider,
+    181|       refreshCalls: pool.refreshBodies.length, error }));
+    182|     expect.soft(pool.refreshBodies).toHaveLength(2);
+       |                                     ^
+    183|     expect.soft(error).toBeNull();
+    184|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[6/14]⎯
+
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: claude &gt; recovers on a background tick when the stored refresh credential changes
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: codex &gt; recovers on a background tick when the stored refresh credential changes
+AssertionError: expected &#x27;OAuth refresh failed with HTTP 400. i…&#x27; to be null
+
+- Expected:
+null
+
++ Received:
+&quot;OAuth refresh failed with HTTP 400. invalid_grant.&quot;
+
+ ❯ src/slopcop-6167.test.ts:183:24
+    181|       refreshCalls: pool.refreshBodies.length, error }));
+    182|     expect.soft(pool.refreshBodies).toHaveLength(2);
+    183|     expect.soft(error).toBeNull();
+       |                        ^
+    184|   });
+    185|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[7/14]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  6 failed | 2 passed (8)
+   Start at  12:56:45
+   Duration  2.79s (transform 613ms, setup 0ms, import 729ms, tests 1.84s, environment 0ms)
+
+</pre></details>
+<details><summary>Second final run</summary><pre>
+ RUN  v4.1.1 VERIFY_CHECKOUT/plugins/account-pool
+
+stdout | src/slopcop-6167.test.ts &gt; proactive rejection: claude &gt; keeps a locally unexpired access token available after proactive rejection
+{&quot;scenario&quot;:&quot;request&quot;,&quot;provider&quot;:&quot;claude&quot;,&quot;status&quot;:429,&quot;error&quot;:&quot;OAuth refresh failed with HTTP 400. invalid_grant.&quot;,&quot;remainingSeconds&quot;:180,&quot;refreshCalls&quot;:1,&quot;upstreamCalls&quot;:0}
+
+stdout | src/slopcop-6167.test.ts &gt; proactive rejection: claude &gt; does not replay a rejected refresh credential and records expiry in background
+{&quot;scenario&quot;:&quot;background&quot;,&quot;provider&quot;:&quot;claude&quot;,&quot;refreshCalls&quot;:3,&quot;identicalRefreshBodies&quot;:true,&quot;expiredSecondsAgo&quot;:420,&quot;error&quot;:null}
+
+stdout | src/slopcop-6167.test.ts &gt; proactive rejection: claude &gt; recovers on a background tick when the stored refresh credential changes
+{&quot;scenario&quot;:&quot;replacement&quot;,&quot;provider&quot;:&quot;claude&quot;,&quot;refreshCalls&quot;:1,&quot;error&quot;:&quot;OAuth refresh failed with HTTP 400. invalid_grant.&quot;}
+
+stdout | src/slopcop-6167.test.ts &gt; proactive rejection: codex &gt; keeps a locally unexpired access token available after proactive rejection
+{&quot;scenario&quot;:&quot;request&quot;,&quot;provider&quot;:&quot;codex&quot;,&quot;status&quot;:429,&quot;error&quot;:&quot;OAuth refresh failed with HTTP 400. invalid_grant.&quot;,&quot;remainingSeconds&quot;:180,&quot;refreshCalls&quot;:1,&quot;upstreamCalls&quot;:0}
+
+stdout | src/slopcop-6167.test.ts &gt; proactive rejection: codex &gt; does not replay a rejected refresh credential and records expiry in background
+{&quot;scenario&quot;:&quot;background&quot;,&quot;provider&quot;:&quot;codex&quot;,&quot;refreshCalls&quot;:3,&quot;identicalRefreshBodies&quot;:true,&quot;expiredSecondsAgo&quot;:420,&quot;error&quot;:null}
+
+stdout | src/slopcop-6167.test.ts &gt; proactive rejection: codex &gt; recovers on a background tick when the stored refresh credential changes
+{&quot;scenario&quot;:&quot;replacement&quot;,&quot;provider&quot;:&quot;codex&quot;,&quot;refreshCalls&quot;:1,&quot;error&quot;:&quot;OAuth refresh failed with HTTP 400. invalid_grant.&quot;}
+
+ ❯ |slopcop-6167| src/slopcop-6167.test.ts (8 tests | 6 failed) 512ms
+     × keeps a locally unexpired access token available after proactive rejection 85ms
+     × does not replay a rejected refresh credential and records expiry in background 63ms
+     × recovers on a background tick when the stored refresh credential changes 62ms
+     × keeps a locally unexpired access token available after proactive rejection 60ms
+     × does not replay a rejected refresh credential and records expiry in background 57ms
+     × recovers on a background tick when the stored refresh credential changes 62ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 6 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: claude &gt; keeps a locally unexpired access token available after proactive rejection
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: codex &gt; keeps a locally unexpired access token available after proactive rejection
+AssertionError: expected 429 to be 200 // Object.is equality
+
+- Expected
++ Received
+
+- 200
++ 429
+
+ ❯ src/slopcop-6167.test.ts:150:25
+    148|     console.log(JSON.stringify({ scenario: &quot;request&quot;, provider, status…
+    149|       remainingSeconds: 180, refreshCalls: pool.refreshBodies.length, …
+    150|     expect.soft(status).toBe(200);
+       |                         ^
+    151|     expect.soft(error).toBeNull();
+    152|     expect.soft(pool.upstreamCalls()).toBe(1);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/14]⎯
+
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: claude &gt; keeps a locally unexpired access token available after proactive rejection
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: codex &gt; keeps a locally unexpired access token available after proactive rejection
+AssertionError: expected &#x27;OAuth refresh failed with HTTP 400. i…&#x27; to be null
+
+- Expected:
+null
+
++ Received:
+&quot;OAuth refresh failed with HTTP 400. invalid_grant.&quot;
+
+ ❯ src/slopcop-6167.test.ts:151:24
+    149|       remainingSeconds: 180, refreshCalls: pool.refreshBodies.length, …
+    150|     expect.soft(status).toBe(200);
+    151|     expect.soft(error).toBeNull();
+       |                        ^
+    152|     expect.soft(pool.upstreamCalls()).toBe(1);
+    153|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/14]⎯
+
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: claude &gt; keeps a locally unexpired access token available after proactive rejection
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: codex &gt; keeps a locally unexpired access token available after proactive rejection
+AssertionError: expected +0 to be 1 // Object.is equality
+
+- Expected
++ Received
+
+- 1
++ 0
+
+ ❯ src/slopcop-6167.test.ts:152:39
+    150|     expect.soft(status).toBe(200);
+    151|     expect.soft(error).toBeNull();
+    152|     expect.soft(pool.upstreamCalls()).toBe(1);
+       |                                       ^
+    153|   });
+    154|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/14]⎯
+
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: claude &gt; does not replay a rejected refresh credential and records expiry in background
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: codex &gt; does not replay a rejected refresh credential and records expiry in background
+AssertionError: expected [ …(3) ] to have a length of 1 but got 3
+
+- Expected
++ Received
+
+- 1
++ 3
+
+ ❯ src/slopcop-6167.test.ts:168:37
+    166|       identicalRefreshBodies: new Set(pool.refreshBodies).size === 1,
+    167|       expiredSecondsAgo: 420, error }));
+    168|     expect.soft(pool.refreshBodies).toHaveLength(1);
+       |                                     ^
+    169|     expect.soft(error).not.toBeNull();
+    170|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/14]⎯
+
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: claude &gt; does not replay a rejected refresh credential and records expiry in background
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: codex &gt; does not replay a rejected refresh credential and records expiry in background
+AssertionError: expected null not to be null
+ ❯ src/slopcop-6167.test.ts:169:28
+    167|       expiredSecondsAgo: 420, error }));
+    168|     expect.soft(pool.refreshBodies).toHaveLength(1);
+    169|     expect.soft(error).not.toBeNull();
+       |                            ^
+    170|   });
+    171|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/14]⎯
+
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: claude &gt; recovers on a background tick when the stored refresh credential changes
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: codex &gt; recovers on a background tick when the stored refresh credential changes
+AssertionError: expected [ Array(1) ] to have a length of 2 but got 1
+
+- Expected
++ Received
+
+- 2
++ 1
+
+ ❯ src/slopcop-6167.test.ts:182:37
+    180|     console.log(JSON.stringify({ scenario: &quot;replacement&quot;, provider,
+    181|       refreshCalls: pool.refreshBodies.length, error }));
+    182|     expect.soft(pool.refreshBodies).toHaveLength(2);
+       |                                     ^
+    183|     expect.soft(error).toBeNull();
+    184|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[6/14]⎯
+
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: claude &gt; recovers on a background tick when the stored refresh credential changes
+ FAIL  |slopcop-6167| src/slopcop-6167.test.ts &gt; proactive rejection: codex &gt; recovers on a background tick when the stored refresh credential changes
+AssertionError: expected &#x27;OAuth refresh failed with HTTP 400. i…&#x27; to be null
+
+- Expected:
+null
+
++ Received:
+&quot;OAuth refresh failed with HTTP 400. invalid_grant.&quot;
+
+ ❯ src/slopcop-6167.test.ts:183:24
+    181|       refreshCalls: pool.refreshBodies.length, error }));
+    182|     expect.soft(pool.refreshBodies).toHaveLength(2);
+    183|     expect.soft(error).toBeNull();
+       |                        ^
+    184|   });
+    185|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[7/14]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  6 failed | 2 passed (8)
+   Start at  12:57:34
+   Duration  1.43s (transform 674ms, setup 0ms, import 800ms, tests 512ms, environment 0ms)
+
+</pre></details>
+<p>Investigation commands consisted of trusted main fetch/revision checks; GitHub read-only metadata and classification reads;
+the authorized SlopCop classification writes; clean worktree creation; the frozen installs and scoped Turbo builds shown above;
+and the focused Vitest command. No app instance, live provider request, or production debugging command ran.</p>
+</main></body></html>
