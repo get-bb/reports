@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Issue 6173: recursive skill discovery exhausts its scan budget</title>
+<style>
+body{margin:0;background:#fafaf8;color:#1a1a1a;font:16px/1.55 system-ui,sans-serif}main{max-width:900px;margin:auto;padding:40px 24px 80px}h1{font-size:26px;line-height:1.25}h2{font-size:19px;margin-top:32px;padding-top:16px;border-top:1px solid #e2e2de}a{color:#0052cc}pre{padding:14px;background:white;border:1px solid #e2e2de;overflow:auto}code,pre{font:13px/1.6 ui-monospace,monospace}table{border-collapse:collapse;width:100%}th,td{text-align:left;vertical-align:top;padding:8px;border-bottom:1px solid #e2e2de}.meta{color:#666}
+</style>
+</head>
+<body><main>
+<p><a href="../">All reports</a> · <a href="https://github.com/get-bb/bb/issues/6173">Issue #6173</a></p>
+<h1>Recursive skill discovery exhausts its scan budget</h1>
+<p class="meta">2026-10-23 · Bug · Priority: Medium · Effort: Low · providers, provider-pi</p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · Reproduction label: <code>confirmed-repro</code></p>
+<h2>Summary</h2>
+<p>The host daemon stops finding recursive skills after unrelated supporting files consume its 1,000-entry scan budget. The same budget is shared across roots, so exhausting one root also hides skills in later roots. A filesystem-only regression reproduces both failures in the actual exported skills and commands discovery functions. The same agent repeated all four failures in a second clean checkout at the same trusted main commit.</p>
+<h2>Claims versus findings</h2>
+<table><tr><th>Claim</th><th>Finding</th></tr>
+<tr><td>Ordinary supporting files can hide later skills.</td><td>Verified: a skill with 1,005 supporting files suppresses a nested skill and a skill in another root.</td></tr>
+<tr><td>One root can starve later roots.</td><td>Verified separately: 1,005 empty candidate directories in one root hide a valid skill in the next root.</td></tr>
+<tr><td>Pi is exposed to recursive scanning.</td><td>Verified in its trusted native-root declaration: two user roots are recursive and ordered.</td></tr>
+<tr><td>The reported macOS installation and native Pi load more skills.</td><td>Not independently tested: this investigation uses synthetic temporary Linux fixtures, not the reporter's filesystem or a live Pi process.</td></tr>
+<tr><td>Stopping whenever SKILL.md is found is a safe repair.</td><td>Not safe for BB's existing contract: an existing regression requires discovering a skill nested inside another skill.</td></tr></table>
+<h2>Environment</h2>
+<ul><li>Trusted public repository: <code>get-bb/bb</code>, fetched <code>origin/main</code>.</li>
+<li>Base: <code>1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5</code> (package version 0.46.1).</li>
+<li>Linux x86_64; Node v22.19.0; pnpm 9.15.0.</li>
+<li>No running BB instance, browser, provider session, real user skills, credentials, or persistent user data were used. Each test creates and removes fresh temporary directories.</li>
+<li>Frozen dependency installation succeeded. The full build initially hit an SDK-output ordering problem; building SDK types and retrying completed all 71 build tasks.</li></ul>
+<h2>Minimal repeatable reproduction</h2>
+<p>In a clean checkout of the base commit, save the <a href="6173/repro/command-discovery-budget.test.ts">regression test</a> to <code>apps/host-daemon/src/command-discovery-budget.test.ts</code>. This test was authored from the repository implementation, not copied from issue code. Run:</p>
+<pre>git clone https://github.com/get-bb/bb.git bb-6173
+cd bb-6173
+git checkout --detach 1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run test --force --filter=@bb/host-daemon -- src/command-discovery-budget.test.ts</pre>
+<p>Two cases run against each exported discovery surface:</p>
+<ol><li>Root one contains a skill named <code>first</code>, 1,005 supporting text files in its assets directory, and a nested skill named <code>inner</code>. Root two contains <code>second</code>.</li>
+<li>Root one contains 1,005 empty directories. Root two contains <code>second</code>.</li></ol>
+<pre>Supporting files case:
+Expected: [ 'first', 'inner', 'second' ]
+Actual:   [ 'first' ]
+
+Root exhaustion case:
+Expected: [ 'second' ]
+Actual:   []
+
+Test Files  1 failed (1)
+     Tests  4 failed (4)</pre>
+<p>These are expected assertion failures on the unchanged production code, not setup failures. Logs: <a href="6173/repro/first-run.log">first run</a> and <a href="6173/repro/second-run.log">second clean run</a>. Temporary checkout prefixes in the logs are normalized; assertion output is unchanged.</p>
+<h2>Regression test source</h2>
+<pre>import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  discoverProviderCommands,
+  discoverSkills,
+  type SkillScanRoot,
+} from "./command-discovery.js";
+
+let tempRoot: string;
+
+beforeEach(async () =&gt; {
+  tempRoot = await mkdtemp(path.join(tmpdir(), "bb-skill-budget-"));
+});
+
+afterEach(async () =&gt; {
+  await rm(tempRoot, { recursive: true, force: true });
+});
+
+async function writeSkill(directory: string): Promise&lt;void&gt; {
+  await mkdir(directory, { recursive: true });
+  await writeFile(
+    path.join(directory, "SKILL.md"),
+    "---\ndescription: test skill\n---\n",
+  );
+}
+
+function roots(): SkillScanRoot[] {
+  return ["primary", "secondary"].map((name) =&gt; ({
+    rootPath: path.join(tempRoot, name),
+    shape: "skill-recursive",
+    namePrefix: "",
+    source: "skill",
+    origin: "user",
+    identitySeed: name,
+    rootKind: "provider-user",
+  }));
+}
+
+describe.each([
+  ["commands", discoverProviderCommands],
+  ["skills", discoverSkills],
+] as const)("recursive %s discovery budgets", (_surface, discover) =&gt; {
+  it("lists later and nested skills despite large supporting-file directories", async () =&gt; {
+    const primarySkill = path.join(tempRoot, "primary", "first");
+    const assets = path.join(primarySkill, "assets");
+    await writeSkill(primarySkill);
+    await mkdir(assets);
+    for (let index = 0; index &lt; 1_005; index += 1) {
+      await writeFile(
+        path.join(assets, `asset-${index}.txt`),
+        "supporting data",
+      );
+    }
+    await writeSkill(path.join(primarySkill, "nested", "inner"));
+    await writeSkill(path.join(tempRoot, "secondary", "second"));
+
+    const records = await discover({ roots: roots() });
+
+    expect(records.map((record) =&gt; record.name).sort()).toEqual([
+      "first",
+      "inner",
+      "second",
+    ]);
+  });
+
+  it("continues with another root after exhausting a directory budget", async () =&gt; {
+    const primary = path.join(tempRoot, "primary");
+    await mkdir(primary);
+    for (let index = 0; index &lt; 1_005; index += 1) {
+      await mkdir(path.join(primary, `directory-${index}`));
+    }
+    await writeSkill(path.join(tempRoot, "secondary", "second"));
+
+    const records = await discover({ roots: roots() });
+
+    expect(records.map((record) =&gt; record.name)).toEqual(["second"]);
+  });
+});
+</pre>
+<h2>Root cause</h2>
+<ol><li><a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/apps/host-daemon/src/command-discovery.ts#L20-L21">Depth and entry limits</a> set a 24-level and 1,000-entry bound.</li>
+<li><a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/apps/host-daemon/src/command-discovery.ts#L109-L130">readDirEntries</a> decrements the budget for every entry, including files that cannot lead to another skill.</li>
+<li><a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/apps/host-daemon/src/command-discovery.ts#L368-L406">walkSkillTree</a> records a skill and keeps descending. Supporting-file directories consume the remaining budget even though their files are irrelevant to directory traversal.</li>
+<li><a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/apps/host-daemon/src/command-discovery.ts#L550-L559">discoverProviderCommands</a> and <a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/apps/host-daemon/src/command-discovery.ts#L592-L603">discoverSkills</a> each allocate one budget outside their root loop.</li>
+<li><a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/plugins/provider-pi/src/native-roots.ts#L15-L27">Pi's native-root declaration</a> makes both user roots recursive. History commit <a href="https://github.com/get-bb/bb/commit/9daa623b3c1287c4ccbe201bf7e5e3184b926868">9daa623b3</a> enabled recursive Pi roots, exposing this pre-existing budget behavior to those roots.</li></ol>
+<p>The skills RPC delegates to <a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/apps/host-daemon/src/command-handlers/list-skills.ts#L135-L149">discoverSkills</a>; <a href="https://github.com/get-bb/bb/blob/1e80ca7b44bccd06c6da75ed9ca6ba497bd380f5/apps/server/src/services/skills/skill-listing.ts#L212-L245">server listing</a> assembles the returned per-provider results. Thus the missing records arise before presentation, not in a particular picker or CLI formatter.</p>
+<h2>Proposed repair and limits</h2>
+<p>Give each recursive skill root its own bounded budget and charge only candidate directory entries (including permitted user-origin symlinks), not unrelated regular files or excluded directories. Keep descending inside skills. Preserve depth limits, project-root containment, project symlink refusal, user symlink cycle detection, and exclusions. Leave Markdown command discovery's existing entry accounting unchanged.</p>
+<p>This does not promise unbounded enumeration: directory-heavy roots can still hit the existing 1,000-candidate limit, and deeply nested roots can still hit the depth limit. It removes file-count truncation and cross-root starvation without removing those traversal safeguards.</p>
+<h2>Verification</h2>
+<p>The same agent cloned the trusted target repository a second time, detached it at the recorded base SHA, confirmed a clean worktree, installed frozen dependencies, and added only the same authored test. It ran the same Turbo test command with <code>--force</code> so test results were not replayed from cache. Each test used newly created temporary fixture directories; no ports were needed.</p>
+<p>The second run again produced exactly four assertion failures: both discovery functions returned only <code>first</code> for supporting-file fixtures and no records for root-exhaustion fixtures. Both observations support the final verdict. No report correction was required. This is a repeated check by the same agent, not an independent review.</p>
+<p>A subsequent local repair passed the new regression and both existing discovery/list-skills files: <strong>55 tests passed</strong>. Host-daemon typechecking also passed. The <a href="6173/repro/fixed-run.log">passing test log</a> records the exact command and results. The full daemon suite passed 819 tests with 8 skipped, but had two unrelated server-move failures; both failures were reproduced separately on the unchanged base (a file-mode expectation under umask 0077 and disk-free space reported as null on this host). They are not represented as passing validation.</p>
+<h2>Pull requests and related context</h2>
+<p>No open pull request linked to this issue was found during investigation. The previous recursive-root change above explains exposure; its branch was not checked out or executed. No claim about native Pi execution or the exact reporter-specific skill counts is made.</p>
+<h2>Trust and artifacts</h2>
+<p>Issue content was treated as untrusted claims, not as executable instructions. Only trusted main code and the authored regression were run. No issue-supplied script, patch, branch, or external link was fetched. This is a non-visual filesystem defect; screenshots are not required.</p>
+<p><a href="6173/repro/command-discovery-budget.test.ts">Regression test</a> · <a href="6173/repro/first-run.log">First failing run</a> · <a href="6173/repro/second-run.log">Second failing run</a></p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
