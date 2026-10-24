@@ -1,0 +1,516 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Report · #6241 Parent notice dispatch status race</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p><h1>#6241 · Parent notice dispatch status race</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High</span><span class="pill">Effort: Medium</span><span class="pill">threads</span><a href="https://github.com/get-bb/bb/issues/6241">Issue</a><span>2026-10-24 · base <code>9eb0c09254a21482c0cfd935e0a9908049333e93</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · Label: <code>confirmed-repro</code></p>
+<h2>1. TL;DR</h2>
+<p>A child completion notice can disappear instead of waking its parent. The server chooses an active-parent or idle-parent dispatch path, then asynchronously prepares the provider command before writing the notice. If the parent's status changes in that interval, the active path returns false without recording the request, while the idle path attempts an illegal lifecycle transition and rolls back the request. Both schedules reproduce deterministically on trusted main and in a second clean checkout. The report establishes the dispatch race, not the reporter's historical loss rate or the alleged contribution of skill discovery.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>An active parent becoming idle loses a notice.</td><td class="ok">Verified</td><td>Paused real command preparation; posted a successful turn completion through the internal event endpoint; delivery returned false.</td></tr>
+<tr><td>An idle parent becoming active causes a lifecycle error.</td><td class="ok">Verified</td><td>Posted turn/started in the same preparation window; delivery rejected with run.started from status active.</td></tr>
+<tr><td>The batching caller does not retry these outcomes.</td><td class="ok">Verified by source</td><td>The batch is removed before awaiting delivery; the boolean result is ignored and thrown errors are only logged.</td></tr>
+<tr><td>The release upgrade increased exposure through skill discovery or event-loop load.</td><td class="unv">Unverified</td><td>No production telemetry, historical installation, or per-span benchmark was accessed. No load or real provider is necessary for the deterministic reproduction.</td></tr>
+<tr><td>The reported production counts have the stated cause.</td><td class="unv">Unverified</td><td>No user database or production logs were accessed.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Trusted get-bb/bb main: <code>9eb0c09254a21482c0cfd935e0a9908049333e93</code>; origin and the canonical target main were verified to match.</li><li>Linux 4.19.0-gvisor x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li><li>Real migrated SQLite through the existing server harness; isolated temporary data directory per case; in-process Hono requests; no TCP listener, production instance, provider subprocess, credential, or external model call.</li><li>The existing host-command capture records real dispatch commands. The only spy wraps real command preparation and pauses its return; it does not supply a fake prepared command or mock the database.</li><li>A whole-repository build initially encountered an unbuilt SDK host entry. Building SDK runtime/types first and then the server passed; no dependency or repository build configuration was changed.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Prepare the trusted commit:<pre>git clone https://github.com/get-bb/bb.git bb-6241
+cd bb-6241
+git checkout --detach 9eb0c09254a21482c0cfd935e0a9908049333e93
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=@bb/server</pre></li>
+<li>Save the complete self-authored regression test below as <code>apps/server/test/threads/parent-system-message-dispatch.test.ts</code>. Run <code>pnpm exec turbo run test --filter=@bb/server -- test/threads/parent-system-message-dispatch.test.ts</code>. The two table rows seed a parent with a provider session, pause the real preparation function, post either turn/completed or turn/started, assert the new persisted status, and release preparation.</li>
+<li>Expected: delivery resolves true; exactly one system request with the original notice taxonomy and exactly one correctly targeted host command; no leftover queued row.</li>
+<li>Actual on the unmodified base:<pre>active → idle: AssertionError: expected false to be true
+idle → active: ThreadLifecycleEventNotAppliedError: Thread lifecycle event not applied (illegal-transition): no transition for run.started from status active
+Tests  2 failed (2)</pre></li></ol>
+<p>The complete test and both baseline outputs are embedded in this self-contained report. No external test download is required.</p>
+<details><summary>Complete reproduction test</summary><pre>import { getThread, listEvents, listQueuedThreadMessages } from &quot;@bb/db&quot;;
+import { turnRequestEventDataSchema, turnScope } from &quot;@bb/domain&quot;;
+import { groupHostDaemonEvents } from &quot;@bb/host-daemon-contract&quot;;
+import { createDeferredPromise } from &quot;@bb/test-helpers&quot;;
+import { afterEach, describe, expect, it, vi } from &quot;vitest&quot;;
+import * as commands from &quot;../../src/services/threads/thread-commands.js&quot;;
+import { queueParentSystemMessage } from &quot;../../src/services/threads/parent-system-messages.js&quot;;
+import {
+  internalAuthHeaders,
+  listQueuedThreadCommands,
+} from &quot;../helpers/commands.js&quot;;
+import { textInput } from &quot;../helpers/prompt-input.js&quot;;
+import {
+  seedEnvironment,
+  seedHostSession,
+  seedProjectWithSource,
+  seedThread,
+  seedThreadRuntimeState,
+  seedTurnStarted,
+} from &quot;../helpers/seed.js&quot;;
+import { withTestHarness } from &quot;../helpers/test-app.js&quot;;
+
+afterEach(() =&gt; vi.restoreAllMocks());
+
+describe(&quot;parent system message dispatch&quot;, () =&gt; {
+  it.each([&quot;active&quot;, &quot;idle&quot;] as const)(
+    &quot;delivers exactly one notice when an initially %s parent changes status during preparation&quot;,
+    async (status) =&gt; {
+      await withTestHarness(async (harness) =&gt; {
+        const { host, session } = seedHostSession(harness.deps);
+        const { project } = seedProjectWithSource(harness.deps, {
+          hostId: host.id,
+          path: &quot;/tmp/parent-notice-dispatch&quot;,
+        });
+        const environment = seedEnvironment(harness.deps, {
+          hostId: host.id,
+          projectId: project.id,
+          path: &quot;/tmp/parent-notice-dispatch&quot;,
+          status: &quot;ready&quot;,
+        });
+        const thread = seedThread(harness.deps, {
+          projectId: project.id,
+          environmentId: environment.id,
+          status,
+        });
+        seedThreadRuntimeState(harness.deps, {
+          environmentId: environment.id,
+          providerThreadId: &quot;provider-parent-notice&quot;,
+          threadId: thread.id,
+        });
+        if (status === &quot;active&quot;) {
+          seedTurnStarted(harness.deps, {
+            threadId: thread.id,
+            turnId: &quot;turn-race&quot;,
+          });
+        }
+
+        const entered = createDeferredPromise&lt;void&gt;();
+        const release = createDeferredPromise&lt;void&gt;();
+        const prepare = commands.prepareTurnSubmitCommandPayload;
+        vi.spyOn(
+          commands,
+          &quot;prepareTurnSubmitCommandPayload&quot;,
+        ).mockImplementationOnce(async (...args) =&gt; {
+          const prepared = await prepare(...args);
+          entered.resolve();
+          await release.promise;
+          return prepared;
+        });
+        const input = textInput(&quot;A child finished its work.&quot;);
+        const subject = {
+          kind: &quot;thread&quot;,
+          threadId: &quot;child-race&quot;,
+          threadName: &quot;Child&quot;,
+        } as const;
+        const sending = queueParentSystemMessage(harness.deps, {
+          input,
+          parentThreadId: thread.id,
+          systemMessageKind: &quot;child-completed&quot;,
+          systemMessageSubject: subject,
+        });
+        const delivered = expect(sending).resolves.toBe(true);
+        try {
+          await entered.promise;
+          const event =
+            status === &quot;active&quot;
+              ? {
+                  type: &quot;turn/completed&quot; as const,
+                  status: &quot;completed&quot; as const,
+                }
+              : { type: &quot;turn/started&quot; as const };
+          const response = await harness.app.request(
+            &quot;/internal/session/events&quot;,
+            {
+              method: &quot;POST&quot;,
+              headers: internalAuthHeaders(harness),
+              body: JSON.stringify({
+                sessionId: session.id,
+                eventGroups: groupHostDaemonEvents([
+                  {
+                    threadId: thread.id,
+                    event: {
+                      ...event,
+                      threadId: thread.id,
+                      providerThreadId: &quot;provider-parent-notice&quot;,
+                      scope: turnScope(&quot;turn-race&quot;),
+                    },
+                  },
+                ]),
+              }),
+            },
+          );
+          expect(response.status, await response.clone().text()).toBe(200);
+          expect(getThread(harness.db, thread.id)?.status).toBe(
+            status === &quot;active&quot; ? &quot;idle&quot; : &quot;active&quot;,
+          );
+        } finally {
+          release.resolve();
+          await delivered;
+        }
+
+        const requests = listEvents(harness.db, { threadId: thread.id })
+          .filter((event) =&gt; event.type === &quot;client/turn/requested&quot;)
+          .map((event) =&gt;
+            turnRequestEventDataSchema.parse(JSON.parse(event.data)),
+          )
+          .filter((event) =&gt; event.initiator === &quot;system&quot;);
+        expect(requests).toEqual([
+          expect.objectContaining({
+            input,
+            initiator: &quot;system&quot;,
+            systemMessageKind: &quot;child-completed&quot;,
+            systemMessageSubject: subject,
+          }),
+        ]);
+        expect(
+          listQueuedThreadCommands(harness, &quot;turn.submit&quot;, thread.id),
+        ).toEqual([
+          expect.objectContaining({
+            input,
+            target:
+              status === &quot;active&quot;
+                ? { mode: &quot;start&quot; }
+                : { mode: &quot;auto&quot;, expectedTurnId: &quot;turn-race&quot; },
+          }),
+        ]);
+        expect(listQueuedThreadMessages(harness.db, thread.id)).toEqual([]);
+      });
+    },
+  );
+});
+</pre></details>
+<h2>5. Root cause</h2>
+<p>The asynchronous preparation is outside the write transaction. Neither dispatch branch can assume the original parent snapshot still describes the transaction's row. The active branch detects a different status but treats it as a terminal non-delivery; the ready branch validates the old snapshot and attempts run.started against the now-active persisted row. Both are dispatch admission failures, not provider failures.</p>
+<p><a href="https://github.com/get-bb/bb/blob/9eb0c09254a21482c0cfd935e0a9908049333e93/apps/server/src/services/threads/parent-system-messages.ts#L223-L238">apps/server/src/services/threads/parent-system-messages.ts:223</a></p><pre>function queueActiveParentSystemMessageInTransaction(
+  tx: DbTransaction,
+  args: QueueActiveParentSystemMessageInTransactionArgs,
+): Extract&lt;HostDaemonCommand, { type: &quot;turn.submit&quot; }&gt; | null {
+  const currentThread = getThread(tx, args.thread.id);
+  if (
+    !currentThread ||
+    currentThread.environmentId !== args.environment.id ||
+    currentThread.status !== &quot;active&quot; ||
+    currentThread.archivedAt !== null ||
+    currentThread.deletedAt !== null
+  ) {
+    return null;
+  }
+
+  const expectedSteerTurnId = getActiveTurnId({ db: tx }, args.thread.id);</pre>
+<p><a href="https://github.com/get-bb/bb/blob/9eb0c09254a21482c0cfd935e0a9908049333e93/apps/server/src/services/threads/parent-system-messages.ts#L384-L403">apps/server/src/services/threads/parent-system-messages.ts:384</a></p><pre>  const activeThread: Thread | null = deps.db.transaction(
+    (tx) =&gt; {
+      ensureThreadCanStartRequest(args.thread);
+      appendPreparedClientTurnRequestedEventWithNotificationInTransaction(tx, {
+        ...parentSystemTurnRequestFields(args),
+        target: { kind: &quot;new-turn&quot; },
+        requestId,
+      });
+      const dispatchKind = command.mode;
+      if (dispatchKind !== &quot;turn.submit&quot;) {
+        return null;
+      }
+      return requireThreadLifecycleEventApplied(
+        applyLoggedThreadLifecycleEventInTransaction(
+          { db: tx, logger: deps.logger },
+          { event: { type: &quot;run.started&quot; }, threadId: args.thread.id },
+        ),
+      );
+    },
+    { behavior: &quot;immediate&quot; },</pre>
+<p><a href="https://github.com/get-bb/bb/blob/9eb0c09254a21482c0cfd935e0a9908049333e93/apps/server/src/services/threads/child-thread-notifications.ts#L389-L417">apps/server/src/services/threads/child-thread-notifications.ts:389</a></p><pre>async function flushChildThreadTurnNotificationBatch(
+  deps: LoggedPendingInteractionWorkSessionDeps,
+  parentThreadId: string,
+): Promise&lt;void&gt; {
+  const batch = childThreadTurnNotificationBatches.get(parentThreadId);
+  if (!batch) {
+    return;
+  }
+  childThreadTurnNotificationBatches.delete(parentThreadId);
+
+  try {
+    await queueParentSystemMessage(deps, {
+      input: buildChildThreadTurnStatusBatchInput({
+        items: batch.items,
+      }),
+      parentThreadId,
+      ...childThreadTurnStatusBatchTaxonomy(batch.items),
+    });
+  } catch (error) {
+    deps.logger.error(
+      {
+        err: error,
+        parentThreadId,
+        childThreads: batch.items.map((item) =&gt; ({
+          childThreadId: item.childThread.id,
+          turnStatus: item.turnStatus,
+        })),
+      },
+      &quot;Failed to queue batched parent turn notifications&quot;,</pre>
+<p>The active branch's preparation await is at <a href="https://github.com/get-bb/bb/blob/9eb0c09254a21482c0cfd935e0a9908049333e93/apps/server/src/services/threads/parent-system-messages.ts#L305">line 305</a>; its null-to-false return is at <a href="https://github.com/get-bb/bb/blob/9eb0c09254a21482c0cfd935e0a9908049333e93/apps/server/src/services/threads/parent-system-messages.ts#L330-L331">lines 330–331</a>. Ready command preparation precedes its transaction at <a href="https://github.com/get-bb/bb/blob/9eb0c09254a21482c0cfd935e0a9908049333e93/apps/server/src/services/threads/parent-system-messages.ts#L367-L384">lines 367–384</a>. Its lifecycle error rolls back the event appended in that same transaction.</p>
+<h2>6. Proposed fix</h2>
+<p>Revalidate the current parent status inside each write transaction before appending any event. A changed snapshot should trigger a local delivery retry, not false success or an unrecoverable lifecycle error. The retry re-reads the parent and environment and re-enters the existing active/ready dispatch path under the same context-clear guard. Archival or deletion still declines delivery. No public protocol, database schema, dependency, or product-policy change is needed.</p>
+<p>The local repair passes both focused regression rows and all 70 relevant existing notification, dispatch, taxonomy, and context-clear tests. Server typecheck also passes. Exact output is embedded in the appendix.</p>
+<h2>7. Verification</h2>
+<p>The same agent repeated the reproduction in a separate clean, detached worktree at <code>9eb0c09254a21482c0cfd935e0a9908049333e93</code>, with its own frozen installation, generated build outputs, migrated database, and new temporary harness directories. Only the self-authored test was copied; production sources stayed unchanged. Command: <code>pnpm exec turbo run test --filter=@bb/server -- test/threads/parent-system-message-dispatch.test.ts</code>. The test task executed on a cache miss. Both rows failed for the same respective reasons as the first run. This is a second clean reproduction, not independent verification.</p>
+<p>During test construction an early completion payload omitted a required provider identity and returned HTTP 400. The payload was corrected from trusted repository event-contract examples; both final reported runs require HTTP 200 and verify the persisted status before evaluating delivery. No conclusion relies on that malformed preliminary run. Paths in logs are normalized for publication.</p>
+<h2>8. Related issues</h2>
+<p>No open pull request linked to #6241 was found through its issue timeline or open pull requests' closing-issue metadata. The reproduction concerns the shared parent-notice delivery owner, not a provider-specific path. Notification policy changes are outside this report.</p>
+<h2>9. Appendix</h2>
+<p>Issue content was treated as untrusted claims only; no issue-supplied command, patch, URL, branch, or test was executed or fetched. The regression was authored from trusted main and existing server harness contracts. No production logs or user data were inspected.</p>
+<p>Checks: frozen install; SDK runtime/types build; server build; focused baseline test; clean-checkout forced baseline test; focused post-fix test; relevant suites; server typecheck; formatting; git diff --check. Exact test/build commands are included in the artifacts; the installation used <code>pnpm install --frozen-lockfile --prefer-offline</code>.</p>
+<details><summary>First baseline output</summary><pre>@bb/server:test:  RUN  v4.1.1 &lt;checkout&gt;/apps/server
+@bb/server:test: 
+@bb/server:test: (node:5764) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test:  ❯ |@bb/server| test/threads/parent-system-message-dispatch.test.ts (2 tests | 2 failed) 2896ms
+@bb/server:test:      × delivers exactly one notice when an initially active parent changes status during preparation 231ms
+@bb/server:test:      × delivers exactly one notice when an initially idle parent changes status during preparation 196ms
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server| test/threads/parent-system-message-dispatch.test.ts &gt; parent system message dispatch &gt; delivers exactly one notice when an initially active parent changes status during preparation
+@bb/server:test: AssertionError: expected false to be true // Object.is equality
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test: - true
+@bb/server:test: + false
+@bb/server:test: 
+@bb/server:test:  ❯ test/threads/parent-system-message-dispatch.test.ts:82:42
+@bb/server:test:      80|           systemMessageSubject: subject,
+@bb/server:test:      81|         });
+@bb/server:test:      82|         const delivered = expect(sending).resolves.toBe(true);
+@bb/server:test:        |                                          ^
+@bb/server:test:      83|         try {
+@bb/server:test:      84|           await entered.promise;
+@bb/server:test:  ❯ withTestHarness test/helpers/test-app.ts:390:18
+@bb/server:test:  ❯ test/threads/parent-system-message-dispatch.test.ts:29:7
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server| test/threads/parent-system-message-dispatch.test.ts &gt; parent system message dispatch &gt; delivers exactly one notice when an initially idle parent changes status during preparation
+@bb/server:test: AssertionError: promise rejected &quot;ThreadLifecycleEventNotAppliedError: Thre… { …(2) }&quot; instead of resolving
+@bb/server:test:  ❯ test/threads/parent-system-message-dispatch.test.ts:82:42
+@bb/server:test:      80|           systemMessageSubject: subject,
+@bb/server:test:      81|         });
+@bb/server:test:      82|         const delivered = expect(sending).resolves.toBe(true);
+@bb/server:test:        |                                          ^
+@bb/server:test:      83|         try {
+@bb/server:test:      84|           await entered.promise;
+@bb/server:test:  ❯ withTestHarness test/helpers/test-app.ts:390:18
+@bb/server:test:  ❯ test/threads/parent-system-message-dispatch.test.ts:29:7
+@bb/server:test: 
+@bb/server:test: Caused by: ThreadLifecycleEventNotAppliedError: Thread lifecycle event not applied (illegal-transition): no transition for run.started from status active
+@bb/server:test:  ❯ requireThreadLifecycleEventApplied ../../packages/db/src/data/threads.ts:2329:11
+@bb/server:test:  ❯ deps.db.transaction.behavior src/services/threads/parent-system-messages.ts:396:14
+@bb/server:test:  ❯ Function.&lt;anonymous&gt; ../../packages/db/src/connection.ts:344:16
+@bb/server:test:  ❯ Function.sqliteTransaction ../../node_modules/.pnpm/better-sqlite3@12.10.0/node_modules/better-sqlite3/lib/methods/transaction.js:65:24
+@bb/server:test:  ❯ BetterSQLiteSession.transaction ../../node_modules/.pnpm/drizzle-orm@0.38.4_@cloudflare+workers-types@4.20260702.1_@opentelemetry+api@1.9.1_@types+bet_oymanfrbpjr52m4tr5hzqpxapa/node_modules/drizzle-orm/better-sqlite3/session.js:34:51
+@bb/server:test:  ❯ BetterSQLite3Database.transaction ../../node_modules/.pnpm/drizzle-orm@0.38.4_@cloudflare+workers-types@4.20260702.1_@opentelemetry+api@1.9.1_@types+bet_oymanfrbpjr52m4tr5hzqpxapa/node_modules/drizzle-orm/sqlite-core/db.js:294:25
+@bb/server:test:  ❯ ../../packages/db/src/connection.ts:342:7
+@bb/server:test:  ❯ transactionCallbacks ../../packages/db/src/connection.ts:327:16
+@bb/server:test:  ❯ BetterSQLite3Database.db.transaction ../../packages/db/src/connection.ts:341:5
+@bb/server:test:  ❯ queueReadyParentSystemMessage src/services/threads/parent-system-messages.ts:384:47
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+@bb/server:test: Serialized Error: { detail: 'no transition for run.started from status active', reason: 'illegal-transition' }
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  2 failed (2)
+@bb/server:test:    Start at  20:37:02
+@bb/server:test:    Duration  36.12s (transform 27.56s, setup 4.90s, import 23.22s, tests 2.90s, environment 0ms)
+@bb/server:test: 
+@bb/server:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/server#test:  ERROR  command (&lt;checkout&gt;/apps/server) /usr/local/bin/pnpm run test test/threads/parent-system-message-dispatch.test.ts exited (1)
+
+ Tasks:    9 successful, 10 total
+Cached:    8 cached, 10 total
+  Time:    39.191s 
+Failed:    @bb/server#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details>
+<details><summary>Second clean baseline output</summary><pre>@bb/server:test:  RUN  v4.1.1 &lt;clean-checkout&gt;/apps/server
+@bb/server:test: 
+@bb/server:test: (node:7388) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test:  ❯ |@bb/server| test/threads/parent-system-message-dispatch.test.ts (2 tests | 2 failed) 2363ms
+@bb/server:test:      × delivers exactly one notice when an initially active parent changes status during preparation 205ms
+@bb/server:test:      × delivers exactly one notice when an initially idle parent changes status during preparation 154ms
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server| test/threads/parent-system-message-dispatch.test.ts &gt; parent system message dispatch &gt; delivers exactly one notice when an initially active parent changes status during preparation
+@bb/server:test: AssertionError: expected false to be true // Object.is equality
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test: - true
+@bb/server:test: + false
+@bb/server:test: 
+@bb/server:test:  ❯ test/threads/parent-system-message-dispatch.test.ts:82:42
+@bb/server:test:      80|           systemMessageSubject: subject,
+@bb/server:test:      81|         });
+@bb/server:test:      82|         const delivered = expect(sending).resolves.toBe(true);
+@bb/server:test:        |                                          ^
+@bb/server:test:      83|         try {
+@bb/server:test:      84|           await entered.promise;
+@bb/server:test:  ❯ withTestHarness test/helpers/test-app.ts:390:18
+@bb/server:test:  ❯ test/threads/parent-system-message-dispatch.test.ts:29:7
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server| test/threads/parent-system-message-dispatch.test.ts &gt; parent system message dispatch &gt; delivers exactly one notice when an initially idle parent changes status during preparation
+@bb/server:test: AssertionError: promise rejected &quot;ThreadLifecycleEventNotAppliedError: Thre… { …(2) }&quot; instead of resolving
+@bb/server:test:  ❯ test/threads/parent-system-message-dispatch.test.ts:82:42
+@bb/server:test:      80|           systemMessageSubject: subject,
+@bb/server:test:      81|         });
+@bb/server:test:      82|         const delivered = expect(sending).resolves.toBe(true);
+@bb/server:test:        |                                          ^
+@bb/server:test:      83|         try {
+@bb/server:test:      84|           await entered.promise;
+@bb/server:test:  ❯ withTestHarness test/helpers/test-app.ts:390:18
+@bb/server:test:  ❯ test/threads/parent-system-message-dispatch.test.ts:29:7
+@bb/server:test: 
+@bb/server:test: Caused by: ThreadLifecycleEventNotAppliedError: Thread lifecycle event not applied (illegal-transition): no transition for run.started from status active
+@bb/server:test:  ❯ requireThreadLifecycleEventApplied ../../packages/db/src/data/threads.ts:2329:11
+@bb/server:test:  ❯ deps.db.transaction.behavior src/services/threads/parent-system-messages.ts:396:14
+@bb/server:test:  ❯ Function.&lt;anonymous&gt; ../../packages/db/src/connection.ts:344:16
+@bb/server:test:  ❯ Function.sqliteTransaction ../../node_modules/.pnpm/better-sqlite3@12.10.0/node_modules/better-sqlite3/lib/methods/transaction.js:65:24
+@bb/server:test:  ❯ BetterSQLiteSession.transaction ../../node_modules/.pnpm/drizzle-orm@0.38.4_@cloudflare+workers-types@4.20260702.1_@opentelemetry+api@1.9.1_@types+bet_oymanfrbpjr52m4tr5hzqpxapa/node_modules/drizzle-orm/better-sqlite3/session.js:34:51
+@bb/server:test:  ❯ BetterSQLite3Database.transaction ../../node_modules/.pnpm/drizzle-orm@0.38.4_@cloudflare+workers-types@4.20260702.1_@opentelemetry+api@1.9.1_@types+bet_oymanfrbpjr52m4tr5hzqpxapa/node_modules/drizzle-orm/sqlite-core/db.js:294:25
+@bb/server:test:  ❯ ../../packages/db/src/connection.ts:342:7
+@bb/server:test:  ❯ transactionCallbacks ../../packages/db/src/connection.ts:327:16
+@bb/server:test:  ❯ BetterSQLite3Database.db.transaction ../../packages/db/src/connection.ts:341:5
+@bb/server:test:  ❯ queueReadyParentSystemMessage src/services/threads/parent-system-messages.ts:384:47
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+@bb/server:test: 
+@bb/server:test: Serialized Error: { detail: 'no transition for run.started from status active', reason: 'illegal-transition' }
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  2 failed (2)
+@bb/server:test:    Start at  20:40:52
+@bb/server:test:    Duration  33.76s (transform 25.67s, setup 4.30s, import 22.26s, tests 2.36s, environment 0ms)
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/server#test:  ERROR  command (&lt;clean-checkout&gt;/apps/server) /usr/local/bin/pnpm run test test/threads/parent-system-message-dispatch.test.ts exited (1)
+
+ Tasks:    9 successful, 10 total
+Cached:    8 cached, 10 total
+  Time:    36.88s 
+Failed:    @bb/server#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details>
+<details><summary>Post-fix focused output</summary><pre>@bb/server:test:  RUN  v4.1.1 &lt;checkout&gt;/apps/server
+@bb/server:test: 
+@bb/server:test: (node:7142) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test:  ✓ |@bb/server| test/threads/parent-system-message-dispatch.test.ts (2 tests) 2714ms
+@bb/server:test: 
+@bb/server:test:  Test Files  1 passed (1)
+@bb/server:test:       Tests  2 passed (2)
+@bb/server:test:    Start at  20:40:41
+@bb/server:test:    Duration  36.96s (transform 27.91s, setup 5.16s, import 23.58s, tests 2.71s, environment 0ms)
+@bb/server:test: 
+
+ Tasks:    10 successful, 10 total
+Cached:    8 cached, 10 total
+  Time:    40.105s 
+
+</pre></details>
+<details><summary>Relevant suite output</summary><pre>@bb/server:test:  RUN  v4.1.1 &lt;checkout&gt;/apps/server
+@bb/server:test: 
+@bb/server:test:  ✓ |@bb/server| test/services/threads/child-thread-notifications.test.ts (11 tests) 20ms
+@bb/server:test: (node:7497) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test: (node:7482) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test: (node:7481) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test: (node:7475) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test:  ✓ |@bb/server| test/public/public-thread-context-clear-dispatch.test.ts (5 tests) 3370ms
+@bb/server:test:  ✓ |@bb/server:isolated| test/threads/system-message-taxonomy-stamping.test.ts (6 tests) 3471ms
+@bb/server:test:      ✓ stamps a single completed child outcome as child-completed  331ms
+@bb/server:test:  ✓ |@bb/server:isolated| test/threads/child-outcome-gaps.test.ts (9 tests) 4133ms
+@bb/server:test:  ✓ |@bb/server| test/threads/thread-send-dispatch.test.ts (39 tests) 8236ms
+@bb/server:test: 
+@bb/server:test:  Test Files  5 passed (5)
+@bb/server:test:       Tests  70 passed (70)
+@bb/server:test:    Start at  20:41:02
+@bb/server:test:    Duration  47.20s (transform 137.41s, setup 29.19s, import 115.40s, tests 19.23s, environment 1ms)
+@bb/server:test: 
+
+ Tasks:    10 successful, 10 total
+Cached:    0 cached, 10 total
+  Time:    1m35.81s 
+
+</pre></details>
+<details><summary>Server typecheck output</summary><pre>• turbo 2.10.12
+
+   • Packages in scope: @bb/server
+   • Running typecheck in 1 packages
+   • Remote caching disabled
+
+@bb/templates:generate:templates: cache hit, replaying logs e70f23933a1e3745
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates &lt;checkout&gt;/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/server:generate:bb-official-marketplace: cache hit, replaying logs 91442dead37aca58
+@bb/server:generate:bb-official-marketplace: 
+@bb/server:generate:bb-official-marketplace: &gt; @bb/server@0.0.1 generate:bb-official-marketplace &lt;checkout&gt;/apps/server
+@bb/server:generate:bb-official-marketplace: &gt; node --conditions=source --import tsx scripts/generate-bb-official-marketplace.ts
+@bb/server:generate:bb-official-marketplace: 
+@bb/templates:generate:plugin-scaffold: cache hit, replaying logs 4d3bb38dccbef304
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold &lt;checkout&gt;/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/process-utils:generate:profile-worker: cache hit, replaying logs 7c0752bc9f20ae7b
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker &lt;checkout&gt;/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+@bb/plugin-build:generate: cache hit, replaying logs 7d74f6e86cca2094
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: &gt; @bb/plugin-build@0.0.1 generate &lt;checkout&gt;/packages/plugin-build
+@bb/plugin-build:generate: &gt; node ./scripts/generate-plugin-theme.mjs &amp;&amp; node ./scripts/generate-runtime-export-manifest.mjs
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: wrote packages/plugin-build/src/generated/plugin-theme.generated.ts
+@bb/plugin-build:generate: wrote &lt;checkout&gt;/packages/plugin-build/src/generated/runtime-export-manifest.generated.ts (react@19.2.4)
+@bb/server:typecheck: cache miss, executing 444c4270bc4bea5a
+@bb/server:typecheck: 
+@bb/server:typecheck: &gt; @bb/server@0.0.1 typecheck &lt;checkout&gt;/apps/server
+@bb/server:typecheck: &gt; tsrs --noEmit
+@bb/server:typecheck: 
+
+ Tasks:    6 successful, 6 total
+Cached:    5 cached, 6 total
+  Time:    2.851s 
+
+</pre></details>
+</main></body></html>
