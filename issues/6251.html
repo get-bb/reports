@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #6251 Reconnect leaves terminal interaction waits unresolved</title>
+<style>
+:root{--canvas:#fafaf8;--ink:#1a1a1a;--muted:#666;--line:#e2e2de;--accent:#0052cc}
+body{margin:0;background:var(--canvas);color:var(--ink);font:16px/1.55 system-ui,sans-serif}main{max-width:980px;margin:auto;padding:40px 24px 80px}h1{font-size:26px;line-height:1.25}h2{font-size:19px;margin-top:34px;padding-top:18px;border-top:1px solid var(--line)}.meta{color:var(--muted);font-size:14px}.pill{display:inline-block;padding:1px 8px;border:1px solid var(--line);border-radius:999px}.verdict{font-weight:600;color:#b60205}table{border-collapse:collapse;width:100%;font-size:14px}td,th{text-align:left;padding:8px;border-bottom:1px solid var(--line);vertical-align:top}code,pre{font:13px/1.5 ui-monospace,monospace}pre{background:white;border:1px solid var(--line);border-radius:6px;padding:14px;overflow:auto}a{color:var(--accent)}
+</style>
+</head>
+<body><main>
+<p><a href="../">← reports</a></p>
+<h1>#6251 · Reconnect leaves terminal interaction waits unresolved</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">High priority</span> <span class="pill">Medium effort</span> <span class="pill">host</span> <span class="pill">threads</span> <span class="pill">provider-claude-code</span> <span class="pill">ask-user-question</span></p>
+<p class="meta"><a href="https://github.com/get-bb/bb/issues/6251">GitHub issue</a> · October 25, 2026 · trusted base <code>7f3414a707a54519749d098165e3a98ff73a4b88</code></p>
+<p class="verdict">Verdict: REPRODUCED · Root-cause confidence: high</p>
+<p>Scope: reproduced at the real server lifecycle and daemon reconnect boundaries using deterministic tests. A live Claude process, real network interruption, and multi-hour user incident were not replayed.</p>
+
+<h2>1. TL;DR</h2>
+<p>A provider can remain blocked waiting for a user response after the server has already ended the interaction. Main still allows an undeliverable answer to interrupt the interaction without ending its active turn. The daemon keeps its own unresolved provider promise, and opening a replacement session does not compare that promise with server state. A focused daemon test fails on main in two clean checkouts because the provider remains waiting after reconnect; a separate real-database server test confirms the terminal interaction, active thread, and rejected registration replay. Reusing the existing registration endpoint on reconnect releases terminal waits without changing the protocol.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>Main can interrupt an interaction after a failed answer delivery.</td><td>Verified</td><td>The server evidence test injects a failed interactive.resolve response through the normal host RPC response handler; persisted status becomes interrupted.</td></tr>
+<tr><td>The thread can remain active after that interruption.</td><td>Verified</td><td>The same test reads the real SQLite thread row and asserts active after settlement.</td></tr>
+<tr><td>Same-instance reconnect leaves an existing provider wait open.</td><td>Verified</td><td>The daemon app reconnect test starts a wait, opens a second session on the same app and instance, and receives still waiting rather than the server rejection.</td></tr>
+<tr><td>The existing registration route can distinguish ended requests.</td><td>Verified</td><td>The real server test replays the identical request and receives outcome=rejected.</td></tr>
+<tr><td>A five-second disconnect timer triggers this on main.</td><td>Not current</td><td>Commit 061685c4a, merged through #4271, removed that historical trigger. The current reproduced trigger is a failed answer command.</td></tr>
+<tr><td>Real Claude steers remain unread for hours and stopping the thread recovers it.</td><td>Unverified here</td><td>No real provider session or production instance was used. The tests establish the blocking state, not the historical duration or a live provider recovery.</td></tr>
+</tbody></table>
+
+<h2>3. Environment</h2>
+<ul><li>Trusted repository: public get-bb/bb; base fetched directly from its main branch, full SHA above.</li><li>Linux 4.19.0-gvisor x86_64; Node 22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li><li>Two separate clean temporary clones, named checkout A and checkout B here. Both used frozen-lockfile installation and the repository Turbo build.</li><li>No live provider, credentials, production state, or BB account data was used. The daemon fixture uses an injected HTTP/WebSocket transport; the server fixture uses its real migrated SQLite database and in-process request handler. Temporary test resources are owned and shut down by their fixtures.</li><li>No long-running dev app or fixed-port service was started. UI, live provider, and remote-host recipes are not run; only the lifecycle boundaries listed here are verified.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<p>Save the patch below as <code>/tmp/issue-6251-reconnect.patch</code>. It only extends the trusted daemon test fixture and adds one test. Save the server test below as <code>apps/server/test/internal/issue-6251-evidence.test.ts</code>.</p>
+<pre>git clone https://github.com/get-bb/bb.git /tmp/issue-6251-source
+cd /tmp/issue-6251-source
+git checkout --detach 7f3414a707a54519749d098165e3a98ff73a4b88
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build
+git apply /tmp/issue-6251-reconnect.patch
+pnpm exec turbo run test --filter=@bb/host-daemon -- --testNamePattern='releases a provider wait when a reconnected session'
+pnpm exec turbo run test --filter=@bb/server -- test/internal/issue-6251-evidence.test.ts</pre>
+<p>Building the SDK first avoids an unrelated first-build plugin/SDK output race encountered during the first setup. The subsequent full builds succeeded in both checkouts.</p>
+<ol><li>The app starts with a single daemon instance and a scripted session ID.</li><li>A real daemon interactive-request registry opens a provider wait. The transport registers it as pending.</li><li>The same app reconnects and receives a second session ID. The scripted server would reject another registration because the interaction has ended.</li><li>Expected: the daemon checks its outstanding request, consumes that rejection, and ends the provider wait.</li><li>Actual on unchanged main: it never makes the second registration, so the wait remains open. The bounded assertion fails rather than leaving the test hanging.</li></ol>
+<pre>FAIL src/app.test.ts &gt; createHostDaemonApp &gt; releases a provider wait when a reconnected session rejects its request
+AssertionError: expected 'still waiting' to be 'Provider request was already handled'
+Expected: "Provider request was already handled"
+Received: "still waiting"
+Test Files  1 failed | 74 skipped (75)
+Tests       1 failed | 828 skipped (829)</pre>
+<details><summary>Complete reconnect reproduction patch</summary><pre>
+diff --git a/apps/host-daemon/src/app.test.ts b/apps/host-daemon/src/app.test.ts
+index 6931666e6..953fb4e8b 100644
+--- a/apps/host-daemon/src/app.test.ts
++++ b/apps/host-daemon/src/app.test.ts
+@@ -54,6 +54,7 @@ interface CreateFetchRecorderArgs {
+   inactiveSessionOnFirstEventPost?: boolean;
+   interactiveRequestError?: Error;
+   interactiveRequestResponse?: HostDaemonInteractiveRequestResponse;
++  interactiveRequestResponses?: HostDaemonInteractiveRequestResponse[];
+   interruptResponses?: Array&lt;() =&gt; Response&gt;;
+   retiredEnvironmentIds?: string[];
+   sessionIds?: string[];
+@@ -112,6 +113,7 @@ function createFetchRecorder(
+   let eventPostCount = 0;
+   let interruptCount = 0;
+   let sessionOpenCount = 0;
++  let interactiveRequestCount = 0;
+   const fetchFn: FetchFn = async (input, init) =&gt; {
+     const url = readFetchUrl(input);
+     const request = {
+@@ -165,7 +167,8 @@ function createFetchRecorder(
+       if (args.interactiveRequestError) {
+         throw args.interactiveRequestError;
+       }
+-      const response: HostDaemonInteractiveRequestResponse =
++      const response: HostDaemonInteractiveRequestResponse = args
++        .interactiveRequestResponses?.[interactiveRequestCount++] ??
+         args.interactiveRequestResponse ?? {
+           outcome: "created",
+           interactionId: "pint_app_test",
+@@ -420,6 +423,81 @@ async function createAppFixture(
+ }
+ 
+ describe("createHostDaemonApp", () =&gt; {
++  it("releases a provider wait when a reconnected session rejects its request", async () =&gt; {
++    let socket: ReconnectingWebSocketLike | undefined;
++    const { app, runtimeOptions, fetchRecorder } = await createAppFixture(
++      {
++        sessionIds: ["session-before", "session-after"],
++        interactiveRequestResponses: [
++          {
++            outcome: "created",
++            interactionId: "pint_app_test",
++            status: "pending",
++          },
++          {
++            outcome: "rejected",
++            reason: "Provider request was already handled",
++          },
++        ],
++      },
++      {
++        createWebSocket: createOpeningWebSocket((created) =&gt; {
++          socket = created;
++        }),
++      },
++    );
++    try {
++      await app.daemon.start();
++      await app.runtimeManager.ensureEnvironment({
++        environmentId: "env-reconnect",
++        workspacePath: await makeTempDir("bb-reconnect-workspace-"),
++      });
++      const onInteractiveRequest = runtimeOptions.current?.onInteractiveRequest;
++      if (!onInteractiveRequest || !socket) {
++        throw new Error("Expected runtime callback and socket");
++      }
++      const request = createCommandApprovalRequest();
++      const outcome = onInteractiveRequest(request).then(
++        () =&gt; "resolved",
++        (error: Error) =&gt; error.message,
++      );
++      await vi.waitFor(() =&gt; {
++        expect(
++          fetchRecorder.requests.filter(
++            (record) =&gt;
++              record.pathname === "/internal/session/interactive-request",
++          ),
++        ).toHaveLength(1);
++      });
++      socket.reconnect();
++      await vi.waitFor(() =&gt; {
++        expect(
++          fetchRecorder.requests.filter(
++            (record) =&gt; record.pathname === "/internal/session/open",
++          ),
++        ).toHaveLength(2);
++      });
++      await expect(
++        Promise.race([
++          outcome,
++          new Promise&lt;string&gt;((resolve) =&gt;
++            setTimeout(() =&gt; resolve("still waiting"), 300),
++          ),
++        ]),
++      ).resolves.toBe("Provider request was already handled");
++      const registrations = fetchRecorder.requests.filter(
++        (record) =&gt; record.pathname === "/internal/session/interactive-request",
++      );
++      expect(registrations).toHaveLength(2);
++      expect(JSON.parse(registrations[1]!.body!)).toMatchObject({
++        sessionId: "session-after",
++        interaction: request,
++      });
++    } finally {
++      await app.daemon.shutdown("test", 0);
++    }
++  });
++
+   it("installs machine variables into the daemon and child processes before work, then removes overrides live", async () =&gt; {
+     vi.stubEnv("MACHINE_DAEMON_TEST", "original");
+     let socket: ReconnectingWebSocketLike | undefined;
+</pre></details>
+<h3>Real server evidence test</h3>
+<p>This passing test proves the main-side prerequisite, not the daemon repair: an answer delivery error creates an interrupted interaction while leaving the thread active. It also verifies the actual endpoint response used by the daemon reproduction. The database is not mocked.</p>
+<details><summary>Complete server test</summary><pre>
+import { getThread, listPendingInteractionsByThread } from "@bb/db";
+import { describe, expect, it, vi } from "vitest";
+import {
+  internalAuthHeaders,
+  reportQueuedCommandError,
+  waitForQueuedCommand,
+} from "../helpers/commands.js";
+import { readJson } from "../helpers/json.js";
+import { seedThreadFixture, seedTurnStarted } from "../helpers/seed.js";
+import {
+  createUserAnswerResolution,
+  createUserQuestionPayload,
+} from "../helpers/pending-interactions.js";
+import { withTestHarness } from "../helpers/test-app.js";
+
+describe("issue 6251 server evidence", () =&gt; {
+  it("interrupts an undelivered answer without ending the active turn and rejects registration replay", async () =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      const { session, thread } = seedThreadFixture(harness, {
+        thread: { status: "active" },
+      });
+      seedTurnStarted(harness.deps, {
+        threadId: thread.id,
+        turnId: "turn-evidence",
+        providerThreadId: "provider-evidence",
+      });
+      const request = {
+        sessionId: session.id,
+        interaction: {
+          threadId: thread.id,
+          turnId: "turn-evidence",
+          providerId: "codex",
+          providerThreadId: "provider-evidence",
+          providerRequestId: "request-evidence",
+          payload: createUserQuestionPayload(),
+        },
+      };
+      const register = () =&gt;
+        harness.app.request("/internal/session/interactive-request", {
+          method: "POST",
+          headers: internalAuthHeaders(harness),
+          body: JSON.stringify(request),
+        });
+      const registration = await register();
+      expect(registration.status).toBe(200);
+      expect(await readJson(registration)).toMatchObject({
+        outcome: "created",
+        status: "pending",
+      });
+      const interaction = listPendingInteractionsByThread(harness.db, {
+        threadId: thread.id,
+      })[0];
+      if (!interaction) throw new Error("Expected persisted question");
+      harness.deps.pendingInteractions.resolvePendingInteraction({
+        threadId: thread.id,
+        interactionId: interaction.id,
+        resolution: createUserAnswerResolution(),
+      });
+      const command = await waitForQueuedCommand(
+        harness,
+        ({ command }) =&gt;
+          command.type === "interactive.resolve" &amp;&amp;
+          command.interactionId === interaction.id,
+      );
+      await reportQueuedCommandError(harness, command, {
+        errorCode: "host_unavailable",
+        errorMessage: "Synthetic transport disconnect before delivery",
+      });
+      await vi.waitFor(() =&gt; {
+        expect(
+          listPendingInteractionsByThread(harness.db, {
+            threadId: thread.id,
+          })[0],
+        ).toMatchObject({
+          status: "interrupted",
+          statusReason: "Synthetic transport disconnect before delivery",
+        });
+      });
+      expect(getThread(harness.db, thread.id)).toMatchObject({
+        status: "active",
+      });
+      const replay = await register();
+      expect(replay.status).toBe(200);
+      expect(await readJson(replay)).toMatchObject({ outcome: "rejected" });
+    });
+  });
+});
+</pre></details>
+<pre>✓ test/internal/issue-6251-evidence.test.ts (1 test)
+Test Files  1 passed (1)
+Tests       1 passed (1)</pre>
+
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/7f3414a707a54519749d098165e3a98ff73a4b88/apps/server/src/services/interactions/pending-interactions.ts#L800-L807">Failed interactive.resolve command settlement</a> interrupts the interaction on every failed report:</p>
+<pre>if (!args.report.ok) {
+  this.interruptPendingInteractionInTransaction(args.deps, {
+    interactionId: args.command.interactionId,
+    reason: args.report.errorMessage,
+  });
+  return;
+}</pre>
+<p><a href="https://github.com/get-bb/bb/blob/7f3414a707a54519749d098165e3a98ff73a4b88/apps/server/src/services/interactions/pending-interactions.ts#L994-L1004">Terminal settlement</a> updates the interaction timeline and listeners; it does not end the host-local provider promise. The server test confirms that the thread remains active.</p>
+<p><a href="https://github.com/get-bb/bb/blob/7f3414a707a54519749d098165e3a98ff73a4b88/apps/host-daemon/src/interactive-request-registry.ts#L106-L196">InteractiveRequestRegistry</a> stores a promise per provider request. Registration and resolution can settle it, but no reconciliation runs when a session is replaced. <a href="https://github.com/get-bb/bb/blob/7f3414a707a54519749d098165e3a98ff73a4b88/apps/host-daemon/src/app.ts#L891-L928">onSessionOpened</a> reconciles plugins, environments, watches, event delivery, and outbound interruptions, not these surviving waits.</p>
+<p>The missing link is not a new endpoint: <a href="https://github.com/get-bb/bb/blob/7f3414a707a54519749d098165e3a98ff73a4b88/apps/server/src/services/interactions/pending-interactions.ts#L444-L467">registration already returns existing for open requests and rejected for ended requests</a>. The daemon simply does not ask again. This is a split lifecycle state: the server no longer exposes an answerable question while the provider still waits for its answer.</p>
+
+<h2>6. Proposed fix and verification</h2>
+<p>Replay the outstanding registrations when a session opens, using the existing endpoint and the current session ID. Share terminal-response handling with initial registration. Preserve still-pending/resolving waits and retain them on transient replay errors. Ignore late responses for entries already delivered, interrupted, or replaced. Return the provider promise immediately so reconciliation can settle it safely even while the original registration is still in flight.</p>
+<p>The local repair stays inside the host-daemon subsystem and changes no wire fields, schema, dependency, stored data, CLI surface, or packaging. The original failing app test passes after the repair. Additional tests cover pending and resolving requests, transient failures, and late/in-flight registration races.</p>
+<pre>pnpm exec turbo run test --filter=@bb/host-daemon -- src/app.test.ts src/interactive-request-registry.test.ts src/server-client.test.ts src/server-connection.test.ts src/command-dispatch.test.ts
+Test Files  5 passed (5)
+Tests       107 passed (107)
+
+pnpm exec turbo run typecheck --filter=@bb/host-daemon
+Tasks: 5 successful, 5 total</pre>
+<p>The broader daemon suite had two unrelated failures: systemd file mode expected 0644 but received 0600 under umask 0077; server-move diskFreeBytes was null instead of numeric in this environment. Both identical failures also occur in checkout B with unchanged production code. They are not represented as a passing full suite and were not modified.</p>
+
+<h2>7. Linked PR review</h2>
+<p><a href="https://github.com/get-bb/bb/pull/6252">PR #6252</a> was closed without merge before this investigation. Metadata and diff were read only after the reproduction test and initial repair were authored; its branch was never checked out or executed. Static inspection shows the same general repair direction: session-open revalidation through the existing endpoint, with explicit treatment of in-flight registrations. This is consistent with the independently observed lifecycle gap. No blocker is asserted from static review alone, and the closed PR itself is not runtime-verified. All executable evidence in this report comes from trusted main plus the tests and repair authored during this investigation. No linked open PR was found before opening a replacement.</p>
+
+<h2>8. Related issues</h2>
+<p>#1650 and #4364 are reporter-supplied comparisons, not independently reproduced here. The verified relevant history is #4271: it removed disconnect-triggered cancellation but did not add provider-wait reconciliation to the session-open callback.</p>
+
+<h2>9. Verification</h2>
+<table><thead><tr><th>Run</th><th>Checkout and command</th><th>Result</th></tr></thead><tbody>
+<tr><td>First, 00:18:07 UTC</td><td>Clean checkout A at the full trusted SHA; frozen install and full build; daemon test-name command above.</td><td>Expected failure: still waiting instead of the rejection.</td></tr>
+<tr><td>Repeat, 00:18:58 UTC</td><td>Second clean temporary checkout B at the identical SHA; its own frozen install, full build, and only the test patch; same command.</td><td>Same assertion and same expected/received values. Production files were unchanged.</td></tr>
+<tr><td>Server evidence, 00:21:53 UTC</td><td>Checkout B; real server harness and server evidence command above.</td><td>One test passed, proving interrupted interaction, active thread, and rejected replay.</td></tr>
+<tr><td>Repair, 00:22:33 UTC</td><td>Checkout A; five relevant daemon suites and scoped typecheck.</td><td>107 tests passed; typecheck passed.</td></tr>
+</tbody></table>
+<p>The same agent performed both clean runs; this is a repeat reproduction, not an independent review. Root-cause permalinks were checked against the recorded base. No screenshot is applicable to this nonvisual lifecycle bug. No live-provider conclusions were upgraded based on unit-level evidence, and no report correction was required after the second run.</p>
+
+<h2>10. Appendix and trust boundary</h2>
+<p>The embedded patch and server test are sufficient to repeat the evidence. Raw logs, local test files, and temporary checkout identifiers remain in private local evidence storage; repository publication policy permits the self-contained report and summary metadata, not raw logs or script directories.</p>
+<p>Read-only GitHub metadata was used to classify the issue as Bug / High / Medium and identify linked PRs. Existing classifications were preserved; initially none existed. Labels applied: host, threads, provider-claude-code, ask-user-question. The verified reproduction label is confirmed-repro.</p>
+<p>Issue text, quoted commands, links, and PR contents were treated as untrusted claims. No issue-provided script, branch, patch, test, or external URL was executed or fetched. The report uses newly authored test fixtures, not production user data.</p>
+</main></body></html>
