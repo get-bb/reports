@@ -34,7 +34,7 @@ body{margin:0;background:var(--canvas);color:var(--ink);font:16px/1.55 system-ui
 
 <h2>4. Minimal reproduction</h2>
 <ol><li>Clone the public target repository and detach at the recorded trusted commit.</li>
-<li>Run the normal frozen install, then apply the independently authored <a href="6297/repro/regression.patch">regression patch</a> from the repository root. The patch extends the existing public timeline test and uses its real database/application harness.</li>
+<li>Run the normal frozen install, then save the inline independently authored regression patch below to a local file and apply it from the repository root. The patch extends the existing public timeline test and uses its real database/application harness.</li>
 <li>Run the focused test. It seeds completed command events; it never executes the synthetic shell text or sends a real message.</li></ol>
 <pre>git clone https://github.com/get-bb/bb.git bb-6297
 cd bb-6297
@@ -56,7 +56,141 @@ pnpm exec turbo run test --filter=@bb/server -- test/public/public-thread-timeli
  Tasks:    9 successful, 10 total
   Time:    39.749s 
 </pre>
-<p>Artifacts: <a href="6297/repro/baseline-first.txt">first baseline</a>, <a href="6297/repro/baseline-clean.txt">second baseline</a>, <a href="6297/repro/public-thread-timeline-output-preview.test.ts">complete test owner with the authored regression</a>.</p>
+<p>Raw artifacts remain in local storage, as required by the reports repository. All reproduction code and expected-versus-actual evidence needed by a reader are included inline here.</p>
+<details><summary>Regression patch: save as regression.patch in a local directory</summary><pre>diff --git a/apps/server/test/public/public-thread-timeline-output-preview.test.ts b/apps/server/test/public/public-thread-timeline-output-preview.test.ts
+index e3bf40ae3..d0479299a 100644
+--- a/apps/server/test/public/public-thread-timeline-output-preview.test.ts
++++ b/apps/server/test/public/public-thread-timeline-output-preview.test.ts
+@@ -1,6 +1,7 @@
+ import { eq } from &quot;drizzle-orm&quot;;
+ import { describe, expect, it } from &quot;vitest&quot;;
+ import { threadEventRowSchema, turnScope } from &quot;@bb/domain&quot;;
++import { parseSentThreadMessage } from &quot;@bb/thread-view&quot;;
+ import {
+   COMPLETED_EVENT_OUTPUT_RETENTION_MS,
+   events,
+@@ -936,6 +937,120 @@ describe(&quot;GET /threads/:id/timeline retained output details&quot;, () =&gt; {
+ });
+ 
+ describe(&quot;GET /threads/:id/timeline delegated rows&quot;, () =&gt; {
++  it(&quot;preserves successful message commands through deferred timeline reads&quot;, async () =&gt; {
++    await withTestHarness(async (harness) =&gt; {
++      const { environment, thread } = seedThreadFixture(harness);
++      const recipient = &quot;thr_abcdefghjk&quot;;
++      const message = &quot;A message for the receiving thread. &quot;.repeat(40);
++      const quoted = `bb thread tell ${recipient} '${message}'`;
++      const heredoc = `bb thread tell ${recipient} --message-file - &lt;&lt;'MESSAGE'\n${message}\nMESSAGE`;
++      const cases = [
++        { command: quoted, exitCode: 0, output: &quot;sent&quot;, message },
++        { command: heredoc, exitCode: 0, output: &quot;sent&quot;, message },
++        {
++          command: `bb thread tell ${recipient} 'short'`,
++          exitCode: 0,
++          output: &quot;acknowledgement&quot;.repeat(100),
++          message: &quot;short&quot;,
++        },
++        {
++          command: `bb thread tell ${recipient} '${&quot;brief &quot;.repeat(60)}'`,
++          exitCode: 0,
++          output: &quot;sent&quot;,
++          message: &quot;brief &quot;.repeat(60),
++        },
++        { command: quoted, exitCode: 1, output: &quot;failed&quot;, message: null },
++        {
++          command: `${quoted} &amp;&amp; printf done`,
++          exitCode: 0,
++          output: &quot;done&quot;,
++          message: null,
++        },
++        {
++          command: `bb thread tell ${recipient} --message-file /tmp/message.txt`,
++          exitCode: 0,
++          output: &quot;acknowledgement&quot;.repeat(100),
++          message: null,
++        },
++      ];
++      const turn = {
++        environmentId: environment.id,
++        providerThreadId: &quot;provider-message-deferral&quot;,
++        scope: turnScope(&quot;turn-message-deferral&quot;),
++        threadId: thread.id,
++      } as const;
++      seedEvent(harness.deps, {
++        ...turn,
++        data: {},
++        sequence: 1,
++        type: &quot;turn/started&quot;,
++      });
++      for (const [index, entry] of cases.entries()) {
++        seedEvent(harness.deps, {
++          ...turn,
++          data: {
++            item: {
++              aggregatedOutput: entry.output,
++              approvalStatus: null,
++              command: entry.command,
++              cwd: &quot;/tmp&quot;,
++              exitCode: entry.exitCode,
++              id: `message-command-${index}`,
++              status: &quot;completed&quot;,
++              type: &quot;commandExecution&quot;,
++            },
++          },
++          sequence: index + 2,
++          type: &quot;item/completed&quot;,
++        });
++      }
++      seedEvent(harness.deps, {
++        ...turn,
++        data: { status: &quot;completed&quot; },
++        sequence: cases.length + 2,
++        type: &quot;turn/completed&quot;,
++      });
++
++      for (const deferContent of [false, true]) {
++        const timeline = await getTimeline(
++          harness,
++          thread.id,
++          `?includeNestedRows=true&amp;deferContent=${deferContent}`,
++        );
++        const rows = timeline.rows.flatMap((row) =&gt;
++          row.kind === &quot;turn&quot; ? (row.children ?? []) : [row],
++        );
++        for (const [index, entry] of cases.entries()) {
++          const row = rows.find(
++            (candidate) =&gt;
++              candidate.kind === &quot;work&quot; &amp;&amp;
++              candidate.workKind === &quot;command&quot; &amp;&amp;
++              candidate.callId === `message-command-${index}`,
++          );
++          if (row?.kind !== &quot;work&quot; || row.workKind !== &quot;command&quot;) {
++            throw new Error(`Missing message command ${index}`);
++          }
++          if (entry.message !== null) {
++            expect(timeline.rows).toContain(row);
++            expect.soft(row.command.length).toBe(entry.command.length);
++            expect.soft(parseSentThreadMessage(row)).toEqual({
++              threadId: recipient,
++              message: entry.message,
++            });
++          } else if (deferContent) {
++            expect(row).toMatchObject({
++              command: entry.command.slice(0, 300),
++              contentDeferred: true,
++              output: &quot;&quot;,
++            });
++          } else {
++            expect(parseSentThreadMessage(row)).toBeNull();
++          }
++        }
++      }
++    });
++  });
++
+   it(&quot;defers settled row content when asked and loads each row by item&quot;, async () =&gt; {
+     await withTestHarness(async (harness) =&gt; {
+       const { environment, thread } = seedThreadFixture(harness, {
+</pre></details>
 <details><summary>Full reproduction test source (existing owner plus new case)</summary><pre>import { eq } from &quot;drizzle-orm&quot;;
 import { describe, expect, it } from &quot;vitest&quot;;
 import { threadEventRowSchema, turnScope } from &quot;@bb/domain&quot;;
@@ -1466,6 +1600,6 @@ pnpm exec oxfmt --check apps/server/src/services/threads/timeline-deferred-conte
 git diff --check
 git diff --numstat origin/main</pre>
 <p>The saved log artifacts contain verbatim assertion and result excerpts, not full dependency logs or private filesystem paths. An auxiliary browser-fixture attempt did not start a server because its required app-dist environment variable was filtered by Turbo; it was removed, and the separate browser prerequisite failure prevented UI verification. Initial fixture mistakes were corrected before the recorded final clean run.</p>
-<p><a href="6297/repro/regression.patch">Regression patch</a> · <a href="6297/repro/related-tests.txt">25-test result</a> · <a href="6297/repro/final-tests.txt">final 16-test result</a> · <a href="6297/repro/typecheck.txt">typecheck result</a></p>
+<p>The regression patch, complete test owner, clean-baseline evidence, and passing results are embedded above. Raw artifacts are not published.</p>
 <p>&gt; AGENT GENERATED</p>
 </main></body></html>
