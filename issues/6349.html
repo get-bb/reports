@@ -1,0 +1,603 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Report · #6349 canonical tab collisions</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#6349 · Canonical tab collisions block synchronization</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Medium priority</span><span class="pill">Low effort</span><span class="pill">ui</span><a href="https://github.com/get-bb/bb/issues/6349">GitHub issue</a><span>2026-10-26 · base <code>748a96524eddedbf58d5eb5bd139f1b8b5c4f536</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · Root-cause confidence: <strong>high</strong></p>
+<h2>1. TL;DR</h2>
+<p>Saved thread tabs can contain an old built-in tab alongside its current plugin-backed replacement. The app converts both entries to the same identifier, but keeps both entries. Its outgoing validation rejects that duplicate before making an SDK update, leaving the saved state unchanged and future writes blocked. The same normalization also affects local-tab migration. A small client-only fix keeps the first occurrence of each normalized identifier.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Mixed old/current built-in tabs can be stored.</td><td>Verified at contract boundary</td><td>The test parses mixed input with the real threadTabsSchema; identifiers are distinct before normalization. No live server/database experiment was needed or performed.</td></tr>
+<tr><td>Normalization creates duplicate Diff identifiers.</td><td>Verified</td><td>Both clean runs produce an extra plugin-fixed:core:diff entry; Info behaves the same way.</td></tr>
+<tr><td>Writes fail repeatedly.</td><td>Verified mechanism</td><td>The scheduled persistence and migration tests drain without invoking the SDK update. The unchanged saved aliases force normalization again on later writes.</td></tr>
+<tr><td>The server rejects the outgoing sync.</td><td>Corrected</td><td>The client evaluates threadTabsSchema.parse before sdk.threads.tabs.update is called. Server validation uses the same contract, but this path fails on the client first.</td></tr>
+<tr><td>The exact reported installation/version and visible toast were observed.</td><td>Unverified live UI</td><td>This is a real production-module unit reproduction on trusted main, not an inspection of the reporter's instance or a browser screenshot.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Public repository get-bb/bb; trusted origin/main commit <code>748a96524eddedbf58d5eb5bd139f1b8b5c4f536</code>.</li><li>Linux 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; repository bb-app version 0.47.1.</li><li>Two separate fresh clones: first <code>source</code>, second <code>verification</code>, under one fresh temporary investigation directory. Both started with unchanged production code.</li><li>No running app, ports, provider sessions, database fixtures, credentials, or user runtime data were used. Ports and data directories: not applicable.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the trusted repository and pin the base; install without changing dependencies; build the SDK and copy the authored regression test:<pre>git clone https://github.com/get-bb/bb.git bb-6349
+cd bb-6349
+git checkout --detach 748a96524eddedbf58d5eb5bd139f1b8b5c4f536
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+curl -fsSL https://get-bb.github.io/reports/issues/6349/repro/thread-tabs-sync.test.ts -o apps/app/src/lib/thread-tabs-sync.test.ts
+pnpm exec turbo run test --filter=@bb/app -- src/lib/thread-tabs-sync.test.ts</pre></li>
+<li>The new cases construct synthetic legacy entries from repository-supported kinds and current tabs from repository factories. The pure cases run each alias order with neighboring browser tabs; the queued cases cover existing-server persistence and initial local migration.</li>
+<li>Expected: one canonical tab per identifier, valid outgoing tabs, successful migration/persistence and a subsequent browser-tab write. Actual on unchanged main:<pre>Test Files  1 failed (1)
+Tests  4 failed | 14 passed (18)</pre>The assertion diff includes the extra canonical Diff and Info entries. Both queued cases observe no SDK update.</li></ol>
+<p><a href="6349/repro/thread-tabs-sync.test.ts">Complete runnable test artifact</a> · <a href="6349/repro/baseline.log">First raw failure log</a> · <a href="6349/repro/verification-baseline.log">Second raw failure log</a></p>
+<details><summary>Complete regression test and existing owner suite</summary><pre>import { openSecondaryPanelTabInState } from &quot;@bb/client-core&quot;;
+import { threadTabsSchema, type ThreadTab } from &quot;@bb/server-contract&quot;;
+import { QueryClient } from &quot;@tanstack/react-query&quot;;
+import { describe, expect, it, vi } from &quot;vitest&quot;;
+import { setCachedThreadTabs } from &quot;@/hooks/cache-owners/thread-tabs-cache-owner&quot;;
+import {
+  createBrowserFixedPanelTab,
+  createEmptyFixedPanelTabsState,
+  createGitDiffFixedPanelTab,
+  createNewTabFixedPanelTab,
+  createTerminalFixedPanelTab,
+  createThreadInfoFixedPanelTab,
+  type FixedPanelTab,
+} from &quot;./fixed-panel-tabs-state&quot;;
+import { createPluginPageFixedPanelTab } from &quot;./fixed-panel-tabs-state&quot;;
+import {
+  areThreadTabListsEquivalent,
+  hasPendingThreadTabsWrite,
+  mergeThreadTabChanges,
+  reconcileFixedPanelTabsState,
+  resolveFixedPanelTabsHydration,
+  scheduleLocalThreadTabsMigration,
+  scheduleThreadTabsPersistence,
+} from &quot;./thread-tabs-sync&quot;;
+
+const updateThreadTabs = vi.hoisted(() =&gt; vi.fn());
+
+vi.mock(&quot;./sdk&quot;, async (importOriginal) =&gt; {
+  const actual = await importOriginal&lt;typeof import(&quot;./sdk&quot;)&gt;();
+  return {
+    ...actual,
+    sdk: { threads: { tabs: { update: updateThreadTabs } } },
+  };
+});
+
+function browserTab(
+  id: string,
+  title: string,
+): Extract&lt;ThreadTab, { kind: &quot;browser&quot; }&gt; {
+  return {
+    environmentId: null,
+    id: `browser:${id}:none`,
+    kind: &quot;browser&quot;,
+    title,
+    url: `https://${id}.example.com`,
+  };
+}
+
+describe(&quot;thread tab synchronization&quot;, () =&gt; {
+  it.each([
+    [&quot;git-diff&quot;, createGitDiffFixedPanelTab()],
+    [&quot;thread-info&quot;, createThreadInfoFixedPanelTab()],
+  ] as const)(
+    &quot;collapses %s aliases in either order while preserving neighboring tabs&quot;,
+    (kind, canonical) =&gt; {
+      const first = browserTab(&quot;first&quot;, &quot;First&quot;);
+      const last = browserTab(&quot;last&quot;, &quot;Last&quot;);
+      const legacy: ThreadTab = { id: `legacy:${kind}`, kind };
+      for (const aliases of [
+        [canonical, legacy],
+        [legacy, canonical],
+      ]) {
+        const saved = threadTabsSchema.parse([first, ...aliases, last]);
+        const merged = mergeThreadTabChanges(saved, [], []);
+        expect(merged).toEqual([first, canonical, last]);
+        expect(threadTabsSchema.safeParse(merged).success).toBe(true);
+        const restored = reconcileFixedPanelTabsState(
+          createEmptyFixedPanelTabsState(),
+          saved,
+        );
+        expect(restored.secondary.tabs).toEqual([first, canonical, last]);
+      }
+    },
+  );
+
+  it.each([&quot;persist&quot;, &quot;migrate&quot;] as const)(
+    &quot;%s writes mixed legacy and canonical tabs once without blocking later writes&quot;,
+    async (mode) =&gt; {
+      const queryClient = new QueryClient();
+      const threadId = `mixed-aliases-${mode}`;
+      const info = createThreadInfoFixedPanelTab();
+      const diff = createGitDiffFixedPanelTab();
+      const mixed: FixedPanelTab[] = [
+        info,
+        diff,
+        { id: &quot;legacy:diff&quot;, kind: &quot;git-diff&quot; },
+        { id: &quot;legacy:info&quot;, kind: &quot;thread-info&quot; },
+      ];
+      const revision = mode === &quot;persist&quot; ? 7 : 0;
+      setCachedThreadTabs(queryClient, threadId, {
+        revision,
+        tabs: mode === &quot;persist&quot; ? threadTabsSchema.parse(mixed) : [],
+      });
+      updateThreadTabs.mockResolvedValue({
+        revision: revision + 1,
+        tabs: [info, diff],
+      });
+      if (mode === &quot;persist&quot;) {
+        scheduleThreadTabsPersistence({
+          queryClient,
+          threadId,
+          previousTabs: [info, diff],
+          tabs: [info, diff],
+        });
+      } else {
+        scheduleLocalThreadTabsMigration({
+          queryClient,
+          threadId,
+          tabs: mixed,
+        });
+      }
+      await vi.waitFor(() =&gt;
+        expect(hasPendingThreadTabsWrite(queryClient, threadId)).toBe(false),
+      );
+      expect(updateThreadTabs).toHaveBeenCalledWith({
+        threadId,
+        expectedRevision: revision,
+        tabs: [info, diff],
+      });
+
+      const added = browserTab(&quot;added&quot;, &quot;Added&quot;);
+      updateThreadTabs.mockResolvedValue({
+        revision: revision + 2,
+        tabs: [info, diff, added],
+      });
+      scheduleThreadTabsPersistence({
+        queryClient,
+        threadId,
+        previousTabs: [info, diff],
+        tabs: [info, diff, added],
+      });
+      await vi.waitFor(() =&gt;
+        expect(hasPendingThreadTabsWrite(queryClient, threadId)).toBe(false),
+      );
+      expect(updateThreadTabs).toHaveBeenCalledWith({
+        threadId,
+        expectedRevision: revision + 1,
+        tabs: [info, diff, added],
+      });
+      queryClient.clear();
+    },
+  );
+
+  it(&quot;converts server-saved Diff and Info tabs in place before reconciling selection&quot;, () =&gt; {
+    const current = createEmptyFixedPanelTabsState({
+      secondary: {
+        tabs: [
+          {
+            id: &quot;plugin-fixed:core:diff&quot;,
+            kind: &quot;plugin-fixed&quot;,
+            pluginId: &quot;core&quot;,
+            tabId: &quot;diff&quot;,
+          },
+        ],
+        activeTabId: &quot;plugin-fixed:core:diff&quot;,
+        isOpen: true,
+      },
+    });
+    const terminal = createTerminalFixedPanelTab({ terminalId: &quot;saved&quot; });
+    const restored = reconcileFixedPanelTabsState(current, [
+      terminal,
+      { id: &quot;git-diff:git-diff:none&quot;, kind: &quot;git-diff&quot; },
+      { id: &quot;thread-info:thread-info:none&quot;, kind: &quot;thread-info&quot; },
+    ]);
+    expect(restored.secondary).toEqual({
+      isOpen: true,
+      activeTabId: &quot;plugin-fixed:core:diff&quot;,
+      tabs: [
+        terminal,
+        {
+          id: &quot;plugin-fixed:core:diff&quot;,
+          kind: &quot;plugin-fixed&quot;,
+          pluginId: &quot;core&quot;,
+          tabId: &quot;diff&quot;,
+        },
+        {
+          id: &quot;plugin-fixed:core:info&quot;,
+          kind: &quot;plugin-fixed&quot;,
+          pluginId: &quot;core&quot;,
+          tabId: &quot;info&quot;,
+        },
+      ],
+    });
+  });
+
+  it(&quot;preserves remote additions and edits when removing a local tab&quot;, () =&gt; {
+    const source = browserTab(&quot;source&quot;, &quot;Source&quot;);
+    const updatedSource = { ...source, title: &quot;Updated elsewhere&quot; };
+    const detour = browserTab(&quot;detour&quot;, &quot;Detour&quot;);
+    const remote = browserTab(&quot;remote&quot;, &quot;Remote&quot;);
+    expect(
+      mergeThreadTabChanges(
+        [updatedSource, detour, remote],
+        [source, detour],
+        [source],
+      ),
+    ).toEqual([updatedSource, remote]);
+  });
+
+  it(&quot;inserts a replacement without restoring other remotely closed tabs&quot;, () =&gt; {
+    const source = browserTab(&quot;source&quot;, &quot;Source&quot;);
+    const placeholder = browserTab(&quot;placeholder&quot;, &quot;Placeholder&quot;);
+    const neighbor = browserTab(&quot;neighbor&quot;, &quot;Neighbor&quot;);
+    const terminal = createTerminalFixedPanelTab({ terminalId: &quot;replacement&quot; });
+    expect(
+      mergeThreadTabChanges(
+        [placeholder, neighbor],
+        [source, placeholder, neighbor],
+        [source, terminal, neighbor],
+      ),
+    ).toEqual([terminal, neighbor]);
+  });
+
+  it(&quot;keeps the server&#x27;s desktop window when saving a local page update&quot;, () =&gt; {
+    const closedWindow = {
+      hostId: &quot;host-1&quot;,
+      instanceId: &quot;closed-window&quot;,
+      generation: &quot;g1&quot;,
+    };
+    const liveWindow = {
+      hostId: &quot;host-1&quot;,
+      instanceId: &quot;live-window&quot;,
+      generation: &quot;g2&quot;,
+    };
+    const local = {
+      ...browserTab(&quot;native&quot;, &quot;Before&quot;),
+      id: &quot;native-tab&quot;,
+      desktopTarget: closedWindow,
+    };
+    const adopted = { ...local, desktopTarget: liveWindow };
+    expect(
+      mergeThreadTabChanges(
+        [adopted],
+        [local],
+        [{ ...local, title: &quot;Reopened&quot; }],
+      ),
+    ).toEqual([{ ...adopted, title: &quot;Reopened&quot; }]);
+  });
+
+  it(&quot;keeps remote ordering unless the local operation reorders tabs&quot;, () =&gt; {
+    const a = browserTab(&quot;a&quot;, &quot;A&quot;);
+    const b = browserTab(&quot;b&quot;, &quot;B&quot;);
+    const c = browserTab(&quot;c&quot;, &quot;C&quot;);
+    const remote = browserTab(&quot;remote&quot;, &quot;Remote&quot;);
+    expect(mergeThreadTabChanges([c, a, b], [a, b, c], [a, c])).toEqual([c, a]);
+    expect(
+      mergeThreadTabChanges([a, remote, b, c], [a, b, c], [c, a, b]),
+    ).toEqual([c, remote, a, b]);
+  });
+
+  it(&quot;preserves local presentation state while adopting remote tabs&quot;, () =&gt; {
+    const first = browserTab(&quot;first&quot;, &quot;First&quot;);
+    const second = browserTab(&quot;second&quot;, &quot;Second&quot;);
+    const current = createEmptyFixedPanelTabsState({
+      lastUsedAt: 123,
+      secondary: {
+        activeTabId: first.id,
+        isOpen: true,
+        tabs: [first],
+      },
+    });
+
+    const withBoth = reconcileFixedPanelTabsState(current, [first, second]);
+    expect(withBoth).toMatchObject({
+      lastUsedAt: 123,
+      secondary: { activeTabId: first.id, isOpen: true },
+    });
+    expect(withBoth.secondary.tabs).toEqual([first, second]);
+
+    const withoutActive = reconcileFixedPanelTabsState(withBoth, [second]);
+    expect(withoutActive).toMatchObject({
+      lastUsedAt: 123,
+      secondary: { activeTabId: second.id, isOpen: true },
+    });
+  });
+
+  it(&quot;drops legacy native side-chat tabs persisted before their removal&quot;, () =&gt; {
+    const browser = browserTab(&quot;first&quot;, &quot;First&quot;);
+    const legacySideChat: ThreadTab = {
+      id: &quot;side-chat:legacy&quot;,
+      kind: &quot;side-chat&quot;,
+      sourceMessageText: &quot;anchor&quot;,
+      sourceSeqEnd: null,
+      threadId: &quot;thr_legacy&quot;,
+      title: &quot;Side chat&quot;,
+    };
+    const current = createEmptyFixedPanelTabsState({
+      lastUsedAt: 123,
+      secondary: { activeTabId: null, isOpen: true, tabs: [] },
+    });
+
+    const reconciled = reconcileFixedPanelTabsState(current, [
+      browser,
+      legacySideChat,
+    ]);
+
+    expect(reconciled.secondary.tabs).toEqual([browser]);
+  });
+
+  it(&quot;keeps plugin page fixed tabs out of thread synchronization&quot;, () =&gt; {
+    const pageTab = createPluginPageFixedPanelTab({
+      fixedTabId: &quot;navigation&quot;,
+      pageId: &quot;tasks&quot;,
+      pluginId: &quot;tasks&quot;,
+    });
+
+    expect(areThreadTabListsEquivalent([pageTab], [])).toBe(true);
+  });
+});
+
+it(&quot;returns to the prior terminal when another client removes the active terminal before its close callback&quot;, () =&gt; {
+  const source = createTerminalFixedPanelTab({ terminalId: &quot;source&quot; });
+  const detour = createTerminalFixedPanelTab({ terminalId: &quot;detour&quot; });
+  const state = openSecondaryPanelTabInState({
+    state: createEmptyFixedPanelTabsState({
+      secondary: {
+        tabs: [createThreadInfoFixedPanelTab(), source],
+        activeTabId: source.id,
+        isOpen: true,
+      },
+    }),
+    tab: detour,
+  });
+  const reconciled = reconcileFixedPanelTabsState(state, [
+    createThreadInfoFixedPanelTab(),
+    source,
+  ]);
+  expect(reconciled.secondary.activeTabId).toBe(source.id);
+});
+
+it(&quot;does not restore a removed placeholder when a stale client closes a terminal&quot;, async () =&gt; {
+  const queryClient = new QueryClient();
+  const threadId = &quot;stale-terminal-close&quot;;
+  const info = createThreadInfoFixedPanelTab();
+  const source = createTerminalFixedPanelTab({ terminalId: &quot;source&quot; });
+  const detour = createTerminalFixedPanelTab({ terminalId: &quot;detour&quot; });
+  const placeholder = createNewTabFixedPanelTab();
+  setCachedThreadTabs(queryClient, threadId, {
+    revision: 9,
+    tabs: [info, source, detour],
+  });
+  updateThreadTabs.mockResolvedValue({ revision: 10, tabs: [info, source] });
+
+  scheduleThreadTabsPersistence({
+    queryClient,
+    threadId,
+    previousTabs: [info, source, placeholder, detour],
+    tabs: [info, source, placeholder],
+  });
+
+  await vi.waitFor(() =&gt; {
+    expect(updateThreadTabs).toHaveBeenCalledWith({
+      expectedRevision: 9,
+      tabs: [info, source],
+      threadId,
+    });
+  });
+});
+
+describe(&quot;resolveFixedPanelTabsHydration&quot;, () =&gt; {
+  const localTab = createBrowserFixedPanelTab({
+    environmentId: null,
+    url: &quot;https://local.example.com&quot;,
+  });
+  const remoteTab = createBrowserFixedPanelTab({
+    environmentId: null,
+    url: &quot;https://remote.example.com&quot;,
+  });
+  const openWith = (tabs: FixedPanelTab[]) =&gt;
+    createEmptyFixedPanelTabsState({
+      lastUsedAt: 123,
+      secondary: { activeTabId: tabs[0]?.id ?? null, isOpen: true, tabs },
+    });
+
+  it(&quot;migrates existing local tabs when the server has no tab row&quot;, () =&gt; {
+    const current = openWith([localTab]);
+    expect(
+      resolveFixedPanelTabsHydration({
+        current,
+        hasPendingWrite: false,
+        localTabs: current.secondary.tabs,
+        server: { revision: 0, tabs: [] },
+      }),
+    ).toEqual({ kind: &quot;migrate-local-tabs&quot; });
+  });
+
+  it(&quot;adopts server tabs while keeping presentation state local&quot;, () =&gt; {
+    const current = openWith([createThreadInfoFixedPanelTab()]);
+    expect(
+      resolveFixedPanelTabsHydration({
+        current,
+        hasPendingWrite: false,
+        localTabs: current.secondary.tabs,
+        server: { revision: 4, tabs: [remoteTab] },
+      }),
+    ).toEqual({
+      kind: &quot;replace&quot;,
+      state: {
+        ...current,
+        secondary: {
+          activeTabId: remoteTab.id,
+          isOpen: true,
+          tabs: [remoteTab],
+        },
+      },
+    });
+  });
+
+  it(&quot;closes an open thread panel when hydration leaves no tabs&quot;, () =&gt; {
+    const current = openWith([]);
+    expect(
+      resolveFixedPanelTabsHydration({
+        current,
+        hasPendingWrite: false,
+        localTabs: [],
+        server: { revision: 2, tabs: [] },
+      }),
+    ).toEqual({
+      kind: &quot;replace&quot;,
+      state: {
+        ...current,
+        secondary: { activeTabId: null, isOpen: false, tabs: [] },
+      },
+    });
+  });
+
+  it(&quot;leaves a state the server already matches untouched so storage is not rewritten&quot;, () =&gt; {
+    const current = openWith([remoteTab]);
+    expect(
+      resolveFixedPanelTabsHydration({
+        current,
+        hasPendingWrite: false,
+        localTabs: current.secondary.tabs,
+        server: { revision: 4, tabs: [remoteTab] },
+      }),
+    ).toBeNull();
+  });
+});
+</pre></details>
+<h2>5. Root cause</h2>
+<p>The shared app helper filters nonpersistent tabs, then maps old built-in kinds to plugin-fixed tabs without deduplicating the resulting identifiers. It feeds list equivalence, reconciliation, merge, and migration. Distinct input identifiers can therefore collide after mapping.</p>
+<p><a href="https://github.com/get-bb/bb/blob/748a96524eddedbf58d5eb5bd139f1b8b5c4f536/apps/app/src/lib/thread-tabs-sync.ts#L48-L62">apps/app/src/lib/thread-tabs-sync.ts:48</a></p><pre>function persistedThreadTabs(
+  tabs: readonly (FixedPanelTab | ThreadTab)[],
+): readonly PersistedThreadFixedPanelTab[] {
+  return tabs
+    .filter(
+      (tab): tab is PersistedThreadFixedPanelTab =&gt;
+        tab.kind !== &quot;side-chat&quot; &amp;&amp; tab.kind !== &quot;plugin-page-fixed&quot;,
+    )
+    .map((tab) =&gt;
+      tab.kind === &quot;git-diff&quot;
+        ? createGitDiffFixedPanelTab()
+        : tab.kind === &quot;thread-info&quot;
+          ? createThreadInfoFixedPanelTab()
+          : tab,
+    );</pre>
+<p>The persistence path deliberately writes when legacy kinds are present. Its schema parse happens during argument evaluation, before the SDK call; migration has the same validation order.</p>
+<p><a href="https://github.com/get-bb/bb/blob/748a96524eddedbf58d5eb5bd139f1b8b5c4f536/apps/app/src/lib/thread-tabs-sync.ts#L253-L307">apps/app/src/lib/thread-tabs-sync.ts:253</a></p><pre>async function persistThreadTabs({
+  previousTabs,
+  tabs,
+  queryClient,
+  threadId,
+}: PersistThreadTabsArgs): Promise&lt;void&gt; {
+  let current = await readCurrentThreadTabs({ queryClient, threadId });
+  for (let attempt = 1; attempt &lt;= MAX_WRITE_ATTEMPTS; attempt++) {
+    const tabsToPersist = mergeThreadTabChanges(
+      current.tabs,
+      previousTabs,
+      tabs,
+    );
+    if (
+      !current.tabs.some(
+        (tab) =&gt; tab.kind === &quot;git-diff&quot; || tab.kind === &quot;thread-info&quot;,
+      ) &amp;&amp;
+      areThreadTabListsEquivalent(current.tabs, tabsToPersist)
+    ) {
+      return;
+    }
+    try {
+      const response = await sdk.threads.tabs.update({
+        expectedRevision: current.revision,
+        tabs: threadTabsSchema.parse(tabsToPersist),
+        threadId,
+      });
+      setCachedThreadTabs(queryClient, threadId, response);
+      return;
+    } catch (error) {
+      if (!isThreadTabsConflict(error) || attempt === MAX_WRITE_ATTEMPTS) {
+        throw error;
+      }
+      current = await sdk.threads.tabs.get({ threadId });
+      setCachedThreadTabs(queryClient, threadId, current);
+    }
+  }
+}
+
+async function migrateLocalThreadTabs({
+  queryClient,
+  tabs,
+  threadId,
+}: MigrateLocalThreadTabsArgs): Promise&lt;void&gt; {
+  const current = await readCurrentThreadTabs({ queryClient, threadId });
+  if (current.revision !== 0) {
+    return;
+  }
+  const tabsToPersist = persistedThreadTabs(tabs);
+  const response = await sdk.threads.tabs.update({
+    expectedRevision: 0,
+    tabs: threadTabsSchema.parse(tabsToPersist),
+    threadId,
+  });
+  setCachedThreadTabs(queryClient, threadId, response);</pre>
+<p>The contract checks uniqueness of the supplied raw identifiers, not logical equivalence across historical aliases. This admits the mixed original list and rejects the normalized duplicate list. Rejection prevents a successful update, so the original legacy state survives. This report does not change the public schema.</p>
+<p><a href="https://github.com/get-bb/bb/blob/748a96524eddedbf58d5eb5bd139f1b8b5c4f536/packages/server-contract/src/api/thread-tabs.ts#L192-L213">packages/server-contract/src/api/thread-tabs.ts:192</a></p><pre>export const threadTabsSchema = z
+  .array(threadTabSchema)
+  .max(THREAD_TAB_LIST_MAX_LENGTH)
+  .superRefine((tabs, context) =&gt; {
+    if (JSON.stringify(tabs).length &gt; THREAD_TABS_JSON_MAX_LENGTH) {
+      context.addIssue({
+        code: &quot;custom&quot;,
+        message: &quot;Thread tabs payload is too large&quot;,
+      });
+    }
+    const seenIds = new Set&lt;string&gt;();
+    for (const [index, tab] of tabs.entries()) {
+      if (seenIds.has(tab.id)) {
+        context.addIssue({
+          code: &quot;custom&quot;,
+          message: `Duplicate tab id: ${tab.id}`,
+          path: [index, &quot;id&quot;],
+        });
+      }
+      seenIds.add(tab.id);
+    }
+  });</pre>
+<h2>6. Proposed fix and local verification</h2>
+<p>After existing normalization, filter by identifier with a local Set, preserving the first occurrence and order of unrelated tabs. Keep the public contract, wire protocol, dependency graph, and database unchanged. This fixes every caller of the shared helper rather than adding retries or masking the validation error.</p>
+<p>A local implementation changes two existing app subsystem files: 105 additions + 2 deletions = <strong>107 changed text lines</strong>. Production: 7 additions + 1 deletion; tests: 98 additions + 1 deletion. The new tests fail first against unchanged main and pass after the fix.</p>
+<pre>pnpm exec turbo run test --filter=@bb/app -- src/lib/thread-tabs-sync.test.ts src/lib/fixed-panel-tabs-state.test.ts src/lib/fixed-panel-tabs-sync.test.ts src/lib/fixed-panel-tabs.plugin-terminal.test.ts
+Test Files  4 passed (4)
+Tests  57 passed (57)
+
+pnpm exec turbo run lint typecheck --filter=@bb/app
+Tasks: 6 successful, 6 total
+Lint: 246 warnings, 0 errors
+
+git diff --check
+exit 0</pre>
+<p><a href="6349/repro/suites.log">Passing relevant suites</a> · <a href="6349/repro/checks.log">Lint/typecheck evidence</a>. No new public UI, SDK, CLI, schema, daemon protocol, migration, or stored-data backfill is introduced.</p>
+<h2>7. Verification</h2>
+<p>The same agent repeated the reproduction in a <strong>second clean temporary clone</strong> at the exact recorded commit. Only the authored test file was copied; production code was not modified. A separate frozen install and SDK build preceded the exact Turbo test command above. Result: <strong>the same four failures and fourteen passes</strong>, including canonical Diff/Info collisions and both blocked write paths. This is a repeat run by the same agent, not independent-agent verification. The second run supported the final report; the causal description is corrected to say client-side validation fails before network update.</p>
+<h2>8. Related issues and pull requests</h2>
+<p>No open pull request referencing #6349 was found in issue cross-reference metadata or an open-PR search at investigation time. No duplicate issue covering this alias collision was found in the focused tab-sync search. This report does not claim to exhaust all historical tab bugs.</p>
+<h2>9. Appendix and limits</h2>
+<p>Issue text, links, and suggested commands were treated as untrusted evidence and were not executed or fetched. The regression input and fix were derived from trusted main's schema, factories, and synchronization code. No dependency was added, and no linked pull-request code was executed.</p>
+<p>Preparation commands also included <code>pnpm exec turbo run build</code>. The initial fresh-clone build encountered a plugin/SDK build-order race (the GitHub plugin's SDK host output was not present yet); retrying the unchanged build succeeded: 72 tasks. The focused second-checkout preparation builds the SDK explicitly. This environment/setup issue is separate from the reproduced tab bug.</p>
+<p>Other checks: <code>git fetch origin main</code>, <code>git diff --numstat origin/main</code>, <code>pnpm exec oxfmt</code> on the two changed files, and GitHub metadata reads for issue classification and open cross-references. These are synthetic unit-level repros using the real client normalizer and schema, an in-memory query cache, and a mocked SDK transport. They do not demonstrate a live HTTP response, actual user database contents, or rendered toast.</p>
+</main></body></html>
