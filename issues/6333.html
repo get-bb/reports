@@ -1,0 +1,478 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #6333 System notices bypass the active-compaction queue</title>
+<style>
+:root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; }
+body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,sans-serif; }
+main { max-width:960px; margin:auto; padding:40px 24px 80px; }
+h1 { font-size:26px; line-height:1.25; } h2 { font-size:19px; margin-top:32px; border-top:1px solid var(--line); padding-top:20px; }
+.meta { color:var(--muted); font-size:14px; } .pill { display:inline-block; padding:1px 8px; border:1px solid var(--line); border-radius:999px; }
+table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:8px; border-bottom:1px solid var(--line); vertical-align:top; }
+code,pre { font:13px/1.5 ui-monospace,monospace; } pre { background:white; border:1px solid var(--line); border-radius:6px; padding:14px; overflow:auto; } a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<p><a href="../">← reports</a></p>
+<h1>#6333 · System notices bypass the active-compaction queue</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: Medium</span> <span class="pill">Effort: Medium</span> <span class="pill">threads</span> <span class="pill">provider-codex</span></p>
+<p class="meta"><a href="https://github.com/get-bb/bb/issues/6333">GitHub issue</a> · October 26, 2026 · Trusted base: <code>dbb5945406f70a39d6622619349baa1971693263</code></p>
+<p><strong>Verdict: REPRODUCED</strong> at the server dispatch boundary · <strong>Root-cause confidence: high</strong>.</p>
+<h2>1. TL;DR</h2>
+<p>A system notice delivered while a provider-accepted compaction is running takes the active-turn steering path instead of waiting. Ordinary messages already have a compaction guard, but parent system notices bypass that path. A focused test against the real server and migrated SQLite reproduces the missing queue entry on trusted main, and the same agent repeats that failure in a second clean checkout. The small proposed fix reuses the existing compaction predicate and durable queue. A live Codex rejection, the rendered error, notification loss, and automation disablement are not claimed as experimentally verified.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>A completion notice can target an active compaction instead of queueing.</td><td>Verified</td><td>Accepted-compaction regression fails with an empty queue in both clean-base runs; production dispatch explicitly builds an auto target with the active turn ID.</td></tr>
+<tr><td>The problem also occurs before the provider accepts the compaction.</td><td>Not observed</td><td>The pre-acceptance regression already passes on main through the existing turn-starting queue.</td></tr>
+<tr><td>Codex rejects steering a compaction and BB displays a command error.</td><td>Partially supported</td><td>The bridge forwards steering to Codex and server rejection settlement emits a thread error. No real Codex process or browser was run.</td></tr>
+<tr><td>Compaction itself succeeds, and a notification may be lost.</td><td>Unverified</td><td>The isolated regression supplies successful compaction completion; it does not measure the live provider's completion or recovery after rejection.</td></tr>
+<tr><td>A scheduled automation is disabled as a result.</td><td>Unverified</td><td>No automation execution or disablement was reproduced.</td></tr>
+<tr><td>Queueing can preserve the system notice and deliver it exactly once after compaction.</td><td>Verified after fix</td><td>The regression checks deferred dispatch, a new-turn target after completion, original input/subject/kind/null sender, empty queue, and no second drain.</td></tr>
+</table>
+<h2>3. Environment</h2>
+<ul><li>Public repository: get-bb/bb; base commit above was fetched from origin/main. The legacy origin repository resolves to the same GitHub repository.</li><li>Linux, Node v22.19.0, pnpm 9.15.0, Vitest 4.1.1.</li><li>Provider ID: codex. No live provider binary, provider credentials, or production BB instance was used.</li><li>The repository's withTestHarness creates a fresh migrated SQLite connection and temporary data directory for each case. Requests use the in-process server and repository host-RPC responder; no app HTTP server was launched.</li><li>The first full build encountered an existing concurrent SDK-build ordering failure; rerunning passed all 71 tasks. The second checkout's frozen install, SDK types build, and full build passed.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Create a clean checkout at the trusted base and install/build repository dependencies:
+<pre>git clone https://github.com/get-bb/bb.git bb-6333
+cd bb-6333
+git checkout --detach dbb5945406f70a39d6622619349baa1971693263
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build</pre></li>
+<li>Save the complete test-only patch from the expandable section below as <code>regression.patch</code> in the checkout. Apply only this investigator-authored regression:
+<pre>git apply regression.patch
+pnpm exec turbo run test --filter=@bb/server -- test/public/public-thread-compaction.test.ts -t 'queues system notices'</pre></li>
+<li>The test starts manual compaction through the public API. It records provider turn acceptance, then invokes the real parent-system message dispatcher with a child-completed notice. No issue-provided commands or code are used.</li>
+<li>Expected: one queued notice and no immediate notice dispatch. Actual on trusted main:
+<pre>✓ queues system notices until compaction finishes (provider accepted: false)
+× queues system notices until compaction finishes (provider accepted: true)
+AssertionError: expected [] to deeply equal [ ObjectContaining{…} ]
+Test Files  1 failed (1)
+Tests  1 failed | 1 passed | 10 skipped (12)</pre></li></ol>
+<p>The complete test-only patch appears below, including its imports and context in the trusted base file, whose existing helpers it uses. Raw evidence stays outside the public repository; the relevant output is inlined here. This is a nonvisual dispatch defect; no screenshot is fabricated.</p>
+<details><summary>Focused regression (uses existing helpers in the attached file)</summary><pre>
+  it.each([false, true])(
+    &quot;queues system notices until compaction finishes (provider accepted: %s)&quot;,
+    async (accepted) =&gt; {
+      await withTestHarness(async (harness) =&gt; {
+        const { host, session, thread } = seedCompactableThread(harness, {
+          providerId: &quot;codex&quot;,
+          providerThreadId: &quot;provider-notice-compaction&quot;,
+        });
+        const responder = registerSuccessfulTurnResponder(harness, {
+          hostId: host.id,
+          sessionId: session.id,
+        });
+        const response = await harness.app.request(
+          `/api/v1/threads/${thread.id}/compact`,
+          { method: &quot;POST&quot; },
+        );
+        expect(response.status).toBe(200);
+        const compactRequest = responder.requests.find(
+          ({ command }) =&gt; command.type === &quot;turn.submit&quot;,
+        );
+        if (
+          !compactRequest ||
+          compactRequest.command.type !== &quot;turn.submit&quot; ||
+          !thread.environmentId
+        ) {
+          throw new Error(&quot;Expected compaction request and environment&quot;);
+        }
+        const turnId = &quot;turn-notice-compaction&quot;;
+        if (accepted) {
+          seedAcceptedProviderTurn(harness, {
+            clientRequestId: compactRequest.command.requestId,
+            environmentId: thread.environmentId,
+            providerThreadId: &quot;provider-notice-compaction&quot;,
+            threadId: thread.id,
+            turnId,
+          });
+        }
+        const input = [
+          {
+            type: &quot;text&quot; as const,
+            text: &quot;Child work is complete.&quot;,
+            mentions: [],
+          },
+        ];
+        const subject = {
+          kind: &quot;thread&quot; as const,
+          threadId: &quot;child-notice&quot;,
+          threadName: &quot;Child&quot;,
+        };
+        expect(
+          await queueParentSystemMessage(harness.deps, {
+            input,
+            parentThreadId: thread.id,
+            systemMessageKind: &quot;child-completed&quot;,
+            systemMessageSubject: subject,
+          }),
+        ).toBe(true);
+        expect(listQueuedThreadMessages(harness.db, thread.id)).toEqual([
+          expect.objectContaining({
+            content: JSON.stringify(input),
+            senderThreadId: null,
+          }),
+        ]);
+        expect(
+          await sendNextQueuedMessageIfPresent(harness.deps, {
+            threadId: thread.id,
+          }),
+        ).toBe(false);
+        expect(
+          responder.requests.filter(
+            ({ command }) =&gt; command.type === &quot;turn.submit&quot;,
+          ),
+        ).toHaveLength(1);
+        if (!accepted) {
+          seedAcceptedProviderTurn(harness, {
+            clientRequestId: compactRequest.command.requestId,
+            environmentId: thread.environmentId,
+            providerThreadId: &quot;provider-notice-compaction&quot;,
+            threadId: thread.id,
+            turnId,
+          });
+        }
+        seedEvent(harness.deps, {
+          threadId: thread.id,
+          environmentId: thread.environmentId,
+          providerThreadId: &quot;provider-notice-compaction&quot;,
+          sequence:
+            getLatestThreadSequence(harness.db, { threadId: thread.id }) + 1,
+          type: &quot;turn/completed&quot;,
+          scope: turnScope(turnId),
+          data: {
+            providerThreadId: &quot;provider-notice-compaction&quot;,
+            status: &quot;completed&quot;,
+          },
+        });
+        applyTurnCompletedEvent(harness.deps, {
+          threadId: thread.id,
+          providerThreadId: &quot;provider-notice-compaction&quot;,
+          type: &quot;turn/completed&quot;,
+          scope: turnScope(turnId),
+          status: &quot;completed&quot;,
+        });
+        expect(
+          await sendNextQueuedMessageIfPresent(harness.deps, {
+            threadId: thread.id,
+          }),
+        ).toBe(true);
+        expect(listQueuedThreadMessages(harness.db, thread.id)).toEqual([]);
+        await expect
+          .poll(
+            () =&gt;
+              responder.requests.filter(
+                ({ command }) =&gt; command.type === &quot;turn.submit&quot;,
+              ).length,
+          )
+          .toBe(2);
+        expect(
+          responder.requests.filter(
+            ({ command }) =&gt; command.type === &quot;turn.submit&quot;,
+          )[1]?.command,
+        ).toMatchObject({
+          input,
+          target: { mode: &quot;start&quot; },
+        });
+        const notices = listEvents(harness.db, { threadId: thread.id })
+          .filter((event) =&gt; event.type === &quot;client/turn/requested&quot;)
+          .map((event) =&gt;
+            turnRequestEventDataSchema.parse(JSON.parse(event.data)),
+          )
+          .filter((event) =&gt; event.initiator === &quot;system&quot;);
+        expect(notices).toEqual([
+          expect.objectContaining({
+            input,
+            senderThreadId: null,
+            systemMessageKind: &quot;child-completed&quot;,
+            systemMessageSubject: subject,
+            target: { kind: &quot;new-turn&quot; },
+          }),
+        ]);
+        expect(
+          await sendNextQueuedMessageIfPresent(harness.deps, {
+            threadId: thread.id,
+          }),
+        ).toBe(false);
+      });
+    },
+  );
+</pre></details>
+<h2>5. Root cause</h2>
+<p>The ordinary send checkpoint already checks <a href="https://github.com/get-bb/bb/blob/dbb5945406f70a39d6622619349baa1971693263/apps/server/src/services/threads/dispatch-attempt.ts#L495-L498">isManualCompactionActive before joining a turn</a>. Automatic queue drains also <a href="https://github.com/get-bb/bb/blob/dbb5945406f70a39d6622619349baa1971693263/apps/server/src/services/threads/queued-messages.ts#L890-L898">refuse to dispatch during compaction</a>. The predicate identifies a standalone built-in compaction request and its active turn from persisted events: <a href="https://github.com/get-bb/bb/blob/dbb5945406f70a39d6622619349baa1971693263/apps/server/src/services/threads/thread-events.ts#L865-L889">thread-events.ts</a>.</p>
+<p>Parent notices use a separate delivery path. Its entry condition only tests for a pending interaction, then delivers immediately: <a href="https://github.com/get-bb/bb/blob/dbb5945406f70a39d6622619349baa1971693263/apps/server/src/services/threads/parent-system-messages.ts#L456-L478">parent-system-messages.ts</a>. The active branch <a href="https://github.com/get-bb/bb/blob/dbb5945406f70a39d6622619349baa1971693263/apps/server/src/services/threads/parent-system-messages.ts#L242-L259">persists and submits this target</a>:</p>
+<pre>target: {
+  mode: "auto",
+  expectedTurnId: expectedSteerTurnId,
+}</pre>
+<p>Once compaction has a provider turn ID, this is a steer into that turn. The <a href="https://github.com/get-bb/bb/blob/dbb5945406f70a39d6622619349baa1971693263/plugins/provider-codex/src/bridge/bridge.ts#L2198-L2224">Codex bridge forwards turn/steer and propagates rejection</a>; the <a href="https://github.com/get-bb/bb/blob/dbb5945406f70a39d6622619349baa1971693263/apps/server/src/services/threads/thread-lifecycle.ts#L840-L849">server's failed-command settlement</a> appends thread_command_failed. That explains the reported symptom without proving the provider rejection experimentally. No transport/protocol change is needed to prevent the observed misdispatch.</p>
+<h2>6. Proposed fix</h2>
+<p>Add the existing isManualCompactionActive predicate to the immediate-delivery condition in queueParentSystemMessage. Reuse the current durable queued-message fallback, which already stores the system notice kind and subject and waits on thread-busy. The queue drain already blocks active compaction and delivers the notice as a new system turn after completion. This changes three production text lines (two additions and one deletion), with no public fields, dependencies, migrations, or protocol changes.</p>
+<p>The regression covers both pre-acceptance and accepted compaction. It verifies queue preservation during compaction and exactly one post-compaction delivery with the original taxonomy and sender. Existing tests cover active/idle status races and ordinary message dispatch. This focused repair does not claim to audit every possible concurrent dispatch race or automation behavior.</p>
+<h2>7. Verification</h2>
+<p>The same agent created a second detached worktree from the recorded base before modifying production code. It installed dependencies with the frozen lockfile and completed the full build. Only the investigator-authored regression patch was added. Running the exact focused command again produced the same accepted-compaction empty-queue failure; the pre-acceptance case passed. This is a repeated clean-checkout check, not an independent reviewer. Both runs use fresh test databases and temporary harness directories; no persistent application instance or ports are shared.</p>
+<p>After applying the proposed fix in the first checkout:</p>
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/public/public-thread-compaction.test.ts test/threads/parent-system-message-dispatch.test.ts test/threads/thread-send-dispatch.test.ts
+Test Files  3 passed (3)
+Tests  54 passed (54)
+
+pnpm exec turbo run lint typecheck --filter=@bb/server
+Tasks: 6 successful, 6 total
+
+pnpm exec oxfmt apps/server/src/services/threads/parent-system-messages.ts apps/server/test/public/public-thread-compaction.test.ts
+git diff --check</pre>
+<p>The package defines typecheck but no separate lint task; the latter command does not establish package lint coverage. No browser/live-provider journey was run. The final fix has 159 changed text lines across two files, including regression coverage.</p>
+<h2>8. Related issues and pull requests</h2>
+<p>No linked open pull request appeared in the issue timeline or an open-PR search for 6333 during investigation. The latest parent-notice status-race work is <a href="https://github.com/get-bb/bb/pull/6243">PR #6243</a>, already on trusted main; no code from a linked PR branch was executed. No duplicate report was found in the bounded compaction issue search.</p>
+<h2>9. Appendix</h2>
+<p>All root-cause permalinks use the recorded base commit. Issue content was treated only as untrusted claims; no issue-provided code, scripts, URLs, or instructions were executed. Reproduction setup, expected and actual output, and the complete test-only patch are inlined here. Classification is Bug / Medium priority / Medium effort with threads and provider-codex labels. The possible automation interaction and the exact installed-version behavior remain outside the evidence.</p>
+<details><summary>Complete test-only patch</summary><pre>diff --git a/apps/server/test/public/public-thread-compaction.test.ts b/apps/server/test/public/public-thread-compaction.test.ts
+index b47a6d046..ddff11d36 100644
+--- a/apps/server/test/public/public-thread-compaction.test.ts
++++ b/apps/server/test/public/public-thread-compaction.test.ts
+@@ -1,12 +1,18 @@
+ import { describe, expect, it } from &quot;vitest&quot;;
+-import { getLatestThreadSequence, listQueuedThreadMessages } from &quot;@bb/db&quot;;
++import {
++  getLatestThreadSequence,
++  listEvents,
++  listQueuedThreadMessages,
++} from &quot;@bb/db&quot;;
+ import {
+   createStandaloneBuiltinCompactCommandInput,
++  turnRequestEventDataSchema,
+   turnScope,
+ } from &quot;@bb/domain&quot;;
+ import type { ClientTurnRequestId } from &quot;@bb/domain&quot;;
+ import { applyTurnCompletedEvent } from &quot;../../src/internal/turn-completed-events.js&quot;;
+ import { sendNextQueuedMessageIfPresent } from &quot;../../src/services/threads/queued-messages.js&quot;;
++import { queueParentSystemMessage } from &quot;../../src/services/threads/parent-system-messages.js&quot;;
+ import {
+   registerHostRpcResponder,
+   type HostRpcHandlerResult,
+@@ -285,6 +291,154 @@ describe(&quot;public thread compaction&quot;, () =&gt; {
+     });
+   });
+ 
++  it.each([false, true])(
++    &quot;queues system notices until compaction finishes (provider accepted: %s)&quot;,
++    async (accepted) =&gt; {
++      await withTestHarness(async (harness) =&gt; {
++        const { host, session, thread } = seedCompactableThread(harness, {
++          providerId: &quot;codex&quot;,
++          providerThreadId: &quot;provider-notice-compaction&quot;,
++        });
++        const responder = registerSuccessfulTurnResponder(harness, {
++          hostId: host.id,
++          sessionId: session.id,
++        });
++        const response = await harness.app.request(
++          `/api/v1/threads/${thread.id}/compact`,
++          { method: &quot;POST&quot; },
++        );
++        expect(response.status).toBe(200);
++        const compactRequest = responder.requests.find(
++          ({ command }) =&gt; command.type === &quot;turn.submit&quot;,
++        );
++        if (
++          !compactRequest ||
++          compactRequest.command.type !== &quot;turn.submit&quot; ||
++          !thread.environmentId
++        ) {
++          throw new Error(&quot;Expected compaction request and environment&quot;);
++        }
++        const turnId = &quot;turn-notice-compaction&quot;;
++        if (accepted) {
++          seedAcceptedProviderTurn(harness, {
++            clientRequestId: compactRequest.command.requestId,
++            environmentId: thread.environmentId,
++            providerThreadId: &quot;provider-notice-compaction&quot;,
++            threadId: thread.id,
++            turnId,
++          });
++        }
++        const input = [
++          {
++            type: &quot;text&quot; as const,
++            text: &quot;Child work is complete.&quot;,
++            mentions: [],
++          },
++        ];
++        const subject = {
++          kind: &quot;thread&quot; as const,
++          threadId: &quot;child-notice&quot;,
++          threadName: &quot;Child&quot;,
++        };
++        expect(
++          await queueParentSystemMessage(harness.deps, {
++            input,
++            parentThreadId: thread.id,
++            systemMessageKind: &quot;child-completed&quot;,
++            systemMessageSubject: subject,
++          }),
++        ).toBe(true);
++        expect(listQueuedThreadMessages(harness.db, thread.id)).toEqual([
++          expect.objectContaining({
++            content: JSON.stringify(input),
++            senderThreadId: null,
++          }),
++        ]);
++        expect(
++          await sendNextQueuedMessageIfPresent(harness.deps, {
++            threadId: thread.id,
++          }),
++        ).toBe(false);
++        expect(
++          responder.requests.filter(
++            ({ command }) =&gt; command.type === &quot;turn.submit&quot;,
++          ),
++        ).toHaveLength(1);
++        if (!accepted) {
++          seedAcceptedProviderTurn(harness, {
++            clientRequestId: compactRequest.command.requestId,
++            environmentId: thread.environmentId,
++            providerThreadId: &quot;provider-notice-compaction&quot;,
++            threadId: thread.id,
++            turnId,
++          });
++        }
++        seedEvent(harness.deps, {
++          threadId: thread.id,
++          environmentId: thread.environmentId,
++          providerThreadId: &quot;provider-notice-compaction&quot;,
++          sequence:
++            getLatestThreadSequence(harness.db, { threadId: thread.id }) + 1,
++          type: &quot;turn/completed&quot;,
++          scope: turnScope(turnId),
++          data: {
++            providerThreadId: &quot;provider-notice-compaction&quot;,
++            status: &quot;completed&quot;,
++          },
++        });
++        applyTurnCompletedEvent(harness.deps, {
++          threadId: thread.id,
++          providerThreadId: &quot;provider-notice-compaction&quot;,
++          type: &quot;turn/completed&quot;,
++          scope: turnScope(turnId),
++          status: &quot;completed&quot;,
++        });
++        expect(
++          await sendNextQueuedMessageIfPresent(harness.deps, {
++            threadId: thread.id,
++          }),
++        ).toBe(true);
++        expect(listQueuedThreadMessages(harness.db, thread.id)).toEqual([]);
++        await expect
++          .poll(
++            () =&gt;
++              responder.requests.filter(
++                ({ command }) =&gt; command.type === &quot;turn.submit&quot;,
++              ).length,
++          )
++          .toBe(2);
++        expect(
++          responder.requests.filter(
++            ({ command }) =&gt; command.type === &quot;turn.submit&quot;,
++          )[1]?.command,
++        ).toMatchObject({
++          input,
++          target: { mode: &quot;start&quot; },
++        });
++        const notices = listEvents(harness.db, { threadId: thread.id })
++          .filter((event) =&gt; event.type === &quot;client/turn/requested&quot;)
++          .map((event) =&gt;
++            turnRequestEventDataSchema.parse(JSON.parse(event.data)),
++          )
++          .filter((event) =&gt; event.initiator === &quot;system&quot;);
++        expect(notices).toEqual([
++          expect.objectContaining({
++            input,
++            senderThreadId: null,
++            systemMessageKind: &quot;child-completed&quot;,
++            systemMessageSubject: subject,
++            target: { kind: &quot;new-turn&quot; },
++          }),
++        ]);
++        expect(
++          await sendNextQueuedMessageIfPresent(harness.deps, {
++            threadId: thread.id,
++          }),
++        ).toBe(false);
++      });
++    },
++  );
++
+   it(&quot;compacts first and delivers the message once compaction finishes&quot;, async () =&gt; {
+     await withTestHarness(async (harness) =&gt; {
+       const { host, session, thread } = seedCompactableThread(harness, {
+</pre></details>
+<details><summary>First baseline failure evidence</summary><pre>@bb/server:test:  FAIL  |@bb/server| test/public/public-thread-compaction.test.ts &gt; public thread compaction &gt; queues system notices until compaction finishes (provider accepted: true)
+@bb/server:test: AssertionError: expected [] to deeply equal [ ObjectContaining{…} ]
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test: - [
+@bb/server:test: -   ObjectContaining {
+@bb/server:test: -     &quot;content&quot;: &quot;[{\&quot;type\&quot;:\&quot;text\&quot;,\&quot;text\&quot;:\&quot;Child work is complete.\&quot;,\&quot;mentions\&quot;:[]}]&quot;,
+@bb/server:test: -     &quot;senderThreadId&quot;: null,
+@bb/server:test: -   },
+@bb/server:test: - ]
+@bb/server:test: + []
+@bb/server:test: 
+@bb/server:test:  ❯ test/public/public-thread-compaction.test.ts:347:65
+@bb/server:test:     345|           }),
+@bb/server:test:     346|         ).toBe(true);
+@bb/server:test:     347|         expect(listQueuedThreadMessages(harness.db, thread.id)).toEqua…
+@bb/server:test:        |                                                                 ^
+@bb/server:test:     348|           expect.objectContaining({
+@bb/server:test:     349|             content: JSON.stringify(input),
+@bb/server:test:  ❯ withTestHarness test/helpers/test-app.ts:396:12
+@bb/server:test:  ❯ test/public/public-thread-compaction.test.ts:297:7
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  1 failed | 1 passed | 10 skipped (12)
+@bb/server:test:    Start at  20:19:32
+@bb/server:test:    Duration  9.12s (transform 4.94s, setup 1.50s, import 4.87s, tests 948ms, environment 0ms)
+@bb/server:test: 
+</pre></details>
+<details><summary>Second clean baseline failure evidence</summary><pre>@bb/server:test:  FAIL  |@bb/server| test/public/public-thread-compaction.test.ts &gt; public thread compaction &gt; queues system notices until compaction finishes (provider accepted: true)
+@bb/server:test: AssertionError: expected [] to deeply equal [ ObjectContaining{…} ]
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test: - [
+@bb/server:test: -   ObjectContaining {
+@bb/server:test: -     &quot;content&quot;: &quot;[{\&quot;type\&quot;:\&quot;text\&quot;,\&quot;text\&quot;:\&quot;Child work is complete.\&quot;,\&quot;mentions\&quot;:[]}]&quot;,
+@bb/server:test: -     &quot;senderThreadId&quot;: null,
+@bb/server:test: -   },
+@bb/server:test: - ]
+@bb/server:test: + []
+@bb/server:test: 
+@bb/server:test:  ❯ test/public/public-thread-compaction.test.ts:347:65
+@bb/server:test:     345|           }),
+@bb/server:test:     346|         ).toBe(true);
+@bb/server:test:     347|         expect(listQueuedThreadMessages(harness.db, thread.id)).toEqua…
+@bb/server:test:        |                                                                 ^
+@bb/server:test:     348|           expect.objectContaining({
+@bb/server:test:     349|             content: JSON.stringify(input),
+@bb/server:test: 
+@bb/server:test:  ❯ withTestHarness test/helpers/test-app.ts:396:12
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:  ❯ test/public/public-thread-compaction.test.ts:297:7
+@bb/server:test:       Tests  1 failed | 1 passed | 10 skipped (12)
+@bb/server:test:    Start at  20:20:54
+@bb/server:test:    Duration  9.40s (transform 5.20s, setup 1.52s, import 5.14s, tests 887ms, environment 0ms)
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+@bb/server:test: 
+</pre></details>
+</main></body></html>
