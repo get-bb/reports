@@ -52,21 +52,35 @@ pnpm exec turbo run build</pre>
 The first broad build in the investigation failed because SDK runtime entries had not been built. After the normal SDK build, the broad build passed: 72 tasks successful.</li>
 <li>Save the exact patch below as <code>/tmp/6379-regression.patch</code> and apply it. This adds a test only; production remains unchanged.
 <pre>git apply /tmp/6379-regression.patch
-pnpm exec turbo run test --filter=@bb/server -- test/public/public-thread-compaction.test.ts -t 'retains sends during provider-started'</pre></li>
+pnpm exec turbo run test --filter=@bb/server -- test/public/public-thread-compaction.test.ts</pre></li>
 <li>The test seeds the provider's persisted turn-start and context-compaction item shape, with no bb compaction request. It calls the real public send route and checks persistent queue retention, no premature host submission, and eventual delivery after completion.</li></ol>
 <p>Exact reproduction test patch (all helper implementations already exist on the recorded base):</p><pre>diff --git a/apps/server/test/public/public-thread-compaction.test.ts b/apps/server/test/public/public-thread-compaction.test.ts
-index ddff11d36..dce9266e3 100644
+index ddff11d36..c038fba85 100644
 --- a/apps/server/test/public/public-thread-compaction.test.ts
 +++ b/apps/server/test/public/public-thread-compaction.test.ts
-@@ -3,6 +3,7 @@ import {
-   getLatestThreadSequence,
-   listEvents,
-   listQueuedThreadMessages,
-+  updateThread,
- } from &quot;@bb/db&quot;;
- import {
-   createStandaloneBuiltinCompactCommandInput,
-@@ -106,6 +107,102 @@ function seedAcceptedProviderTurn(
+@@ -32,7 +32,11 @@ import { withTestHarness, type TestAppHarness } from &quot;../helpers/test-app.js&quot;;
+ 
+ function seedCompactableThread(
+   harness: TestAppHarness,
+-  args: { providerId: string; providerThreadId: string },
++  args: {
++    providerId: string;
++    providerThreadId: string;
++    status?: &quot;idle&quot; | &quot;active&quot;;
++  },
+ ) {
+   const { host, session } = seedHostSession(harness.deps);
+   const { project } = seedProjectWithSource(harness.deps, {
+@@ -46,7 +50,7 @@ function seedCompactableThread(
+     environmentId: environment.id,
+     projectId: project.id,
+     providerId: args.providerId,
+-    status: &quot;idle&quot;,
++    status: args.status ?? &quot;idle&quot;,
+   });
+   seedThreadRuntimeState(harness.deps, {
+     environmentId: environment.id,
+@@ -106,6 +110,215 @@ function seedAcceptedProviderTurn(
  }
  
  describe(&quot;public thread compaction&quot;, () =&gt; {
@@ -75,12 +89,12 @@ index ddff11d36..dce9266e3 100644
 +      const { host, session, thread } = seedCompactableThread(harness, {
 +        providerId: &quot;pi&quot;,
 +        providerThreadId: &quot;provider-maintenance&quot;,
++        status: &quot;active&quot;,
 +      });
 +      const responder = registerSuccessfulTurnResponder(harness, {
 +        hostId: host.id,
 +        sessionId: session.id,
 +      });
-+      updateThread(harness.db, harness.hub, thread.id, { status: &quot;active&quot; });
 +      const turnId = &quot;provider-maintenance-turn&quot;;
 +      seedTurnStarted(harness.deps, {
 +        threadId: thread.id,
@@ -166,6 +180,119 @@ index ddff11d36..dce9266e3 100644
 +    });
 +  });
 +
++  it.each([&quot;requested-turn&quot;, &quot;completed-item&quot;, &quot;previous-turn&quot;, &quot;nested-item&quot;])(
++    &quot;does not block steering for compaction in %s&quot;,
++    async (scenario) =&gt; {
++      await withTestHarness(async (harness) =&gt; {
++        const { host, session, thread } = seedCompactableThread(harness, {
++          providerId: &quot;pi&quot;,
++          providerThreadId: &quot;provider-compaction-control&quot;,
++          status: scenario === &quot;requested-turn&quot; ? &quot;idle&quot; : &quot;active&quot;,
++        });
++        const responder = registerSuccessfulTurnResponder(harness, {
++          hostId: host.id,
++          sessionId: session.id,
++        });
++        if (!thread.environmentId) {
++          throw new Error(&quot;Expected compactable thread environment&quot;);
++        }
++        const turnId = &quot;control-turn&quot;;
++        if (scenario === &quot;requested-turn&quot;) {
++          const response = await harness.app.request(
++            `/api/v1/threads/${thread.id}/send`,
++            {
++              method: &quot;POST&quot;,
++              headers: { &quot;content-type&quot;: &quot;application/json&quot; },
++              body: JSON.stringify({
++                mode: &quot;start&quot;,
++                input: [{ type: &quot;text&quot;, text: &quot;Start ordinary work&quot; }],
++              }),
++            },
++          );
++          expect(response.status).toBe(200);
++          const request = responder.requests.find(
++            ({ command }) =&gt; command.type === &quot;turn.submit&quot;,
++          );
++          if (!request || request.command.type !== &quot;turn.submit&quot;) {
++            throw new Error(&quot;Expected ordinary turn request&quot;);
++          }
++          seedAcceptedProviderTurn(harness, {
++            clientRequestId: request.command.requestId,
++            environmentId: thread.environmentId,
++            providerThreadId: &quot;provider-compaction-control&quot;,
++            threadId: thread.id,
++            turnId,
++          });
++        } else {
++          seedTurnStarted(harness.deps, {
++            threadId: thread.id,
++            environmentId: thread.environmentId,
++            providerThreadId: &quot;provider-compaction-control&quot;,
++            turnId,
++          });
++        }
++        const itemEvent = {
++          threadId: thread.id,
++          environmentId: thread.environmentId,
++          providerThreadId: &quot;provider-compaction-control&quot;,
++          scope: turnScope(
++            scenario === &quot;previous-turn&quot; ? &quot;older-turn&quot; : turnId,
++          ),
++          data: {
++            item: {
++              type: &quot;contextCompaction&quot; as const,
++              id: &quot;control-compaction&quot;,
++              ...(scenario === &quot;nested-item&quot;
++                ? { parentToolCallId: &quot;child-work&quot; }
++                : {}),
++            },
++          },
++        };
++        seedEvent(harness.deps, {
++          ...itemEvent,
++          sequence:
++            getLatestThreadSequence(harness.db, { threadId: thread.id }) + 1,
++          type: &quot;item/started&quot;,
++        });
++        if (scenario === &quot;completed-item&quot;) {
++          seedEvent(harness.deps, {
++            ...itemEvent,
++            sequence:
++              getLatestThreadSequence(harness.db, { threadId: thread.id }) + 1,
++            type: &quot;item/completed&quot;,
++          });
++        }
++        const submissionsBefore = responder.requests.filter(
++          ({ command }) =&gt; command.type === &quot;turn.submit&quot;,
++        ).length;
++        const response = await harness.app.request(
++          `/api/v1/threads/${thread.id}/send`,
++          {
++            method: &quot;POST&quot;,
++            headers: { &quot;content-type&quot;: &quot;application/json&quot; },
++            body: JSON.stringify({
++              mode: &quot;steer&quot;,
++              input: [{ type: &quot;text&quot;, text: &quot;Keep working&quot; }],
++            }),
++          },
++        );
++        expect(response.status).toBe(200);
++        await expect(readJson(response)).resolves.toMatchObject({
++          delivery: &quot;sent&quot;,
++        });
++        expect(listQueuedThreadMessages(harness.db, thread.id)).toHaveLength(0);
++        await expect
++          .poll(
++            () =&gt;
++              responder.requests.filter(
++                ({ command }) =&gt; command.type === &quot;turn.submit&quot;,
++              ).length,
++          )
++          .toBe(submissionsBefore + 1);
++      });
++    },
++  );
++
    it(&quot;dispatches the same structured /compact turn as the composer&quot;, async () =&gt; {
      await withTestHarness(async (harness) =&gt; {
        const { host, session, thread } = seedCompactableThread(harness, {
@@ -181,7 +308,7 @@ index ddff11d36..dce9266e3 100644
 +   "delivery": "sent",
 
 Test Files  1 failed (1)
-Tests  1 failed | 12 skipped (13)</pre>
+Tests  1 failed | 16 passed (17)</pre>
 <h2>5. Root cause</h2>
 <p><a href="https://github.com/get-bb/bb/blob/b6743a36bd9eae1408c35cfc2c7ab1d2419dc79d/plugins/provider-pi/src/delta-translation.ts#L727-L743">plugins/provider-pi/src/delta-translation.ts:727-L743</a> translates manual compaction into its own turn and compaction item.
 <a href="https://github.com/get-bb/bb/blob/b6743a36bd9eae1408c35cfc2c7ab1d2419dc79d/packages/provider-bridge-protocol/src/assembler/delta-assembler.ts#L775-L783">packages/provider-bridge-protocol/src/assembler/delta-assembler.ts:775-L783</a> turns that delta into a contextCompaction item.</p>
@@ -201,8 +328,8 @@ No open linked PR was found at investigation time. This is metadata-only, not a 
 <h2>9. Verification</h2>
 <p>The same agent repeated the test in a second clean worktree created directly at <code>b6743a36bd9eae1408c35cfc2c7ab1d2419dc79d</code>. Only the authored regression patch was applied; production stayed byte-identical to main.
 The frozen install and SDK prerequisite build were repeated, and Turbo ran the identical focused command above. Both runs exited 1 at the same delivery assertion: queued was expected and sent was returned.
-The first run took 27.164 seconds including orchestration; the second took 29.058 seconds. Neither failure was a timeout or setup failure.</p>
-<p>An initial draft test incorrectly called a database helper; that setup error was corrected before both recorded reproduction runs. It is not counted as evidence. No report claim depends on that draft.</p>
+Neither failure was a timeout or setup failure. All 16 control tests passed in each run.</p>
+<p>Correction: the initially published draft used an invalid fixture state update, leaving the thread idle. The fixture now creates an active thread directly, and both clean reproductions were repeated with unchanged production code. The earlier draft runs are not counted as evidence. The patch embedded here is the corrected test and includes the steering controls.</p>
 <h2>10. Appendix and limits</h2>
 <p>The trusted-base control command <code>pnpm exec turbo run test --filter=@bb/server -- test/public/public-thread-compaction.test.ts</code> passed all 12 existing tests before the regression was added.
 The reproduction patch is embedded here rather than publishing raw logs, paths, or test artifacts. Local evidence is retained in isolated investigation storage.</p>
