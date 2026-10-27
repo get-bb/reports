@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Issue 6379 · Provider maintenance bypasses compaction admission</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main>
+<p><a href="../">Reports</a></p><h1>#6379 · Provider maintenance bypasses compaction admission</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High</span><span class="pill">Effort: Medium</span><span class="pill">providers · threads · provider-pi</span></p>
+<p><a href="https://github.com/get-bb/bb/issues/6379">GitHub issue</a> · October 27, 2026 · Base <code>b6743a36bd9eae1408c35cfc2c7ab1d2419dc79d</code></p>
+<p><strong>Verdict: REPRODUCED at the server dispatch boundary.</strong> Root-cause confidence: <strong>high</strong>.</p>
+<h2>1. TL;DR</h2>
+<p>A message arriving during a provider-owned maintenance turn is dispatched immediately rather than retained until compaction finishes.
+The server recognizes manual compaction from a bb command request, not from the provider's own maintenance events.
+Pi emits a separate turn and a context-compaction item for manual compaction even when bb did not request it.
+A focused public send-route test fails on untouched main in two clean checkouts: expected queued, received sent.
+This reproduces the admission defect; an authenticated live Pi extension run and its full error/message-loss chain were not executed.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Provider-started manual compaction opens a turn.</td><td>Verified in trusted source.</td><td>Pi translator emits turn.open and item.open for manual compaction; existing translator test covers the resulting turn/started and item/started events.</td></tr>
+<tr><td>The send is steered rather than queued.</td><td>Reproduced.</td><td>Public API regression sends mode steer during an active maintenance turn and receives delivery sent instead of queued.</td></tr>
+<tr><td>bb-requested compaction queues messages.</td><td>Verified.</td><td>All 12 pre-existing public compaction tests pass, including compaction queue/drain behavior.</td></tr>
+<tr><td>Pi rejects prompts while manual compaction runs.</td><td>Verified in installed dependency source, not a live session.</td><td>AgentSession.prompt checks its manual-compaction controller before input handling and throws.</td></tr>
+<tr><td>The full thread fails and the message is never delivered.</td><td>Not reproduced end to end.</td><td>The harness acknowledges host RPCs. It proves the wrong admission decision, not a real Pi failure or the eventual UI state.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Trusted repository: public get-bb/bb, origin/main at the full base commit above.</li>
+<li>Linux 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li>
+<li>Installed source dependency: @earendil-works/pi-coding-agent 0.84.0. The reporter's desktop/provider version combination was not independently run.</li>
+<li>Two clean detached/base checkouts; separate temporary harness data directories and real migrated SQLite databases via createMigratedConnection. No user runtime data, provider account, or development server used.</li>
+<li>No app/server listener ports: requests use the Hono in-process API. The host RPC responder is an existing harness fixture.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the trusted repository and select the recorded commit:
+<pre>git clone https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout --detach b6743a36bd9eae1408c35cfc2c7ab1d2419dc79d
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build</pre>
+The first broad build in the investigation failed because SDK runtime entries had not been built. After the normal SDK build, the broad build passed: 72 tasks successful.</li>
+<li>Save the exact patch below as <code>/tmp/6379-regression.patch</code> and apply it. This adds a test only; production remains unchanged.
+<pre>git apply /tmp/6379-regression.patch
+pnpm exec turbo run test --filter=@bb/server -- test/public/public-thread-compaction.test.ts -t 'retains sends during provider-started'</pre></li>
+<li>The test seeds the provider's persisted turn-start and context-compaction item shape, with no bb compaction request. It calls the real public send route and checks persistent queue retention, no premature host submission, and eventual delivery after completion.</li></ol>
+<p>Exact reproduction test patch (all helper implementations already exist on the recorded base):</p><pre>diff --git a/apps/server/test/public/public-thread-compaction.test.ts b/apps/server/test/public/public-thread-compaction.test.ts
+index ddff11d36..dce9266e3 100644
+--- a/apps/server/test/public/public-thread-compaction.test.ts
++++ b/apps/server/test/public/public-thread-compaction.test.ts
+@@ -3,6 +3,7 @@ import {
+   getLatestThreadSequence,
+   listEvents,
+   listQueuedThreadMessages,
++  updateThread,
+ } from &quot;@bb/db&quot;;
+ import {
+   createStandaloneBuiltinCompactCommandInput,
+@@ -106,6 +107,102 @@ function seedAcceptedProviderTurn(
+ }
+ 
+ describe(&quot;public thread compaction&quot;, () =&gt; {
++  it(&quot;retains sends during provider-started compaction and delivers them afterward&quot;, async () =&gt; {
++    await withTestHarness(async (harness) =&gt; {
++      const { host, session, thread } = seedCompactableThread(harness, {
++        providerId: &quot;pi&quot;,
++        providerThreadId: &quot;provider-maintenance&quot;,
++      });
++      const responder = registerSuccessfulTurnResponder(harness, {
++        hostId: host.id,
++        sessionId: session.id,
++      });
++      updateThread(harness.db, harness.hub, thread.id, { status: &quot;active&quot; });
++      const turnId = &quot;provider-maintenance-turn&quot;;
++      seedTurnStarted(harness.deps, {
++        threadId: thread.id,
++        environmentId: thread.environmentId,
++        providerThreadId: &quot;provider-maintenance&quot;,
++        turnId,
++      });
++      seedEvent(harness.deps, {
++        threadId: thread.id,
++        environmentId: thread.environmentId,
++        providerThreadId: &quot;provider-maintenance&quot;,
++        sequence:
++          getLatestThreadSequence(harness.db, { threadId: thread.id }) + 1,
++        type: &quot;item/started&quot;,
++        scope: turnScope(turnId),
++        data: { item: { type: &quot;contextCompaction&quot;, id: &quot;maintenance-item&quot; } },
++      });
++
++      const response = await harness.app.request(
++        `/api/v1/threads/${thread.id}/send`,
++        {
++          method: &quot;POST&quot;,
++          headers: { &quot;content-type&quot;: &quot;application/json&quot; },
++          body: JSON.stringify({
++            mode: &quot;steer&quot;,
++            input: [{ type: &quot;text&quot;, text: &quot;Continue after maintenance&quot; }],
++          }),
++        },
++      );
++      expect(response.status).toBe(200);
++      await expect(readJson(response)).resolves.toMatchObject({
++        delivery: &quot;queued&quot;,
++        queuedMessage: { waitingOn: { kind: &quot;thread-busy&quot; } },
++      });
++      expect(listQueuedThreadMessages(harness.db, thread.id)).toHaveLength(1);
++      expect(
++        responder.requests.filter(
++          ({ command }) =&gt; command.type === &quot;turn.submit&quot;,
++        ),
++      ).toHaveLength(0);
++      expect(
++        await sendNextQueuedMessageIfPresent(harness.deps, {
++          threadId: thread.id,
++        }),
++      ).toBe(false);
++
++      seedEvent(harness.deps, {
++        threadId: thread.id,
++        environmentId: thread.environmentId,
++        providerThreadId: &quot;provider-maintenance&quot;,
++        sequence:
++          getLatestThreadSequence(harness.db, { threadId: thread.id }) + 1,
++        type: &quot;turn/completed&quot;,
++        scope: turnScope(turnId),
++        data: { providerThreadId: &quot;provider-maintenance&quot;, status: &quot;completed&quot; },
++      });
++      applyTurnCompletedEvent(harness.deps, {
++        threadId: thread.id,
++        providerThreadId: &quot;provider-maintenance&quot;,
++        type: &quot;turn/completed&quot;,
++        scope: turnScope(turnId),
++        status: &quot;completed&quot;,
++      });
++      expect(
++        await sendNextQueuedMessageIfPresent(harness.deps, {
++          threadId: thread.id,
++        }),
++      ).toBe(true);
++      expect(listQueuedThreadMessages(harness.db, thread.id)).toHaveLength(0);
++      await expect
++        .poll(() =&gt;
++          responder.requests.filter(
++            ({ command }) =&gt; command.type === &quot;turn.submit&quot;,
++          ),
++        )
++        .toMatchObject([
++          {
++            command: {
++              input: [{ type: &quot;text&quot;, text: &quot;Continue after maintenance&quot; }],
++            },
++          },
++        ]);
++    });
++  });
++
+   it(&quot;dispatches the same structured /compact turn as the composer&quot;, async () =&gt; {
+     await withTestHarness(async (harness) =&gt; {
+       const { host, session, thread } = seedCompactableThread(harness, {
+</pre>
+<p>Expected: <code>delivery: queued</code> with <code>waitingOn.kind: thread-busy</code>, no host submission during compaction, then one delivery after completion.</p>
+<p>Actual on both clean checkouts, excerpted verbatim from the assertion diff:</p>
+<pre>-   "delivery": "queued",
+-   "queuedMessage": {
+-     "waitingOn": {
+-       "kind": "thread-busy",
+-     },
+-   },
++   "delivery": "sent",
+
+Test Files  1 failed (1)
+Tests  1 failed | 12 skipped (13)</pre>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/b6743a36bd9eae1408c35cfc2c7ab1d2419dc79d/plugins/provider-pi/src/delta-translation.ts#L727-L743">plugins/provider-pi/src/delta-translation.ts:727-L743</a> translates manual compaction into its own turn and compaction item.
+<a href="https://github.com/get-bb/bb/blob/b6743a36bd9eae1408c35cfc2c7ab1d2419dc79d/packages/provider-bridge-protocol/src/assembler/delta-assembler.ts#L775-L783">packages/provider-bridge-protocol/src/assembler/delta-assembler.ts:775-L783</a> turns that delta into a contextCompaction item.</p>
+<p><a href="https://github.com/get-bb/bb/blob/b6743a36bd9eae1408c35cfc2c7ab1d2419dc79d/apps/server/src/services/threads/thread-events.ts#L865-L889">apps/server/src/services/threads/thread-events.ts:865-L889</a> only recognizes an active manual compaction when its associated request, or the last thread request, is a standalone built-in compact command.
+A provider-owned maintenance turn has no matching client request. Therefore a valid compaction item does not satisfy this predicate.</p>
+<p><a href="https://github.com/get-bb/bb/blob/b6743a36bd9eae1408c35cfc2c7ab1d2419dc79d/apps/server/src/services/threads/dispatch-attempt.ts#L490-L500">apps/server/src/services/threads/dispatch-attempt.ts:490-L500</a> uses that predicate as the compaction wait gate. When it returns false, the active-turn send proceeds toward steering.
+The dependency's AgentSession.prompt rejects prompts whenever its manual compaction controller exists. That explains the reported rejection, but the complete live rejection/error cascade remains a source-supported inference, not a reproduced transcript.</p>
+<h2>6. Proposed fix</h2>
+<p>Preserve the existing command-request guard. For an active provider-owned turn without an accepted bb request, inspect that turn's root contextCompaction lifecycle and wait while its item is open.
+Use a targeted thread/turn query, not a whole-thread event scan. Preserve steering during ordinary requested turns, including provider automatic compaction that does not own a separate maintenance turn.
+No provider protocol, persisted schema, or product-policy change is required. The added route-level regression must fail before the fix and pass afterward, including queue drain.</p>
+<h2>7. Linked pull request metadata</h2>
+<p>GitHub cross-reference metadata identifies PR #6380 as closed and unmerged. No linked branch was checked out or executed, and no patch from it was used.
+No open linked PR was found at investigation time. This is metadata-only, not a code-review verdict.</p>
+<h2>8. Related issues</h2>
+<p>No other issue was investigated. This report distinguishes provider-owned maintenance admission from the existing bb-requested compaction cases by running the existing public suite as a control.</p>
+<h2>9. Verification</h2>
+<p>The same agent repeated the test in a second clean worktree created directly at <code>b6743a36bd9eae1408c35cfc2c7ab1d2419dc79d</code>. Only the authored regression patch was applied; production stayed byte-identical to main.
+The frozen install and SDK prerequisite build were repeated, and Turbo ran the identical focused command above. Both runs exited 1 at the same delivery assertion: queued was expected and sent was returned.
+The first run took 27.164 seconds including orchestration; the second took 29.058 seconds. Neither failure was a timeout or setup failure.</p>
+<p>An initial draft test incorrectly called a database helper; that setup error was corrected before both recorded reproduction runs. It is not counted as evidence. No report claim depends on that draft.</p>
+<h2>10. Appendix and limits</h2>
+<p>The trusted-base control command <code>pnpm exec turbo run test --filter=@bb/server -- test/public/public-thread-compaction.test.ts</code> passed all 12 existing tests before the regression was added.
+The reproduction patch is embedded here rather than publishing raw logs, paths, or test artifacts. Local evidence is retained in isolated investigation storage.</p>
+<p>Issue content, comments, and linked material were treated as untrusted claims. No issue-provided scripts, patches, branches, commands, or external links were executed or fetched.
+This is a deterministic server-boundary reproduction, not an independent-agent verification, a desktop/macOS reproduction, or a live extension test.</p>
+</main></body></html>
