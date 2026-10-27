@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Issue 6373: RPC validation field diagnostics</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main>
+<p><a href="../">Reports</a></p><h1>#6373 · RPC validation diagnostics omit structured field paths</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Low priority</span><span class="pill">Low effort</span><span class="pill">plugins</span><a href="https://github.com/get-bb/bb/issues/6373">Issue</a><span>2026-10-27</span></p>
+<p><strong>Verdict: REPRODUCED · Root-cause confidence: high.</strong> Trusted base: <code>b6743a36bd9eae1408c35cfc2c7ab1d2419dc79d</code>.</p>
+<h2>1. TL;DR</h2>
+<p>A plugin's invalid RPC argument receives an informative HTTP error, but its server warning loses the failing field path. The validator supplies normalized structured issues; the boundary error's ordinary Error message contains only the generic summary, and the runtime logs only that summary. A real plugin loaded by the existing server test harness reproduces the mismatch through the actual HTTP route. Both input and output validation exhibit it. Two clean trusted checkouts reproduce the same missing-path assertions without a live BB instance or private runtime data.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>RPC rejection warnings omit the failing field</td><td class="ok">Verified</td><td>Both route tests receive path entries / 0 / count in the HTTP error, but neither warning contains it.</td></tr>
+<tr><td>The detail is computed before logging</td><td class="ok">Verified</td><td>The real normalized issue survives in PluginRpcBoundaryError.rpcError and reaches the HTTP response.</td></tr>
+<tr><td>The wrapper discards the original cause</td><td>Refined</td><td>invokeWrapped retains cause for the caller; it is specifically its warning and status summary that use only Error.message.</td></tr>
+<tr><td>Schema messages can safely be logged without values</td><td>Not generally safe</td><td>The RPC contract accepts arbitrary Standard Schema issue.message strings. A validator can echo sensitive input in that text. The reproduction uses a synthetic custom-message sentinel to guard against forwarding it to logs.</td></tr>
+<tr><td>Frequency and behavior in the reported release</td><td>Unverified</td><td>Only the pinned current main commit was executed; no historical release, external plugin, or claimed historical frequency was tested.</td></tr></table>
+<h2>3. Environment</h2><ul><li>Linux x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1; Zod from the frozen repository lockfile.</li><li>Two detached worktrees at the same trusted commit; fresh frozen dependency installs and SDK/server builds in each.</li><li>Real migrated temporary SQLite databases and freshly created plugin/data directories, cleaned by the harness. HTTP is exercised in-process with Hono app.request: no listening ports, host daemons, production instance, account, or provider.</li><li>A first broad build hit an existing SDK dist build-order prerequisite. Building SDK runtime/types explicitly and then the server succeeded in both checkouts; this is setup, not the reproduction failure.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone trusted main and pin the recorded base:<pre>git clone https://github.com/get-bb/bb.git bb-6373
+cd bb-6373
+git checkout --detach b6743a36bd9eae1408c35cfc2c7ab1d2419dc79d
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=@bb/server</pre></li>
+<li>Copy <a href="6373/repro/plugin-rpc-validation-logging.test.ts">the reproduction test</a> to <code>apps/server/test/services/plugins/plugin-rpc-validation-logging.test.ts</code>.</li>
+<li>Run:<pre>pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-rpc-validation-logging.test.ts</pre></li></ol>
+<p><strong>Expected:</strong> the warning identifies the normalized field path while omitting the supplied value and arbitrary custom validation text. The response must retain the structured issue and original generic message.</p>
+<p><strong>Actual:</strong> HTTP 400 for input / 500 for output includes <code>issues[0].path = ["entries",0,"count"]</code>, but warnings are only:</p>
+<pre>[plugin:rpc-diagnostics] rpc inspect failed: rpc input validation failed
+[plugin:rpc-diagnostics] rpc inspect failed: rpc output validation failed</pre>
+<p>Both tests fail at the final path assertion; all HTTP-contract, handler-invocation, and no-payload assertions pass first. These are intentionally failing desired-behavior regression tests against unmodified production code.</p>
+<h3>Complete reproduction test</h3><pre>import { mkdtemp, rm, writeFile } from &quot;node:fs/promises&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { expect, it, vi } from &quot;vitest&quot;;
+import { defineRpcContract } from &quot;@get-bb/plugin-sdk&quot;;
+import { z } from &quot;zod&quot;;
+import { createTestAppHarness } from &quot;../../helpers/test-app.js&quot;;
+
+it.each([&quot;input&quot;, &quot;output&quot;] as const)(
+  &quot;logs RPC %s validation paths without payloads or custom issue messages&quot;,
+  async (phase) =&gt; {
+    const harness = await createTestAppHarness();
+    const rootDir = await mkdtemp(join(tmpdir(), &quot;bb-rpc-diagnostics-&quot;));
+    const warn = vi.spyOn(harness.deps.logger, &quot;warn&quot;);
+    try {
+      await writeFile(
+        join(rootDir, &quot;package.json&quot;),
+        JSON.stringify({
+          name: &quot;bb-plugin-rpc-diagnostics&quot;,
+          version: &quot;0.1.0&quot;,
+          bb: {
+            name: &quot;RPC diagnostics fixture&quot;,
+            description: &quot;Validation logging fixture&quot;,
+            branding: { icon: &quot;Zap&quot; },
+            server: &quot;./server.ts&quot;,
+          },
+        }),
+      );
+      await writeFile(
+        join(rootDir, &quot;server.ts&quot;),
+        &quot;export default function plugin() {}&quot;,
+      );
+      expect((await harness.pluginService.installPath(rootDir)).status).toBe(
+        &quot;running&quot;,
+      );
+      const api = harness.pluginService.getApi(&quot;rpc-diagnostics&quot;);
+      if (!api) throw new Error(&quot;fixture plugin did not start&quot;);
+      const schema = z.object({
+        entries: z.array(
+          z.object({ count: z.number({ error: &quot;private-validator-detail&quot; }) }),
+        ),
+      });
+      const invalid = { entries: [{ count: &quot;private-payload-content&quot; }] };
+      const handler = vi.fn(() =&gt; (phase === &quot;output&quot; ? invalid : null));
+      api.rpc.register(
+        defineRpcContract({
+          inspect: {
+            input: phase === &quot;input&quot; ? schema : z.null(),
+            output: phase === &quot;output&quot; ? schema : z.null(),
+          },
+        }),
+        { inspect: handler },
+      );
+      const response = await harness.app.request(
+        &quot;/api/v1/plugins/rpc-diagnostics/rpc/inspect&quot;,
+        {
+          method: &quot;POST&quot;,
+          headers: { &quot;content-type&quot;: &quot;application/json&quot; },
+          body: JSON.stringify(phase === &quot;input&quot; ? invalid : null),
+        },
+      );
+      const body = await response.json();
+      expect(response.status).toBe(phase === &quot;input&quot; ? 400 : 500);
+      expect(body).toMatchObject({
+        ok: false,
+        error: {
+          code: `invalid_${phase}`,
+          message: `rpc ${phase} validation failed`,
+          issues: [
+            {
+              path: [&quot;entries&quot;, 0, &quot;count&quot;],
+              message: &quot;private-validator-detail&quot;,
+            },
+          ],
+        },
+      });
+      expect(handler).toHaveBeenCalledTimes(phase === &quot;input&quot; ? 0 : 1);
+      const warning = warn.mock.calls
+        .map(([message]) =&gt; String(message))
+        .find((message) =&gt; message.includes(&quot;rpc inspect failed:&quot;));
+      console.log(JSON.stringify({ phase, response: body, warning }));
+      expect(warning).toBeDefined();
+      expect(warning).not.toContain(&quot;private-payload-content&quot;);
+      expect(warning).not.toContain(&quot;private-validator-detail&quot;);
+      expect(warning).toContain('[&quot;entries&quot;,0,&quot;count&quot;]');
+    } finally {
+      warn.mockRestore();
+      await harness.pluginService.stop();
+      await harness.cleanup();
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  },
+);
+</pre>
+<h2>5. Root cause</h2>
+<ol><li><a href="https://github.com/get-bb/bb/blob/b6743a36bd9eae1408c35cfc2c7ab1d2419dc79d/packages/plugin-sdk/src/internal/host-policy.ts#L3637-L3665"><code>packages/plugin-sdk/src/internal/host-policy.ts:3637</code></a> normalizes string/numeric issue paths and keeps issue.message.</li>
+<li><a href="https://github.com/get-bb/bb/blob/b6743a36bd9eae1408c35cfc2c7ab1d2419dc79d/packages/plugin-sdk/src/internal/host-policy.ts#L3688-L3713"><code>packages/plugin-sdk/src/internal/host-policy.ts:3688</code></a> packages a generic message alongside normalized issues on validation failure.</li>
+<li><a href="https://github.com/get-bb/bb/blob/b6743a36bd9eae1408c35cfc2c7ab1d2419dc79d/apps/server/src/services/plugins/plugin-service.ts#L473-L481"><code>apps/server/src/services/plugins/plugin-service.ts:473</code></a> constructs the Error with <code>super(rpcError.message)</code>; issues remain on its separate rpcError field.</li>
+<li><a href="https://github.com/get-bb/bb/blob/b6743a36bd9eae1408c35cfc2c7ab1d2419dc79d/apps/server/src/services/plugins/plugin-runtime.ts#L827-L864"><code>apps/server/src/services/plugins/plugin-runtime.ts:827</code></a> logs only <code>error.message</code>. The cause is returned, not discarded.</li>
+<li><a href="https://github.com/get-bb/bb/blob/b6743a36bd9eae1408c35cfc2c7ab1d2419dc79d/apps/server/src/services/plugins/plugin-service.ts#L2142-L2185"><code>apps/server/src/services/plugins/plugin-service.ts:2142</code></a> returns the retained structured rpcError to the route; <a href="https://github.com/get-bb/bb/blob/b6743a36bd9eae1408c35cfc2c7ab1d2419dc79d/apps/server/src/routes/plugins.ts#L986-L1018"><code>apps/server/src/routes/plugins.ts:986</code></a> serializes it and maps input/output errors to HTTP statuses.</li></ol>
+<h2>6. Proposed fix</h2><p>Append a small bounded summary of normalized issue paths to the internal boundary Error message, leaving rpcError itself unchanged. JSON-encode paths to preserve array indices and escape control characters. Cap the number of paths and summary length; represent a pathless issue as the root. Do not blindly append arbitrary Standard Schema issue messages or input/output objects: messages can contain values and are not a safe logging primitive. Unknown-key names and expected-type prose are not separate trusted metadata in this normalized issue contract; obtaining them without exposing values needs a separately designed contract, not message parsing.</p>
+<h2>7. Related issues and PR metadata</h2><p>No open pull request in get-bb/bb links to this issue in the checked metadata. The issue timeline includes a cross-reference from a separate plugin repository's PR #438, which was merged by the final metadata check and does not close this issue. No external PR code or branches were fetched or executed. Nearby plugin-boundary issue #2519 concerns a different caller contract and is not evidence for this logging defect.</p>
+<h2>8. Verification</h2><p>The same agent repeated the reproduction, not an independent reviewer. A second clean detached worktree named <code>second</code> was created at the recorded base commit. Before copying the reproduction test it had no source changes. Dependencies were freshly installed; SDK and server builds passed; the same Turbo test command ran with fresh harness data directories and no ports. Both cases again failed only because the warning omitted the normalized path. No report correction was needed after the second run. Confidence is high for this unit/in-process HTTP path; packaged release and a long-running production instance were not exercised.</p>
+<h3>repro-first.log</h3><pre>@bb/server:test: {&quot;phase&quot;:&quot;input&quot;,&quot;response&quot;:{&quot;ok&quot;:false,&quot;error&quot;:{&quot;code&quot;:&quot;invalid_input&quot;,&quot;message&quot;:&quot;rpc input validation failed&quot;,&quot;issues&quot;:[{&quot;message&quot;:&quot;private-validator-detail&quot;,&quot;path&quot;:[&quot;entries&quot;,0,&quot;count&quot;]}]}},&quot;warning&quot;:&quot;[plugin:rpc-diagnostics] rpc inspect failed: rpc input validation failed&quot;}
+@bb/server:test: {&quot;phase&quot;:&quot;output&quot;,&quot;response&quot;:{&quot;ok&quot;:false,&quot;error&quot;:{&quot;code&quot;:&quot;invalid_output&quot;,&quot;message&quot;:&quot;rpc output validation failed&quot;,&quot;issues&quot;:[{&quot;message&quot;:&quot;private-validator-detail&quot;,&quot;path&quot;:[&quot;entries&quot;,0,&quot;count&quot;]}]}},&quot;warning&quot;:&quot;[plugin:rpc-diagnostics] rpc inspect failed: rpc output validation failed&quot;}
+@bb/server:test: AssertionError: expected '[plugin:rpc-diagnostics] rpc inspect …' to contain '[&quot;entries&quot;,0,&quot;count&quot;]'
+@bb/server:test: Expected: &quot;[&quot;entries&quot;,0,&quot;count&quot;]&quot;
+@bb/server:test: Received: &quot;[plugin:rpc-diagnostics] rpc inspect failed: rpc input validation failed&quot;
+@bb/server:test: AssertionError: expected '[plugin:rpc-diagnostics] rpc inspect …' to contain '[&quot;entries&quot;,0,&quot;count&quot;]'
+@bb/server:test: Expected: &quot;[&quot;entries&quot;,0,&quot;count&quot;]&quot;
+@bb/server:test: Received: &quot;[plugin:rpc-diagnostics] rpc inspect failed: rpc output validation failed&quot;
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  2 failed (2)
+@bb/server:test:    Duration  9.51s (transform 5.15s, setup 1.54s, import 5.17s, tests 857ms, environment 0ms)</pre>
+<h3>repro-second.log</h3><pre>@bb/server:test: {&quot;phase&quot;:&quot;input&quot;,&quot;response&quot;:{&quot;ok&quot;:false,&quot;error&quot;:{&quot;code&quot;:&quot;invalid_input&quot;,&quot;message&quot;:&quot;rpc input validation failed&quot;,&quot;issues&quot;:[{&quot;message&quot;:&quot;private-validator-detail&quot;,&quot;path&quot;:[&quot;entries&quot;,0,&quot;count&quot;]}]}},&quot;warning&quot;:&quot;[plugin:rpc-diagnostics] rpc inspect failed: rpc input validation failed&quot;}
+@bb/server:test: {&quot;phase&quot;:&quot;output&quot;,&quot;response&quot;:{&quot;ok&quot;:false,&quot;error&quot;:{&quot;code&quot;:&quot;invalid_output&quot;,&quot;message&quot;:&quot;rpc output validation failed&quot;,&quot;issues&quot;:[{&quot;message&quot;:&quot;private-validator-detail&quot;,&quot;path&quot;:[&quot;entries&quot;,0,&quot;count&quot;]}]}},&quot;warning&quot;:&quot;[plugin:rpc-diagnostics] rpc inspect failed: rpc output validation failed&quot;}
+@bb/server:test: AssertionError: expected '[plugin:rpc-diagnostics] rpc inspect …' to contain '[&quot;entries&quot;,0,&quot;count&quot;]'
+@bb/server:test: Expected: &quot;[&quot;entries&quot;,0,&quot;count&quot;]&quot;
+@bb/server:test: Received: &quot;[plugin:rpc-diagnostics] rpc inspect failed: rpc input validation failed&quot;
+@bb/server:test: AssertionError: expected '[plugin:rpc-diagnostics] rpc inspect …' to contain '[&quot;entries&quot;,0,&quot;count&quot;]'
+@bb/server:test: Expected: &quot;[&quot;entries&quot;,0,&quot;count&quot;]&quot;
+@bb/server:test: Received: &quot;[plugin:rpc-diagnostics] rpc inspect failed: rpc output validation failed&quot;
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  2 failed (2)
+@bb/server:test:    Duration  8.86s (transform 4.83s, setup 1.47s, import 4.77s, tests 827ms, environment 0ms)</pre>
+<h2>9. Appendix</h2><p>Artifacts: <a href="6373/repro/repro-first.log">first complete test log</a>, <a href="6373/repro/repro-second.log">second complete test log</a>, <a href="6373/repro/plugin-rpc-validation-logging.test.ts">repeatable test</a>. Local checkout paths in logs are replaced by <code>$WORK</code>. All payload/message sentinels are synthetic, not credentials or user data.</p>
+<p>Issue content was treated solely as untrusted claims; none of its commands, patches, external links, or instructions was executed. Investigation commands were trusted-repository fetch/worktree creation, frozen installs, Turbo builds/tests, repository source reads, and read-only GitHub metadata queries. Publication uses the authorized SlopCop GitHub wrapper. No browser or screenshots are needed for a server logging defect.</p>
+</main></body></html>
