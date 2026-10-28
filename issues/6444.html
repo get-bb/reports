@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #6444 · Inherited agent-directory environment survives bridge startup</title>
+<style>
+:root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; }
+body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,sans-serif; }
+main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+h1 { font-size:26px; line-height:1.25; } h2 { font-size:18px; margin-top:36px; padding-top:20px; border-top:1px solid var(--line); }
+.meta { color:var(--muted); font-size:14px; } .pill { display:inline-block; padding:1px 8px; border:1px solid var(--line); border-radius:999px; }
+table { border-collapse:collapse; width:100%; font-size:14px; } th,td { text-align:left; padding:8px; border-bottom:1px solid var(--line); vertical-align:top; }
+pre,code { font:13px/1.5 ui-monospace,monospace; } pre { overflow:auto; padding:12px; background:white; border:1px solid var(--line); border-radius:6px; }
+a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← Reports</a></p>
+<h1>#6444 · Inherited agent-directory environment survives bridge startup</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Medium priority</span> <span class="pill">Low effort</span> <span class="pill">providers</span> <span class="pill">provider-pi</span> <a href="https://github.com/get-bb/bb/issues/6444">Issue</a></p>
+<p class="meta">October 28, 2026 · Trusted main: <code>f8c0701e94ba74a09bf48b1dcc4f49aa22ce81b7</code></p>
+<p><strong>Verdict: NOT REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> for the environment-inheritance mechanism.</p>
+
+<h2>1. TL;DR</h2>
+<p>The issue infers that an agent-directory setting disappears because it is absent from the provider registry's environment object. That object contains only explicit overrides, not the complete environment of the spawned process. The process manager first copies the sanitized daemon environment, and the sanitizer retains <code>PI_CODING_AGENT_DIR</code>. A real bridge worker received a synthetic directory value without adding it to the Pi declaration. Both the configured case and the unset control passed in two separate clean checkouts; no authenticated Pi session was started.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>The Pi declaration does not list the directory variable.</td><td>Verified</td><td>The trusted declaration lists only two BB-prefixed bridge overrides; the test reads the real declaration.</td></tr>
+<tr><td>The registry adapter's process env lacks the directory value.</td><td>Verified</td><td>Both test cases assert that the adapter overlay omits this key.</td></tr>
+<tr><td>Therefore the bridge process cannot receive the daemon value.</td><td>Refuted at the real spawn boundary</td><td>The spawned worker writes its actual environment value to a temporary file, and the configured case matches exactly.</td></tr>
+<tr><td>The sanitizer does not remove this non-BB variable.</td><td>Verified, but supports inheritance rather than loss</td><td>The process manager merges this sanitized inherited environment before the adapter overlay.</td></tr>
+<tr><td>Pi's final agent-directory behavior fails in a running deployment.</td><td>Unverified</td><td>No live Pi session or enrolled daemon was used. This report isolates the proposed declaration-to-child failure.</td></tr>
+</table>
+
+<h2>3. Environment</h2>
+<ul><li>Public repository: <code>get-bb/bb</code>; freshly fetched main matched the reported base commit above.</li>
+<li>Linux <code>4.19.0-gvisor</code>, Node <code>v22.19.0</code>, pnpm <code>9.15.0</code>, Vitest <code>4.1.1</code>.</li>
+<li>Two separate detached temporary worktrees at the same trusted commit, each with its own frozen dependency install.</li>
+<li>Actual runtime process manager, actual bridge worker, actual Pi declaration, trusted scripted-echo provider fixture. The fixture avoids authentication and model traffic; it is not the real Pi agent.</li>
+<li>No HTTP server or ports. Every test creates fresh workspace and bridge-data directories under the OS temporary directory, then shuts down its worker and deletes its data.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol><li>In a clean clone of the public repository, check out the recorded trusted base and install dependencies:
+<pre>git checkout --detach f8c0701e94ba74a09bf48b1dcc4f49aa22ce81b7
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build build:types --filter=@get-bb/plugin-sdk</pre></li>
+<li>Save the <a href="#reproduction-source">inline test</a> as <code>packages/agent-runtime/src/issue-6444.repro.test.ts</code>.</li>
+<li>Run the real worker observation through the repository's test orchestration:
+<pre>pnpm exec turbo run test --force --filter=@bb/agent-runtime -- src/issue-6444.repro.test.ts</pre></li></ol>
+<p><strong>Expected for correct inheritance:</strong> the registry overlay is missing the key, but the child has the configured directory. With the variable unset, the child reports <code>null</code>. <strong>Actual:</strong> both assertions pass. Thus the registry-only observation is real, but does not establish the reported failure.</p>
+<pre>First checkout:
+✓ |@bb/agent-runtime:isolated| src/issue-6444.repro.test.ts (2 tests) 893ms
+Test Files  1 passed (1)
+     Tests  2 passed (2)
+
+Second checkout (cache bypassed):
+✓ |@bb/agent-runtime:isolated| src/issue-6444.repro.test.ts (2 tests) 887ms
+Test Files  1 passed (1)
+     Tests  2 passed (2)</pre>
+<p>The output excerpts above are verbatim apart from removing the test runner's repeated package prefix and leading whitespace. Raw logs and a standalone copy of the test are retained locally, not published, in accordance with this reports repository's policy. No production source is modified.</p>
+<details id="reproduction-source"><summary>Complete test source</summary><pre>
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, expect, it, vi } from "vitest";
+import {
+  parseJsonRpcLine,
+  settleJsonRpcResponse,
+} from "@bb/provider-bridge-protocol/bridge-kit";
+import { piProviderDeclaration } from "../../../plugins/provider-pi/src/declaration.js";
+import { createProviderForId } from "./provider-registry.js";
+import { RuntimeProviderProcessManager } from "./runtime-provider-process.js";
+import { RuntimeThreadIdentityRegistry } from "./runtime-thread-identity.js";
+import { createScriptedEchoLaunch } from "./test/runtime-test-harness.js";
+
+afterEach(() => vi.unstubAllEnvs());
+
+it.each(["configured", "unset"])(
+  "observes the daemon environment inside a real bridge worker (%s)",
+  async (mode) => {
+    const workspacePath = mkdtempSync(join(tmpdir(), "bb-6444-worker-"));
+    const configuredDir = join(workspacePath, "agent-home");
+    const outputPath = join(workspacePath, "observed.json");
+    const expectedValue = mode === "configured" ? configuredDir : undefined;
+    vi.stubEnv("PI_CODING_AGENT_DIR", expectedValue);
+    const declaration = piProviderDeclaration();
+    const bridgeLaunch = {
+      ...createScriptedEchoLaunch(),
+      envPassthrough: declaration.env?.passthrough ?? [],
+    };
+    const adapter = createProviderForId("pi", {
+      additionalWorkspaceWriteRoots: [],
+      bridgeNodeExecutablePath: process.execPath,
+      bridgeLaunch,
+    });
+    expect(bridgeLaunch.envPassthrough).not.toContain("PI_CODING_AGENT_DIR");
+    expect(adapter.process.env?.PI_CODING_AGENT_DIR).toBeUndefined();
+    const probe = [
+      'import { writeFileSync } from "node:fs";',
+      `writeFileSync(${JSON.stringify(outputPath)}, JSON.stringify({`,
+      "agentDir: process.env.PI_CODING_AGENT_DIR ?? null",
+      "}));",
+    ].join("\n");
+    const processAdapter = {
+      ...adapter,
+      process: {
+        ...adapter.process,
+        args: [
+          "--import",
+          `data:text/javascript,${encodeURIComponent(probe)}`,
+          ...adapter.process.args,
+        ],
+      },
+    };
+    const identities = new RuntimeThreadIdentityRegistry();
+    let nextRequestId = 1;
+    const manager = new RuntimeProviderProcessManager({
+      additionalWorkspaceWriteRoots: [],
+      bridgeBundleDir: undefined,
+      createAdapter: () => processAdapter,
+      captureThreadExitState: (threadId) => ({
+        activeTurnId: null,
+        pendingTurnStart: false,
+        providerThreadId: null,
+        threadId,
+      }),
+      createProviderIdentityState: (providerId) =>
+        identities.createProviderState({ providerId }),
+      env: undefined,
+      getNextRequestId: () => nextRequestId++,
+      handleDeferredEvents: () => {},
+      handleStdoutLine: ({ line, providerProcess }) => {
+        const parsed = parseJsonRpcLine(line);
+        if (parsed.kind === "response") {
+          settleJsonRpcResponse({
+            id: parsed.parsedId,
+            pending: providerProcess.pending,
+            response: parsed.parsed,
+          });
+        }
+      },
+      onProcessExit: undefined,
+      onProviderThreadDetached: (threadId) => identities.clearThread(threadId),
+      onStderr: undefined,
+      skillRoots: [],
+      workspacePath,
+    });
+    try {
+      await manager.ensureProvider({
+        bridgeLaunch,
+        processKey: "issue-6444",
+        providerId: "pi",
+      });
+      expect(JSON.parse(readFileSync(outputPath, "utf8"))).toEqual({
+        agentDir: expectedValue ?? null,
+      });
+      console.log(
+        `${mode}: adapter overlay absent; child agent directory ${expectedValue === undefined ? "absent" : "matches daemon value"}`,
+      );
+    } finally {
+      await manager.shutdown();
+      rmSync(bridgeLaunch.dataDir, { recursive: true, force: true });
+      rmSync(workspacePath, { recursive: true, force: true });
+    }
+  },
+);
+</pre></details>
+
+<h2>5. Root cause of the misleading reproduction</h2>
+<p>The real Pi <a href="https://github.com/get-bb/bb/blob/f8c0701e94ba74a09bf48b1dcc4f49aa22ce81b7/plugins/provider-pi/src/declaration.ts#L16">declaration</a> omits the directory variable, and the <a href="https://github.com/get-bb/bb/blob/f8c0701e94ba74a09bf48b1dcc4f49aa22ce81b7/apps/server/src/services/providers/plugin-provider-registration.ts#L228">server registration</a> forwards that declared list. The <a href="https://github.com/get-bb/bb/blob/f8c0701e94ba74a09bf48b1dcc4f49aa22ce81b7/packages/agent-runtime/src/provider-registry.ts#L46-L64">registry</a> picks those keys into the adapter's environment overlay. This much agrees with the issue's intermediate observation.</p>
+<p>The missing step is <a href="https://github.com/get-bb/bb/blob/f8c0701e94ba74a09bf48b1dcc4f49aa22ce81b7/packages/agent-runtime/src/runtime-provider-process.ts#L372-L389">the actual process spawn</a>:</p>
+<pre>const env: NodeJS.ProcessEnv = {
+  ...sanitizeInheritedChildProcessEnv({ env: process.env }),
+  ...this.args.env,
+  ...processConfig.env,
+};
+const managed = spawnManagedProcess({
+  command: processConfig.command,
+  args: processConfig.args,
+  cwd: this.args.workspacePath,
+  env,
+});</pre>
+<p><a href="https://github.com/get-bb/bb/blob/f8c0701e94ba74a09bf48b1dcc4f49aa22ce81b7/packages/process-utils/src/environment.ts#L6-L24">The sanitizer</a> removes <code>NODE_ENV</code> and <code>BB_*</code> values, not this <code>PI_*</code> setting. An absent property in a later object spread does not erase a property already inherited from the daemon. BB-prefixed bridge command overrides need explicit passthrough because they are sanitized; the non-BB agent-directory variable does not. There is no confirmed production root cause for a missing child value on this trusted base.</p>
+
+<h2>6. Proposed fix / next experiment</h2>
+<p>No production change is justified for the stated inheritance failure. If a real Pi deployment still uses the wrong directory, first verify that the actual daemon process was launched with the intended value, then inspect Pi's own directory handling in an isolated session. Merely exporting a value in a different shell does not alter an already-running daemon. That is a next diagnostic step, not an observed cause in this issue.</p>
+
+<h2>7. Linked PR review</h2>
+<h3><a href="https://github.com/get-bb/bb/pull/6445">PR #6445</a> — static diff only</h3>
+<p>The open PR adds the non-BB variable to the Pi declaration and updates the existing exact-list assertion in <code>plugins/provider-pi/server.test.ts:17</code>. Its branch was not checked out or executed. <strong>Medium finding:</strong> that assertion checks declaration data rather than the child process, so its pre-fix failure does not prove a delivery failure. The added declaration is redundant for the specific inherited-daemon scenario verified here. No other PR behavior is claimed to have been tested.</p>
+<p><strong>Verdict:</strong> unnecessary for the reported inheritance mechanism; a real daemon/Pi failure would need additional evidence. No duplicate PR was created.</p>
+
+<h2>8. Related issues</h2>
+<p>Repository search also found <a href="https://github.com/get-bb/bb/issues/5092">#5092</a> (environment path expansion) and <a href="https://github.com/get-bb/bb/issues/3925">#3925</a> (project-scoped provider configuration for skill discovery). These describe different mechanisms, not verified duplicates.</p>
+
+<h2>9. Verification</h2>
+<p>The same agent repeated the experiment in a second separate temporary worktree initially clean at the full trusted commit. It received its own frozen install, SDK build, temporary workspaces, and bridge-data directories. The exact test artifact was copied there and executed with Turbo <code>--force</code>; the second run reports <code>Cached: 0 cached, 7 total</code>, so it did not reuse the first run's result. Both configured and unset observations passed again. This is a second clean run, not independent verification.</p>
+<p>Two existing runtime environment tests also passed on trusted main:</p>
+<pre>pnpm exec turbo run test --filter=@bb/agent-runtime -- src/runtime.process-lifecycle.test.ts -t 'scrubs inherited bb runtime env vars|overlays adapter process env'
+
+✓ |@bb/agent-runtime:isolated| src/runtime.process-lifecycle.test.ts (32 tests | 30 skipped) 88ms
+Test Files  1 passed (1)
+     Tests  2 passed | 30 skipped (32)</pre>
+<p><strong>Correction to the initial hypothesis:</strong> the registry omission is genuine, but treating its env overlay as the final process environment is incorrect. The report verdict reflects the executed spawn path rather than the issue's proposed diagnosis.</p>
+
+<h2>10. Appendix / limits</h2>
+<p>The initial normal <code>pnpm exec turbo run build</code> was attempted in both worktrees. It stopped at plugin builds because SDK <code>dist/process.js</code> and <code>dist/host.js</code> had not yet been built. Explicit <code>pnpm exec turbo run build build:types --filter=@get-bb/plugin-sdk</code> succeeded in each checkout, followed by the focused Turbo test runs above. This report does not claim a successful full-monorepo build.</p>
+<p>The worker probe adds a Node preload that writes only the synthetic directory value to a temporary file; it does not replace environment assembly or bypass the initialize handshake. The provider implementation is the repository's scripted-echo fixture. Authenticated Pi behavior, daemon service-manager configuration, and existing user data were not inspected.</p>
+<p>Issue content and the PR diff were treated as untrusted hypotheses; no supplied command, patch, branch, or reproduction test was executed. Only trusted main and the locally authored test were run.</p>
+<p class="meta">AGENT GENERATED · SlopCop</p>
+</main></body></html>
