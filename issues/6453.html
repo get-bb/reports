@@ -1,0 +1,547 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #6453 Codex session catalogs diverge from model discovery</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p><h1>#6453 · Codex session catalogs diverge from model discovery</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Medium</span><span class="pill">providers · provider-codex · confirmed-repro</span>
+<a href="https://github.com/get-bb/bb/issues/6453">GitHub issue</a><span>October 28, 2026 · base <code>1a4a1d254c7b1f70d340ef9c800dad77dbeb8e66</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>A new Codex session can successfully read a catalog containing an additional model while BB's discovery API still returns the older list. The session's catalog is retained for session-specific behavior, but is not published to the server catalog that feeds the model picker. Discovery separately reuses a persistent app-server with no age-based replacement, so even another successful model-list request can repeat the older catalog. A hermetic regression against unchanged main reproduces that divergence, including proof that the new session actually consumed the updated response. The same agent repeated the failure in a second clean checkout; no production account, inference request, or live BB instance was used.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>A fresh session can see more models than discovery.</td><td class="ok">Verified</td><td>The session publishes a capability that exists only in the changed catalog; the following discovery request still omits the added model.</td></tr>
+<tr><td>Refreshing the server cache alone is insufficient.</td><td class="ok">Verified at the bridge boundary</td><td>A new successful bridge model/list request returns only catalog-base after the session consumed catalog-base plus catalog-added. Static tracing shows that this is the source of the server refresh result.</td></tr>
+<tr><td>The session result does not update the picker store.</td><td class="ok">Verified in source</td><td>The session loader publishes only session-option state; the server store is updated through provider.list_models responses.</td></tr>
+<tr><td>The reported desktop installation, external catalog rollout, and refresh workaround behave exactly as described.</td><td class="unv">Unverified</td><td>No Windows desktop, live account, or actual provider rollout was exercised. The report establishes the deterministic BB-side lifecycle defect, not external service behavior.</td></tr>
+</table>
+<h2>3. Environment</h2>
+<ul><li>Public target repository: get-bb/bb. Trusted origin/main at <code>1a4a1d254c7b1f70d340ef9c800dad77dbeb8e66</code>, checked again after both runs.</li>
+<li>Linux x86_64 sandbox; Node v22.19.0; pnpm 9.15.0; repository-provided Vitest and fake Codex app-server.</li>
+<li>Two separate detached checkouts at the same trusted commit, each installed with the frozen lockfile and built with Turbo. No issue-supplied code, linked branch, or dependency was used.</li>
+<li>No HTTP server, port, production database, or real provider credentials were needed. Each test created a new temporary workspace and fixture; teardown killed child processes, restored environment stubs, and removed that workspace.</li></ul>
+<h2>4. Minimal reproduction</h2><ol>
+<li>Prepare the trusted repository and dependencies:</li></ol><pre>git clone https://github.com/get-bb/bb.git bb-6453
+cd bb-6453
+git checkout --detach 1a4a1d254c7b1f70d340ef9c800dad77dbeb8e66
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build</pre>
+<p>The first unrestricted build initially encountered missing SDK runtime dist files in the GitHub plugin. Explicitly building the existing SDK first resolved that setup prerequisite; the subsequent full build passed all 72 tasks in both checkouts. This was not classified as part of this bug.</p>
+<ol start="2"><li>Replace <code>plugins/provider-codex/src/bridge/bridge.model-list.test.ts</code> with the complete test file below. It retains the existing tests and adds one owner-boundary regression; production code remains unchanged.</li></ol><pre>import { mkdtemp, readFile, rm, writeFile } from &quot;node:fs/promises&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { afterEach, beforeEach, expect, it, vi } from &quot;vitest&quot;;
+import { z } from &quot;zod&quot;;
+import {
+  BRIDGE_JSON_RPC_ERRORS,
+  THREAD_DELTA_NOTIFICATION_METHOD,
+} from &quot;@get-bb/plugin-sdk/provider-bridge&quot;;
+import { experimental_createBridgeJsonRpcTestHarness as createBridgeJsonRpcTestHarness } from &quot;@get-bb/plugin-sdk/provider-bridge/testing&quot;;
+import { experimental_killAllChildrenForTests, handleLine } from &quot;./bridge.js&quot;;
+import {
+  FULL_ACCESS_SESSION_OPTIONS,
+  stubFakeCodexAppServer,
+} from &quot;./fake-codex-app-server-harness.js&quot;;
+
+let harness: ReturnType&lt;typeof createBridgeJsonRpcTestHarness&gt;;
+const temporaryDirectories: string[] = [];
+
+beforeEach(() =&gt; {
+  stubFakeCodexAppServer();
+  harness = createBridgeJsonRpcTestHarness(handleLine);
+});
+
+afterEach(async () =&gt; {
+  experimental_killAllChildrenForTests();
+  harness.restore();
+  vi.unstubAllEnvs();
+  await Promise.all(
+    temporaryDirectories
+      .splice(0)
+      .map((path) =&gt; rm(path, { recursive: true, force: true })),
+  );
+});
+
+it(&quot;reuses one initialized app-server across model catalog requests&quot;, async () =&gt; {
+  harness.sendRequest(1, &quot;model/list&quot;, {});
+  const first = await harness.waitForResponse(1);
+  harness.sendRequest(2, &quot;model/list&quot;, {});
+  const second = await harness.waitForResponse(2);
+
+  expect(first.error).toBeUndefined();
+  expect(second.error).toBeUndefined();
+  expect(second.result).toEqual(first.result);
+});
+
+it(&quot;returns the current catalog after a fresh session discovers additional models&quot;, async () =&gt; {
+  const workDir = await mkdtemp(join(tmpdir(), &quot;bb-codex-catalog-refresh-&quot;));
+  temporaryDirectories.push(workDir);
+  const scriptPath = join(workDir, &quot;script.json&quot;);
+  const initialModel = { id: &quot;catalog-base&quot;, model: &quot;catalog-base&quot; };
+  await writeFile(
+    scriptPath,
+    JSON.stringify({ modelList: { data: [initialModel] }, turns: [] }),
+  );
+  stubFakeCodexAppServer(scriptPath);
+  harness.sendRequest(1, &quot;model/list&quot;, {});
+  const initial = await harness.waitForResponse(1);
+  expect(initial.error).toBeUndefined();
+  expect(initial.result).toMatchObject({
+    models: [{ model: &quot;catalog-base&quot; }],
+  });
+
+  const addedModel = {
+    id: &quot;catalog-added&quot;,
+    model: &quot;catalog-added&quot;,
+    displayName: &quot;Added catalog entry&quot;,
+    supportedReasoningEfforts: [
+      { reasoningEffort: &quot;high&quot;, description: &quot;High&quot; },
+    ],
+    defaultReasoningEffort: &quot;high&quot;,
+    availableAccessPrograms: { cyber: [&quot;standard&quot;, &quot;daybreakBlue&quot;] },
+  };
+  await writeFile(
+    scriptPath,
+    JSON.stringify({ modelList: { data: [initialModel, addedModel] }, turns: [] }),
+  );
+  harness.sendRequest(2, &quot;thread/start&quot;, {
+    threadId: &quot;thr_catalog_refresh&quot;,
+    cwd: workDir,
+    instructionMode: &quot;append&quot;,
+    options: FULL_ACCESS_SESSION_OPTIONS,
+  });
+  expect((await harness.waitForResponse(2)).error).toBeUndefined();
+  await vi.waitFor(() =&gt; {
+    expect(harness.messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          method: THREAD_DELTA_NOTIFICATION_METHOD,
+          params: expect.objectContaining({
+            threadId: &quot;thr_catalog_refresh&quot;,
+            deltas: expect.arrayContaining([
+              expect.objectContaining({
+                kind: &quot;extension.state&quot;,
+                extensionKind: &quot;bb/session-options&quot;,
+                payload: {
+                  options: [expect.objectContaining({ id: &quot;daybreak&quot; })],
+                },
+              }),
+            ]),
+          }),
+        }),
+      ]),
+    );
+  });
+
+  harness.sendRequest(3, &quot;model/list&quot;, {});
+  const refreshed = await harness.waitForResponse(3);
+  expect(refreshed.error).toBeUndefined();
+  const catalog = z
+    .object({ models: z.array(z.object({ model: z.string() }).passthrough()) })
+    .parse(refreshed.result);
+  expect(catalog.models.map((model) =&gt; model.model)).toEqual([
+    &quot;catalog-base&quot;,
+    &quot;catalog-added&quot;,
+  ]);
+  expect(catalog.models[1]).toMatchObject({
+    displayName: &quot;Added catalog entry&quot;,
+    defaultReasoningEffort: &quot;high&quot;,
+  });
+});
+
+it(&quot;launches the catalog app-server on the requested pool route&quot;, async () =&gt; {
+  const workDir = await mkdtemp(join(tmpdir(), &quot;bb-codex-model-route-&quot;));
+  temporaryDirectories.push(workDir);
+  const scriptPath = join(workDir, &quot;script.json&quot;);
+  const launchLogPath = join(workDir, &quot;launches.jsonl&quot;);
+  await writeFile(scriptPath, JSON.stringify({ launchLogPath, turns: [] }));
+  stubFakeCodexAppServer(scriptPath);
+  const pooled = {
+    CODEX_OPENAI_BASE_URL: &quot;http://127.0.0.1:1/pool/v1&quot;,
+    CODEX_POOL_AUTH_TOKEN: &quot;machine-token&quot;,
+  };
+
+  harness.sendRequest(1, &quot;model/list&quot;, { envVars: pooled });
+  const first = await harness.waitForResponse(1);
+  harness.sendRequest(2, &quot;model/list&quot;, { envVars: pooled });
+  const repeated = await harness.waitForResponse(2);
+  harness.sendRequest(3, &quot;model/list&quot;, { envVars: {} });
+  const local = await harness.waitForResponse(3);
+
+  expect([first.error, repeated.error, local.error]).toEqual([
+    undefined,
+    undefined,
+    undefined,
+  ]);
+  expect(repeated.result).toEqual(first.result);
+  expect(local.result).not.toEqual(first.result);
+  const launches = (await readFile(launchLogPath, &quot;utf8&quot;))
+    .trim()
+    .split(&quot;\n&quot;)
+    .map(
+      (line) =&gt;
+        JSON.parse(line) as { args: string[]; poolToken: string | null },
+    );
+  expect(launches).toHaveLength(2);
+  expect(launches[0]?.args).toContain(&#x27;model_provider=&quot;bb-account-pool&quot;&#x27;);
+  expect(launches[0]?.args).toContain(
+    &#x27;openai_base_url=&quot;http://127.0.0.1:1/pool/v1&quot;&#x27;,
+  );
+  expect(launches[0]?.poolToken).toBe(&quot;machine-token&quot;);
+  expect(launches[1]?.args).not.toContain(&#x27;model_provider=&quot;bb-account-pool&quot;&#x27;);
+  expect(launches[1]?.poolToken).toBeNull();
+});
+
+it.each([
+  {
+    name: &quot;configured model&quot;,
+    configRead: { config: { model: &quot;configured-model&quot; } },
+    configReadError: false,
+    expectedDefaults: [false, true],
+  },
+  {
+    name: &quot;unset model&quot;,
+    configRead: { config: { model: null } },
+    configReadError: false,
+    expectedDefaults: [true, false],
+  },
+  {
+    name: &quot;model outside the catalog&quot;,
+    configRead: { config: { model: &quot;unlisted-model&quot; } },
+    configReadError: false,
+    expectedDefaults: [true, false],
+  },
+  {
+    name: &quot;unavailable configuration API&quot;,
+    configRead: { config: { model: &quot;configured-model&quot; } },
+    configReadError: true,
+    expectedDefaults: [true, false],
+  },
+  {
+    name: &quot;malformed configuration response&quot;,
+    configRead: { config: { model: 42 } },
+    configReadError: false,
+    expectedDefaults: [true, false],
+  },
+])(&quot;resolves catalog defaults with $name&quot;, async (scenario) =&gt; {
+  const workDir = await mkdtemp(join(tmpdir(), &quot;bb-codex-model-default-&quot;));
+  temporaryDirectories.push(workDir);
+  const scriptPath = join(workDir, &quot;script.json&quot;);
+  const catalog = [
+    { id: &quot;catalog-id&quot;, model: &quot;catalog-model&quot;, isDefault: true },
+    { id: &quot;configured-id&quot;, model: &quot;configured-model&quot;, isDefault: false },
+  ];
+  await writeFile(
+    scriptPath,
+    JSON.stringify({
+      modelList: { data: catalog },
+      configRead: scenario.configRead,
+      configReadError: scenario.configReadError,
+      turns: [],
+    }),
+  );
+  stubFakeCodexAppServer(scriptPath);
+
+  harness.sendRequest(1, &quot;model/list&quot;, {});
+  const response = await harness.waitForResponse(1);
+
+  expect(response.error).toBeUndefined();
+  expect(response.result).toMatchObject({
+    models: catalog.map((model, index) =&gt; ({
+      id: model.id,
+      model: model.model,
+      isDefault: scenario.expectedDefaults[index],
+    })),
+    selectedOnlyModels: [],
+  });
+});
+
+it(&quot;replaces the cached app-server after a model catalog failure&quot;, async () =&gt; {
+  const workDir = await mkdtemp(join(tmpdir(), &quot;bb-codex-model-list-&quot;));
+  temporaryDirectories.push(workDir);
+  const scriptPath = join(workDir, &quot;script.json&quot;);
+  await writeFile(
+    scriptPath,
+    JSON.stringify({
+      modelListFailOnceMarkerPath: join(workDir, &quot;failed-once&quot;),
+      turns: [],
+    }),
+  );
+  stubFakeCodexAppServer(scriptPath);
+
+  harness.sendRequest(1, &quot;model/list&quot;, {});
+  const failed = await harness.waitForResponse(1);
+  harness.sendRequest(2, &quot;model/list&quot;, {});
+  const recovered = await harness.waitForResponse(2);
+
+  expect(failed.error?.message).toContain(
+    &quot;Codex model/list returned no supported models.&quot;,
+  );
+  expect(recovered.error).toBeUndefined();
+  expect(recovered.result).toMatchObject({
+    models: [
+      {
+        displayName: &quot;Fake model&quot;,
+      },
+    ],
+  });
+});
+
+it(&quot;rejects a model catalog request with the missing-executable code when codex cannot be spawned&quot;, async () =&gt; {
+  vi.stubEnv(
+    &quot;BB_CODEX_BRIDGE_APP_SERVER_COMMAND&quot;,
+    join(tmpdir(), &quot;bb-codex-does-not-exist&quot;),
+  );
+  vi.stubEnv(&quot;BB_CODEX_BRIDGE_APP_SERVER_ARGS&quot;, &quot;[]&quot;);
+
+  harness.sendRequest(1, &quot;model/list&quot;, {});
+  const response = await harness.waitForResponse(1);
+
+  expect(response.error?.code).toBe(BRIDGE_JSON_RPC_ERRORS.MISSING_EXECUTABLE);
+  expect(response.error?.message).toContain(&quot;could not find the Codex CLI&quot;);
+});
+</pre>
+<ol start="3"><li>Run the catalog tests and their session-capability sibling:</li></ol><pre>pnpm exec turbo run test --filter=bb-plugin-provider-codex -- src/bridge/bridge.model-list.test.ts src/bridge/bridge.daybreak.test.ts</pre>
+<p><strong>Expected:</strong> the session consumes the new catalog and subsequent discovery returns both fixture models with current metadata. <strong>Actual:</strong> the session capability assertion passes, but discovery still returns the first model only. No turn is started.</p><pre>AssertionError: expected [ &#x27;catalog-base&#x27; ] to deeply equal [ &#x27;catalog-base&#x27;, &#x27;catalog-added&#x27; ]
+
+  [
+    &quot;catalog-base&quot;,
+-   &quot;catalog-added&quot;,
+  ]
+
+Test Files  1 failed | 1 passed (2)
+     Tests  1 failed | 16 passed (17)</pre>
+<p>The fake app-server reads its fixture once per process. Updating the fixture therefore simulates different catalog snapshots across process lifetimes rather than mocking BB's catalog behavior. A Daybreak session-option notification is the positive witness: only the newly added model enables it, so observing that notification proves the new session's response has been processed before the final failing assertion. The existing tests establish reuse, pool routing, configured defaults, error recovery, and session capability behavior.</p>
+<h2>5. Root cause</h2>
+<h3>Separate session and discovery consumers</h3><p>The fresh session requests and parses its own catalog, stores the promise on the session, and publishes only the session-specific option state.</p><p><a href="https://github.com/get-bb/bb/blob/1a4a1d254c7b1f70d340ef9c800dad77dbeb8e66/plugins/provider-codex/src/bridge/bridge.ts#L1036-L1060">plugins/provider-codex/src/bridge/bridge.ts:1036</a></p><pre>function loadSessionModelCatalog(
+  connection: CodexAppServerConnection,
+): Promise&lt;CodexModelCatalog | null&gt; {
+  return connection
+    .request({
+      method: &quot;model/list&quot;,
+      params: {},
+      resultSchema: ignoredChildResultSchema,
+      timeoutMs: SESSION_MODEL_CATALOG_TIMEOUT_MS,
+    })
+    .then(parseModelCatalog)
+    .catch(() =&gt; null);
+}
+
+function publishDaybreakState(
+  session: CodexBridgeSession,
+  catalog: CodexModelCatalog | null,
+): void {
+  if (session.closing || catalog === null || !catalog.daybreakAvailable) {
+    return;
+  }
+  const payload = {
+    options: [codexDaybreakOption(session.daybreakEnabled ?? false)],
+  };
+  const serialized = JSON.stringify(payload);</pre><p><a href="https://github.com/get-bb/bb/blob/1a4a1d254c7b1f70d340ef9c800dad77dbeb8e66/plugins/provider-codex/src/bridge/bridge.ts#L1393-L1396">plugins/provider-codex/src/bridge/bridge.ts:1393</a></p><pre>    const modelCatalog = loadSessionModelCatalog(connection);
+    session.modelCatalog = modelCatalog;
+    void modelCatalog.then((catalog) =&gt; publishDaybreakState(session, catalog));
+    return { session, codexThreadId };</pre>
+<h3>Discovery keeps its process indefinitely while healthy</h3><p>Matching pool routes reuse the cached initialized app-server without a freshness condition. The discovery handler asks that process for model/list, so successful reads do not imply a newly launched provider or a current account catalog.</p><p><a href="https://github.com/get-bb/bb/blob/1a4a1d254c7b1f70d340ef9c800dad77dbeb8e66/plugins/provider-codex/src/bridge/bridge.ts#L1523-L1540">plugins/provider-codex/src/bridge/bridge.ts:1523</a></p><pre>async function getModelListConnection(
+  envVars: Readonly&lt;Record&lt;string, string&gt;&gt; | undefined,
+): Promise&lt;CodexAppServerConnection&gt; {
+  const launchKey = poolRouteLaunchKey(envVars);
+  if (modelListConnection !== null) {
+    if (
+      modelListConnection.launchKey === launchKey &amp;&amp;
+      !modelListConnection.connection.exited
+    ) {
+      return modelListConnection.connection;
+    }
+    retireModelListConnection(modelListConnection.connection);
+  }
+  if (modelListConnectionPromise?.launchKey === launchKey) {
+    return modelListConnectionPromise.promise;
+  }
+
+  const pending = {</pre><p><a href="https://github.com/get-bb/bb/blob/1a4a1d254c7b1f70d340ef9c800dad77dbeb8e66/plugins/provider-codex/src/bridge/bridge.ts#L1635-L1650">plugins/provider-codex/src/bridge/bridge.ts:1635</a></p><pre>
+async function handleModelList(
+  id: string | number,
+  params: z.infer&lt;typeof modelListParamsSchema&gt;,
+): Promise&lt;void&gt; {
+  let connection: CodexAppServerConnection | null = null;
+  try {
+    connection = await getModelListConnection(params.envVars);
+    const result = await connection.request({
+      method: &quot;model/list&quot;,
+      params: {},
+      resultSchema: ignoredChildResultSchema,
+      timeoutMs: CHILD_REQUEST_TIMEOUT_MS,
+    });
+    const { models, selectedOnlyModels } = parseModelCatalog(result);
+    const configuredModel = await connection</pre>
+<h3>The server picker reads its own catalog store</h3><p>The picker resolves the server catalog store; refreshing that store issues provider.list_models and commits the response. The session-only catalog does not enter this path. Thus server TTL expiration cannot by itself resolve divergence inside the persistent discovery process.</p><p><a href="https://github.com/get-bb/bb/blob/1a4a1d254c7b1f70d340ef9c800dad77dbeb8e66/apps/server/src/services/system/execution-options.ts#L568-L586">apps/server/src/services/system/execution-options.ts:568</a></p><pre>    cwd: string | null;
+    hostId: string;
+    provider: ProviderInfo;
+    access: ProviderModelCatalogAccess;
+  },
+): Promise&lt;ModelListResult&gt; {
+  if (!args.provider.available) {
+    return unavailableProviderModelResult(args.provider.id);
+  }
+  const result = await deps.lifecycleDedupers.providerModelCatalogs.read(
+    deps,
+    args,
+  );
+  if (result.kind === &quot;catalog&quot;) {
+    return {
+      models: result.models,
+      selectedOnlyModels: result.selectedOnlyModels,
+      modelLoadError: null,
+    };</pre><p><a href="https://github.com/get-bb/bb/blob/1a4a1d254c7b1f70d340ef9c800dad77dbeb8e66/apps/server/src/services/providers/provider-model-catalog-store.ts#L506-L525">apps/server/src/services/providers/provider-model-catalog-store.ts:506</a></p><pre>    entry.refresh = refresh;
+    refresh.promise = callHostOnlineRpc(deps, {
+      hostId,
+      timeoutMs: COMMAND_TIMEOUT_MS,
+      command: {
+        type: &quot;provider.list_models&quot;,
+        providerId,
+        ...(scopeKey === &quot;&quot; ? {} : { cwd: scopeKey }),
+        bridgeLaunch: launch.bridgeLaunch,
+        contributedEnv: launch.contributedEnv,
+      },
+    }).then(
+      (result) =&gt;
+        settle(deps, entry, refresh, {
+          ok: true,
+          models: result.models,
+          selectedOnlyModels: result.selectedOnlyModels,
+        }),
+      (error: unknown) =&gt; settle(deps, entry, refresh, { ok: false, error }),
+    );</pre><p><a href="https://github.com/get-bb/bb/blob/1a4a1d254c7b1f70d340ef9c800dad77dbeb8e66/apps/server/src/services/providers/provider-model-catalog-store.ts#L436-L447">apps/server/src/services/providers/provider-model-catalog-store.ts:436</a></p><pre>    if (settlement.ok) {
+      entry.good = {
+        fingerprint: refresh.fingerprint,
+        models: settlement.models,
+        selectedOnlyModels: settlement.selectedOnlyModels,
+        modelsJson: JSON.stringify(settlement.models),
+        selectedOnlyModelsJson: JSON.stringify(settlement.selectedOnlyModels),
+        fetchedAt: refresh.markedStale ? 0 : now,
+      };
+      entry.failure = null;
+      entry.unavailableDetail = null;
+      persistGood(deps, entry.key, entry.good);</pre>
+<h3>The deterministic process snapshot</h3><p>These trusted fixture lines establish how the reproduction represents a provider catalog that changes between launches:</p><p><a href="https://github.com/get-bb/bb/blob/1a4a1d254c7b1f70d340ef9c800dad77dbeb8e66/plugins/provider-codex/src/bridge/fake-codex-app-server.mjs#L208-L212">plugins/provider-codex/src/bridge/fake-codex-app-server.mjs:208</a></p><pre>const scriptPath = scriptPathFromArgs(process.argv.slice(2));
+const script = scriptPath ? JSON.parse(readFileSync(scriptPath, &quot;utf8&quot;)) : null;
+const scriptedTurns = script?.turns ?? null;
+const requestLogPath = script?.requestLogPath ?? null;
+const responseLogPath = script?.responseLogPath ?? null;</pre><p><a href="https://github.com/get-bb/bb/blob/1a4a1d254c7b1f70d340ef9c800dad77dbeb8e66/plugins/provider-codex/src/bridge/fake-codex-app-server.mjs#L439-L449">plugins/provider-codex/src/bridge/fake-codex-app-server.mjs:439</a></p><pre>    case &quot;model/list&quot;:
+      if (shouldFailThisModelList()) {
+        respond(id, { data: [] });
+        return;
+      }
+      if (script?.modelList) {
+        setTimeout(
+          () =&gt; respond(id, script.modelList),
+          script.modelListDelayMs ?? 0,
+        );
+        return;</pre>
+<h2>6. Proposed fix and simple-fix gate</h2>
+<p>Route validated session catalogs to the same host/provider/route-scoped server catalog store used by discovery, retaining model metadata and reasoning options and reusing the existing picker-change notification after storage. Preserve route and account isolation, and do not let stale in-flight discovery replace a newer session catalog. Also give the dedicated discovery process an explicit freshness policy so manual refresh is not indefinitely tied to one process snapshot.</p>
+<p><strong>No pull request:</strong> the complete repair crosses the provider bridge/runtime and server catalog subsystem boundary. Existing bridge notifications do not include a catalog-update event, so choosing a publication path requires shared-contract or cross-subsystem work and fails the one-existing-subsystem/no-public-protocol simple-fix constraints. Merely restarting discovery would not deliver a session catalog to the picker immediately. No partial production fix, branch, or push was made.</p><p><a href="https://github.com/get-bb/bb/blob/1a4a1d254c7b1f70d340ef9c800dad77dbeb8e66/packages/provider-bridge-protocol/src/notifications.ts#L4-L10">packages/provider-bridge-protocol/src/notifications.ts:4</a></p><pre>export const BRIDGE_NOTIFICATION_METHODS = {
+  threadIdentity: &quot;thread/identity&quot;,
+  sessionReplaced: &quot;session/replaced&quot;,
+  providerRaw: &quot;provider/raw&quot;,
+  providerRecovery: &quot;provider/recovery&quot;,
+  error: &quot;error&quot;,
+} as const;</pre>
+<p>The local diagnostic patch changes one test file, 85 additions plus 2 deletions (87 text lines); no binary, generated, lockfile, migration, dependency, or production change is present. That small test does not make the full repair eligible. <code>git diff --check</code> passes. No linked open pull request appeared in issue cross-reference metadata or the open-PR search for issue 6453.</p>
+<h2>7. Verification</h2>
+<p>The same agent created a second clean detached checkout from the recorded trusted commit, installed the frozen dependencies, built the SDK and the full repository, and added only the same locally authored test patch. It used a different new temporary fixture/workspace and no ports or persistent BB data. The exact test command from section 4 again failed only the new catalog regression; all 16 pre-existing selected tests passed. This is a repeat verification by the same agent, not independent verification. No correction to the root-cause finding was required.</p>
+<p>Second full build: <code>72 successful, 72 total</code>. Both test runs: <code>1 failed | 16 passed</code>, failing at the final returned-model list assertion after the fresh-session capability witness passes.</p>
+<h2>8. Related issues and limits</h2>
+<p>No additional issue was investigated. This report does not verify an external model rollout, provider installation upgrade, Windows-specific behavior, or a visual picker interaction. It reproduces the real bridge API and session lifecycle that supply the picker and traces the remaining server read path in trusted source.</p>
+<p>Issue text and comments were treated only as untrusted claims. No issue-supplied command, test, script, branch, or external URL was executed or fetched. All reproduction code was authored from the trusted main-branch implementation and its existing fake-process harness.</p>
+<h2>9. Appendix</h2><h3>First run — actual failure</h3><pre>bb-plugin-provider-codex:test:  FAIL  |bb-plugin-provider-codex| src/bridge/bridge.model-list.test.ts &gt; returns the current catalog after a fresh session discovers additional models
+bb-plugin-provider-codex:test: AssertionError: expected [ &#x27;catalog-base&#x27; ] to deeply equal [ &#x27;catalog-base&#x27;, &#x27;catalog-added&#x27; ]
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test: - Expected
+bb-plugin-provider-codex:test: + Received
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test:   [
+bb-plugin-provider-codex:test:     &quot;catalog-base&quot;,
+bb-plugin-provider-codex:test: -   &quot;catalog-added&quot;,
+bb-plugin-provider-codex:test:   ]
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test:  ❯ src/bridge/bridge.model-list.test.ts:113:54
+bb-plugin-provider-codex:test:     111|     .object({ models: z.array(z.object({ model: z.string() }).passthro…
+bb-plugin-provider-codex:test:     112|     .parse(refreshed.result);
+bb-plugin-provider-codex:test:     113|   expect(catalog.models.map((model) =&gt; model.model)).toEqual([
+bb-plugin-provider-codex:test:        |                                                      ^
+bb-plugin-provider-codex:test:     114|     &quot;catalog-base&quot;,
+bb-plugin-provider-codex:test:     115|     &quot;catalog-added&quot;,
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test:  Test Files  1 failed | 1 passed (2)
+bb-plugin-provider-codex:test:       Tests  1 failed | 16 passed (17)
+bb-plugin-provider-codex:test:    Start at  17:36:20
+bb-plugin-provider-codex:test:    Duration  1.65s (transform 838ms, setup 0ms, import 1.64s, tests 1.04s, environment 0ms)
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test:  ELIFECYCLE  Test failed. See above for more details.
+bb-plugin-provider-codex#test:  ERROR  command (&lt;checkout-1&gt;/plugins/provider-codex) /usr/local/bin/pnpm run test src/bridge/bridge.model-list.test.ts src/bridge/bridge.daybreak.test.ts exited (1)
+
+ Tasks:    6 successful, 7 total
+Cached:    0 cached, 7 total
+  Time:    4.833s 
+Failed:    bb-plugin-provider-codex#test
+
+ ERROR  run failed: command  exited (1)
+</pre><h3>Second clean run — actual failure</h3><pre>bb-plugin-provider-codex:test:  FAIL  |bb-plugin-provider-codex| src/bridge/bridge.model-list.test.ts &gt; returns the current catalog after a fresh session discovers additional models
+bb-plugin-provider-codex:test: AssertionError: expected [ &#x27;catalog-base&#x27; ] to deeply equal [ &#x27;catalog-base&#x27;, &#x27;catalog-added&#x27; ]
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test: - Expected
+bb-plugin-provider-codex:test: + Received
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test:   [
+bb-plugin-provider-codex:test:     &quot;catalog-base&quot;,
+bb-plugin-provider-codex:test: -   &quot;catalog-added&quot;,
+bb-plugin-provider-codex:test:   ]
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test:  ❯ src/bridge/bridge.model-list.test.ts:113:54
+bb-plugin-provider-codex:test:     111|     .object({ models: z.array(z.object({ model: z.string() }).passthro…
+bb-plugin-provider-codex:test:     112|     .parse(refreshed.result);
+bb-plugin-provider-codex:test:     113|   expect(catalog.models.map((model) =&gt; model.model)).toEqual([
+bb-plugin-provider-codex:test:        |                                                      ^
+bb-plugin-provider-codex:test:     114|     &quot;catalog-base&quot;,
+bb-plugin-provider-codex:test:     115|     &quot;catalog-added&quot;,
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test:  Test Files  1 failed | 1 passed (2)
+bb-plugin-provider-codex:test:       Tests  1 failed | 16 passed (17)
+bb-plugin-provider-codex:test:    Start at  17:37:26
+bb-plugin-provider-codex:test:    Duration  1.61s (transform 858ms, setup 0ms, import 1.66s, tests 966ms, environment 0ms)
+bb-plugin-provider-codex:test: 
+bb-plugin-provider-codex:test:  ELIFECYCLE  Test failed. See above for more details.
+bb-plugin-provider-codex#test:  ERROR  command (&lt;checkout-2&gt;/plugins/provider-codex) /usr/local/bin/pnpm run test src/bridge/bridge.model-list.test.ts src/bridge/bridge.daybreak.test.ts exited (1)
+
+ Tasks:    6 successful, 7 total
+Cached:    5 cached, 7 total
+  Time:    3.128s 
+Failed:    bb-plugin-provider-codex#test
+
+ ERROR  run failed: command  exited (1)
+</pre>
+<p>Build and evidence preparation used only frozen installation, the SDK-first Turbo build commands shown above, the stated test command, detached Git worktree creation at the pinned commit, read-only GitHub issue/property/label/PR queries, <code>git diff --numstat</code>, <code>git diff --check</code>, and trusted-base source inspection. Raw logs and the diagnostic patch remain outside this public repository; the complete executable regression and its exact failure are embedded above.</p>
+</main></body></html>
