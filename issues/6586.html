@@ -31,7 +31,70 @@
 <h2>3. Environment</h2>
 <ul><li>Public repository get-bb/bb; trusted origin/main commit shown above.</li><li>Linux x86_64; Node v22.19.0; pnpm 9.15.0.</li><li>No provider versions involved: real operating-system child processes execute author-created shell fixtures.</li><li>No server, browser, listening port, real bb instance, or persistent application data used.</li><li>Each test creates a fresh OS temporary directory and deletes it in the repository's existing cleanup hook.</li></ul>
 <h2>4. Minimal reproduction</h2>
-<p>Start from a clean checkout of the trusted base. The regression was derived from repository code and existing fixture conventions, not copied from issue code. Download the <a href="6586/repro/regression.patch">authored test patch</a> and save it outside the checkout as <code>regression.patch</code>.</p>
+<p>Start from a clean checkout of the trusted base. The regression was derived from repository code and existing fixture conventions, not copied from issue code. Save the inline patch below outside the checkout as <code>regression.patch</code>.</p>
+<pre>diff --git a/packages/process-utils/test/host-toolchain.test.ts b/packages/process-utils/test/host-toolchain.test.ts
+index 3fd11d57e4..217d56a7ed 100644
+--- a/packages/process-utils/test/host-toolchain.test.ts
++++ b/packages/process-utils/test/host-toolchain.test.ts
+@@ -251,6 +251,57 @@ describe.skipIf(process.platform === &quot;win32&quot;)(&quot;host toolchain recovery&quot;, () =&gt; {
+     );
+   });
+&#32;
++  it.each([&quot;exit&quot;, &quot;timeout&quot;])(
++    &quot;recovers a resolved command&#x27;s helper PATH after an interactive probe %s&quot;,
++    async (failure) =&gt; {
++      const root = await scratch();
++      const bin = join(root, &quot;commands&quot;);
++      const helpers = join(root, &quot;helpers&quot;);
++      const unavailable = join(root, &quot;unavailable&quot;);
++      const shell = join(root, &quot;shell&quot;);
++      await writeFile(unavailable, &quot;&quot;);
++      await script(
++        join(bin, &quot;needs-helper&quot;),
++        &quot;#!/bin/sh\nstartup-helper || exit 1\n&quot;,
++      );
++      await script(join(helpers, &quot;startup-helper&quot;), &quot;#!/bin/sh\nprintf recovered\n&quot;);
++      await script(
++        shell,
++        `#!/bin/sh
++if [ &quot;$1&quot; = &#x27;-ilc&#x27; ]; then
++  if [ -f &quot;${unavailable}&quot; ]; then
++    ${failure === &quot;timeout&quot; ? &quot;exec /bin/sleep 30&quot; : &quot;exit 1&quot;}
++  fi
++  printf &#x27;__BB_SHELL_ENV_START__\\nPATH=${helpers}:${bin}:/usr/bin:/bin\\n__BB_SHELL_ENV_END__\\n&#x27;
++else
++  printf &#x27;__BB_SHELL_ENV_START__\\nPATH=${bin}:/usr/bin:/bin\\n__BB_SHELL_ENV_END__\\n&#x27;
++fi
++`,
++      );
++      const toolchain = new HostToolchain({
++        HOME: root,
++        PATH: &quot;/usr/bin:/bin&quot;,
++        SHELL: shell,
++      });
++      await toolchain.refresh();
++      const execute = () =&gt; {
++        const launch = toolchain.command(&quot;needs-helper&quot;);
++        expect(launch.command).toBe(join(bin, &quot;needs-helper&quot;));
++        return spawnSync(launch.command, launch.args, {
++          env: launch.env,
++          encoding: &quot;utf8&quot;,
++        });
++      };
++      expect(execute().status).toBe(1);
++      await rm(unavailable);
++      toolchain.invalidateFailure(1);
++      await expect
++        .poll(() =&gt; execute().stdout, { timeout: 2000 })
++        .toBe(&quot;recovered&quot;);
++    },
++    10000,
++  );
++
+   it(&quot;does not block the caller while discovery runs&quot;, async () =&gt; {
+     const root = await scratch();
+     const shell = join(root, &quot;slow-shell&quot;);
+</pre>
 <pre>git clone https://github.com/get-bb/bb.git bb-6586
 cd bb-6586
 git checkout abcff9f0537bd16649f0baf0c301e79000d945ad
@@ -44,7 +107,7 @@ pnpm exec turbo run test --filter=@bb/process-utils --force -- --testNamePattern
 <pre>AssertionError: expected '' to be 'recovered' // Object.is equality
 Test Files  1 failed | 17 skipped (18)
      Tests  2 failed | 132 skipped (134)</pre>
-<p>Full output: <a href="6586/repro/first-run.log">first run</a> and <a href="6586/repro/second-run.log">second clean run</a>. The regression's observable contract is eventual helper-dependent command success after a degraded discovery; existing tests cover missing executables and retained complete environments, not an already-resolved command exiting 1. It requires no production-only testing hook.</p>
+<p>The first run exited 1 and completed in 9.973 seconds; the forced second clean run exited 1 and completed in 10.48 seconds. Both failed exactly the two new cases above. Raw logs remain in the local investigation workspace, not the public report repository. The regression's observable contract is eventual helper-dependent command success after a degraded discovery; existing tests cover missing executables and retained complete environments, not an already-resolved command exiting 1. It requires no production-only testing hook.</p>
 <pre>  it.each([&quot;exit&quot;, &quot;timeout&quot;])(
     &quot;recovers a resolved command&#x27;s helper PATH after an interactive probe %s&quot;,
     async (failure) =&gt; {
@@ -106,11 +169,81 @@ fi
 <p>Important limit: <a href="https://github.com/get-bb/bb/blob/abcff9f0537bd16649f0baf0c301e79000d945ad/apps/host-daemon/src/start-host-daemon.ts#L154-L164">daemon runtime-shell resolution</a> explicitly invokes refresh, and <a href="https://github.com/get-bb/bb/blob/abcff9f0537bd16649f0baf0c301e79000d945ad/apps/host-daemon/src/app.ts#L690-L715">its runtime cache</a> has a separate refresh mechanism. The component result cannot establish why a particular real-world incident persisted for multiple turns.</p>
 <h2>6. Proposed fix and simple-fix gate</h2>
 <p>Remember whether the retained environment came from the login-only fallback. While that state persists, a nonzero numeric process exit should trigger the existing coalesced background refresh. A successful preferred probe clears the degraded state; do not broaden ordinary failure recovery after a complete probe or treat a shell supporting only login discovery as degraded.</p>
-<p>A local <a href="6586/repro/prototype-fix.patch">prototype production patch</a> makes both focused regressions pass. It touches two files in process-utils with the test: 69 added lines plus 6 removed lines, 75 total. No dependency, generated file, data, public API, wire protocol, or security change is involved. <code>git diff --check</code>, package typecheck, and package lint pass.</p>
+<p>A local prototype production patch makes both focused regressions pass. It touches two files in process-utils with the test: 69 added lines plus 6 removed lines, 75 total. No dependency, generated file, data, public API, wire protocol, or security change is involved. <code>git diff --check</code>, package typecheck, and package lint pass. The unpushed prototype is included inline:</p>
+<pre>diff --git a/packages/process-utils/src/host-toolchain.ts b/packages/process-utils/src/host-toolchain.ts
+index a7b3884fc6..88f9cc28ec 100644
+--- a/packages/process-utils/src/host-toolchain.ts
++++ b/packages/process-utils/src/host-toolchain.ts
+@@ -142,7 +142,7 @@ function runProbe(
+ async function readShellEnvironment(
+   env: NodeJS.ProcessEnv,
+   retainPrevious: boolean,
+-): Promise&lt;NodeJS.ProcessEnv | null&gt; {
++): Promise&lt;{ env: NodeJS.ProcessEnv; fallback: boolean } | null&gt; {
+   if (process.platform === &quot;win32&quot;) {
+     const registry = join(
+       envValue(env, &quot;SystemRoot&quot;) ?? &quot;C:\\Windows&quot;,
+@@ -186,7 +186,10 @@ async function readShellEnvironment(
+     };
+     return paths.length === 0
+       ? null
+-      : { PATH: mergePath(...paths.map(expand), envValue(env, &quot;PATH&quot;)) };
++      : {
++          env: { PATH: mergePath(...paths.map(expand), envValue(env, &quot;PATH&quot;)) },
++          fallback: false,
++        };
+   }
+   const shell =
+     env.SHELL?.trim() ||
+@@ -216,13 +219,14 @@ async function readShellEnvironment(
+       if (key === &quot;PATH&quot; || NETWORK_KEYS.includes(key))
+         values[key] = line.slice(separator + 1);
+     }
+-    if (values.PATH) return values;
++    if (values.PATH) return { env: values, fallback: arg !== shellArgs[0] };
+   }
+   return null;
+ }
+&#32;
+ export class HostToolchain {
+   private shellEnv: NodeJS.ProcessEnv = {};
++  private shellEnvFallback = false;
+   private readonly inheritedPath: string | undefined;
+   private readonly misses = new Set&lt;string&gt;();
+   private nodePath: string;
+@@ -243,8 +247,11 @@ export class HostToolchain {
+     this.refreshedAt = Date.now();
+     const retainPrevious = this.shellEnv.PATH !== undefined;
+     this.refreshing = readShellEnvironment(this.baseEnv, retainPrevious)
+-      .then((env) =&gt; {
+-        if (env !== null) this.shellEnv = env;
++      .then((result) =&gt; {
++        if (result !== null) {
++          this.shellEnv = result.env;
++          this.shellEnvFallback = result.fallback;
++        }
+       })
+       .finally(() =&gt; {
+         this.refreshing = null;
+@@ -259,7 +266,12 @@ export class HostToolchain {
+       &quot;code&quot; in errorOrCode
+         ? errorOrCode.code
+         : errorOrCode;
+-    if (code === &quot;ENOENT&quot; || code === 127) void this.refresh();
++    if (
++      code === &quot;ENOENT&quot; ||
++      code === 127 ||
++      (this.shellEnvFallback &amp;&amp; typeof code === &quot;number&quot; &amp;&amp; code !== 0)
++    )
++      void this.refresh();
+   }
+&#32;
+   private searchPath(env: NodeJS.ProcessEnv): string {
+</pre>
 <p><strong>No pull request is opened, and the prototype is not committed or pushed.</strong> The required existing-suite pass gate is not met: the full package suite has 1 failure, 117 passes, and 16 skips. An unchanged-production check in the second checkout reproduces that existing failure by itself. Its native-provider test resolves the host-installed <code>/usr/local/bin/claude</code> ahead of the disposable HOME fixture and receives a real CLI input error. This unrelated environment-sensitive failure was not changed to force the gate green.</p>
 <pre>Error: Command failed: /usr/local/bin/claude
 Error: Input must be provided either through stdin or as a prompt argument when using --print</pre>
-<p>Evidence: <a href="6586/repro/prototype-suite.log">prototype suite/typecheck/lint</a> and <a href="6586/repro/baseline-existing.log">unchanged-production existing-test failure</a>. Fix follow-up: establish a clean test environment for the existing provider fixture, then rerun the full owning package suite before proposing the contained repair.</p>
+<p>Prototype run: <code>1 failed | 117 passed | 16 skipped (134)</code>. Unchanged-production existing-test run: <code>1 failed | 133 skipped (134)</code>. Both report the identical native-provider test error above. Fix follow-up: establish a clean test environment for the existing provider fixture, then rerun the full owning package suite before proposing the contained repair.</p>
 <h2>7. Verification</h2>
 <p>The same agent repeated the reproduction, not an independent reviewer. A second clean temporary checkout was cloned from local trusted Git objects, its origin set to get-bb/bb, and detached at <code>abcff9f0537bd16649f0baf0c301e79000d945ad</code>. Only the authored test patch was installed; production remained unchanged. A new frozen dependency installation and scoped Turbo build succeeded. The focused command above ran with <code>--force</code> to avoid accepting cached test results and failed both cases for the same recovery assertion. Each run allocated new temporary fixture directories. No report correction was required beyond limiting claims to the verified shared-toolchain defect.</p>
 <h2>8. Related issues</h2>
@@ -132,6 +265,6 @@ Local prototype:
 pnpm exec turbo run test typecheck lint --filter=@bb/process-utils
 git diff --check
 git diff --numstat origin/main</pre>
-<p>Reproduction source fragment: <a href="6586/repro/regression-fragment.ts">download</a>. Nonvisual defect: screenshots are not applicable.</p>
+<p>The complete authored patch and source fragment appear inline above, keeping the public report self-contained. Raw artifacts remain outside the public report repository. Nonvisual defect: screenshots are not applicable.</p>
 <p>&gt; AGENT GENERATED</p>
 </main></body></html>
