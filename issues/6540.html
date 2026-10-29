@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Issue 6540 · Quadratic file-edit history reconstruction</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main>
+<p><a href="../">Reports</a></p>
+<h1>#6540 · Quadratic file-edit history reconstruction blocks the event loop</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Medium</span><span class="pill">threads, perf</span></p>
+<p><a href="https://github.com/get-bb/bb/issues/6540">GitHub issue</a> · October 29, 2026 · trusted main <code>3bacfac9ed69d42392076e5b3da2815bec822cd8</code></p>
+<p><strong>Verdict: REPRODUCED</strong> · Root-cause confidence: <strong>high</strong> for the synchronous projection hotspot. Live browser/API latency and the reporter's exact measurements were not tested.</p>
+
+<h2>1. TL;DR</h2>
+<p>A server rebuilding a long edit-heavy conversation runs the shared projection synchronously, so timers and other requests cannot progress until it returns. A newly written synthetic history of 6,000 file edits and 18,001 events blocked a zero-delay timer for approximately 989 ms. A second clean trusted checkout repeated the block at approximately 983 ms. Every file-change start/completion needlessly searched and copied the growing message array, even when the call was new or the existing rows were already updated in place. A bounded two-file fix skips those two unnecessary rebuilds; the same test then took approximately 135 ms and the existing thread-view suite passed.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Long edit histories can synchronously stall the server.</td><td>Verified mechanism</td><td>The real shared projection delayed a timer by 989 ms and 983 ms on trusted main. No live HTTP server or browser was used.</td></tr>
+<tr><td>File-edit replacement copies the whole history.</td><td>Verified</td><td>The original replacement helper unconditionally uses findIndex and filter for each lifecycle update with file changes.</td></tr>
+<tr><td>Every output update scans all file edits.</td><td>Qualified</td><td>The flush helper scans all historical edits, but its callers flush at turn completion, interruption, or finalization, not on every individual stdout delta. The reproduced quadratic cost comes from file-change lifecycle replacement.</td></tr>
+<tr><td>The scheduler's pause equals build duration.</td><td>Verified source, not quantified</td><td>The pause is min(1,000 ms, build duration); an approximately 50% duty cycle applies only while builds stay below that cap and pushes remain pending.</td></tr>
+<tr><td>A byte-budget query prepares a statement every rebuild.</td><td>Verified source, causal share unverified</td><td>The query helper prepares on each invocation; this report does not benchmark its database cost.</td></tr>
+<tr><td>Reported macOS timings, percentages, and multi-second speedup.</td><td>Unverified</td><td>No reporter logs or branch code were executed. These are different Linux/Node 22 fixtures and cannot validate those exact numbers.</td></tr>
+</table>
+
+<h2>3. Environment</h2>
+<ul><li>Public repository get-bb/bb, official origin/main at <code>3bacfac9ed69d42392076e5b3da2815bec822cd8</code>.</li>
+<li>Linux x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li>
+<li>Two separate temporary source checkouts; no production runtime data, provider processes, ports, or application data directory.</li>
+<li>Frozen installs completed. Initial full build needed the documented SDK build:types preparation; afterward all 72 build tasks succeeded in both checkouts.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the official public target and select the recorded commit; install and build dependencies.</li></ol>
+<pre>git clone https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout --detach 3bacfac9ed69d42392076e5b3da2815bec822cd8
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build</pre>
+<p>Save the test below as <code>packages/thread-view/test/timeline-file-edit-responsiveness.test.ts</code>, then run:</p>
+<pre>pnpm exec turbo run test --filter=@bb/thread-view -- test/timeline-file-edit-responsiveness.test.ts --silent=false</pre>
+<p>Expected: all 6,000 projected edits retain completed status and output, with synchronous projection below a deliberately loose 500 ms guard. Actual on unchanged production code: data assertions pass but the latency assertion fails.</p>
+<pre>First trusted checkout:
+{&quot;events&quot;:18001,&quot;edits&quot;:6000,&quot;projectionMs&quot;:988.7867210000001,&quot;timerDelayMs&quot;:988.9052310000001}
+AssertionError: expected 988.7867210000001 to be less than 500
+
+Second clean checkout:
+{&quot;events&quot;:18001,&quot;edits&quot;:6000,&quot;projectionMs&quot;:983.201864,&quot;timerDelayMs&quot;:983.325254}
+AssertionError: expected 983.201864 to be less than 500</pre>
+<p>This tests the real projection, not a simulated implementation. The timer is scheduled immediately before synchronous projection and measured before message assertions. The fixture has one active turn; it is a stress case, not a claim that 1,000 total messages always block for the same duration. Elapsed-time assertions vary by machine; the budget is not a frame-latency guarantee.</p>
+<h3>Complete regression test</h3>
+<pre>import { turnScope } from &quot;@bb/domain&quot;;
+import { expect, it } from &quot;vitest&quot;;
+import {
+  buildEventProjection,
+  type ThreadEventWithMeta,
+} from &quot;../src/build-event-projection.js&quot;;
+import { getProjectionEntryMessages } from &quot;../src/event-projection-flatten.js&quot;;
+
+function editHistory(count: number): ThreadEventWithMeta[] {
+  const history: ThreadEventWithMeta[] = [];
+  function append(event: ThreadEventWithMeta[&quot;event&quot;]): void {
+    const sequence = history.length + 1;
+    history.push({
+      event,
+      meta: { id: `event-${sequence}`, seq: sequence, createdAt: sequence },
+    });
+  }
+  const common = {
+    threadId: &quot;responsiveness-thread&quot;,
+    providerThreadId: &quot;responsiveness-provider&quot;,
+    scope: turnScope(&quot;responsiveness-turn&quot;),
+  };
+  append({ ...common, type: &quot;turn/started&quot; });
+  for (let index = 0; index &lt; count; index++) {
+    const item = {
+      type: &quot;fileChange&quot; as const,
+      id: `edit-${index}`,
+      changes: [{ path: `src/file-${index}.ts`, kind: &quot;update&quot; as const }],
+      approvalStatus: null,
+    };
+    append({
+      ...common,
+      type: &quot;item/started&quot;,
+      item: { ...item, status: &quot;pending&quot; },
+    });
+    append({
+      ...common,
+      type: &quot;item/fileChange/outputDelta&quot;,
+      itemId: item.id,
+      delta: `saved-${index}`,
+    });
+    append({
+      ...common,
+      type: &quot;item/completed&quot;,
+      item: { ...item, status: &quot;completed&quot; },
+    });
+  }
+  return history;
+}
+
+it(&quot;projects a long streamed edit history without a half-second synchronous stall&quot;, async () =&gt; {
+  const options = {
+    threadName: &quot;Responsiveness fixture&quot;,
+    threadStatus: &quot;active&quot; as const,
+    turnMessageDetail: &quot;full&quot; as const,
+  };
+  buildEventProjection(editHistory(100), options);
+  const history = editHistory(6000);
+  const startedAt = performance.now();
+  const pendingTimer = new Promise&lt;number&gt;((resolve) =&gt; {
+    setTimeout(() =&gt; resolve(performance.now() - startedAt), 0);
+  });
+  const projection = buildEventProjection(history, options);
+  const projectionMs = performance.now() - startedAt;
+  const timerDelayMs = await pendingTimer;
+  const edits = projection.entries
+    .flatMap(getProjectionEntryMessages)
+    .filter((message) =&gt; message.kind === &quot;file-edit&quot;);
+  console.log(
+    JSON.stringify({
+      events: history.length,
+      edits: edits.length,
+      projectionMs,
+      timerDelayMs,
+    }),
+  );
+  expect(edits).toHaveLength(6000);
+  expect(edits[0]?.stdout).toBe(&quot;saved-0&quot;);
+  expect(edits[5999]?.stdout).toBe(&quot;saved-5999&quot;);
+  expect(edits.every((message) =&gt; message.status === &quot;completed&quot;)).toBe(true);
+  expect(projectionMs).toBeLessThan(500);
+}, 30_000);
+</pre>
+<p>The complete test and exact output are inline to follow the reports repository's no-published-test-artifacts policy. Raw evidence and an artifact copy are retained locally, not committed to this public site.</p>
+
+<h2>5. Root cause</h2>
+<p>The file-change upsert mutates reusable row objects, then calls replacement even when their identities and order did not change. For new calls it similarly filters the entire existing history before appending. With N independent edits the growing-array scans cost O(N²), allocating a new history array on each start/completion. The helper runs on the same JavaScript event loop as request handling.</p>
+<p><a href="https://github.com/get-bb/bb/blob/3bacfac9ed69d42392076e5b3da2815bec822cd8/packages/thread-view/src/operation-projection.ts#L641-L657">Original replacement helper</a>:</p>
+<pre>function replaceFileEditMessagesForCall(
+  state: OperationProjectionState,
+  callId: string,
+  nextRows: readonly EventProjectionFileEditMessage[],
+): void {
+  const insertionIndex = state.messages.findIndex(
+    (message) =&gt; message.kind === &quot;file-edit&quot; &amp;&amp; message.callId === callId,
+  );
+  const messagesWithoutCallRows = state.messages.filter(
+    (message) =&gt; message.kind !== &quot;file-edit&quot; || message.callId !== callId,
+  );
+  if (insertionIndex === -1) {
+    messagesWithoutCallRows.push(...nextRows);
+  } else {
+    messagesWithoutCallRows.splice(insertionIndex, 0, ...nextRows);
+  }
+  state.messages = messagesWithoutCallRows;
+}</pre>
+<ul><li><a href="https://github.com/get-bb/bb/blob/3bacfac9ed69d42392076e5b3da2815bec822cd8/packages/thread-view/src/operation-projection.ts#L752-L803">Lifecycle upsert updates rows and invokes replacement</a>.</li>
+<li><a href="https://github.com/get-bb/bb/blob/3bacfac9ed69d42392076e5b3da2815bec822cd8/apps/server/src/services/threads/timeline.ts#L1447-L1466">The server invokes the shared projection synchronously in its timeline build</a>.</li>
+<li><a href="https://github.com/get-bb/bb/blob/3bacfac9ed69d42392076e5b3da2815bec822cd8/packages/thread-view/src/operation-projection.ts#L410-L433">Historical flush traversal</a> and <a href="https://github.com/get-bb/bb/blob/3bacfac9ed69d42392076e5b3da2815bec822cd8/packages/thread-view/src/event-projection-state.ts#L175-L202">its callers</a>: distinct remaining costs, not removed by the narrow fix.</li>
+<li><a href="https://github.com/get-bb/bb/blob/3bacfac9ed69d42392076e5b3da2815bec822cd8/apps/server/src/services/threads/thread-timeline-windows.ts#L300-L321">Push scheduler pause</a> and <a href="https://github.com/get-bb/bb/blob/3bacfac9ed69d42392076e5b3da2815bec822cd8/packages/db/src/data/events.ts#L3290-L3310">byte-budget statement preparation</a>: source-confirmed contributors requiring separate measurement.</li></ul>
+
+<h2>6. Proposed fix and measured validation</h2>
+<p>Use the existing call-to-rows map: append directly for a new call, and return when the same row objects remain in the same order. Their fields have already been updated. Preserve the original replacement fallback for structural changes, removals, and reordering; introduce no cached positions, additional state, or wire changes.</p>
+<pre>After the 11-line production change:
+{&quot;events&quot;:18001,&quot;edits&quot;:6000,&quot;projectionMs&quot;:135.12772099999995,&quot;timerDelayMs&quot;:135.24380099999996}
+Test Files  1 passed (1)
+Tests       1 passed (1)
+
+Full package verification:
+Test Files  32 passed (32)
+Tests       506 passed (506)
+Tasks       4 successful, 4 total (tests, typecheck, upstream dependencies)</pre>
+<p>The before/after result supports this hotspot fix, not a promise that all scheduler, database, or browser latency is eliminated. Existing tests cover reused call IDs across turns, row identity, moves, multi-file updates, grouping, and interruption. The focused guard was added before the production change and failed for the intended latency reason. Final change size: 93 added text lines, zero deletions, two files; 11 production lines and an 82-line regression. No dependency, migration, generated file, persisted data, protocol, or public API change. Formatting and git diff --check passed. This package has no lint task; Turbo correctly reported zero lint tasks.</p>
+
+<h2>7. Linked PR review</h2>
+<h3><a href="https://github.com/get-bb/bb/pull/6544">#6544</a> — closed, unmerged</h3>
+<p>Metadata and diff were read only as untrusted evidence after the local reproduction and fix were written. The diff changes scheduler pacing, caches a prepared database statement, tracks pending stdout scopes and file-row positions, and adds tests across eight files (1,230 changed lines). It targets additional costs but exceeds this run's simple-fix limits. No branch checkout or tests from it were run, and no correctness approval is implied. The narrower local fix was designed from trusted main and does not depend on that diff. No linked open PR existed when the duplicate check ran.</p>
+
+<h2>8. Related issues</h2>
+<p><a href="https://github.com/get-bb/bb/issues/1972">#1972</a> is closed and concerns conversation-outline history reconstruction. Its symptom is similar, but this reproduction executes file-edit projection rather than the outline.</p>
+
+<h2>9. Verification</h2>
+<p>The same agent created a second clean detached checkout at the exact trusted base, performed a separate frozen install and full build, copied only the newly authored regression test, and reran the command above. Production source in that checkout remained unchanged. The repeated 983 ms projection and delayed timer support the final root-cause conclusion. This is a second run by the same agent, not independent verification. Both baseline runs failed only the intended 500 ms budget after validating completed outputs. No report correction was needed after the second run.</p>
+
+<h2>10. Appendix and limits</h2>
+<p>Relevant verification commands:</p>
+<pre>pnpm exec turbo run test --filter=@bb/thread-view -- test/timeline-file-edit-responsiveness.test.ts --silent=false
+pnpm exec turbo run test typecheck --filter=@bb/thread-view
+pnpm exec oxfmt packages/thread-view/src/operation-projection.ts packages/thread-view/test/timeline-file-edit-responsiveness.test.ts
+pnpm exec turbo run lint --filter=@bb/thread-view
+git diff --check
+git diff --numstat origin/main</pre>
+<p>Issue data was treated as untrusted. No supplied command, external branch, patch, script, or test was executed. All running production code came from official origin/main or the local 11-line change. No live app, browser click, HTTP latency, macOS behavior, reporter log statistics, or provider-specific behavior was validated. The larger fixture demonstrates a provider-independent blocking mechanism and a regression boundary; future measurement should include real timeline-window selection and concurrent HTTP requests.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
