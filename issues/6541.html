@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Issue 6541: desktop restore scheduling and menu replacement</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">Reports</a> · 2026-10-29</p>
+<h1>#6541 · Desktop restore scheduling and redundant native menus</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Low</span><span class="pill">desktop · perf · confirmed-repro</span><a href="https://github.com/get-bb/bb/issues/6541">Issue</a></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> (production-owner tests, not a macOS live-app reproduction).</p>
+<h2>1. TL;DR</h2>
+<p>Restoring multiple saved desktop windows waits for each page navigation before it starts creating the next window. A slow first page therefore delays every subsequent window, even though the windows can load independently. Separately, every accepted system-settings refresh asks Electron to build and replace the application menu, whether or not any displayed item or accelerator changed. Both mechanisms reproduce on trusted main in two separate checkouts using newly authored regression tests. No issue-provided code, commands, branches, or test files were executed.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Saved windows wait for the previous page navigation.</td><td>Verified</td><td>With three real persisted window entries and unresolved fake page navigations, only one load starts. The other two cannot begin until it resolves.</td></tr>
+<tr><td>Unchanged settings cause native-menu replacement.</td><td>Verified</td><td>Two equivalent installations call both Electron build and installation twice. Trusted source routes every accepted config refresh to this installer.</td></tr>
+<tr><td>Activation, reconnect, and polling trigger settings refresh.</td><td>Source-verified; not exercised against a remote server</td><td>main.ts owns all three triggers, including a five-minute poll interval.</td></tr>
+<tr><td>Exact five-window millisecond measurements and macOS presentation order.</td><td>Unverified here</td><td>The reproduction measures scheduling invariants rather than elapsed time. Native compositor/show order is not asserted; the repair preserves persisted result ordering.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Trusted repository: public get-bb/bb. Base: <code>3bacfac9ed69d42392076e5b3da2815bec822cd8</code>, fetched directly from canonical main on 2026-10-29.</li><li>Linux x86_64; Node v22.19.0; pnpm 9.15.0; desktop package 0.48.0; Vitest 4.1.1.</li><li>Both checkouts use frozen-lockfile installs and Turbo desktop builds with upstream dependencies.</li><li>No BB server, daemon, provider, browser, ports, or owner runtime data were used. Tests create fresh temporary user-data directories and remove them. The loopback URL in the test is a navigation argument to a fake window, not a network request.</li><li>Native macOS menu and window recipes are blocked: this host is Linux/headless and its Electron binary also lacks libglib-2.0.so.0. These are explicit limits, not native verification passes.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<p>The attached patch changes only trusted-main desktop tests, reusing the repository's existing fake Electron-window fixture. Persistence and factory code run for real; the fake loadURL boundary merely holds navigation promises unresolved. The menu mock records the real installer's calls to Electron and invokes the handlers produced by the production template builder.</p>
+<ol><li>Clone the trusted repository and select the recorded base:<pre>git clone https://github.com/get-bb/bb.git bb-6541
+cd bb-6541
+git checkout --detach 3bacfac9ed69d42392076e5b3da2815bec822cd8
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/desktop</pre></li>
+<li>Save the <a href="6541/repro/regression.patch">regression patch</a> from this report and apply it:<pre>git apply /path/to/regression.patch
+pnpm exec turbo run test --filter=@bb/desktop -- test/desktop-window-factory.test.ts test/menu.test.ts</pre></li>
+<li>Expected: all saved loads begin while none is completed; equivalent menu inputs preserve one native menu. Actual baseline assertions:<pre>AssertionError: expected [ FakeDesktopWindow{ ... } ] to have a length of 3 but got 1
+AssertionError: expected "vi.fn()" to be called 1 times, but got 2 times</pre>These are intentionally failing bug assertions, not install or test-discovery failures.</li></ol>
+<details><summary>Complete reproduction test patch (including callback and invalidation guards)</summary><pre>diff --git a/apps/desktop/test/desktop-window-factory.test.ts b/apps/desktop/test/desktop-window-factory.test.ts
+index dfbee046e..d91df1a26 100644
+--- a/apps/desktop/test/desktop-window-factory.test.ts
++++ b/apps/desktop/test/desktop-window-factory.test.ts
+@@ -2,7 +2,7 @@ import { mkdtemp, rm } from &quot;node:fs/promises&quot;;
+ import { tmpdir } from &quot;node:os&quot;;
+ import { join } from &quot;node:path&quot;;
+ import type { BrowserWindowConstructorOptions } from &quot;electron&quot;;
+-import { afterEach, describe, expect, it } from &quot;vitest&quot;;
++import { afterEach, describe, expect, it, vi } from &quot;vitest&quot;;
+ import {
+   MACOS_TRAFFIC_LIGHT_INSET_PX,
+   MACOS_TRAFFIC_LIGHT_TOP_INSET_PX,
+@@ -323,6 +323,59 @@ async function createFactoryHarness(
+ }
+ 
+ describe(&quot;desktop window factory&quot;, () =&gt; {
++  it(&quot;starts every saved page before any finishes and returns saved order&quot;, async () =&gt; {
++    const original = await createFactoryHarness();
++    for (const stateKey of [&quot;primary&quot;, &quot;window-second&quot;, &quot;window-third&quot;]) {
++      const browserWindow = await original.factory.createWindow({
++        initialUrl: null,
++        stateKey,
++      });
++      if (!(browserWindow instanceof FakeDesktopWindow))
++        throw new Error(&quot;Expected a fake window&quot;);
++      browserWindow.bounds.x = original.createdWindows.length * 100;
++    }
++    await original.factory.persistOpenWindows();
++    const releases: Array&lt;() =&gt; void&gt; = [];
++    const loads = Array.from(
++      { length: 3 },
++      () =&gt; new Promise&lt;void&gt;((resolve) =&gt; releases.push(resolve)),
++    );
++    const started: DesktopBrowserWindow[] = [];
++    const completed: DesktopBrowserWindow[] = [];
++    let releaseAll = false;
++    const restarted = await createFactoryHarness({
++      userDataPath: original.userDataPath,
++      onWindowCreated(browserWindow) {
++        const load = loads[started.length];
++        browserWindow.loadURL = async () =&gt; {
++          started.push(browserWindow);
++          if (!releaseAll) await load;
++          completed.push(browserWindow);
++        };
++      },
++    });
++    const restoring = restarted.factory.restoreSavedWindows({
++      initialUrl: &quot;http://127.0.0.1:41234&quot;,
++    });
++    try {
++      await vi.waitFor(() =&gt; expect(started).toHaveLength(3));
++      expect(completed).toHaveLength(0);
++      releases[2]?.();
++      await vi.waitFor(() =&gt; expect(completed).toEqual([started[2]]));
++      releases[1]?.();
++      releases[0]?.();
++      expect(
++        (await restoring).map((window) =&gt; window.getNormalBounds()),
++      ).toEqual(
++        original.createdWindows.map((window) =&gt; window.getNormalBounds()),
++      );
++    } finally {
++      releaseAll = true;
++      for (const release of releases) release();
++      await restoring;
++    }
++  });
++
+   it.each([
+     [0.5, 4],
+     [1.5, 26],
+diff --git a/apps/desktop/test/menu.test.ts b/apps/desktop/test/menu.test.ts
+index 25f1a1ad8..73d85ac48 100644
+--- a/apps/desktop/test/menu.test.ts
++++ b/apps/desktop/test/menu.test.ts
+@@ -1,15 +1,30 @@
+-import { describe, expect, it, vi } from &quot;vitest&quot;;
++import { beforeEach, describe, expect, it, vi } from &quot;vitest&quot;;
+ import type { BaseWindow, MenuItemConstructorOptions } from &quot;electron&quot;;
+ 
+-vi.mock(&quot;electron&quot;, () =&gt; ({
+-  app: { name: &quot;bb&quot; },
+-  Menu: { sendActionToFirstResponder: vi.fn() },
+-}));
++vi.mock(&quot;electron&quot;, () =&gt; {
++  const buildFromTemplate = vi.fn((_template: MenuItemConstructorOptions[]) =&gt; {
++    const menuItem = { submenu: { on: vi.fn() } };
++    return { getMenuItemById: vi.fn(() =&gt; menuItem) };
++  });
++  let applicationMenu: ReturnType&lt;typeof buildFromTemplate&gt; | null = null;
++  return {
++    app: { name: &quot;bb&quot; },
++    Menu: {
++      buildFromTemplate,
++      getApplicationMenu: () =&gt; applicationMenu,
++      setApplicationMenu: vi.fn((menu: typeof applicationMenu) =&gt; {
++        applicationMenu = menu;
++      }),
++      sendActionToFirstResponder: vi.fn(),
++    },
++  };
++});
+ 
+ import { Menu } from &quot;electron&quot;;
+ 
+ import {
+   buildApplicationMenuTemplate,
++  installApplicationMenu,
+   SET_SERVER_URL_MENU_LABEL,
+   type InstallApplicationMenuArgs,
+ } from &quot;../src/menu.js&quot;;
+@@ -56,7 +71,7 @@ function menuArgs(
+ }
+ 
+ function findServerSubmenu(
+-  template: MenuItemConstructorOptions[],
++  template: Parameters&lt;typeof Menu.buildFromTemplate&gt;[0],
+ ): MenuItemConstructorOptions[] {
+   const windowMenu = template.find((item) =&gt; item.label === &quot;Window&quot;);
+   const windowSubmenu = windowMenu?.submenu as MenuItemConstructorOptions[];
+@@ -80,6 +95,138 @@ function findDesktopSettingsServerSubmenu(
+ }
+ 
+ describe(&quot;application menu&quot;, () =&gt; {
++  beforeEach(() =&gt; {
++    Menu.setApplicationMenu(null);
++    vi.clearAllMocks();
++  });
++
++  it(&quot;keeps an unchanged native menu while using the latest callbacks&quot;, () =&gt; {
++    const oldOpenNewTab = vi.fn();
++    const newOpenNewTab = vi.fn();
++    const oldSelectServer = vi.fn();
++    const newSelectServer = vi.fn();
++    const onServerMenuWillShow = vi.fn();
++    installApplicationMenu(
++      menuArgs(() =&gt; {}, {
++        openNewTab: oldOpenNewTab,
++        selectServer: oldSelectServer,
++      }),
++    );
++    const template = vi.mocked(Menu.buildFromTemplate).mock.calls[0]?.[0];
++    if (!template) throw new Error(&quot;Expected an installed template&quot;);
++    installApplicationMenu(
++      menuArgs(() =&gt; {}, {
++        openNewTab: newOpenNewTab,
++        selectServer: newSelectServer,
++        onServerMenuWillShow,
++      }),
++    );
++    expect(Menu.buildFromTemplate).toHaveBeenCalledTimes(1);
++    expect(Menu.setApplicationMenu).toHaveBeenCalledTimes(1);
++    const fileItems = template.find((item) =&gt; item.label === &quot;File&quot;)
++      ?.submenu as MenuItemConstructorOptions[];
++    fileItems
++      .find((item) =&gt; item.label === &quot;New Tab&quot;)
++      ?.click?.({} as never, undefined, {} as never);
++    expect(oldOpenNewTab).not.toHaveBeenCalled();
++    expect(newOpenNewTab).toHaveBeenCalledOnce();
++    const menu = vi.mocked(Menu.buildFromTemplate).mock.results[0]?.value;
++    const submenu = menu?.getMenuItemById(&quot;bb-server-menu&quot;)?.submenu;
++    if (!submenu) throw new Error(&quot;Expected a server submenu&quot;);
++    const listener = vi.mocked(submenu.on).mock.calls[0]?.[1];
++    if (!listener) throw new Error(&quot;Expected a server menu listener&quot;);
++    listener();
++    expect(onServerMenuWillShow).toHaveBeenCalledOnce();
++    installApplicationMenu(
++      menuArgs(() =&gt; {}, { selectServer: newSelectServer }),
++    );
++    listener();
++    expect(onServerMenuWillShow).toHaveBeenCalledOnce();
++    findServerSubmenu(template)[0]?.click?.(
++      {} as never,
++      undefined,
++      {} as never,
++    );
++    expect(oldSelectServer).not.toHaveBeenCalled();
++    expect(newSelectServer).toHaveBeenCalledWith(&quot;builtin&quot;);
++  });
++
++  it.each&lt;Partial&lt;InstallApplicationMenuArgs&gt;&gt;([
++    { isMac: false },
++    { showBuiltinServer: false },
++    { connectServersSkipReason: &quot;unauthorized&quot; },
++    { servers: [{ checked: false, id: &quot;builtin&quot;, name: BUILTIN_SERVER_NAME }] },
++    {
++      servers: [
++        { checked: true, id: &quot;custom:other&quot;, name: BUILTIN_SERVER_NAME },
++      ],
++    },
++    { servers: [{ checked: true, id: &quot;builtin&quot;, name: &quot;Renamed&quot; }] },
++    { servers: [] },
++    {
++      accelerators: {
++        closeWindowOrSideTab: undefined,
++        createNewWindow: undefined,
++        openNewTab: &quot;CommandOrControl+T&quot;,
++        openNewThread: undefined,
++        openSettings: undefined,
++        reopenClosedTab: undefined,
++      },
++    },
++  ])(&quot;replaces the native menu when its contents change: %j&quot;, (overrides) =&gt; {
++    installApplicationMenu(menuArgs(() =&gt; {}));
++    const previousMenu = Menu.getApplicationMenu();
++    installApplicationMenu(menuArgs(() =&gt; {}, overrides));
++    expect(Menu.getApplicationMenu()).not.toBe(previousMenu);
++    expect(Menu.setApplicationMenu).toHaveBeenCalledTimes(2);
++  });
++
++  it(&quot;reinstalls the menu if another owner removes it&quot;, () =&gt; {
++    installApplicationMenu(menuArgs(() =&gt; {}));
++    Menu.setApplicationMenu(null);
++    installApplicationMenu(menuArgs(() =&gt; {}));
++    expect(Menu.getApplicationMenu()).not.toBeNull();
++    expect(Menu.buildFromTemplate).toHaveBeenCalledTimes(2);
++  });
++
++  it(&quot;updates server routing even when the displayed label stays the same&quot;, () =&gt; {
++    const selectServer = vi.fn();
++    for (const id of [&quot;custom:first&quot;, &quot;custom:second&quot;]) {
++      installApplicationMenu(
++        menuArgs(() =&gt; {}, {
++          selectServer,
++          servers: [{ checked: true, id, name: &quot;Remote&quot; }],
++        }),
++      );
++    }
++    const template = vi.mocked(Menu.buildFromTemplate).mock.calls[1]?.[0];
++    if (!template) throw new Error(&quot;Expected an updated server template&quot;);
++    findServerSubmenu(template)[0]?.click?.(
++      {} as never,
++      undefined,
++      {} as never,
++    );
++    expect(selectServer).toHaveBeenCalledWith(&quot;custom:second&quot;);
++  });
++
++  it.each([&quot;This Mac&quot;, BUILTIN_SERVER_NAME])(
++    &quot;restores native checked state after an unsuccessful selection: %s&quot;,
++    (label) =&gt; {
++      const args = menuArgs(() =&gt; {});
++      installApplicationMenu(args);
++      const template = vi.mocked(Menu.buildFromTemplate).mock.calls[0]?.[0];
++      if (!template) throw new Error(&quot;Expected an installed template&quot;);
++      const serverItems = findServerSubmenu(template);
++      const item = serverItems.find(
++        (item) =&gt; item.label === label || item.label === `Show ${label}`,
++      );
++      if (!item?.click) throw new Error(&quot;Expected a server action&quot;);
++      item.click({} as never, undefined, {} as never);
++      installApplicationMenu(args);
++      expect(Menu.buildFromTemplate).toHaveBeenCalledTimes(2);
++    },
++  );
++
+   it.each([true, false])(
+     &quot;opens local logs independently of runtime ownership (isMac=%s)&quot;,
+     (isMac) =&gt; {
+</pre></details>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/3bacfac9ed69d42392076e5b3da2815bec822cd8/apps/desktop/src/desktop-window-factory.ts#L439-L448">apps/desktop/src/desktop-window-factory.ts:439</a> awaits each createWindow in a loop:</p><pre>    const restoredWindows: DesktopBrowserWindow[] = [];
+    for (const entry of entries) {
+      restoredWindows.push(
+        await createWindow({
+          initialUrl: restoreArgs.initialUrl,
+          stateKey: entry.stateKey,
+        }),
+      );
+    }
+    return restoredWindows;</pre>
+<p>That promise includes the initial navigation (<a href="https://github.com/get-bb/bb/blob/3bacfac9ed69d42392076e5b3da2815bec822cd8/apps/desktop/src/desktop-window-factory.ts#L405-L421">apps/desktop/src/desktop-window-factory.ts:405</a>); construction of the next saved window is therefore gated by completion of the previous page.</p>
+<p><a href="https://github.com/get-bb/bb/blob/3bacfac9ed69d42392076e5b3da2815bec822cd8/apps/desktop/src/main.ts#L1046-L1061">apps/desktop/src/main.ts:1046</a> resolves accelerators and calls refreshApplicationMenu unconditionally after a successful, current settings request. <a href="https://github.com/get-bb/bb/blob/3bacfac9ed69d42392076e5b3da2815bec822cd8/apps/desktop/src/menu.ts#L359-L369">apps/desktop/src/menu.ts:359</a> then always builds and installs a native menu:</p><pre>export function installApplicationMenu(args: InstallApplicationMenuArgs): void {
+  const menu = Menu.buildFromTemplate(buildApplicationMenuTemplate(args));
+  const onServerMenuWillShow = args.onServerMenuWillShow;
+  if (onServerMenuWillShow !== undefined) {
+    for (const id of SERVER_MENU_ITEM_IDS) {
+      menu.getMenuItemById(id)?.submenu?.on(&quot;menu-will-show&quot;, () =&gt; {
+        onServerMenuWillShow();
+      });
+    }
+  }
+  Menu.setApplicationMenu(menu);</pre>
+<p>There is no content-equivalence check. The activation hook at <a href="https://github.com/get-bb/bb/blob/3bacfac9ed69d42392076e5b3da2815bec822cd8/apps/desktop/src/main.ts#L2885-L2890">apps/desktop/src/main.ts:2885</a>, the configuration-sync open/realtime callbacks at <a href="https://github.com/get-bb/bb/blob/3bacfac9ed69d42392076e5b3da2815bec822cd8/apps/desktop/src/main.ts#L1005-L1028">apps/desktop/src/main.ts:1005</a>, and the polling setup at <a href="https://github.com/get-bb/bb/blob/3bacfac9ed69d42392076e5b3da2815bec822cd8/apps/desktop/src/main.ts#L1070-L1087">apps/desktop/src/main.ts:1070</a> all reach this path. Window registration already occurs before first navigation; this is a distinct scheduling defect, not late registration.</p>
+<h2>6. Proposed fix and safety</h2>
+<p>Use Promise.all over the saved entries, preserving the returned array's persisted order while allowing navigation to overlap. Reuse the installed native menu when its serialized template and ordered server IDs are unchanged and Electron still has that same menu installed. Refresh retained callback arguments even when skipping native replacement, and always dispatch the server-open hook through the latest arguments. Invalidate the cache before radio/checkbox actions because Electron may mutate checked state even if the action fails and application settings stay unchanged.</p>
+<p>The implemented candidate changes four desktop-subsystem files, 271 text lines counting additions plus deletions. It adds no dependency, public API, protocol, schema, stored-data, packaging, migration, or release change. The unchanged empty-state fallback is retained. The fix does not promise native show/compositor order.</p>
+<h2>7. Verification</h2>
+<p>The same agent repeated the reproduction in a second newly created detached checkout at the exact base commit, with its own frozen install, dependency builds, and fresh test user-data directories. No owner data or existing development server was used. This is a second clean reproduction, not independent-agent verification.</p>
+<pre>git worktree add --detach /tmp/issue-6541-second 3bacfac9ed69d42392076e5b3da2815bec822cd8
+cd /tmp/issue-6541-second
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/desktop
+git apply /path/to/regression.patch
+pnpm exec turbo run test --force --filter=@bb/desktop -- test/desktop-window-factory.test.ts test/menu.test.ts</pre>
+<ul><li>First baseline run: both regression tests fail for the intended reasons; 45 existing tests pass.</li><li>Second baseline run with the final test patch: both regressions fail for the same reasons; 57 tests pass. No production fix is present in that checkout.</li><li>After the fix: six relevant suites pass, <strong>87 tests</strong>. They cover the factory, menus, accelerator resolution, persistence, server lists, and server targets.</li><li><code>pnpm exec turbo run lint typecheck --filter=@bb/desktop</code> passes the package's available typecheck task; no package lint task is configured.</li><li>The complete desktop run reports 616 passing tests and 2 skipped tests, with one unrelated packaging check failing because Electron cannot load <code>libglib-2.0.so.0</code>. The identical packaging check fails on unmodified production code in the second checkout. No dependency was installed and no packaging behavior was changed.</li><li><code>git diff --check</code> passes; all changes are text.</li></ul>
+<p>During verification, the regression fixture was corrected to use ES2022-compatible deferred promises, stable fake submenu identity, and distinct saved geometries. Both intended baseline failures remain unchanged. The final fixture checks persisted result order, not construction callback timing or macOS show order.</p>
+<h2>8. Related issues and pull requests</h2>
+<p>GitHub linked metadata shows <a href="https://github.com/get-bb/bb/pull/6545">PR #6545</a> was closed without merge on 2026-10-29 at 09:20:51 UTC. No linked open pull request existed when checked. Its branch/code was not executed or used to design this patch. This report does not make a correctness verdict on that closed patch. The existing pre-navigation registration regression also passes.</p>
+<h2>9. Appendix</h2>
+<p>Issue content was treated as untrusted claims. Embedded checkout/install/test instructions and external branches were ignored. All executed application code came from recorded trusted main plus this agent's local changes.</p>
+<ul><li><a href="6541/repro/first-run.log">first-run.log</a></li><li><a href="6541/repro/second-run.log">second-run.log</a></li><li><a href="6541/repro/after-fix.log">after-fix.log</a></li><li><a href="6541/repro/typecheck.log">typecheck.log</a></li><li><a href="6541/repro/full-suite-environment-failure.log">full-suite-environment-failure.log</a></li><li><a href="6541/repro/baseline-packaging-environment-failure.log">baseline-packaging-environment-failure.log</a></li><li><a href="6541/repro/regression.patch">Complete regression patch</a></li></ul>
+<pre>pnpm exec turbo run test --filter=@bb/desktop -- test/desktop-window-factory.test.ts test/menu.test.ts test/desktop-menu-shortcuts.test.ts test/window-state.test.ts test/server-list.test.ts test/server-target.test.ts
+pnpm exec turbo run lint typecheck --filter=@bb/desktop
+git diff --check
+git diff --numstat origin/main</pre>
+<p>The raw full-suite log also records an attempted CLI exclusion that Vitest's workspace projects did not honor; it is not described as a passing run. Logs have checkout/home paths removed.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
