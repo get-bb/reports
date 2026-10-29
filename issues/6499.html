@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #6499 · Shared acknowledgement outages expire host leases</title>
+<style>
+:root{--canvas:#fafaf8;--ink:#1a1a1a;--muted:#666;--line:#e2e2de;--accent:#0052cc;--warn:#b26a00}
+body{margin:0;background:var(--canvas);color:var(--ink);font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:900px;margin:0 auto;padding:40px 24px 80px}h1{font-size:26px;line-height:1.25;margin:0 0 12px}h2{font-size:18px;margin:36px 0 10px;padding-top:20px;border-top:1px solid var(--line)}.meta{color:var(--muted);font-size:14px}.pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;border:1px solid var(--line)}.verdict{color:var(--warn);font-weight:600}table{border-collapse:collapse;width:100%;font-size:14px}td,th{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);vertical-align:top}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}pre{background:#fff;border:1px solid var(--line);border-radius:6px;padding:12px;overflow:auto}a{color:var(--accent)}
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#6499 · Shared acknowledgement outages expire host leases</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">High priority</span> <span class="pill">Medium effort</span> <span class="pill">host</span> <span class="pill">connect</span> <span class="pill">perf</span> · <a href="https://github.com/get-bb/bb/issues/6499">GitHub issue</a></p>
+<p class="meta">Investigation completed October 29, 2026 · trusted main commit <code>0950d00f962029433790f9fed432c7061051a32e</code></p>
+<p class="verdict">PARTIALLY REPRODUCED · Root-cause confidence: medium · Reproduction label: partial-repro</p>
+
+<h2>1. TL;DR</h2>
+<p>A shared loss of server heartbeat replies can make otherwise responsive host clients reconnect together. Three real <code>ServerConnection</code> objects, using the repository's existing fake transport and controlled clock, all request reconnect at simulated time 35,000 ms during a 32-second acknowledgement blackout. Two shorter-blackout controls pass. This demonstrates the host lease mechanism, not the original server CPU stall, real daemon processes, Cloudflare resets, or 502/503/504 responses. The tunnel client already has separate stall grace; keeping that tunnel alive does not renew acknowledgements at remote hosts.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Claim</th><th>Finding</th><th>Evidence / limit</th></tr></thead><tbody>
+<tr><td>Several hosts can disconnect at the same instant without crashing.</td><td>Verified at the client boundary</td><td>All three connections invoke reconnect(1013, heartbeat-ack-timeout) at time 35,000. No host process is launched, so process survival is not independently tested.</td></tr>
+<tr><td>A server stall longer than the host lease can cause these disconnects.</td><td>Partially verified</td><td>A withheld-acknowledgement transport models the externally visible consequence of a blocked server. Independent client timers keep running. The CPU stall itself is not reproduced.</td></tr>
+<tr><td>A short stall necessarily exceeds the 30-second lease.</td><td>Not supported as a general claim</td><td>14- and 25-second blackout controls survive this schedule. Expiry depends on the age of the last acknowledgement and timer phase, not only the individual stall duration.</td></tr>
+<tr><td>The connect tunnel closes because its heartbeat deadline is also 30 seconds.</td><td>Not supported on tested main</td><td>Tunnel deadline is 60 seconds with one late-tick grace period. All 27 tunnel-client tests pass, including a 90-second local-stall case.</td></tr>
+<tr><td>A particular origin stall caused all reported edge resets and HTTP errors.</td><td>Unverified</td><td>No reporter runtime data or production tunnel was accessed. A recent acknowledged heartbeat followed by transport code 1006 is not by itself proof of heartbeat-deadline expiry.</td></tr>
+<tr><td>The original frequency, historical logs, and version-specific production symptoms are accurate.</td><td>Unverified</td><td>The test uses current trusted main, whose packaged app version is 0.48.0, not a deployed 0.46.1 installation.</td></tr>
+</tbody></table>
+
+<h2>3. Environment</h2>
+<ul>
+<li>Public repository get-bb/bb; origin/main matched the GitHub main SHA before running repository code.</li>
+<li>Base: <code>0950d00f962029433790f9fed432c7061051a32e</code>; Linux x86_64; Node v22.19.0; pnpm 9.15.0.</li>
+<li>Frozen install completed. Initial full build encountered missing Plugin SDK runtime output. Building the existing SDK through Turbo, then repeating the full build, passed: 72 successful tasks. No dependency was added.</li>
+<li>No dev server, network listener, provider session, Cloudflare account, or real user database was used. Fixture URLs are inert; transport is injected by the existing test fixture.</li>
+<li>Evidence was checked in the original clean-main checkout and a separate temporary detached worktree at the same commit. No linked PR code was run.</li>
+</ul>
+
+<h2>4. Minimal reproduction</h2>
+<p>This intentionally failing test asserts the requested resilience, rather than today's documented lease-expiry contract. It calls the production <code>ServerConnection</code> implementation; it does not implement heartbeat decisions in a mock. The only simulated part is the transport and elapsed time. It reuses existing fixture helpers without adding a production seam.</p>
+<ol>
+<li>Obtain trusted main and its normal dependencies:
+<pre>git clone https://github.com/get-bb/bb.git /tmp/bb-6499-first
+cd /tmp/bb-6499-first
+git checkout --detach 0950d00f962029433790f9fed432c7061051a32e
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build</pre></li>
+<li>Insert the following test immediately inside the existing <code>describe("ServerConnection", () =&gt; {</code> in <code>apps/host-daemon/src/server-connection.test.ts</code>. All helpers and imports already exist there:
+<pre>  it.each([14_000, 25_000, 32_000])(
+    "SlopCop 6499: retains three responsive clients across a %i ms server acknowledgement blackout",
+    async (outageMs) =&gt; {
+      vi.useFakeTimers();
+      vi.setSystemTime(0);
+      const fixtures = Array.from({ length: 3 }, () =&gt;
+        createConnectionFixture({
+          heartbeatIntervalMs: 5_000,
+          leaseTimeoutMs: 30_000,
+          autoReconnect: false,
+        }),
+      );
+      const reconnectTimes: number[][] = fixtures.map(() =&gt; []);
+      try {
+        for (const [index, fixture] of fixtures.entries()) {
+          await fixture.connection.start();
+          const socket = fixture.webSocket.sockets[0];
+          if (!socket) throw new Error("Expected test socket");
+          vi.mocked(socket.reconnect).mockImplementation(() =&gt; {
+            reconnectTimes[index]?.push(Date.now());
+          });
+          socket.onmessage?.({
+            data: JSON.stringify({ type: "heartbeat-ack" }),
+          });
+        }
+        await vi.advanceTimersByTimeAsync(4_999);
+        await vi.advanceTimersByTimeAsync(outageMs);
+        console.log(JSON.stringify({ outageMs, reconnectTimes }));
+        for (const fixture of fixtures) {
+          expect(fixture.webSocket.sockets[0]?.reconnect).not.toHaveBeenCalled();
+        }
+      } finally {
+        for (const fixture of fixtures) await fixture.connection.shutdown();
+      }
+    },
+  );</pre></li>
+<li>Run the focused reproduction:
+<pre>pnpm exec turbo run test --filter=@bb/host-daemon -- --testNamePattern 'SlopCop 6499'</pre></li>
+</ol>
+<p><strong>Clock schedule:</strong> last acknowledgement at time 0; blackout begins at time 4,999, just before the first scheduled heartbeat. No server acknowledgement is delivered before the observation point. The 32-second case ends at time 36,999. The client evaluates the lease every 5 seconds and reconnects at time 35,000. The shorter controls end before expiry. This is a bounded acknowledgement-blackout experiment, not a recovery-after-blackout or real CPU-stall test.</p>
+<p><strong>Desired result:</strong> all three connections remain open throughout the 32-second blackout. <strong>Observed verbatim:</strong></p>
+<pre>{"outageMs":32000,"reconnectTimes":[[35000],[35000],[35000]]}
+AssertionError: expected "vi.fn()" to not be called at all, but actually been called 1 times
+
+1st vi.fn() call:
+Array [
+  1013,
+  "heartbeat-ack-timeout",
+]
+
+Test Files  1 failed | 75 skipped (76)
+     Tests  1 failed | 2 passed | 848 skipped (851)</pre>
+<p>The test leaves production code unchanged. The existing test named “reconnects when server heartbeat acknowledgements stop” already requires this expiry behavior; removing it would conceal a liveness-policy change.</p>
+
+<h2>5. Root cause</h2>
+<p><strong>Verified narrow mechanism:</strong> <a href="https://github.com/get-bb/bb/blob/0950d00f962029433790f9fed432c7061051a32e/apps/server/src/constants.ts#L1-L4">server constants</a> advertise a 5-second heartbeat interval and a 30-second lease. The <a href="https://github.com/get-bb/bb/blob/0950d00f962029433790f9fed432c7061051a32e/apps/server/src/ws/daemon-protocol.ts#L145-L179">server message handler</a> runs on the origin's event loop, updates session state, and <a href="https://github.com/get-bb/bb/blob/0950d00f962029433790f9fed432c7061051a32e/apps/server/src/ws/daemon-protocol.ts#L302-L304">sends the acknowledgement</a>. If that loop cannot run, the replies cannot be produced by this handler.</p>
+<p>The <a href="https://github.com/get-bb/bb/blob/0950d00f962029433790f9fed432c7061051a32e/apps/host-daemon/src/server-connection.ts#L827-L837">daemon's delayed-local-tick grace</a> only applies when its own timer is delayed beyond the lease. A stalled origin does not delay a remote host's timer. The <a href="https://github.com/get-bb/bb/blob/0950d00f962029433790f9fed432c7061051a32e/apps/host-daemon/src/server-connection.ts#L863-L888">remote client's acknowledgement-age check</a> therefore reaches:</p>
+<pre>if (
+  lastAcknowledgedAt !== null &amp;&amp;
+  now - lastAcknowledgedAt &gt; session.leaseTimeoutMs
+) {
+  this.clearHeartbeat();
+  this.websocket.reconnect(1013, "heartbeat-ack-timeout");
+  return;
+}</pre>
+<p>The excerpt omits only existing diagnostic logging. This is intentional current behavior, independently covered by <a href="https://github.com/get-bb/bb/blob/0950d00f962029433790f9fed432c7061051a32e/apps/host-daemon/src/server-connection.test.ts#L602-L636">the existing expiry test</a>. A shared outage aligns expiry across hosts whose last acknowledgements are aligned; perfectly simultaneous disconnects are not guaranteed for every possible connection phase.</p>
+<p><strong>Separate tunnel mechanism:</strong> the <a href="https://github.com/get-bb/bb/blob/0950d00f962029433790f9fed432c7061051a32e/packages/tunnel-client/src/session.ts#L22-L24">tunnel constants</a> use a 20-second heartbeat and 60-second deadline. Its <a href="https://github.com/get-bb/bb/blob/0950d00f962029433790f9fed432c7061051a32e/packages/tunnel-client/src/session.ts#L181-L214">late-tick grace</a> restarts that tunnel's local deadline once until another acknowledgement arrives. This does not extend the daemon's lease. The <a href="https://github.com/get-bb/bb/blob/0950d00f962029433790f9fed432c7061051a32e/packages/tunnel-client/test/heartbeat.test.ts#L79-L106">existing 90-second-stall coverage</a> passes. Separately, <a href="https://github.com/get-bb/bb/blob/0950d00f962029433790f9fed432c7061051a32e/apps/connect/src/tunnel-do.ts#L881-L897">tunnel teardown</a> abandons visitor streams, so a real tunnel transport loss has its own fan-out path.</p>
+<p><strong>Unresolved underlying cause:</strong> this investigation did not identify the production work that blocked the origin, reproduce a Cloudflare transport reset, or demonstrate that the same cause explains every reported disconnect reason. Overall confidence is medium; confidence in the host lease-expiry mechanism is high.</p>
+
+<h2>6. Proposed fix / next experiment</h2>
+<p>No automatic production fix is safe from this evidence alone. Increasing the advertised lease changes server/daemon wire-field meaning and failure-detection policy; coordinating that with tunnel deadlines crosses subsystems. A healthy remote client cannot distinguish a dead server from a server that has stopped replying using only these heartbeat messages. An arbitrary grace period would trade reconnect storms for delayed detection and requires a deliberate liveness budget, not a cosmetic timeout increase.</p>
+<p>Next, use an isolated local multi-process setup with separate origin and daemon event loops. Reproduce a controlled 32-second origin block while the transport remains intact, capture each layer's monotonic heartbeat ages, then separately inject a tunnel reset. Profile the origin workload that produces the real stall. Keep actual-dead-peer and local-suspension regressions alongside any future resilience test. This report's failing test is a candidate acceptance test once that policy is chosen, not proof that deleting the existing expiry check is correct.</p>
+<p>No open PR linked to #6499 was found in issue timeline metadata or the repository's open-PR search during this run. No branch was pushed and no fix PR was opened because the whole production failure was only partially reproduced and the apparent mitigation is not an eligible simple fix.</p>
+
+<h2>7. Related issues</h2>
+<p>The reporter cites <a href="https://github.com/get-bb/bb/issues/3407">#3407</a>, <a href="https://github.com/get-bb/bb/issues/5634">#5634</a>, <a href="https://github.com/get-bb/bb/issues/2718">#2718</a>, and <a href="https://github.com/get-bb/bb/issues/6450">#6450</a>. These are context only; this report does not assert that their causes or fixes apply. No external URL from issue content was fetched.</p>
+
+<h2>8. Verification</h2>
+<p>The same agent repeated the reproduction in a second, initially clean detached worktree at the exact recorded base SHA. Its initial porcelain status was empty. Only the authored test insertion was applied. A separate frozen install was run there, followed by the identical Turbo test command. No live ports or data directories were needed for either run.</p>
+<table><thead><tr><th>Run</th><th>Result</th></tr></thead><tbody>
+<tr><td>First checkout, focused reproduction</td><td>Exit 1: 14-second and 25-second controls pass; 32-second case fails. All three reconnect at 35,000.</td></tr>
+<tr><td>Second clean checkout, same reproduction</td><td>Exit 1: same 2 passes, 1 failure, reconnectTimes [[35000],[35000],[35000]].</td></tr>
+<tr><td>Existing host heartbeat / suspension checks</td><td>Exit 0: 4 passed, 847 skipped.</td></tr>
+<tr><td>Existing complete tunnel-client suite</td><td>Exit 0: 7 files, 27 tests passed.</td></tr>
+<tr><td>Full build after SDK runtime preparation</td><td>Exit 0: 72 successful tasks.</td></tr>
+</tbody></table>
+<p>This is repeat verification by one agent, not an independent review. The final verdict is deliberately narrowed to PARTIALLY REPRODUCED: deterministic client lease expiry is supported twice; the complete claimed origin-stall → tunnel-reset → HTTP-error chain remains unverified.</p>
+
+<h2>9. Appendix</h2>
+<p>Additional verification commands:</p>
+<pre>pnpm exec turbo run test --filter=@bb/host-daemon -- --testNamePattern 'heartbeat|system-suspension'
+pnpm exec turbo run test --filter=@bb/tunnel-client
+git diff --check</pre>
+<p>GitHub read-only inspection covered visibility, valid issue properties and labels, all comments (none at investigation start), open linked PR metadata (none), and similar host issues. Missing classification values were filled without replacing existing values. Reproduction commands never used issue-supplied shell text or runtime data.</p>
+<p>Raw local logs, the insertion patch, and exact temporary paths are retained outside this public reports repository. This repository forbids committed scripts, test files, diffs, logs, or per-issue artifact directories; the complete reproduction test is therefore embedded above instead. The HTML contains no real user hostnames, credentials, private data, or production identifiers.</p>
+<p><strong>Untrusted-data boundary:</strong> the issue's suggested remediation was treated only as a claim to evaluate. No issue instruction, script, attachment, linked branch, or production endpoint was executed or followed.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
