@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #6505 Automation process-group cleanup skips ordinary completion</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#6505 · Automation process-group cleanup skips ordinary completion</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">Priority: High</span><span class="pill">Effort: Low</span><span class="pill">plugins · automations · confirmed-repro</span><a href="https://github.com/get-bb/bb/issues/6505">Issue</a><span>2026-10-29</span></p>
+<p>Trusted base: <code>0950d00f962029433790f9fed432c7061051a32e</code> (<code>origin/main</code> fetched from <code>get-bb/bb</code>).</p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+
+<h2>1. TL;DR</h2>
+<p>A script automation can finish successfully or fail while a worker it started keeps running. The runner starts a POSIX process group but kills that group at completion only when a timeout or output limit occurred. A child whose standard streams do not hold the runner's pipes open allows the runner to finish and cancel its timeout without stopping the child. Two independently created clean checkouts of the same trusted main commit reproduced this with an authored Node worker test. This establishes the lifecycle leak, not the reported macOS machine-wide resource exhaustion.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Workers survive ordinary successful and failed script completion.</td><td class="ok">Verified</td><td>Exit codes 0 and 7 both returned correctly, without timeout, while the unreferenced worker remained alive beyond the two-second assertion window in both clean runs.</td></tr>
+<tr><td>Detached output streams expose the leak.</td><td class="ok">Verified</td><td>The authored worker uses <code>stdio: "ignore"</code>, shares its parent's process group, and survives after <code>executeStoredScript</code> resolves.</td></tr>
+<tr><td>Cleanup is conditional on time/output limits.</td><td class="ok">Verified</td><td>The close handler clears both timers and gates <code>SIGKILL</code> on the two limit flags.</td></tr>
+<tr><td>Children survive quitting the desktop app; runaway CLI chains exhaust macOS memory.</td><td class="unv">Unverified here</td><td>No desktop instance, real workload, runaway chain, or macOS host was used. POSIX detachment and missing cleanup explain persistence after ordinary completion, but this investigation does not measure shutdown or memory pressure.</td></tr>
+<tr><td>The defect is separate from recursive CLI startup.</td><td class="ok">Verified for this reproduction</td><td>The test worker runs only a Node interval and never invokes the bb CLI. The runner's normal executable discovery remains unmodified.</td></tr></table>
+
+<h2>3. Environment</h2>
+<ul><li>Linux 4.19.0-gvisor x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li>
+<li>Both checkouts use exactly <code>0950d00f962029433790f9fed432c7061051a32e</code>; production files were unchanged.</li>
+<li>Fresh temporary plugin directories for every case; all authored workers are killed in test cleanup. Linux zombie states are excluded by the repository's existing process-liveness helper.</li>
+<li>No provider, database fixture, browser, live bb instance, or listening port is required. <code>http://127.0.0.1:1</code> is an unused context value, not a launched server.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<p>The following patch was authored from trusted repository code, not copied from issue content. It extends the existing process-containment tests at their real script execution boundary, reusing their Linux-aware process-liveness helper. The test starts a Node worker with ignored standard streams, unrefs it, and exits the parent with 0 or 7.</p>
+<ol><li>Clone the public target repository and select the recorded trusted main commit:<pre>git clone https://github.com/get-bb/bb.git bb-6505
+cd bb-6505
+git checkout --detach 0950d00f962029433790f9fed432c7061051a32e
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=bb-plugin-automations...</pre></li>
+<li>Save the patch below as <code>regression.patch</code>, then run:<pre>git apply regression.patch
+pnpm exec turbo run test --filter=bb-plugin-automations -- src/automations.test.ts -t 'terminates an unreferenced worker'</pre></li></ol>
+<h3 id="regression-test">Complete regression patch</h3><pre>diff --git a/plugins/automations/src/automations.test.ts b/plugins/automations/src/automations.test.ts
+index f270b0d5e..10e2135b8 100644
+--- a/plugins/automations/src/automations.test.ts
++++ b/plugins/automations/src/automations.test.ts
+@@ -2082,6 +2082,58 @@ async function isProcessRunning(pid: number): Promise&lt;boolean&gt; {
+ }
+ 
+ describe(&quot;script process containment&quot;, () =&gt; {
++  it.skipIf(process.platform === &quot;win32&quot;).each([0, 7])(
++    &quot;terminates an unreferenced worker after the script exits with code %i&quot;,
++    async (exitCode) =&gt; {
++      const pluginDataDir = await mkdtemp(join(tmpdir(), &quot;bb-auto-worker-&quot;));
++      const scriptDir = automationScriptDir(pluginDataDir, &quot;auto_worker&quot;);
++      let workerPid: number | undefined;
++      try {
++        await mkdir(scriptDir, { recursive: true });
++        await writeFile(
++          join(scriptDir, &quot;worker.mjs&quot;),
++          [
++            'import { spawn } from &quot;node:child_process&quot;;',
++            'const worker = spawn(process.execPath, [&quot;-e&quot;, &quot;setInterval(() =&gt; {}, 1000)&quot;], { stdio: &quot;ignore&quot; });',
++            &quot;worker.unref();&quot;,
++            &quot;console.log(JSON.stringify({ worker: worker.pid }));&quot;,
++            `process.exit(${exitCode});`,
++          ].join(&quot;\n&quot;),
++        );
++        const result = await executeStoredScript({
++          pluginDataDir,
++          automationId: &quot;auto_worker&quot;,
++          runId: &quot;run_worker&quot;,
++          projectId: &quot;proj_test&quot;,
++          scriptFile: &quot;worker.mjs&quot;,
++          interpreter: &quot;node&quot;,
++          timeoutMs: 30_000,
++          serverUrl: &quot;http://127.0.0.1:1&quot;,
++          workingDir: scriptsRoot(pluginDataDir),
++        });
++        const workerMatch = result.output.match(/&quot;worker&quot;:(\d+)/u);
++        expect(workerMatch).not.toBeNull();
++        const parsedWorkerPid = Number(workerMatch?.[1]);
++        workerPid = parsedWorkerPid;
++        expect(Number.isSafeInteger(parsedWorkerPid)).toBe(true);
++        expect(result.exitCode).toBe(exitCode);
++        expect(result.timedOut).toBe(false);
++        await expect
++          .poll(() =&gt; isProcessRunning(parsedWorkerPid), { timeout: 2_000 })
++          .toBe(false);
++      } finally {
++        if (workerPid !== undefined &amp;&amp; Number.isSafeInteger(workerPid)) {
++          try {
++            process.kill(workerPid, &quot;SIGKILL&quot;);
++          } catch (error) {
++            if ((error as NodeJS.ErrnoException).code !== &quot;ESRCH&quot;) throw error;
++          }
++        }
++        await rm(pluginDataDir, { recursive: true, force: true });
++      }
++    },
++  );
++
+   it(&quot;terminates descendant processes when a script times out&quot;, async ({
+     skip,
+   }) =&gt; {
+</pre>
+<h3>Expected</h3><pre>Both script exit codes are preserved; timedOut is false.
+Both workers are no longer running after their script runs settle.
+Tests 2 passed</pre>
+<h3>Actual (both clean runs)</h3><pre>FAIL ... terminates an unreferenced worker after the script exits with code 0
+FAIL ... terminates an unreferenced worker after the script exits with code 7
+AssertionError: expected true to be false // Object.is equality
+Tests 2 failed | 58 skipped (60)</pre>
+<p>The failures occur at the worker-liveness assertion, after the PID, exit-code and timeout assertions pass. This is not an import, setup, database, or executable-discovery failure.</p>
+
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/0950d00f962029433790f9fed432c7061051a32e/plugins/automations/src/script-runner.ts#L178-L190">Group signaling, lines 178–190</a>, sends signals to <code>-child.pid</code> on POSIX, so it can kill remaining members even after the original group leader exits. Windows falls back to the direct child.</p>
+<p><a href="https://github.com/get-bb/bb/blob/0950d00f962029433790f9fed432c7061051a32e/plugins/automations/src/script-runner.ts#L208-L221">Spawn and termination, lines 208–221</a>:</p><pre>    const child = spawn(args.command, [args.scriptPath], {
+      cwd: args.cwd,
+      detached: process.platform !== &quot;win32&quot;,
+      env: args.env,
+      stdio: [&quot;ignore&quot;, &quot;pipe&quot;, &quot;pipe&quot;],
+    });
+
+    const terminateGroup = (): void =&gt; {
+      signalProcessGroup(child, &quot;SIGTERM&quot;);
+      if (forceKill) return;
+      forceKill = setTimeout(() =&gt; {
+        signalProcessGroup(child, &quot;SIGKILL&quot;);
+      }, 1_000);
+      forceKill.unref();</pre>
+<p><a href="https://github.com/get-bb/bb/blob/0950d00f962029433790f9fed432c7061051a32e/plugins/automations/src/script-runner.ts#L242-L261">Completion and timeout, lines 242–261</a>:</p><pre>    child.once(&quot;close&quot;, (code) =&gt; {
+      clearTimeout(timeout);
+      if (forceKill) clearTimeout(forceKill);
+      if (timedOut || outputLimitExceeded) {
+        signalProcessGroup(child, &quot;SIGKILL&quot;);
+      }
+      const suffix = outputLimitExceeded ? &quot;\n[output truncated]\n&quot; : &quot;&quot;;
+      const stderr = Buffer.concat(stderrChunks).toString(&quot;utf8&quot;);
+      resolve({
+        exitCode: timedOut ? null : outputLimitExceeded ? 1 : code,
+        output: `${Buffer.concat(stdoutChunks).toString(&quot;utf8&quot;)}${stderr}${suffix}`,
+        stderr,
+        timedOut,
+      });
+    });
+    timeout = setTimeout(() =&gt; {
+      timedOut = true;
+      terminateGroup();
+    }, args.timeoutMs);
+    timeout.unref();</pre>
+<p>With ignored worker stdio, the script's pipes close immediately after its own exit. Neither limit flag is set. The close handler clears the timeout, omits process-group termination and resolves the result. The worker is not part of the direct child's lifetime and remains runnable. The SDK spawn wrapper forwards the detached option and observes executable-discovery failures; it adds no group reaping (<a href="https://github.com/get-bb/bb/blob/0950d00f962029433790f9fed432c7061051a32e/packages/process-utils/src/host-process.ts#L25-L29">observer</a>, <a href="https://github.com/get-bb/bb/blob/0950d00f962029433790f9fed432c7061051a32e/packages/process-utils/src/host-process.ts#L61-L76">spawn</a>).</p>
+
+<h2>6. Proposed fix</h2>
+<p>Use the existing process-group kill at the close boundary regardless of the two limit flags. Preserve the existing timeout/output handling, original exit code, and Windows direct-child fallback. Document that completed runs clean up remaining processes in their group. This is local lifecycle cleanup, not a new sandbox or permission boundary: explicitly detached new sessions can escape the group, and this proposal does not claim Windows tree termination. Children that retain the script's output pipes still use the existing timeout path; immediate exit-event cleanup is a separate lifecycle improvement.</p>
+<p>Keep the focused regression at the existing containment-test owner and run the complete automations test suite, lint and typecheck before proposing a ready PR.</p>
+
+<h2>7. Related issues and pull requests</h2>
+<p>No open pull request linked to #6505 was found in the issue timeline or open-PR search at investigation time. The separate recursive CLI startup issue is not needed for this reproduction. No linked PR code or issue-provided test was executed.</p>
+
+<h2>8. Verification</h2>
+<p>The same agent created a second clean checkout at the full trusted base SHA, performed a separate frozen installation and dependency build, and applied only the authored regression patch. Fresh per-case temporary directories and new worker PIDs were used. No ports were started. The exact focused Turbo command from section 4 again failed both worker-liveness checks, with the two expected exit codes preserved. No root-cause correction was needed after this second run. This is repeat verification by the same agent, not an independent-agent review.</p>
+
+<h2>9. Appendix</h2>
+<p>Issue content was treated as untrusted claims. Instructions, linked code, commands, scripts and patches in that content were not executed. All executed repository code came from trusted main plus the authored test. Repository publication policy requires evidence inline rather than separate tracked logs or test files; the full patch and sanitized test logs are embedded here.</p>
+<h3>First run: complete sanitized Turbo log</h3><pre>• turbo 2.10.12
+
+   • Packages in scope: bb-plugin-automations
+   • Running test in 1 packages
+   • Remote caching disabled
+
+//:ensure-native-modules: cache bypass, force executing 55cb634fd9cec9cc
+@bb/process-utils:generate:profile-worker: cache hit, replaying logs d74ec751f263b5a0
+@bb/templates:generate:templates: cache hit, replaying logs 93b1a043e9bef440
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates $FIRST_CHECKOUT/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/templates:generate:plugin-scaffold: cache hit, replaying logs 861b2a7bfce88684
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold $FIRST_CHECKOUT/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker $FIRST_CHECKOUT/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+@bb/plugin-build:generate: cache hit, replaying logs f0fe156bda5e0055
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: &gt; @bb/plugin-build@0.0.1 generate $FIRST_CHECKOUT/packages/plugin-build
+@bb/plugin-build:generate: &gt; node ./scripts/generate-plugin-theme.mjs &amp;&amp; node ./scripts/generate-runtime-export-manifest.mjs
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: plugin-theme.generated.ts up to date
+@bb/plugin-build:generate: host-tailwind.css up to date
+@bb/plugin-build:generate: host-tailwind-version.ts up to date
+@bb/plugin-build:generate: wrote $FIRST_CHECKOUT/packages/plugin-build/src/generated/runtime-export-manifest.generated.ts (react@19.3.0)
+@get-bb/plugin-sdk:build: cache hit, replaying logs 994944c8f6794b2e
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build: &gt; @get-bb/plugin-sdk@0.6.97 build $FIRST_CHECKOUT/packages/plugin-sdk
+@get-bb/plugin-sdk:build: &gt; node scripts/build-runtime.mjs
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build: Built 23 @get-bb/plugin-sdk runtime entries.
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules $FIRST_CHECKOUT
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+bb-plugin-automations:test: cache miss, executing 3ffffd340fa7eeb7
+bb-plugin-automations:test: 
+bb-plugin-automations:test: &gt; bb-plugin-automations@0.1.0 test $FIRST_CHECKOUT/plugins/automations
+bb-plugin-automations:test: &gt; vitest run --config vitest.config.ts &quot;src/automations.test.ts&quot; &quot;-t&quot; &quot;terminates an unreferenced worker&quot;
+bb-plugin-automations:test: 
+bb-plugin-automations:test: 
+bb-plugin-automations:test:  RUN  v4.1.1 $FIRST_CHECKOUT/plugins/automations
+bb-plugin-automations:test: 
+bb-plugin-automations:test:  ❯ src/automations.test.ts (60 tests | 2 failed | 58 skipped) 4282ms
+bb-plugin-automations:test:      ↓ decodes stored script executions without a working-directory policy as automation-storage
+bb-plugin-automations:test:      ↓ migrates stored agent automations to current permission modes
+bb-plugin-automations:test:      ↓ settles older duplicate running rows so single-flight can be introduced on history
+bb-plugin-automations:test:      ↓ settles ghost script runs and threadless agent runs as interrupted
+bb-plugin-automations:test:      ↓ settles agent runs by their thread's state and leaves live threads alone
+bb-plugin-automations:test:      ↓ keeps the spring-forward run for 0 9 * * * in America/Chicago
+bb-plugin-automations:test:      ↓ keeps the spring-forward run for 0 3 * * * in America/Chicago
+bb-plugin-automations:test:      ↓ keeps the spring-forward run for 0 1 * * * in America/Chicago
+bb-plugin-automations:test:      ↓ keeps the spring-forward run for 0 9 * * * in America/New_York
+bb-plugin-automations:test:      ↓ keeps the spring-forward run for 0 9 * * * in Europe/London
+bb-plugin-automations:test:      ↓ keeps the spring-forward run for 0 9 * * 0 in America/Chicago
+bb-plugin-automations:test:      ↓ validates and computes once triggers
+bb-plugin-automations:test:      ↓ CAS claims a scheduled run only once
+bb-plugin-automations:test:      ↓ settles a running automation exactly once
+bb-plugin-automations:test:      ↓ does not re-enable a manually paused automation after failure
+bb-plugin-automations:test:      ↓ auto-pauses after three consecutive scheduled failures
+bb-plugin-automations:test:      ↓ enforces one running execution per automation
+bb-plugin-automations:test:      ↓ resets consecutive failures after a successful run
+bb-plugin-automations:test:      ↓ resets consecutive failures when a scheduled tick is skipped
+bb-plugin-automations:test:      ↓ does not re-arm one-shot automations after dispatch failure
+bb-plugin-automations:test:      ↓ leaves undispatched agent automations unchanged when next due at 1000
+bb-plugin-automations:test:      ↓ leaves undispatched agent automations unchanged when next due at 2000
+bb-plugin-automations:test:      ↓ does not repeatedly select degraded agent executions for sweeping
+bb-plugin-automations:test:      ↓ finds healthy due work after a full batch of malformed rows
+bb-plugin-automations:test:      ↓ rejects denormalized fields that disagree with stored JSON
+bb-plugin-automations:test:      ↓ dedupes manual runs by idempotency key
+bb-plugin-automations:test:      ↓ records skipped script close state
+bb-plugin-automations:test:      ↓ chooses runnable defaults for new scripts and preserves the automation-storage directory on replacement
+bb-plugin-automations:test:      ↓ reads the server host identity after a co-located daemon initializes
+bb-plugin-automations:test:      ↓ updates only a script working-directory policy
+bb-plugin-automations:test:      ↓ validates project availability before creating an automation
+bb-plugin-automations:test:      ↓ removes a stored script directory after switching to agent execution
+bb-plugin-automations:test:      ↓ removes only a superseded stored script file after a filename change
+bb-plugin-automations:test:      ↓ removes a newly staged filename when the database update fails
+bb-plugin-automations:test:      ↓ does not overwrite the active filename when the database update fails
+bb-plugin-automations:test:      ↓ preserves a tier named none and clears it with a separate flag
+bb-plugin-automations:test:      ↓ resolves the source against ctx.cwd and reports the stored snapshot copy
+bb-plugin-automations:test:      ↓ reads the file on the thread's environment host or the --host override
+bb-plugin-automations:test:      ↓ prints a refresh command that quotes the path and keeps script settings
+bb-plugin-automations:test:      ↓ rejects an empty working-directory value on create and replacement
+bb-plugin-automations:test:      ↓ prepends bb's directory to PATH only when it is absolute
+bb-plugin-automations:test:      × terminates an unreferenced worker after the script exits with code 0 2218ms
+bb-plugin-automations:test:      × terminates an unreferenced worker after the script exits with code 7 2062ms
+bb-plugin-automations:test:      ↓ terminates descendant processes when a script times out
+bb-plugin-automations:test:      ↓ runs in the actual server-host source instead of a remote primary source
+bb-plugin-automations:test:      ↓ reports a resolved directory equal to the process working directory
+bb-plugin-automations:test:      ↓ fails project policy instead of using another host's source
+bb-plugin-automations:test:      ↓ fails project policy when the server has no co-located host
+bb-plugin-automations:test:      ↓ reuses one project lookup within a dispatch context
+bb-plugin-automations:test:      ↓ fails when the project source is not a directory
+bb-plugin-automations:test:      ↓ includes the first stderr line in a failed run summary
+bb-plugin-automations:test:      ↓ suppresses only a trailing wakeAgent false object
+bb-plugin-automations:test:      ↓ maps silent successful scripts to skipped runs
+bb-plugin-automations:test:      ↓ caps stderr failure details
+bb-plugin-automations:test:      ↓ skips blank and carriage-return lines before the first stderr detail
+bb-plugin-automations:test:      ↓ omits the detail when stderr holds only line breaks
+bb-plugin-automations:test:      ↓ finds a trailing stderr detail after a large run of blank lines
+bb-plugin-automations:test:      ↓ removes terminal control sequences from stderr failure details
+bb-plugin-automations:test:      ↓ ingests legacy rows, moves environment into agent execution, and imports scripts once
+bb-plugin-automations:test:      ↓ rejects legacy rows with inconsistent execution metadata
+bb-plugin-automations:test: 
+bb-plugin-automations:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+bb-plugin-automations:test: 
+bb-plugin-automations:test:  FAIL  src/automations.test.ts &gt; script process containment &gt; terminates an unreferenced worker after the script exits with code 0
+bb-plugin-automations:test:  FAIL  src/automations.test.ts &gt; script process containment &gt; terminates an unreferenced worker after the script exits with code 7
+bb-plugin-automations:test: AssertionError: expected true to be false // Object.is equality
+bb-plugin-automations:test: 
+bb-plugin-automations:test: - Expected
+bb-plugin-automations:test: + Received
+bb-plugin-automations:test: 
+bb-plugin-automations:test: - false
+bb-plugin-automations:test: + true
+bb-plugin-automations:test: 
+bb-plugin-automations:test:  ❯ src/automations.test.ts:2123:12
+bb-plugin-automations:test:     2121|         await expect
+bb-plugin-automations:test:     2122|           .poll(() =&gt; isProcessRunning(parsedWorkerPid), { timeout: 2_…
+bb-plugin-automations:test:     2123|           .toBe(false);
+bb-plugin-automations:test:        |            ^
+bb-plugin-automations:test:     2124|       } finally {
+bb-plugin-automations:test:     2125|         if (workerPid !== undefined &amp;&amp; Number.isSafeInteger(workerPid)…
+bb-plugin-automations:test: 
+bb-plugin-automations:test: Caused by: Error: Matcher did not succeed in time.
+bb-plugin-automations:test:  ❯ src/automations.test.ts:2121:9
+bb-plugin-automations:test: 
+bb-plugin-automations:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+bb-plugin-automations:test: 
+bb-plugin-automations:test: 
+bb-plugin-automations:test:  Test Files  1 failed (1)
+bb-plugin-automations:test:       Tests  2 failed | 58 skipped (60)
+bb-plugin-automations:test:    Start at  02:03:15
+bb-plugin-automations:test:    Duration  4.88s (transform 287ms, setup 0ms, import 430ms, tests 4.28s, environment 0ms)
+bb-plugin-automations:test: 
+bb-plugin-automations:test:  ELIFECYCLE  Test failed. See above for more details.
+bb-plugin-automations#test:  ERROR  command ($FIRST_CHECKOUT/plugins/automations) /usr/local/bin/pnpm run test src/automations.test.ts -t terminates an unreferenced worker exited (1)
+
+ Tasks:    6 successful, 7 total
+Cached:    5 cached, 7 total
+  Time:    6.372s 
+Failed:    bb-plugin-automations#test
+
+ ERROR  run failed: command  exited (1)
+</pre>
+<h3>Second clean run: complete sanitized Turbo log</h3><pre>• turbo 2.10.12
+
+   • Packages in scope: bb-plugin-automations
+   • Running test in 1 packages
+   • Remote caching disabled
+
+//:ensure-native-modules: cache bypass, force executing 55cb634fd9cec9cc
+@bb/process-utils:generate:profile-worker: cache miss, executing d74ec751f263b5a0
+@bb/templates:generate:templates: cache miss, executing 93b1a043e9bef440
+@bb/templates:generate:plugin-scaffold: cache miss, executing 861b2a7bfce88684
+@bb/plugin-build:generate: cache miss, executing f0fe156bda5e0055
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker $SECOND_CHECKOUT/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules $SECOND_CHECKOUT
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold $SECOND_CHECKOUT/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: &gt; @bb/plugin-build@0.0.1 generate $SECOND_CHECKOUT/packages/plugin-build
+@bb/plugin-build:generate: &gt; node ./scripts/generate-plugin-theme.mjs &amp;&amp; node ./scripts/generate-runtime-export-manifest.mjs
+@bb/plugin-build:generate: 
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates $SECOND_CHECKOUT/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+//:ensure-native-modules: [ensure-native-modules] Detached hardlinked better-sqlite3 binary before verification
+@get-bb/plugin-sdk:build: cache miss, executing 994944c8f6794b2e
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build: &gt; @get-bb/plugin-sdk@0.6.97 build $SECOND_CHECKOUT/packages/plugin-sdk
+@get-bb/plugin-sdk:build: &gt; node scripts/build-runtime.mjs
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build: Built 23 @get-bb/plugin-sdk runtime entries.
+@bb/plugin-build:generate: plugin-theme.generated.ts up to date
+@bb/plugin-build:generate: host-tailwind.css up to date
+@bb/plugin-build:generate: host-tailwind-version.ts up to date
+@bb/plugin-build:generate: wrote $SECOND_CHECKOUT/packages/plugin-build/src/generated/runtime-export-manifest.generated.ts (react@19.3.0)
+bb-plugin-automations:test: cache miss, executing 3ffffd340fa7eeb7
+bb-plugin-automations:test: 
+bb-plugin-automations:test: &gt; bb-plugin-automations@0.1.0 test $SECOND_CHECKOUT/plugins/automations
+bb-plugin-automations:test: &gt; vitest run --config vitest.config.ts &quot;src/automations.test.ts&quot; &quot;-t&quot; &quot;terminates an unreferenced worker&quot;
+bb-plugin-automations:test: 
+bb-plugin-automations:test: 
+bb-plugin-automations:test:  RUN  v4.1.1 $SECOND_CHECKOUT/plugins/automations
+bb-plugin-automations:test: 
+bb-plugin-automations:test:  ❯ src/automations.test.ts (60 tests | 2 failed | 58 skipped) 4280ms
+bb-plugin-automations:test:      ↓ decodes stored script executions without a working-directory policy as automation-storage
+bb-plugin-automations:test:      ↓ migrates stored agent automations to current permission modes
+bb-plugin-automations:test:      ↓ settles older duplicate running rows so single-flight can be introduced on history
+bb-plugin-automations:test:      ↓ settles ghost script runs and threadless agent runs as interrupted
+bb-plugin-automations:test:      ↓ settles agent runs by their thread's state and leaves live threads alone
+bb-plugin-automations:test:      ↓ keeps the spring-forward run for 0 9 * * * in America/Chicago
+bb-plugin-automations:test:      ↓ keeps the spring-forward run for 0 3 * * * in America/Chicago
+bb-plugin-automations:test:      ↓ keeps the spring-forward run for 0 1 * * * in America/Chicago
+bb-plugin-automations:test:      ↓ keeps the spring-forward run for 0 9 * * * in America/New_York
+bb-plugin-automations:test:      ↓ keeps the spring-forward run for 0 9 * * * in Europe/London
+bb-plugin-automations:test:      ↓ keeps the spring-forward run for 0 9 * * 0 in America/Chicago
+bb-plugin-automations:test:      ↓ validates and computes once triggers
+bb-plugin-automations:test:      ↓ CAS claims a scheduled run only once
+bb-plugin-automations:test:      ↓ settles a running automation exactly once
+bb-plugin-automations:test:      ↓ does not re-enable a manually paused automation after failure
+bb-plugin-automations:test:      ↓ auto-pauses after three consecutive scheduled failures
+bb-plugin-automations:test:      ↓ enforces one running execution per automation
+bb-plugin-automations:test:      ↓ resets consecutive failures after a successful run
+bb-plugin-automations:test:      ↓ resets consecutive failures when a scheduled tick is skipped
+bb-plugin-automations:test:      ↓ does not re-arm one-shot automations after dispatch failure
+bb-plugin-automations:test:      ↓ leaves undispatched agent automations unchanged when next due at 1000
+bb-plugin-automations:test:      ↓ leaves undispatched agent automations unchanged when next due at 2000
+bb-plugin-automations:test:      ↓ does not repeatedly select degraded agent executions for sweeping
+bb-plugin-automations:test:      ↓ finds healthy due work after a full batch of malformed rows
+bb-plugin-automations:test:      ↓ rejects denormalized fields that disagree with stored JSON
+bb-plugin-automations:test:      ↓ dedupes manual runs by idempotency key
+bb-plugin-automations:test:      ↓ records skipped script close state
+bb-plugin-automations:test:      ↓ chooses runnable defaults for new scripts and preserves the automation-storage directory on replacement
+bb-plugin-automations:test:      ↓ reads the server host identity after a co-located daemon initializes
+bb-plugin-automations:test:      ↓ updates only a script working-directory policy
+bb-plugin-automations:test:      ↓ validates project availability before creating an automation
+bb-plugin-automations:test:      ↓ removes a stored script directory after switching to agent execution
+bb-plugin-automations:test:      ↓ removes only a superseded stored script file after a filename change
+bb-plugin-automations:test:      ↓ removes a newly staged filename when the database update fails
+bb-plugin-automations:test:      ↓ does not overwrite the active filename when the database update fails
+bb-plugin-automations:test:      ↓ preserves a tier named none and clears it with a separate flag
+bb-plugin-automations:test:      ↓ resolves the source against ctx.cwd and reports the stored snapshot copy
+bb-plugin-automations:test:      ↓ reads the file on the thread's environment host or the --host override
+bb-plugin-automations:test:      ↓ prints a refresh command that quotes the path and keeps script settings
+bb-plugin-automations:test:      ↓ rejects an empty working-directory value on create and replacement
+bb-plugin-automations:test:      ↓ prepends bb's directory to PATH only when it is absolute
+bb-plugin-automations:test:      × terminates an unreferenced worker after the script exits with code 0 2223ms
+bb-plugin-automations:test:      × terminates an unreferenced worker after the script exits with code 7 2055ms
+bb-plugin-automations:test:      ↓ terminates descendant processes when a script times out
+bb-plugin-automations:test:      ↓ runs in the actual server-host source instead of a remote primary source
+bb-plugin-automations:test:      ↓ reports a resolved directory equal to the process working directory
+bb-plugin-automations:test:      ↓ fails project policy instead of using another host's source
+bb-plugin-automations:test:      ↓ fails project policy when the server has no co-located host
+bb-plugin-automations:test:      ↓ reuses one project lookup within a dispatch context
+bb-plugin-automations:test:      ↓ fails when the project source is not a directory
+bb-plugin-automations:test:      ↓ includes the first stderr line in a failed run summary
+bb-plugin-automations:test:      ↓ suppresses only a trailing wakeAgent false object
+bb-plugin-automations:test:      ↓ maps silent successful scripts to skipped runs
+bb-plugin-automations:test:      ↓ caps stderr failure details
+bb-plugin-automations:test:      ↓ skips blank and carriage-return lines before the first stderr detail
+bb-plugin-automations:test:      ↓ omits the detail when stderr holds only line breaks
+bb-plugin-automations:test:      ↓ finds a trailing stderr detail after a large run of blank lines
+bb-plugin-automations:test:      ↓ removes terminal control sequences from stderr failure details
+bb-plugin-automations:test:      ↓ ingests legacy rows, moves environment into agent execution, and imports scripts once
+bb-plugin-automations:test:      ↓ rejects legacy rows with inconsistent execution metadata
+bb-plugin-automations:test: 
+bb-plugin-automations:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+bb-plugin-automations:test: 
+bb-plugin-automations:test:  FAIL  src/automations.test.ts &gt; script process containment &gt; terminates an unreferenced worker after the script exits with code 0
+bb-plugin-automations:test:  FAIL  src/automations.test.ts &gt; script process containment &gt; terminates an unreferenced worker after the script exits with code 7
+bb-plugin-automations:test: AssertionError: expected true to be false // Object.is equality
+bb-plugin-automations:test: 
+bb-plugin-automations:test: - Expected
+bb-plugin-automations:test: + Received
+bb-plugin-automations:test: 
+bb-plugin-automations:test: - false
+bb-plugin-automations:test: + true
+bb-plugin-automations:test: 
+bb-plugin-automations:test:  ❯ src/automations.test.ts:2123:12
+bb-plugin-automations:test:     2121|         await expect
+bb-plugin-automations:test:     2122|           .poll(() =&gt; isProcessRunning(parsedWorkerPid), { timeout: 2_…
+bb-plugin-automations:test:     2123|           .toBe(false);
+bb-plugin-automations:test:        |            ^
+bb-plugin-automations:test:     2124|       } finally {
+bb-plugin-automations:test:     2125|         if (workerPid !== undefined &amp;&amp; Number.isSafeInteger(workerPid)…
+bb-plugin-automations:test: 
+bb-plugin-automations:test: Caused by: Error: Matcher did not succeed in time.
+bb-plugin-automations:test:  ❯ src/automations.test.ts:2121:9
+bb-plugin-automations:test: 
+bb-plugin-automations:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+bb-plugin-automations:test: 
+bb-plugin-automations:test: 
+bb-plugin-automations:test:  Test Files  1 failed (1)
+bb-plugin-automations:test:       Tests  2 failed | 58 skipped (60)
+bb-plugin-automations:test:    Start at  02:04:09
+bb-plugin-automations:test:    Duration  4.87s (transform 284ms, setup 0ms, import 423ms, tests 4.28s, environment 0ms)
+bb-plugin-automations:test: 
+bb-plugin-automations:test:  ELIFECYCLE  Test failed. See above for more details.
+bb-plugin-automations#test:  ERROR  command ($SECOND_CHECKOUT/plugins/automations) /usr/local/bin/pnpm run test src/automations.test.ts -t terminates an unreferenced worker exited (1)
+
+ Tasks:    6 successful, 7 total
+Cached:    0 cached, 7 total
+  Time:    8.073s 
+Failed:    bb-plugin-automations#test
+
+ ERROR  run failed: command  exited (1)
+</pre>
+<p>Investigation commands: read-only GitHub metadata and timeline; trusted-origin fetch; two clean detached checkouts; frozen pnpm install; scoped Turbo dependency build; the focused test command above; source inspection and numbered source excerpts; <code>uname -srm</code>, <code>node --version</code>, <code>pnpm --version</code>. No production runtime or user data was accessed.</p>
+<p>Generated by SlopCop · new-issue-autopilot · 2026-10-29.</p>
+</main></body></html>
