@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #6660 Active capture lost during composer teardown</title>
+<style>
+:root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; }
+body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+main { max-width:960px; margin:0 auto; padding:40px 24px 80px; }
+h1 { font-size:26px; line-height:1.25; margin:0 0 10px; }
+h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+.meta { color:var(--muted); font-size:14px; }
+.pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+.high { background:var(--high); color:#fff; }
+.ok { color:var(--ok); font-weight:600; }
+table { border-collapse:collapse; width:100%; font-size:14px; }
+td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#6660 · Active voice capture is discarded by composer teardown</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill high">High</span> <span class="pill">Effort: Medium</span> <span class="pill">ui</span> · <a href="https://github.com/get-bb/bb/issues/6660">GitHub issue</a> · 2026-10-30</p>
+<p class="meta">Trusted main: <code>a1bf55b6a04c7948ae5ae0dcfcbdec27d2b507a2</code></p>
+<p><strong>Verdict: <span class="ok">REPRODUCED</span></strong> · Root-cause confidence: <strong>high</strong> · Reproduction label: <code>confirmed-repro</code></p>
+
+<h2>1. TL;DR</h2>
+<p>A composer that disappears while its microphone is still recording loses the audio already captured. Its cleanup deliberately treats disappearance like cancellation: it disables transcription and clears the in-memory audio buffer. The recoverable-recording store is reached only later in the accepted stop path, so this cleanup never creates an entry to retry. A regression probe against the real React hook reproduces zero transcription requests, zero transcript deliveries, zero recoverable recordings, and zero error notifications after unmount. Explicit Stop succeeds and explicit Cancel discards, using the same delayed recorder fixture.</p>
+
+<h2>2. Claims vs findings</h2>
+<table>
+<tr><th>Claim tested</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Unmount during active recording silently discards buffered audio.</td><td>Verified</td><td>Three minutes of simulated recording, an emitted audio chunk, unmount, then the delayed final recorder event. No transcription, transcript, retry entry, or error toast.</td></tr>
+<tr><td>Accepted recordings can finish after the composer leaves.</td><td>Verified at hook boundary</td><td>The Stop control succeeds after unmount. Existing accepted-transcription and delayed-stop tests also pass.</td></tr>
+<tr><td>There is no incremental recording persistence before Stop.</td><td>Verified by source tracing</td><td>The data event only appends to a ref; the store write occurs inside the accepted onstop branch, after the discard early return.</td></tr>
+<tr><td>Question free-text input can also lose accepted transcription.</td><td>Source corroborated; not separately exercised</td><td>The textarea uses an ephemeral key, checks its mounted flag before and after the transcription request, and suppresses transcript delivery after unmount. Its lifetime problem needs a separate destination/ownership decision.</td></tr>
+<tr><td>Specific desktop hardware, packaged release, several minutes of real speech.</td><td>Not directly verified</td><td>This investigation uses current trusted main on Linux with the repository's recorder fake. No physical microphone, macOS desktop, real speech, or provider account was used.</td></tr>
+</table>
+
+<h2>3. Environment</h2>
+<ul>
+<li>Public repository <code>get-bb/bb</code>, main commit <code>a1bf55b6a04c7948ae5ae0dcfcbdec27d2b507a2</code>; fetched again before publication, with no newer relevant change.</li>
+<li>Linux x86_64; Node <code>v22.19.0</code>; pnpm <code>9.15.0</code>; Vitest <code>4.1.1</code>; React hook tests in jsdom.</li>
+<li>First trusted checkout and a second clean detached temporary worktree at the identical base. Only the locally authored test was added; production files were unchanged.</li>
+<li>No app server, ports, runtime data directory, provider session, browser profile, or real user data was used. No dependency was added.</li>
+<li>Frozen installs completed. Full Turbo builds passed in both checkouts (72/72 tasks each). The first build attempt needed the installed Plugin SDK runtime built first; the commands below include that step.</li>
+</ul>
+
+<h2>4. Minimal reproduction</h2>
+<p>This is a lifecycle/data-loss defect, not a rendering defect; no screenshot is needed to establish the loss. The test uses the existing <code>DeferredRecorder</code>, setup, and cleanup in the trusted hook test file. It does not reimplement the hook, the recording store, or the discard policy.</p>
+<ol>
+<li>Prepare a trusted checkout and build it:
+<pre>git clone https://github.com/get-bb/bb.git bb-6660
+cd bb-6660
+git checkout --detach a1bf55b6a04c7948ae5ae0dcfcbdec27d2b507a2
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build</pre></li>
+<li>In <code>apps/app/src/hooks/useVoiceInput.test.tsx</code>, insert the complete test below immediately before the existing test named <code>discards a recording when its composer unmounts before acceptance</code>. Do not change production code.
+<pre>it.each(["stop", "cancel", "unmount"] as const)(
+  "issue 6660 capture lifecycle: %s",
+  async (action) =&gt; {
+    vi.stubGlobal("MediaRecorder", DeferredRecorder);
+    const onTranscribe = vi.fn().mockResolvedValue("Preserved dictation");
+    const onTranscript = vi.fn();
+    const options = {
+      recordingKey: `thread/issue-6660-${action}`,
+      onTranscribe,
+      onTranscript,
+    };
+    const { result, unmount } = renderHook(() =&gt; useVoiceInput(options));
+    await act(() =&gt; result.current.start());
+    vi.advanceTimersByTime(180_000);
+    act(() =&gt; {
+      DeferredRecorder.current.ondataavailable({
+        data: new Blob(["audio captured before navigation"]),
+      });
+    });
+    expect(result.current.state).toBe("recording");
+    if (action === "stop") act(() =&gt; result.current.stop("insert"));
+    if (action === "cancel") act(() =&gt; result.current.cancel());
+    unmount();
+    await act(async () =&gt; DeferredRecorder.current.finish());
+    const remounted = renderHook(() =&gt; useVoiceInput(options));
+    console.info(
+      "issue-6660 evidence",
+      JSON.stringify({
+        action,
+        transcriptionCalls: onTranscribe.mock.calls.length,
+        transcriptCalls: onTranscript.mock.calls.length,
+        failedRecordings: remounted.result.current.failedRecordings.length,
+        errorToasts: vi.mocked(appToast.error).mock.calls.length,
+      }),
+    );
+    expect(remounted.result.current.failedRecordings).toEqual([]);
+    expect(appToast.error).not.toHaveBeenCalled();
+    if (action === "cancel") {
+      expect(onTranscribe).not.toHaveBeenCalled();
+      expect(onTranscript).not.toHaveBeenCalled();
+    } else {
+      expect(onTranscribe).toHaveBeenCalledOnce();
+      expect(onTranscript).toHaveBeenCalledWith("Preserved dictation", "insert");
+    }
+  },
+);</pre></li>
+<li>Run the existing hook suite plus the probe:
+<pre>pnpm exec turbo run test --filter=@bb/app -- src/hooks/useVoiceInput.test.tsx --silent=false</pre></li>
+</ol>
+<p><strong>Expected:</strong> under an unmount-as-Stop preservation policy, Stop and Unmount each transcribe and deliver once; explicit Cancel does neither. The defect itself is broader than that policy: current teardown neither retains the recording nor leaves the recorder running, so it also fails recovery-based and continue-recording alternatives.</p>
+<p><strong>Actual:</strong> the requested preservation assertion fails only on Unmount. These are verbatim evidence lines from the second run:</p>
+<pre>issue-6660 evidence {"action":"stop","transcriptionCalls":1,"transcriptCalls":1,"failedRecordings":0,"errorToasts":0}
+issue-6660 evidence {"action":"cancel","transcriptionCalls":0,"transcriptCalls":0,"failedRecordings":0,"errorToasts":0}
+issue-6660 evidence {"action":"unmount","transcriptionCalls":0,"transcriptCalls":0,"failedRecordings":0,"errorToasts":0}
+
+FAIL  |@bb/app:isolated| src/hooks/useVoiceInput.test.tsx &gt; issue 6660 capture lifecycle: unmount
+AssertionError: expected "vi.fn()" to be called once, but got 0 times
+
+Test Files  1 failed (1)
+     Tests  1 failed | 24 passed (25)</pre>
+<p>The unchanged upstream suite has 22 passing tests, including one that explicitly requires discard-before-acceptance. The two passing added cases control for a broken recorder fake or transcription callback. IndexedDB itself was not exercised in jsdom; the no-recovery conclusion combines the real in-memory store result with the source fact that the only initial store write is unreachable on this path.</p>
+
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/a1bf55b6a04c7948ae5ae0dcfcbdec27d2b507a2/apps/app/src/hooks/useVoiceInput.ts#L365-L383">Unmount cleanup, useVoiceInput.ts:365–383</a> reads whether a recording was already accepted. An active recorder instead has transcription disabled before stop:</p>
+<pre>if (recorder &amp;&amp; recorder.state === "recording") {
+  shouldTranscribeRef.current = false;
+  try {
+    recorder.stop();
+  } catch {}
+}
+...
+if (!acceptedRecordingPending) {
+  chunksRef.current = [];
+  startedAtMsRef.current = null;
+  promptContextRef.current = undefined;
+}</pre>
+<p><a href="https://github.com/get-bb/bb/blob/a1bf55b6a04c7948ae5ae0dcfcbdec27d2b507a2/apps/app/src/hooks/useVoiceInput.ts#L556-L619">Data and stop handlers, useVoiceInput.ts:556–619</a>: data events only push into the component ref. The stop handler sees disabled transcription, clears the buffer again, sets idle, and returns before file creation or <code>saveVoiceRecording</code>. The same result therefore occurs even when the recorder delivers its final chunk asynchronously after unmount.</p>
+<p><a href="https://github.com/get-bb/bb/blob/a1bf55b6a04c7948ae5ae0dcfcbdec27d2b507a2/apps/app/src/lib/voice-recording-store.ts#L138-L178">Recording store, voice-recording-store.ts:138–178</a>: the recovery store can only retain audio once a file has been saved into it. It has no ownership of an actively recording composer's chunk buffer. This is why existing failed-recording retention cannot rescue this path.</p>
+<p><a href="https://github.com/get-bb/bb/blob/a1bf55b6a04c7948ae5ae0dcfcbdec27d2b507a2/apps/app/src/hooks/useVoiceInput.test.tsx#L458-L469">Existing upstream test, useVoiceInput.test.tsx:458–469</a> expressly requires unaccepted recordings to be discarded. The problem is not merely a missed ref assignment; the lifecycle currently encodes destructive product policy.</p>
+<p>The question field has an additional lifetime constraint: <a href="https://github.com/get-bb/bb/blob/a1bf55b6a04c7948ae5ae0dcfcbdec27d2b507a2/apps/app/src/components/promptbox/VoiceInputTextarea.tsx#L40-L54">VoiceInputTextarea.tsx:40–54</a> selects an ephemeral key, throws an AbortError when unmounted around the request, and ignores transcript delivery afterward. <a href="https://github.com/get-bb/bb/blob/a1bf55b6a04c7948ae5ae0dcfcbdec27d2b507a2/apps/app/src/hooks/useVoiceInput.ts#L393-L396">Ephemeral cleanup</a> deletes recordings for that key. Unlike <a href="https://github.com/get-bb/bb/blob/a1bf55b6a04c7948ae5ae0dcfcbdec27d2b507a2/apps/app/src/components/promptbox/prompt-voice-intent.ts#L23-L43">persisted composer draft delivery</a>, this input does not have a durable destination once its question closes.</p>
+
+<h2>6. Proposed fix and simple-fix decision</h2>
+<p>First choose whether leaving a recording should stop and retain audio or keep an app-level recording alive. Keep explicit cancellation destructive. A stop-and-retain implementation for persisted composers can reuse accepted recording/draft delivery, but it must preserve duration, context, pending-stop ordering, and audio until the final recorder event. Ephemeral question inputs additionally need a recoverable owner or an explicit navigation guard, not a callback into an already removed field.</p>
+<p><strong>No automatic pull request.</strong> Changing the expressly tested discard-on-unmount policy, and deciding ownership for disappearing question fields, requires a product decision. That fails the rule's simple-fix gate even if a narrow code change would fit the line limit. No production patch, source branch, or source push was made. GitHub cross-reference metadata and an open-PR search for the issue number returned no linked open PR at investigation time.</p>
+
+<h2>7. Verification</h2>
+<p>The same agent repeated the test in a second initially clean detached worktree at the full trusted base commit. It had its own frozen install, generated build output, and test process; no ports or app data directories were necessary. The pristine hook suite passed <code>22/22</code> before adding the reproduction. After applying only the locally authored test, the identical command above produced <code>24 passed, 1 failed</code>, with the same Unmount failure and all three evidence records. The first checkout also produced <code>24 passed, 1 failed</code>. This is a second clean reproduction by the same agent, not an independent review.</p>
+<p>Both full builds finished successfully after the SDK runtime prerequisite was built. Root-cause links were checked against the recorded base, including the original pre-probe test line numbers. The repeat run required no report correction. Physical microphone capture, actual desktop navigation timing, page reload/crash recovery, real provider transcription, and the question-field runtime scenario remain outside this verification.</p>
+
+<h2>8. Related code and history</h2>
+<p>The upstream failed-recording retention change is <a href="https://github.com/get-bb/bb/commit/2cc5a113f6">2cc5a113f6</a>; it preserves failed accepted files, not active chunks. Accepted draft delivery is owned by <code>prompt-voice-intent.ts</code> and <code>usePromptVoice.ts</code>. The current tests clearly distinguish acceptance, explicit cancellation, and unmount before acceptance. Issue-provided links and executable snippets were treated only as untrusted claims, not fetched or run.</p>
+
+<h2>9. Appendix</h2>
+<p>Commands used for evidence: <code>git fetch origin main</code>, <code>git rev-parse origin/main</code>, source inspection at the recorded commit, <code>git log</code> for the recording owner, the frozen install/build/test commands above, and a second <code>git worktree add --detach</code> at the same SHA. GitHub reads checked visibility, current issue properties, valid classification values, similar issue classification, and linked open PRs. Raw build and test logs and the reproduction patch are retained locally, not published. Repository publication rules require tests and exact output inline in this HTML rather than separate artifacts.</p>
+<p>Type <strong>Bug</strong>, Priority <strong>High</strong>, Effort <strong>Medium</strong>, and area <strong>ui</strong> were filled because they were missing. High reflects silent loss of user-authored audio; Medium reflects a lifecycle fix with ownership and destination considerations.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
