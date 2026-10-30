@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #6680 Dispatch admission and replay safety</title>
+<style>
+:root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; }
+body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+main { max-width:960px; margin:0 auto; padding:40px 24px 80px; }
+h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+h3 { font-size:15px; margin:22px 0 6px; }
+.meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+.pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+table { border-collapse:collapse; width:100%; font-size:14px; }
+td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#6680 · Dispatch admission and replay safety</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: High</span><span class="pill">plugins · tasks</span><a href="https://github.com/get-bb/bb/issues/6680">GitHub issue</a><span>October 30, 2026</span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+<p>Trusted base: <code>6c9c7cca66afe48b2da6ecdb3290bf441dfb3280</code>, fetched directly from <code>get-bb/bb</code> main. Reproduction label: <code>confirmed-repro</code>.</p>
+
+<h2>1. TL;DR</h2>
+<p>The real Tasks control sends two delegate RPCs when two click events enter before React commits its pending state. The real delegate handler independently requests a new thread for every delivery, including overlapping requests and a request replayed after a simulated lost reply. A simulated ambiguous SDK failure also leaves no attached row or retained dispatch outcome, so a retry requests another thread. The existing request contains no attempt identity: identical inputs can mean either a retry or an intentional second dispatch, so globally deduplicating task/preset pairs would break supported behavior. These results were repeated by the same investigator in a second clean trusted checkout; real provider execution, browser double-click timing, and process-crash recovery were not tested.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>Pre-commit UI reentry submits twice.</td><td>Verified at the real rendered control.</td><td>Two clicks in one React act produce two recorded delegate calls while the response remains pending. Ordinary physical browser double-click timing is not established.</td></tr>
+<tr><td>Overlapping delegate deliveries request two workers.</td><td>Verified at the plugin/SDK boundary.</td><td>Two SDK spawn invocations; two different thread IDs persisted in real plugin SQLite.</td></tr>
+<tr><td>A replay after a lost response requests a new worker.</td><td>Verified with simulated reply loss.</td><td>The first delegate completes but its result is discarded by a transport surrogate. Replaying its identical payload yields two spawn requests and two attached rows.</td></tr>
+<tr><td>An ambiguous spawn outcome is not retained.</td><td>Verified under SDK fault injection.</td><td>The SDK surrogate records a created worker then throws. No row is attached; retry records a second worker and attaches only the latter.</td></tr>
+<tr><td>A deliberate later dispatch must still work.</td><td>Verified control case.</td><td>Two sequential intentional calls succeed and attach two workers. They have exactly the same current payload as the lost-response replay.</td></tr>
+<tr><td>A proposed external implementation is sufficient.</td><td>Not dynamically verified.</td><td>No external checkout, issue-provided script, branch, or test was executed. Closed PR #6681 was inspected statically only.</td></tr>
+</tbody></table>
+
+<h2>3. Environment</h2>
+<ul>
+<li>Tasks package version 0.1.2; Linux 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; repository-locked Vitest 4.1.1, React and jsdom.</li>
+<li>Two detached trusted source workspaces at the recorded base, each with its own frozen dependency installation and full Turbo build. Full builds: 72 successful tasks in each checkout.</li>
+<li>The SDK testing host supplies real temporary-file SQLite; <code>createStore</code> initializes the real plugin-owned migration schema. The core database is not mocked or used. Thread SDK effects and UI RPC transport are surrogates; the actual Tasks handler and rendered Tasks app execute.</li>
+<li>No real model/provider invocation, credentials, user runtime data, HTTP server, ports, or live BB instance used. Temporary plugin fixture data is disposed by the harness.</li>
+</ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol>
+<li>Create a trusted checkout and install its locked dependencies:
+<pre>work=$(mktemp -d)
+git clone --single-branch --branch main https://github.com/get-bb/bb.git "$work/source"
+cd "$work/source"
+git checkout --detach 6c9c7cca66afe48b2da6ecdb3290bf441dfb3280
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build</pre></li>
+<li>Save the complete reproduction patch below as <code>regression.patch</code> outside the checkout and apply it. It adds only investigator-authored tests; no production source changes, dependencies, or external code.
+<pre>git apply /path/to/regression.patch
+pnpm exec turbo run test --filter=bb-plugin-tasks -- delegate/issue-6680.test.ts views/detail/threads.test.tsx</pre></li>
+<li>Observe four expected desired-behavior failures, one passing deliberate-redispatch control, and four passing existing UI tests. The server retry and deliberate-redispatch tests intentionally expose a missing contract: the present API cannot express their different intent. A future repair must add that distinction rather than silently collapsing all identical requests.</li>
+</ol>
+<h3>Expected vs actual</h3>
+<pre>Expected UI delegate calls while pending: 1
+Actual: batched clicks { transportCalls: 2 }
+
+Expected attached workers for overlapping delivery: 1
+Actual: createdWorkers: [ 'thr_overlap0', 'thr_overlap1' ], attachedWorkers: 2
+
+Expected workers after lost-reply redelivery: 1
+Actual: lost delegate reply { spawnedWorkers: 2, attachedWorkers: 2 }
+
+Expected no automatic second spawn after an ambiguous outcome: 1 worker effect
+Actual: createdWorkers: [ 'thr_ambiguous0', 'thr_ambiguous1' ], attachedWorkers: 1
+
+AssertionError: expected [ { …(8) }, { …(8) } ] to have a length of 1 but got 2
+AssertionError: expected [ 'thr_ambiguous0', 'thr_ambiguous1' ] to have a length of 1 but got 2
+
+Test Files  2 failed (2)
+Tests       4 failed | 5 passed (9)
+Exit status: 1 in each checkout</pre>
+<p>There is no screenshot: this is an event admission and replay defect, not a visual rendering defect. Worker effects above are SDK surrogates, not claims that real providers ran.</p>
+<h3>Complete investigator-authored reproduction patch</h3>
+<pre>diff --git a/plugins/tasks/delegate/issue-6680.test.ts b/plugins/tasks/delegate/issue-6680.test.ts
+new file mode 100644
+index 000000000..e40eb0176
+--- /dev/null
++++ b/plugins/tasks/delegate/issue-6680.test.ts
+@@ -0,0 +1,151 @@
++import {
++  createFakePluginHost,
++  makeThreadResponse,
++} from "@get-bb/plugin-sdk/testing";
++import { expect, it } from "vitest";
++import { createStore } from "../api";
++import { registerDelegation } from ".";
++
++function fixture(spawn: () =&gt; Promise&lt;{ id: string }&gt;) {
++  const { bb, harness } = createFakePluginHost({
++    pluginId: "tasks",
++    sdk: {
++      threads: {
++        spawn,
++        get: async ({ threadId }) =&gt;
++          makeThreadResponse({ id: threadId, status: "starting" }),
++      },
++    },
++  });
++  const store = createStore(bb);
++  const project = store.tasks.createProject({
++    name: "Dispatch reproduction",
++    prefix: "REP",
++    color: "blue",
++    linkedBbProjectId: "proj_reproduction",
++  });
++  const task = store.tasks.createTask({
++    projectId: project.id,
++    title: "Exercise delegation admission",
++  });
++  const preset = store.tasks.createPreset({
++    name: "Reproduction worker",
++    providerId: "claude-code",
++    modelId: "claude-sonnet-4-5",
++    reasoningLevel: "high",
++    serviceTier: null,
++    permissionMode: "full",
++    environmentKind: "project-default",
++    baseBranch: null,
++    machineId: null,
++    instructions: "",
++    builtin: false,
++  });
++  registerDelegation(bb, store);
++  return {
++    harness,
++    store,
++    task,
++    input: { taskId: task.id, presetId: preset.id },
++  };
++}
++
++it("issue 6680: overlapping delivery should not create a second worker", async () =&gt; {
++  let releaseSpawn = () =&gt; {};
++  const gate = new Promise&lt;void&gt;((resolve) =&gt; {
++    releaseSpawn = resolve;
++  });
++  let signalSpawn = () =&gt; {};
++  const started = new Promise&lt;void&gt;((resolve) =&gt; {
++    signalSpawn = resolve;
++  });
++  const createdWorkers: string[] = [];
++  const { harness, store, task, input } = fixture(async () =&gt; {
++    const threadId = `thr_overlap${createdWorkers.length}`;
++    createdWorkers.push(threadId);
++    signalSpawn();
++    await gate;
++    return { id: threadId };
++  });
++  try {
++    const deliveries = [
++      harness.callRpc("delegate", input),
++      harness.callRpc("delegate", input),
++    ];
++    await started;
++    releaseSpawn();
++    await Promise.all(deliveries);
++    console.log("overlapping delivery", {
++      createdWorkers,
++      attachedWorkers: store.tasks.listTaskThreads(task.id).length,
++    });
++    expect(store.tasks.listTaskThreads(task.id)).toHaveLength(1);
++  } finally {
++    releaseSpawn();
++    await harness.dispose();
++  }
++});
++
++it("issue 6680: redelivery after a lost delegate response should reuse the worker", async () =&gt; {
++  let workerCount = 0;
++  const { harness, store, task, input } = fixture(async () =&gt; ({
++    id: `thr_redelivery${++workerCount}`,
++  }));
++  try {
++    const loseReply = async () =&gt; {
++      await harness.callRpc("delegate", input);
++      throw new Error("Simulated lost delegate response");
++    };
++    await expect(loseReply()).rejects.toThrow(
++      "Simulated lost delegate response",
++    );
++    await harness.callRpc("delegate", input);
++    console.log("lost delegate reply", {
++      spawnedWorkers: workerCount,
++      attachedWorkers: store.tasks.listTaskThreads(task.id).length,
++    });
++    expect(store.tasks.listTaskThreads(task.id)).toHaveLength(1);
++  } finally {
++    await harness.dispose();
++  }
++});
++
++it("issue 6680: retry after an ambiguous spawn failure should not spawn again", async () =&gt; {
++  const createdWorkers: string[] = [];
++  const { harness, store, task, input } = fixture(async () =&gt; {
++    const threadId = `thr_ambiguous${createdWorkers.length}`;
++    createdWorkers.push(threadId);
++    if (createdWorkers.length === 1) {
++      throw new Error("Simulated response loss after the thread side effect");
++    }
++    return { id: threadId };
++  });
++  try {
++    await expect(harness.callRpc("delegate", input)).rejects.toThrow(
++      "Simulated response loss",
++    );
++    expect(store.tasks.listTaskThreads(task.id)).toHaveLength(0);
++    await harness.callRpc("delegate", input);
++    console.log("ambiguous failure retry", {
++      createdWorkers,
++      attachedWorkers: store.tasks.listTaskThreads(task.id).length,
++    });
++    expect(createdWorkers).toHaveLength(1);
++  } finally {
++    await harness.dispose();
++  }
++});
++
++it("issue 6680: deliberately repeated dispatch remains supported", async () =&gt; {
++  let workerCount = 0;
++  const { harness, store, task, input } = fixture(async () =&gt; ({
++    id: `thr_deliberate${++workerCount}`,
++  }));
++  try {
++    await harness.callRpc("delegate", input);
++    await harness.callRpc("delegate", input);
++    expect(store.tasks.listTaskThreads(task.id)).toHaveLength(2);
++  } finally {
++    await harness.dispose();
++  }
++});
+diff --git a/plugins/tasks/views/detail/threads.test.tsx b/plugins/tasks/views/detail/threads.test.tsx
+index ce634034f..45d5f244b 100644
+--- a/plugins/tasks/views/detail/threads.test.tsx
++++ b/plugins/tasks/views/detail/threads.test.tsx
+@@ -1,5 +1,5 @@
+ // @vitest-environment jsdom
+-import { cleanup, fireEvent, waitFor } from "@testing-library/react";
++import { act, cleanup, fireEvent, waitFor } from "@testing-library/react";
+ import { afterEach, describe, expect, it } from "vitest";
+ import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
+ import { makeTask, rpcInput } from "../../test-fixtures.js";
+@@ -89,6 +89,66 @@ function detailRpc(overrides: Record&lt;string, unknown&gt; = {}) {
+ }
+ 
+ describe("task detail pull request pills", () =&gt; {
++  it("issue 6680: a batched double click should send one pending dispatch", async () =&gt; {
++    let releaseResponse = () =&gt; {};
++    const pending = new Promise&lt;void&gt;((resolve) =&gt; {
++      releaseResponse = resolve;
++    });
++    const slot = renderSlot(
++      app.navPanels[0]!,
++      { subPath: "task/TSK-5" },
++      {
++        rpc: detailRpc({
++          listPresets: () =&gt; ({
++            presets: [
++              {
++                id: "01HZZZZZZZZZZZZZZZZZZZZZW1",
++                name: "Reproduction worker",
++                providerId: "claude-code",
++                modelId: "claude-sonnet-4-5",
++                reasoningLevel: "high",
++                serviceTier: null,
++                permissionMode: "full",
++                environmentKind: "project-default",
++                baseBranch: null,
++                machineId: null,
++                instructions: "",
++                builtin: false,
++                createdAt: "2026-10-30T00:00:00.000Z",
++                updatedAt: "2026-10-30T00:00:00.000Z",
++              },
++            ],
++          }),
++          delegate: async () =&gt; {
++            await pending;
++            return { threadId: "thr_reproduction" };
++          },
++        }),
++      },
++    );
++    try {
++      const button = (
++        await slot.findAllByRole("button", {
++          name: "Reproduction worker",
++        })
++      )[0]!;
++      act(() =&gt; {
++        fireEvent.click(button);
++        fireEvent.click(button);
++      });
++      const deliveries = slot.rpcCalls.filter(
++        ({ method }) =&gt; method === "delegate",
++      );
++      console.log("batched clicks", { transportCalls: deliveries.length });
++      expect(deliveries).toHaveLength(1);
++    } finally {
++      await act(async () =&gt; {
++        releaseResponse();
++        await pending;
++      });
++    }
++  });
++
+   it("links a thread's pull request as a keyboard-reachable anchor", async () =&gt; {
+     const slot = renderSlot(
+       app.navPanels[0]!,
+</pre>
+
+<h2>5. Root cause</h2>
+<h3>UI state is not a synchronous admission guard</h3>
+<p><a href="https://github.com/get-bb/bb/blob/6c9c7cca66afe48b2da6ecdb3290bf441dfb3280/plugins/tasks/views/detail/threads.tsx#L156-L182">DispatchControl, lines 156–182</a> sets React state then immediately sends the RPC. It does not synchronously record that an invocation has been admitted. The rendered disabled state only takes effect after commit, so another event batched before that commit enters the same function.</p>
+<pre>const dispatch = async (presetId: string) =&gt; {
+  setDispatching(true);
+  try {
+    await rpc.call("delegate", { taskId, presetId });
+  } finally {
+    setDispatching(false);
+  }
+};</pre>
+<p>This excerpt omits only the error-reporting catch. The independently authored UI test uses the existing real app slot and one of the two responsive copies of the actual dispatch control; it does not substitute a fake React component.</p>
+<h3>Server spawning precedes persistence and has no replay key</h3>
+<p><a href="https://github.com/get-bb/bb/blob/6c9c7cca66afe48b2da6ecdb3290bf441dfb3280/plugins/tasks/delegate/index.ts#L298-L366">delegate, lines 298–366</a> reads task/preset context, awaits environment selection, and calls <code>bb.sdk.threads.spawn</code>. Only after that await succeeds does a SQLite transaction attach the returned thread and create comments. There is no pending admission entry, completed-attempt lookup, or unknown-outcome record before spawn. Different returned thread IDs create distinct attached rows. Transactional attachment cannot undo or deduplicate an external spawn effect that already happened.</p>
+<p>The <a href="https://github.com/get-bb/bb/blob/6c9c7cca66afe48b2da6ecdb3290bf441dfb3280/plugins/tasks/delegate/contract.ts#L7-L17">strict delegate input schema</a> contains only <code>taskId</code>, <code>presetId</code>, and optional instructions. It cannot identify a retry of a particular dispatch attempt. The <a href="https://github.com/get-bb/bb/blob/6c9c7cca66afe48b2da6ecdb3290bf441dfb3280/plugins/tasks/cli/index.ts#L2574-L2617">CLI dispatch path</a> calls this same handler without any attempt identity, so a UI-only lock cannot provide server retry safety.</p>
+
+<h2>6. Proposed fix and simple-fix decision</h2>
+<p>Add a synchronous, per-control pending latch to close the batched-event admission gap and release it in a finally path. Separately design explicit dispatch-attempt identity across UI, RPC, and CLI so retries can reuse an identity and deliberate dispatches can create a fresh one. A durable attempt record should reserve before spawn, replay completed results, reject payload mismatches, and preserve ambiguous outcomes instead of automatically spawning again. A plugin record alone cannot atomically commit an external core spawn; recovery and user-visible unknown-outcome behavior require an explicit policy.</p>
+<p><strong>No automatic fix PR:</strong> the complete retry-safe repair needs a request-contract change and durable stored state or a broader core idempotency design, plus an unknown-outcome policy. Those violate this rule's no-schema/no-stored-data/no-architecture-decision simple-fix conditions. A task/preset in-memory mutex alone would neither survive restart nor distinguish a legitimate new dispatch. A UI-only patch would leave the verified server retry defect unresolved. No production fix branch, commit, or push was made.</p>
+
+<h2>7. Linked PR review</h2>
+<p><a href="https://github.com/get-bb/bb/pull/6681">PR #6681</a> was closed and unmerged when inspected; there was no open linked PR. GitHub metadata and its diff were read as untrusted data, after authoring the reproduction. Static scope: 12 files including delegate contract, plugin database schema, CLI, UI, tests, and documentation. Its diff proposes attempt identity, durable reservations/completions, and a UI admission guard, which target the mechanisms demonstrated here. It is not eligible as this rule's simple fix because it changes schema/stored state and more than five files. No correctness endorsement or blocking-defect conclusion is made: its branch and tests were never run, and the static inspection was not an exhaustive review.</p>
+
+<h2>8. Related issues</h2>
+<p>The trusted source path establishes a thread-dispatch admission problem, not task-record creation. No additional issue findings are asserted; references mentioned in the incoming report were not needed to establish the cause.</p>
+
+<h2>9. Verification</h2>
+<p>The same investigator created a second clean detached worktree at <code>6c9c7cca66afe48b2da6ecdb3290bf441dfb3280</code>, confirmed a clean status before applying the same test-only patch, installed frozen dependencies, and ran a full Turbo build. The identical focused command reproduced the same four failures and five passes with newly created temporary plugin SQLite stores. No shared server, data directory, or ports were used. This is a repeated clean reproduction by the same agent, not an independent review.</p>
+<pre>pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec turbo run test --filter=bb-plugin-tasks -- delegate/issue-6680.test.ts views/detail/threads.test.tsx
+
+First checkout:  4 failed | 5 passed (9), exit 1
+Second checkout: 4 failed | 5 passed (9), exit 1
+Both full builds: 72 successful tasks
+
+Relevant original tests:
+pnpm exec turbo run test --filter=bb-plugin-tasks -- delegate/delegate.test.ts cli/cli.test.ts db.test.ts views/detail/threads.test.tsx -t '^(?!.*issue 6680)'
+4 test files passed; 60 tests passed; 1 investigator-added UI regression excluded by name
+git diff --check: exit 0</pre>
+<p>The initial UI fixture lookup encountered both responsive button copies; it was corrected to target a single real control before the final two runs. Both final copies use the same public fixture model ID; no provider invocation is performed. Re-fetching origin/main after the investigation returned the same trusted base commit.</p>
+
+<h2>10. Appendix and boundaries</h2>
+<ul>
+<li>Evidence above is the complete test-only patch and the relevant verbatim assertion/count output. Raw build/test logs and API responses remain local, not in this public repository.</li>
+<li>Observed baseline control: intentional repeated dispatch attaches two workers. The retry tests do not supply a missing attempt field because the strict baseline schema cannot accept one.</li>
+<li>Not tested: real provider invocation, a live browser/dev server, ordinary physical click scheduling, a real network partition, process crash/restart, or the external proposed fix. The SDK transport failures are explicit fault injection, not observations of a production outage.</li>
+<li>Issue content, links, and linked code were treated as untrusted claims. No supplied command, script, test, external branch, or patch was executed. Only code from trusted target main and investigator-authored tests ran.</li>
+</ul>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
