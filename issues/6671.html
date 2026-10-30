@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #6671 HTTP proxy cancellation lifecycle</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main><p class="meta"><a href="../">← reports</a></p>
+<h1>#6671 · Downstream cancellation leaves HTTP proxy connections open</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High</span><span class="pill">Effort: Low</span><span class="pill">host · perf · confirmed-repro</span><a href="https://github.com/get-bb/bb/issues/6671">GitHub issue</a><span>2026-10-30 · base <code>9662c45478f4a74f33f11b70187657d97f1e14a7</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>The daemon's loopback HTTP proxy keeps its upstream connection open after its caller goes away. A direct test of the trusted main-branch source reproduces this while awaiting response headers, streaming a response, and uploading a request. Each cancelled local connection is closed, but its origin-side socket remains open for the full one-second observation window. Two completed requests reuse one upstream connection normally. This establishes a connection-lifecycle defect, not the reported machine-wide macOS failure: no network exhaustion or real provider requests were attempted.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Disconnecting during an HTTP response leaves the upstream connection open.</td><td class="ok">Verified</td><td>The streaming-response case fails the socket-release assertion in both clean source checkouts.</td></tr>
+<tr><td>Cancellation before headers or during a request upload has the same defect.</td><td class="ok">Verified</td><td>Both additional cases fail in each run; upload cancellation waits until the origin receives body bytes.</td></tr>
+<tr><td>Successful completed requests should retain keepalive reuse.</td><td class="ok">Verified on baseline</td><td>The positive control completes two responses on the same origin socket.</td></tr>
+<tr><td>Repeated cancellations exhaust macOS network buffers.</td><td class="unv">Unverified</td><td>This run used Linux and small loopback requests. It did not reproduce OS exhaustion, inspect a production daemon, or validate a causal threshold.</td></tr>
+<tr><td>Specific released packages or a recent provider-client version trigger the accumulation.</td><td class="unv">Unverified</td><td>No installed release, client, provider, or private diagnostic data was used.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Repository: public <code>get-bb/bb</code>; trusted <code>origin/main</code> commit <code>9662c45478f4a74f33f11b70187657d97f1e14a7</code>.</li>
+<li>Linux x86_64, kernel 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0.</li>
+<li>Two fresh clones, each detached or branched directly from the recorded trusted commit. No linked PR code was checked out or executed.</li>
+<li>The reproduction uses only Node built-ins and the production proxy module. All listeners bind <code>127.0.0.1</code> on newly allocated ephemeral ports and are closed by test teardown. No app instance, data directory, credentials, authentication service, or provider is needed.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Obtain the trusted source:<pre>git clone https://github.com/get-bb/bb.git bb-proxy-check
+cd bb-proxy-check
+git checkout --detach 9662c45478f4a74f33f11b70187657d97f1e14a7</pre></li>
+<li>Save the following self-contained test as <code>machine-proxy-lifecycle.repro.mts</code> in that checkout's root. It was authored from the trusted source's lifecycle, not copied from the issue or PR.<pre>import assert from &quot;node:assert/strict&quot;;
+import { once } from &quot;node:events&quot;;
+import http from &quot;node:http&quot;;
+import net, { type AddressInfo, type Socket } from &quot;node:net&quot;;
+import { setTimeout as delay } from &quot;node:timers/promises&quot;;
+import { test, type TestContext } from &quot;node:test&quot;;
+import { startMachineAuthProxy } from &quot;./apps/host-daemon/src/machine-auth-proxy.ts&quot;;
+
+async function fixture(
+  context: TestContext,
+  handler: http.RequestListener,
+) {
+  const connections = new Set&lt;Socket&gt;();
+  const origin = http.createServer(handler);
+  origin.on(&quot;connection&quot;, (socket) =&gt; {
+    connections.add(socket);
+    socket.on(&quot;error&quot;, () =&gt; {});
+  });
+  origin.listen(0, &quot;127.0.0.1&quot;);
+  await once(origin, &quot;listening&quot;);
+  const proxy = await startMachineAuthProxy({
+    serverUrl: `http://127.0.0.1:${(origin.address() as AddressInfo).port}`,
+    serverHeaders: {},
+  });
+  context.after(async () =&gt; {
+    for (const socket of connections) socket.destroy();
+    await proxy.close();
+    await new Promise&lt;void&gt;((resolve) =&gt; origin.close(() =&gt; resolve()));
+  });
+  return new URL(proxy.serverUrl);
+}
+
+for (const phase of [&quot;awaiting headers&quot;, &quot;streaming response&quot;, &quot;uploading request&quot;] as const) {
+  test(`client cancellation releases upstream while ${phase}`, { timeout: 5_000 }, async (context) =&gt; {
+    const observed = Promise.withResolvers&lt;Socket&gt;();
+    const url = await fixture(context, (request, response) =&gt; {
+      request.on(&quot;error&quot;, () =&gt; {});
+      if (phase === &quot;streaming response&quot;) {
+        response.writeHead(200, { &quot;content-type&quot;: &quot;text/plain&quot; });
+        response.write(&quot;stream started&quot;);
+      }
+      if (phase === &quot;uploading request&quot;) {
+        request.once(&quot;data&quot;, () =&gt; observed.resolve(request.socket));
+      } else {
+        observed.resolve(request.socket);
+        request.resume();
+      }
+    });
+    const client = net.connect(Number(url.port), url.hostname);
+    client.on(&quot;error&quot;, () =&gt; {});
+    context.after(() =&gt; client.destroy());
+    await once(client, &quot;connect&quot;);
+    const firstBytes = phase === &quot;streaming response&quot; ? once(client, &quot;data&quot;) : null;
+    const head = phase === &quot;uploading request&quot;
+      ? `POST /probe HTTP/1.1\r\nHost: ${url.host}\r\nContent-Length: 4096\r\n\r\npartial upload`
+      : `GET /probe HTTP/1.1\r\nHost: ${url.host}\r\n\r\n`;
+    client.write(head);
+    const upstreamSocket = await observed.promise;
+    if (firstBytes !== null) await firstBytes;
+    const clientClosed = once(client, &quot;close&quot;);
+    client.destroy();
+    await clientClosed;
+    const deadline = Date.now() + 1_000;
+    while (!upstreamSocket.destroyed &amp;&amp; Date.now() &lt; deadline) await delay(10);
+    console.log(JSON.stringify({ phase, clientClosed: client.destroyed, upstreamClosed: upstreamSocket.destroyed }));
+    assert.equal(upstreamSocket.destroyed, true, &quot;upstream must close after downstream cancellation&quot;);
+  });
+}
+
+test(&quot;completed responses preserve upstream keepalive reuse&quot;, { timeout: 5_000 }, async (context) =&gt; {
+  const sockets: Socket[] = [];
+  const url = await fixture(context, (request, response) =&gt; {
+    sockets.push(request.socket);
+    response.end(&quot;complete&quot;);
+  });
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  context.after(() =&gt; agent.destroy());
+  for (let requestIndex = 0; requestIndex &lt; 2; requestIndex += 1) {
+    await new Promise&lt;void&gt;((resolve, reject) =&gt; {
+      http.get(url, { agent }, (response) =&gt; {
+        response.on(&quot;error&quot;, reject);
+        response.on(&quot;end&quot;, resolve);
+        response.resume();
+      }).on(&quot;error&quot;, reject);
+    });
+  }
+  assert.equal(sockets.length, 2);
+  assert.equal(sockets[0], sockets[1], &quot;completed requests must reuse the upstream connection&quot;);
+  assert.equal(sockets[0].destroyed, false);
+  console.log(JSON.stringify({ completedRequests: sockets.length, reusedUpstream: sockets[0] === sockets[1] }));
+});
+</pre></li>
+<li>Run it without installing any dependencies:<pre>node --experimental-strip-types --test machine-proxy-lifecycle.repro.mts</pre></li></ol>
+<p><strong>Expected:</strong> all four tests pass; each cancellation prints <code>upstreamClosed: true</code> and the completed-request control prints <code>reusedUpstream: true</code>.</p>
+<p><strong>Actual:</strong> exit status 1 in each checkout, with three cancellation assertion failures (<code>false !== true</code>) and one passing keepalive control. Selected output, verbatim:</p><pre># {&quot;phase&quot;:&quot;awaiting headers&quot;,&quot;clientClosed&quot;:true,&quot;upstreamClosed&quot;:false}
+# {&quot;phase&quot;:&quot;streaming response&quot;,&quot;clientClosed&quot;:true,&quot;upstreamClosed&quot;:false}
+# {&quot;phase&quot;:&quot;uploading request&quot;,&quot;clientClosed&quot;:true,&quot;upstreamClosed&quot;:false}
+# {&quot;completedRequests&quot;:2,&quot;reusedUpstream&quot;:true}
+# tests 4
+# pass 1
+# fail 3
+# cancelled 0
+# skipped 0</pre>
+<p>No screenshot is appropriate for this non-visual transport defect. The complete repeatable test is embedded here; raw logs and temporary checkout paths are deliberately not published.</p>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/9662c45478f4a74f33f11b70187657d97f1e14a7/apps/host-daemon/src/machine-auth-proxy.ts#L142-L166">The HTTP forwarding handler at the recorded base</a> creates an upstream request, pipes the caller's request into it, and pipes an upstream response back to the caller. Its lifecycle callbacks propagate upstream failures toward the downstream response only:</p>
+<pre>upstreamResponse.on("error", () =&gt; args.response.destroy());
+upstreamResponse.on("close", () =&gt; {
+  if (!upstreamResponse.complete) args.response.destroy();
+});
+upstreamResponse.pipe(args.response);
+...
+args.request.pipe(upstream);</pre>
+<p>There is no downstream request-abort listener or downstream response-close listener to destroy the upstream request. A destroyed pipe destination therefore does not cause this handler to cancel its outstanding origin-side work. The three failing cases exercise both sides of that missing lifecycle transition, including the interval before any upstream response exists. The positive control distinguishes abandoned connections from intentionally reusable, fully completed connections.</p>
+<p>The test proves sockets remain open beyond the observation interval until its explicit teardown. It does not establish the precise retained-buffer size, indefinite lifetime, or operating-system exhaustion threshold.</p>
+<h2>6. Proposed fix</h2>
+<p>Within the existing HTTP forwarding handler, cancel the upstream request when the downstream upload aborts or when the downstream response closes before finishing. Check <code>writableFinished</code> so normal completion preserves keepalive reuse. If an upstream response arrives after the downstream response is destroyed, release it instead of piping it; suppress attempts to write an error response into an already destroyed downstream. Preserve existing header validation and machine-auth behavior. This proposal requires no wire, authentication, schema, packaging, or public API change.</p>
+<h2>7. PR review</h2>
+<p><a href="https://github.com/get-bb/bb/pull/6672">Open PR #6672</a> declares issue #6671 as a closing reference. Only its GitHub metadata and diff were read as untrusted data. No PR branch, patch, or tests were executed.</p>
+<p>The inspected diff adds downstream abort/early-close cancellation, a late-response guard, and a destroyed-downstream error guard in the owning HTTP handler, plus tests for the three disconnect phases and completed keepalive. This is consistent with the root cause established on trusted main. No concrete correctness finding was identified in this bounded static review; runtime correctness of the PR remains unverified. A duplicate fix PR is intentionally not opened.</p>
+<h2>8. Related issues</h2>
+<p>No other issue was needed to establish this result. The reproduction reaches the native daemon HTTP proxy directly, without a plugin-route adapter or WebSocket handshake.</p>
+<h2>9. Verification</h2>
+<p>The same agent repeated the reproduction in a second newly cloned checkout of <code>9662c45478f4a74f33f11b70187657d97f1e14a7</code>, confirmed a clean working tree before adding only the newly authored test, and used newly allocated loopback ports. This is a second clean run, not an independent investigation.</p>
+<pre>node --experimental-strip-types --test machine-proxy-lifecycle.repro.mts
+# {&quot;phase&quot;:&quot;awaiting headers&quot;,&quot;clientClosed&quot;:true,&quot;upstreamClosed&quot;:false}
+# {&quot;phase&quot;:&quot;streaming response&quot;,&quot;clientClosed&quot;:true,&quot;upstreamClosed&quot;:false}
+# {&quot;phase&quot;:&quot;uploading request&quot;,&quot;clientClosed&quot;:true,&quot;upstreamClosed&quot;:false}
+# {&quot;completedRequests&quot;:2,&quot;reusedUpstream&quot;:true}
+# tests 4
+# pass 1
+# fail 3
+# cancelled 0
+# skipped 0</pre>
+<p>Both runs agree: three failed cancellation tests and one passing completed-request control. No correction to the reproduction conclusion was required. No fix was applied or claimed as tested.</p>
+<h2>10. Appendix: checks and trust boundary</h2>
+<p>The repository's existing HTTP/WebSocket proxy suite passes all 12 tests on unchanged production source, demonstrating that its baseline coverage misses downstream HTTP cancellation:</p>
+<pre>pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec turbo run build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run test --filter=@bb/host-daemon -- src/machine-auth-proxy.test.ts
+pnpm exec turbo run build --filter=@bb/host-daemon</pre>
+<p>The initial whole-repository build stopped in the GitHub plugin because SDK runtime output was missing in the fresh checkout. The documented SDK bootstrap succeeded, the existing focused suite passed 12/12, and the subsequent targeted host-daemon build passed. The initial broad build was not re-run. This environmental bootstrap issue is separate from the native reproduction, which needs no built packages.</p>
+<p>Issue and PR contents were treated solely as untrusted claims. No supplied script or patch was run, no issue-supplied external URL was fetched, and no private runtime data was inspected. Classification: Bug; High priority for resource-lifecycle impact; Low effort for a contained existing-handler correction; area <code>host</code> with <code>perf</code>. Verdict label: <code>confirmed-repro</code>.</p>
+</main></body></html>
