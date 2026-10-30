@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Report · #6724 · Request progress is excluded from the gate deadline</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#6724 · Request progress is excluded from the gate deadline</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Medium priority</span><span class="pill">Low effort</span><span class="pill">bug · remote · connect</span><a href="https://github.com/get-bb/bb/issues/6724">GitHub issue</a><span>2026-10-30</span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+<p class="meta">Investigation base <code>7877c1c7316e6f68dec3bb1f337158e4a55cd9dd</code>; fix base <code>a0e513398f02d47ec5df874b89fec4edfc248894</code>. No connect-next files changed between these commits.</p>
+<h2>1. TL;DR</h2>
+<p>The remote-access gate starts one fixed timer before routing, uploading, and waiting for the server's headers. It does not reset that timer when upload bytes arrive or when forwarding finishes. A healthy tunnel therefore cannot save a request that is actively uploading or whose origin needs longer than the initial budget. Real frps and frpc reproduced both failures twice, in separate clean checkouts; fast controls succeeded. A gate-local repair now tracks upload progress, keeps stalled uploads bounded, and adopts the ten-minute connected-tunnel wait policy already present in trusted main's Cloudflare gate.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>A continuously progressing upload can receive a timeout before completion.</td><td class="ok">Verified</td><td>8 × 2 KiB chunks, 600 ms apart, require about 4.2 s. With a 3 s configured deadline the gate answers 504 at about 3.007 s, after only 5 chunks, while the tunnel remains located here.</td></tr>
+<tr><td>A finite slow origin answer fails with the tunnel connected.</td><td class="ok">Verified</td><td>An origin scheduled to answer after 4 s instead yields the gate's 504 at about 3 s. A 600 ms origin succeeds.</td></tr>
+<tr><td>The ordinary and voice budgets are 30 s and 90 s.</td><td class="ok">Verified in code</td><td>Constants and path selection at the recorded commit. Reproductions scale the ordinary timer to 3 s; they do not wait 90 s.</td></tr>
+<tr><td>Fly streams real public uploads and permits multi-minute quiet responses.</td><td class="unv">Not remeasured</td><td>No public service or production traffic was used. The local HTTP streaming failure is sufficient to establish the gate defect, but is not evidence about Fly's proxy limits.</td></tr>
+<tr><td>Cloudflare has a related repaired timeout policy.</td><td class="ok">Verified in trusted main</td><td>Commit a0e513398f02d47ec5df874b89fec4edfc248894 introduces a ten-minute maximum wait and removes voice-specific budgeting in apps/connect. This report does not rerun that subsystem.</td></tr>
+</table>
+<h2>3. Environment</h2>
+<ul><li>Linux 4.19.0-gvisor, Node 22.19.0, pnpm 9.15.0, Vitest 4.1.1.</li><li>Real repository-managed frps and frpc 0.71.0; test downloader validates the archive SHA-256. No new package dependency.</li><li>Stand-in account API and origin, real gate, signed assertions, and real frp tunnel. No real provider, account, server data, or credential was used.</li><li>Separate temporary checkouts A and B, each with its own frozen install/build. The harness allocates fresh loopback ports and temporary frpc directories per run, then stops all processes and removes those directories.</li><li>Test head deadline: 3,000 ms; repair cap used in tests: 9,000 ms. Production defaults: 30,000 ms idle/head checks and 600,000 ms maximum.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone only trusted main and select the recorded base.<pre>git clone https://github.com/get-bb/bb.git bb-6724
+cd bb-6724
+git checkout --detach 7877c1c7316e6f68dec3bb1f337158e4a55cd9dd
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/connect-next</pre></li>
+<li>Save the complete self-authored test patch below as <code>reproduction.patch</code> and apply it. It changes only tests and their origin fixture, not the gate.<pre>git apply reproduction.patch
+pnpm exec turbo run test --filter=@bb/connect-next -- test/gate.e2e.test.ts -t 'regression:' --silent=false</pre></li>
+<li>Expected: fast and progressing uploads both return 200; a finite 4 s answer returns 200; a stalled upload still receives 504 with request-body stage; a never-answering connected origin reaches the 9 s cap. Actual baseline: four expectations fail and two fast controls pass. The cap expectation deliberately specifies the existing main policy selected for the repair; the old implementation returns at 3 s.</li></ol>
+<h3>Repeatable test patch</h3><p>This patch is authored from trusted repository fixtures, not copied from issue code. All code needed for this reproduction is inline; raw evidence remains outside the public reports repository, per its publishing policy.</p><pre>diff --git a/apps/connect-next/test/gate.e2e.test.ts b/apps/connect-next/test/gate.e2e.test.ts
+index d29105408..ab2ddad4b 100644
+--- a/apps/connect-next/test/gate.e2e.test.ts
++++ b/apps/connect-next/test/gate.e2e.test.ts
+@@ -1,4 +1,4 @@
+-import type { IncomingMessage } from &quot;node:http&quot;;
++import { request as httpRequest, type IncomingMessage } from &quot;node:http&quot;;
+ import { brotliDecompressSync, gunzipSync } from &quot;node:zlib&quot;;
+ import { afterAll, beforeAll, describe, expect, it } from &quot;vitest&quot;;
+ import WebSocket from &quot;ws&quot;;
+@@ -44,6 +44,7 @@ const DESKTOP = &quot;bb-connect.desktop_session&quot;;
+ const BEE = `bee.${BASE_DOMAIN}`;
+ const GRACE_MS = 2_000;
+ const HEAD_MS = 3_000;
++const MAX_WAIT_MS = HEAD_MS * 3;
+ 
+ const fixture: AccountFixture = {
+   labels: {
+@@ -955,12 +956,143 @@ describe.skipIf(!availability.ok)(&quot;connect-next gate end to end&quot;, () =&gt; {
+   });
+ 
+   describe(&quot;deadlines and offline&quot;, () =&gt; {
+-    it(&quot;answers 504 when the server does not send a response head&quot;, async () =&gt; {
++    it.each([0, HEAD_MS / 5])(
++      &quot;regression: accepts a progressing upload with %i ms chunk spacing&quot;,
++      async (spacingMs) =&gt; {
++        const chunkCount = 8;
++        const chunk = Buffer.alloc(2048, &quot;b&quot;);
++        const started = Date.now();
++        let sentChunks = 0;
++        const answer = await new Promise&lt;{ status: number; text: string }&gt;(
++          (resolve, reject) =&gt; {
++            let timer: NodeJS.Timeout | undefined;
++            const outgoing = httpRequest(
++              {
++                hostname: &quot;127.0.0.1&quot;,
++                port: gate.webPort,
++                method: &quot;POST&quot;,
++                path: &quot;/echo?deadline-upload&quot;,
++                headers: {
++                  ...owner,
++                  host: BEE,
++                  &quot;content-length&quot;: String(chunkCount * chunk.length),
++                },
++                agent: false,
++              },
++              (response) =&gt; {
++                clearTimeout(timer);
++                const chunks: Buffer[] = [];
++                response.on(&quot;data&quot;, (data: Buffer) =&gt; chunks.push(data));
++                response.on(&quot;error&quot;, reject);
++                response.on(&quot;end&quot;, () =&gt; {
++                  outgoing.destroy();
++                  resolve({
++                    status: response.statusCode ?? 0,
++                    text: Buffer.concat(chunks).toString(),
++                  });
++                });
++              },
++            );
++            outgoing.on(&quot;error&quot;, (error) =&gt; {
++              clearTimeout(timer);
++              reject(error);
++            });
++            const sendChunk = () =&gt; {
++              if (outgoing.destroyed) return;
++              outgoing.write(chunk);
++              sentChunks += 1;
++              if (sentChunks === chunkCount) outgoing.end();
++              else timer = setTimeout(sendChunk, spacingMs);
++            };
++            sendChunk();
++          },
++        );
++        console.log(
++          JSON.stringify({
++            scenario: &quot;upload&quot;,
++            spacingMs,
++            elapsedMs: Date.now() - started,
++            sentChunks,
++            totalChunks: chunkCount,
++            tunnel: gate.directory.locate(&quot;bee&quot;).kind,
++            ...answer,
++          }),
++        );
++        expect(answer.status).toBe(200);
++        expect(sentChunks).toBe(chunkCount);
++        expect(origin.seen.at(-1)?.body.length).toBe(chunkCount * chunk.length);
++      },
++    );
++
++    it.each([HEAD_MS / 5, HEAD_MS + 1000])(
++      &quot;regression: delivers a finite answer delayed %i ms through a connected tunnel&quot;,
++      async (waitMs) =&gt; {
++        const started = Date.now();
++        const answer = await get(`/deadline-answer?wait=${waitMs}`);
++        console.log(
++          JSON.stringify({
++            scenario: &quot;delayed-answer&quot;,
++            elapsedMs: Date.now() - started,
++            originDelayMs: waitMs,
++            tunnel: gate.directory.locate(&quot;bee&quot;).kind,
++            status: answer.status,
++            text: answer.text,
++          }),
++        );
++        expect(answer.status).toBe(200);
++      },
++    );
++
++    it(&quot;regression: bounds waiting for a connected server that never answers&quot;, async () =&gt; {
+       const started = Date.now();
+       const answer = await get(&quot;/slow&quot;);
+       expect(answer.status).toBe(504);
+       expect(answer.text).toContain(&quot;stage: response-head&quot;);
++      expect(Date.now() - started).toBeGreaterThanOrEqual(MAX_WAIT_MS - 50);
++      expect(Date.now() - started).toBeLessThan(MAX_WAIT_MS + 1500);
++    });
++
++    it(&quot;regression: expires an upload that stops making progress&quot;, async () =&gt; {
++      const started = Date.now();
++      const answer = await new Promise&lt;{ status: number; text: string }&gt;(
++        (resolve, reject) =&gt; {
++          const outgoing = httpRequest(
++            {
++              hostname: &quot;127.0.0.1&quot;,
++              port: gate.webPort,
++              path: &quot;/echo?stalled-upload&quot;,
++              method: &quot;POST&quot;,
++              headers: { ...owner, host: BEE, &quot;content-length&quot;: &quot;4096&quot; },
++              agent: false,
++            },
++            (response) =&gt; {
++              const chunks: Buffer[] = [];
++              response.on(&quot;data&quot;, (chunk: Buffer) =&gt; chunks.push(chunk));
++              response.on(&quot;error&quot;, reject);
++              response.on(&quot;end&quot;, () =&gt; {
++                outgoing.destroy();
++                resolve({
++                  status: response.statusCode ?? 0,
++                  text: Buffer.concat(chunks).toString(),
++                });
++              });
++            },
++          );
++          outgoing.on(&quot;error&quot;, reject);
++          outgoing.write(Buffer.alloc(2048));
++        },
++      );
++      console.log(
++        JSON.stringify({
++          scenario: &quot;stalled-upload&quot;,
++          elapsedMs: Date.now() - started,
++          ...answer,
++        }),
++      );
++      expect(answer.status).toBe(504);
++      expect(answer.text).toContain(&quot;stage: request-body&quot;);
+       expect(Date.now() - started).toBeGreaterThanOrEqual(HEAD_MS - 50);
++      expect(Date.now() - started).toBeLessThan(HEAD_MS + 1500);
+     });
+ 
+     it(&quot;answers 503 for a label with no tunnel&quot;, async () =&gt; {
+diff --git a/apps/connect-next/test/harness.ts b/apps/connect-next/test/harness.ts
+index 8b98e2f81..d923b16f8 100644
+--- a/apps/connect-next/test/harness.ts
++++ b/apps/connect-next/test/harness.ts
+@@ -296,7 +296,12 @@ export async function startOrigin(options: OriginOptions) {
+   };
+   const server = http.createServer(async (request, response) =&gt; {
+     const chunks: Buffer[] = [];
+-    for await (const chunk of request) chunks.push(chunk as Buffer);
++    try {
++      for await (const chunk of request) chunks.push(chunk as Buffer);
++    } catch (error) {
++      if (request.destroyed &amp;&amp; !request.complete) return;
++      throw error;
++    }
+     const assertion = await verify(request);
+     const entry: SeenRequest = {
+       method: request.method ?? &quot;GET&quot;,
+@@ -316,6 +321,14 @@ export async function startOrigin(options: OriginOptions) {
+       return;
+     }
+     if (path === &quot;/slow&quot;) return;
++    if (path === &quot;/deadline-answer&quot;) {
++      const delay = Number(
++        new URL(request.url ?? &quot;/&quot;, &quot;http://origin.test&quot;).searchParams.get(
++          &quot;wait&quot;,
++        ),
++      );
++      await new Promise((resolve) =&gt; setTimeout(resolve, delay));
++    }
+     if (path === &quot;/refuse&quot; || path === &quot;/plain-401&quot;) {
+       const body = JSON.stringify(
+         path === &quot;/refuse&quot;
+</pre>
+<h3>Actual baseline output, checkout A</h3><pre>@bb/connect-next:test: {&quot;scenario&quot;:&quot;upload&quot;,&quot;spacingMs&quot;:0,&quot;elapsedMs&quot;:20,&quot;sentChunks&quot;:8,&quot;totalChunks&quot;:8,&quot;tunnel&quot;:&quot;here&quot;,&quot;status&quot;:200,&quot;text&quot;:&quot;{\&quot;ok\&quot;:true,\&quot;url\&quot;:\&quot;/echo?deadline-upload\&quot;}&quot;}
+@bb/connect-next:test: {&quot;scenario&quot;:&quot;upload&quot;,&quot;spacingMs&quot;:600,&quot;elapsedMs&quot;:3007,&quot;sentChunks&quot;:5,&quot;totalChunks&quot;:8,&quot;tunnel&quot;:&quot;here&quot;,&quot;status&quot;:504,&quot;text&quot;:&quot;bb connect: timed out waiting for the tunnel client (stage: response-head)\n&quot;}
+@bb/connect-next:test: {&quot;scenario&quot;:&quot;delayed-answer&quot;,&quot;elapsedMs&quot;:608,&quot;originDelayMs&quot;:600,&quot;tunnel&quot;:&quot;here&quot;,&quot;status&quot;:200,&quot;text&quot;:&quot;{\&quot;ok\&quot;:true,\&quot;url\&quot;:\&quot;/deadline-answer?wait=600\&quot;}&quot;}
+@bb/connect-next:test: {&quot;scenario&quot;:&quot;delayed-answer&quot;,&quot;elapsedMs&quot;:3003,&quot;originDelayMs&quot;:4000,&quot;tunnel&quot;:&quot;here&quot;,&quot;status&quot;:504,&quot;text&quot;:&quot;bb connect: timed out waiting for the tunnel client (stage: response-head)\n&quot;}
+@bb/connect-next:test: {&quot;scenario&quot;:&quot;stalled-upload&quot;,&quot;elapsedMs&quot;:3003,&quot;status&quot;:504,&quot;text&quot;:&quot;bb connect: timed out waiting for the tunnel client (stage: response-head)\n&quot;}
+@bb/connect-next:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 4 ⎯⎯⎯⎯⎯⎯⎯
+@bb/connect-next:test:  Test Files  1 failed (1)
+@bb/connect-next:test:       Tests  4 failed | 2 passed | 39 skipped (45)
+@bb/connect-next#test:  ERROR  command (SCRATCH/base/apps/connect-next) /usr/local/bin/pnpm run test test/gate.e2e.test.ts -t regression: --silent=false exited (1)
+ Tasks:    2 successful, 3 total
+ ERROR  run failed: command  exited (1)</pre>
+<h3>Actual fixed output</h3><pre>@bb/connect-next:test: {&quot;scenario&quot;:&quot;upload&quot;,&quot;spacingMs&quot;:0,&quot;elapsedMs&quot;:22,&quot;sentChunks&quot;:8,&quot;totalChunks&quot;:8,&quot;tunnel&quot;:&quot;here&quot;,&quot;status&quot;:200,&quot;text&quot;:&quot;{\&quot;ok\&quot;:true,\&quot;url\&quot;:\&quot;/echo?deadline-upload\&quot;}&quot;}
+@bb/connect-next:test: {&quot;scenario&quot;:&quot;upload&quot;,&quot;spacingMs&quot;:600,&quot;elapsedMs&quot;:4210,&quot;sentChunks&quot;:8,&quot;totalChunks&quot;:8,&quot;tunnel&quot;:&quot;here&quot;,&quot;status&quot;:200,&quot;text&quot;:&quot;{\&quot;ok\&quot;:true,\&quot;url\&quot;:\&quot;/echo?deadline-upload\&quot;}&quot;}
+@bb/connect-next:test: {&quot;scenario&quot;:&quot;delayed-answer&quot;,&quot;elapsedMs&quot;:608,&quot;originDelayMs&quot;:600,&quot;tunnel&quot;:&quot;here&quot;,&quot;status&quot;:200,&quot;text&quot;:&quot;{\&quot;ok\&quot;:true,\&quot;url\&quot;:\&quot;/deadline-answer?wait=600\&quot;}&quot;}
+@bb/connect-next:test: {&quot;scenario&quot;:&quot;delayed-answer&quot;,&quot;elapsedMs&quot;:4006,&quot;originDelayMs&quot;:4000,&quot;tunnel&quot;:&quot;here&quot;,&quot;status&quot;:200,&quot;text&quot;:&quot;{\&quot;ok\&quot;:true,\&quot;url\&quot;:\&quot;/deadline-answer?wait=4000\&quot;}&quot;}
+@bb/connect-next:test: {&quot;scenario&quot;:&quot;stalled-upload&quot;,&quot;elapsedMs&quot;:3005,&quot;status&quot;:504,&quot;text&quot;:&quot;bb connect: timed out forwarding the request body (stage: request-body)\n&quot;}
+@bb/connect-next:test:  Test Files  1 passed (1)
+@bb/connect-next:test:       Tests  6 passed | 39 skipped (45)
+ Tasks:    3 successful, 3 total</pre>
+<p>The final focused run has 6 passing cases. The stalled upload still times out around 3 s; the never-answering origin times out around 9 s. The slow upload completes around 4.2 s and the delayed answer arrives around 4 s, both HTTP 200.</p>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/7877c1c7316e6f68dec3bb1f337158e4a55cd9dd/apps/connect-next/src/gate.ts#L775-L805">serve, lines 775–805</a> enters <code>withDeadline</code> before access resolution and forwarding. <a href="https://github.com/get-bb/bb/blob/7877c1c7316e6f68dec3bb1f337158e4a55cd9dd/apps/connect-next/src/gate.ts#L676-L703">withDeadline, lines 676–703</a> arms exactly one timer and races it against the whole operation:</p>
+<pre>timer = setTimeout(() =&gt; resolve(STALLED), deadlineMs);
+const work = run();
+const winner = await Promise.race([work, stalled]);</pre>
+<p>No request-body progress can refresh that deadline. At <a href="https://github.com/get-bb/bb/blob/7877c1c7316e6f68dec3bb1f337158e4a55cd9dd/apps/connect-next/src/gate.ts#L386-L400">upstreamFetch, lines 386–400</a>, the stage is set to response-head before <code>body.pipe(outgoing)</code>, so an upload timeout is misreported as waiting for the origin's headers. Once the same timer wins, the gate aborts the upstream request and emits its own 504. Tunnel presence is not consulted by the timeout path.</p>
+<p><a href="https://github.com/get-bb/bb/blob/7877c1c7316e6f68dec3bb1f337158e4a55cd9dd/apps/connect-next/src/gate.ts#L61-L72">Constants</a> and <a href="https://github.com/get-bb/bb/blob/7877c1c7316e6f68dec3bb1f337158e4a55cd9dd/apps/connect-next/src/gate.ts#L170-L180">path selection</a> explain why ordinary requests use 30 s and voice transcription uses 90 s at the baseline. Changing that special case alone cannot distinguish progress from inactivity.</p>
+<h2>6. Fix and safety</h2>
+<p>The repair stays in connect-next's existing gate and fixtures, plus its documentation: five files, 262 changed text lines (additions plus deletions). It adds a request-body stage, timestamps incoming body progress, and starts a fresh head budget when the outgoing request finishes forwarding. Only an authenticated, routed HTTP request with a known subdomain may keep waiting beyond the head budget, and only while the directory still locates its tunnel. The timer enforces a ten-minute ceiling even when progress or tunnel presence continues.</p>
+<p>The ten-minute ceiling is not a new product decision: <a href="https://github.com/get-bb/bb/blob/a0e513398f02d47ec5df874b89fec4edfc248894/apps/connect/src/response-head-timeout.ts">trusted main already establishes it</a> for the Cloudflare gate. Routing and WebSocket handshakes retain their original bounded behavior. The voice exception is removed in favor of this same rule. No dependency, lockfile, generated file, migration, persisted data, public protocol, schema, access-control rule, or release mechanism changes.</p>
+<p>All 6 focused regressions pass after the repair. Relevant existing suites, build, and typecheck:</p><pre>@bb/connect-next:test:  Test Files  6 passed (6)
+@bb/connect-next:test:       Tests  99 passed (99)
+ Tasks:    5 successful, 5 total</pre>
+<p>Not verified: a Fly staging deployment, real image generation/transcription, production proxy limits, or silent-dead-frp detection timing. The presence check uses frp's existing directory lifecycle, not an independent per-request heartbeat. The hard cap bounds that uncertainty.</p>
+<h2>7. Verification</h2>
+<p>The same agent repeated the reproduction in a second clean checkout at <code>7877c1c7316e6f68dec3bb1f337158e4a55cd9dd</code>, with another frozen install/build and newly allocated ports and temporary directories. This is a repeat check, not independent verification. The unchanged production gate again produced the same two user-visible HTTP failures, the same incorrect upload stage, and the early cap result:</p><pre>@bb/connect-next:test: {&quot;scenario&quot;:&quot;upload&quot;,&quot;spacingMs&quot;:0,&quot;elapsedMs&quot;:20,&quot;sentChunks&quot;:8,&quot;totalChunks&quot;:8,&quot;tunnel&quot;:&quot;here&quot;,&quot;status&quot;:200,&quot;text&quot;:&quot;{\&quot;ok\&quot;:true,\&quot;url\&quot;:\&quot;/echo?deadline-upload\&quot;}&quot;}
+@bb/connect-next:test: {&quot;scenario&quot;:&quot;upload&quot;,&quot;spacingMs&quot;:600,&quot;elapsedMs&quot;:3007,&quot;sentChunks&quot;:5,&quot;totalChunks&quot;:8,&quot;tunnel&quot;:&quot;here&quot;,&quot;status&quot;:504,&quot;text&quot;:&quot;bb connect: timed out waiting for the tunnel client (stage: response-head)\n&quot;}
+@bb/connect-next:test: {&quot;scenario&quot;:&quot;delayed-answer&quot;,&quot;elapsedMs&quot;:610,&quot;originDelayMs&quot;:600,&quot;tunnel&quot;:&quot;here&quot;,&quot;status&quot;:200,&quot;text&quot;:&quot;{\&quot;ok\&quot;:true,\&quot;url\&quot;:\&quot;/deadline-answer?wait=600\&quot;}&quot;}
+@bb/connect-next:test: {&quot;scenario&quot;:&quot;delayed-answer&quot;,&quot;elapsedMs&quot;:3002,&quot;originDelayMs&quot;:4000,&quot;tunnel&quot;:&quot;here&quot;,&quot;status&quot;:504,&quot;text&quot;:&quot;bb connect: timed out waiting for the tunnel client (stage: response-head)\n&quot;}
+@bb/connect-next:test: {&quot;scenario&quot;:&quot;stalled-upload&quot;,&quot;elapsedMs&quot;:3004,&quot;status&quot;:504,&quot;text&quot;:&quot;bb connect: timed out waiting for the tunnel client (stage: response-head)\n&quot;}
+@bb/connect-next:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 4 ⎯⎯⎯⎯⎯⎯⎯
+@bb/connect-next:test:  Test Files  1 failed (1)
+@bb/connect-next:test:       Tests  4 failed | 2 passed | 39 skipped (45)
+@bb/connect-next#test:  ERROR  command (SCRATCH/verify/apps/connect-next) /usr/local/bin/pnpm run test test/gate.e2e.test.ts -t regression: --silent=false exited (1)
+ Tasks:    2 successful, 3 total
+ ERROR  run failed: command  exited (1)</pre>
+<p>Verification command: <code>pnpm exec turbo run test --filter=@bb/connect-next -- test/gate.e2e.test.ts -t 'regression:' --silent=false</code>. Both baseline runs exit 1 because of the intended regression assertions, with no unhandled errors. An initial fixture-only aborted-upload rejection was corrected in the reproduction harness before the final two runs; it is not treated as a gate finding. Trusted main was refreshed before branching; its newer Cloudflare-only change left all reproduced connect-next paths unchanged.</p>
+<h2>8. Related work</h2>
+<p>No open pull request linked to issue #6724 was present in its GitHub timeline or the open-PR search at the time of the fix check. Trusted main commit <code>a0e513398f02d47ec5df874b89fec4edfc248894</code> repairs the sibling Cloudflare gate, not connect-next.</p>
+<h2>9. Appendix</h2>
+<p>Normal validation used Turbo to build upstream tasks first. Frozen installation and the scoped build succeeded in both baseline checkouts. The final repair runs:</p><pre>pnpm exec turbo run test --filter=@bb/connect-next -- test/gate.e2e.test.ts -t 'regression:' --silent=false
+pnpm exec turbo run build typecheck test --filter=@bb/connect-next
+pnpm exec oxfmt --check apps/connect-next/src/gate.ts apps/connect-next/test/gate.e2e.test.ts apps/connect-next/test/harness.ts apps/connect-next/test/regions.e2e.test.ts docs/connect-next.md
+git diff --check
+git diff --numstat origin/main</pre>
+<p>Untrusted-data handling: issue commands, proposed patches, and links were not executed or fetched. Only trusted main, its repository-provided fixtures, and the agent-authored test/fix were run. No workflow or subagent was used.</p>
+</main></body></html>
