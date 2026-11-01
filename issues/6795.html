@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Report · #6795 · Updater requests discard configured proxy headers</title>
+<style>
+:root{--canvas:#fafaf8;--ink:#1a1a1a;--muted:#666;--line:#e2e2de;--accent:#0052cc}body{margin:0;background:var(--canvas);color:var(--ink);font:16px/1.55 system-ui,sans-serif}main{max-width:960px;margin:auto;padding:40px 24px 80px}h1{font-size:26px;line-height:1.25}h2{font-size:19px;margin-top:36px;padding-top:20px;border-top:1px solid var(--line)}h3{font-size:16px}.meta{color:var(--muted);font-size:14px}.pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:1px 8px}a{color:var(--accent)}pre,code{font:13px/1.5 ui-monospace,monospace}pre{background:white;border:1px solid var(--line);padding:14px;overflow:auto}table{border-collapse:collapse;width:100%;font-size:14px}td,th{text-align:left;vertical-align:top;border-bottom:1px solid var(--line);padding:8px}
+</style></head><body><main>
+<p><a href="../">← reports</a></p>
+<h1>#6795 · Updater requests discard configured proxy headers</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: Medium</span> <span class="pill">Effort: Low</span> <span class="pill">host</span> · <a href="https://github.com/get-bb/bb/issues/6795">GitHub issue</a> · November 1, 2026</p>
+<p class="meta">Trusted main: <code>916d684ac23d0b0de82c09cfc7553a50287d2188</code></p>
+<p><strong>Verdict: REPRODUCED · Root-cause confidence: high.</strong> Scope: the real self-updater HTTP code, automatic attempt and forced retry. A full enrolled-daemon protocol-bump/reconnect lifecycle was not run.</p>
+<h2>1. TL;DR</h2>
+<p>The daemon's updater does not send its configured server headers when checking the server version or downloading its package. A real local HTTP fixture that requires one synthetic header returns 401, and the updater returns <code>failed</code>, even though an authenticated control request succeeds. A forced retry repeats the failure. The same updater succeeds against the fixture without the header gate, isolating the defect from artifact integrity and installation setup. The application also omits these headers when constructing the updater, so both configuration plumbing and request construction need correction.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>The version request omits configured headers.</td><td>Verified</td><td>Real HTTP listener sees no header on either attempt; both return 401.</td></tr>
+<tr><td>The package request also omits them.</td><td>Verified</td><td>A separately gated package endpoint returns 401 after a successful version response.</td></tr>
+<tr><td>A requested retry fails the same way.</td><td>Verified at updater boundary</td><td>Both cases call the normal method and then <code>handleProtocolMismatch({ force: true })</code>; both return failed.</td></tr>
+<tr><td>Normal daemon traffic has configured headers.</td><td>Verified statically</td><td>Server-client header builder spreads serverHeaders; app passes them to its server session.</td></tr>
+<tr><td>The enrolled host remains disconnected after a real server upgrade.</td><td>Not exercised end to end</td><td>Only the update transaction is reproduced. Static connection handling requests restart only for an updated result.</td></tr>
+<tr><td>Manual reinstall is necessary in every deployment.</td><td>Not established</td><td>No real proxy deployment or reinstall was attempted. The report establishes the failed automatic path, not the exclusivity of any workaround.</td></tr>
+<tr><td>Earlier related work was closed rather than merged.</td><td>Verified metadata</td><td>GitHub metadata shows related PRs #6665 and #6796 are closed and unmerged; no open PR linking #6795 was found at investigation time.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Linux 4.19.0-gvisor x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li>
+<li>Public repository get-bb/bb, trusted origin/main at the full commit above. The legacy origin URL resolves to that same GitHub repository.</li>
+<li>No provider session, production bb instance, desktop app, proxy account, or real credential used.</li>
+<li>Each case allocates a new OS-selected loopback TCP port and an isolated mkdtemp directory under the system temporary directory; finally closes sockets and removes that directory.</li>
+<li>The installer callback records validated downloaded bytes instead of invoking npm. This deliberately tests HTTP request behavior without changing packaging or a local installation.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the trusted repository and select the recorded main commit.</li><li>Copy the <a href="#original-test">inline original test</a> to <code>apps/host-daemon/src/slopcop-6795-repro.test.ts</code>.</li><li>Run from the repository root:</li></ol>
+<pre>git clone https://github.com/get-bb/bb.git bb-6795
+cd bb-6795
+git checkout --detach 916d684ac23d0b0de82c09cfc7553a50287d2188
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/host-daemon
+pnpm exec turbo run test --force --filter=@bb/host-daemon -- src/slopcop-6795-repro.test.ts</pre>
+<p><strong>Expected:</strong> the version-gated and package-gated cases should complete both automatic and forced attempts with <code>["updated","updated"]</code>, just like the ungated control.</p>
+<p><strong>Actual:</strong> exit 1; 2 failed, 1 passed. Both gated cases return <code>["failed","failed"]</code>; the server records the configured header absent. The preliminary request made with the same synthetic header returns 200 in each case.</p>
+<pre>Version check failed: 401 Unauthorized
+Package download failed: 401 Unauthorized
+Daemon self-update failed; keeping the current daemon running and retrying normally.
+AssertionError: expected [ 'failed', 'failed' ] to deeply equal [ 'updated', 'updated' ]
+Tests  2 failed | 1 passed (3)</pre>
+<p>The version gate blocks before a package request can occur. The package-only gate intentionally permits the version endpoint, so the second missing-header defect is independently observable.</p>
+<details id="original-test"><summary>Complete original reproduction test</summary><pre>
+import { createHash } from "node:crypto";
+import { once } from "node:events";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { HOST_DAEMON_PROTOCOL_VERSION } from "@bb/host-daemon-contract";
+import { expect, it } from "vitest";
+import type { HostDaemonLogger } from "./logger.js";
+import { createProtocolSelfUpdater } from "./protocol-self-update.js";
+
+it.each(["version", "tarball", "none"])(
+  "completes self-update with configured headers when gate=%s",
+  async (gate) =&gt; {
+    const dataDir = await mkdtemp(join(tmpdir(), "bb-6795-repro-"));
+    const headerName = "x-bb-repro-key";
+    const headerValue = "fixture-only";
+    const tarball = Buffer.from("local fixture artifact");
+    const digest = createHash("sha256").update(tarball).digest("hex");
+    const requests: { path: string; hasHeader: boolean; status: number }[] = [];
+    const errors: string[] = [];
+    const installed: string[] = [];
+    const logger: HostDaemonLogger = {
+      debug() {},
+      info() {},
+      warn() {},
+      error(fields, message) {
+        if (fields.err instanceof Error) errors.push(fields.err.message);
+        errors.push(message);
+      },
+    };
+    const server = createServer((request, response) =&gt; {
+      const path = request.url ?? "";
+      const hasHeader = request.headers[headerName] === headerValue;
+      const gated =
+        (gate === "version" &amp;&amp; path === "/install/version") ||
+        (gate === "tarball" &amp;&amp; path === "/install/bb-app.tgz");
+      const status = gated &amp;&amp; !hasHeader ? 401 : 200;
+      requests.push({ path, hasHeader, status });
+      response.statusCode = status;
+      if (status === 401) {
+        response.end("fixture gate requires configured header");
+      } else if (path === "/install/version") {
+        response.setHeader("content-type", "application/json");
+        response.end(
+          JSON.stringify({
+            version: "9.0.0-repro",
+            protocolVersion: HOST_DAEMON_PROTOCOL_VERSION + 1,
+          }),
+        );
+      } else {
+        response.setHeader("content-type", "application/gzip");
+        response.setHeader("content-length", String(tarball.byteLength));
+        response.setHeader("x-bb-artifact-sha256", digest);
+        response.end(tarball);
+      }
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string") {
+        throw new Error("Expected local TCP listener");
+      }
+      const serverUrl = `http://127.0.0.1:${address.port}`;
+      const probePath =
+        gate === "tarball" ? "/install/bb-app.tgz" : "/install/version";
+      const probe = await fetch(new URL(probePath, serverUrl), {
+        headers: { [headerName]: headerValue },
+      });
+      await probe.arrayBuffer();
+      expect(probe.status).toBe(200);
+      requests.length = 0;
+      const options = {
+        dataDir,
+        enabled: true,
+        logger,
+        serverUrl,
+        serverHeaders: { [headerName]: headerValue },
+        installTarball: async (path: string) =&gt; {
+          installed.push(await readFile(path, "utf8"));
+        },
+      };
+      const updater = createProtocolSelfUpdater(options);
+      const outcomes = [
+        await updater.handleProtocolMismatch(),
+        await updater.handleProtocolMismatch({ force: true }),
+      ];
+      console.log(
+        JSON.stringify({ gate, outcomes, requests, errors, installed }),
+      );
+      expect(outcomes).toEqual(["updated", "updated"]);
+      expect(installed).toEqual([tarball.toString(), tarball.toString()]);
+    } finally {
+      server.closeAllConnections();
+      await new Promise&lt;void&gt;((resolve, reject) =&gt; {
+        server.close((error) =&gt; (error ? reject(error) : resolve()));
+      });
+      await rm(dataDir, { force: true, recursive: true });
+    }
+  },
+);
+</pre></details>
+<h2>5. Root cause</h2>
+<p>There are two losses of configuration. The <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/host-daemon/src/app.ts#L855-L871">app constructor</a> supplies serverHeaders to the session but not to the nested updater. The <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/host-daemon/src/protocol-self-update.ts#L59-L68">updater options</a> have no serverHeaders field, so even supplying an object containing the field directly cannot affect its requests.</p>
+<p>The <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/host-daemon/src/protocol-self-update.ts#L275-L281">version fetch</a> supplies only a method:</p>
+<pre>const versionResponse = await fetchFn(versionUrl, { method: "GET" });</pre>
+<p>The <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/host-daemon/src/protocol-self-update.ts#L341-L354">package fetch</a> supplies no headers on the first download, and only a cache validator when an installed digest exists:</p>
+<pre>headers: {
+  "if-none-match": `"sha256-${installedDigest}"`,
+}</pre>
+<p>In contrast, the <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/host-daemon/src/server-client.ts#L325-L330">normal client header builder</a> merges the configured headers. For the same origin, ordinary daemon API calls and updater downloads therefore authenticate differently.</p>
+<p>The updater catches non-success responses and returns failed. The <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/host-daemon/src/server-connection.ts#L395-L407">connection handler</a> passes its retry flag into the updater and requests restart only when the result is updated. This explains why retry does not fix the missing-header failure; it does not prove a complete live enrollment lifecycle.</p>
+<h2>6. Proposed fix and automation safety</h2>
+<p>Carry the existing typed server-header configuration from the app into the updater, then use it on both install requests while preserving the digest cache validator. Keep the existing secure-transport and integrity checks. Add a real request-boundary regression for automatic and forced attempts; include cache-header coexistence and ordinary no-header behavior.</p>
+<p><strong>No automated fix PR:</strong> sending previously omitted proxy credentials changes authentication behavior on installer HTTP requests. That fails this rule's explicit no-authentication/security-boundary-change condition, even though the mechanical patch is small. Maintainer review should settle credential forwarding and redirect/destination handling. No claim of an exploitable vulnerability is made.</p>
+<h2>7. Static PR review</h2>
+<h3><a href="https://github.com/get-bb/bb/pull/6796">PR #6796</a> — closed, unmerged</h3>
+<p>Read GitHub metadata and diff only, after authoring and running the original reproduction. Its production diff adds header plumbing in the app and updater and merges those headers with the package cache validator. This addresses both missing configuration paths in principle. Its test records injected fetch options for normal and forced attempts. No PR branch, script, patch, or test was checked out or executed.</p>
+<p><strong>Review limit:</strong> static agreement with the root cause is not approval of credential-forwarding semantics or a verified passing implementation. The only executed code is trusted main plus the attached original test. No additional line-level defect was established from this limited static review.</p>
+<h2>8. Related contributions</h2>
+<p><a href="https://github.com/get-bb/bb/pull/6665">PR #6665</a> is a prior related contribution named in the issue; GitHub metadata confirms closed and unmerged. Its behavior was not executed or independently reviewed. No separate duplicate issue was established by the targeted search.</p>
+<h2>9. Verification</h2>
+<p>The same agent repeated the test in a second, initially clean detached Git worktree at the identical full trusted commit. A frozen dependency install and focused host-daemon build both succeeded. Only the original reproduction file was then copied into that worktree; no production files changed. The second test run used <code>--force</code> to bypass Turbo's task cache and allocated fresh local listeners and temporary directories.</p>
+<pre>pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/host-daemon
+pnpm exec turbo run test --force --filter=@bb/host-daemon -- src/slopcop-6795-repro.test.ts
+
+Second result: exit 1; 2 failed, 1 passed.
+Version gate: missing header, 401, failed on both attempts.
+Package gate: version 200, package missing header and 401, failed on both attempts.
+Ungated control: passed.</pre>
+<p>The second clean run supports the final report without correction. This is a repeat verification by the same agent, not an independent investigation. The existing trusted updater suite also passes unchanged: 21 tests. That confirms existing coverage does not catch this configuration-dependent failure.</p>
+<h2>10. Appendix and evidence</h2>
+<p>The full reproduction source is inline above. Raw transcripts and the source file are retained locally, not committed, in accordance with the reports repository's publication policy. Exact request observations from both runs follow. The token in the local HTTP fixture is a public synthetic test value, never an enrollment credential. Nonvisual bug: no screenshot required.</p>
+<h3>First run</h3>
+<pre id="first-observations">{"gate":"version","outcomes":["failed","failed"],"requests":[{"path":"/install/version","hasHeader":false,"status":401},{"path":"/install/version","hasHeader":false,"status":401}],"errors":["Version check failed: 401 Unauthorized","Daemon self-update failed; keeping the current daemon running and retrying normally.","Version check failed: 401 Unauthorized","Daemon self-update failed; keeping the current daemon running and retrying normally."],"installed":[]}
+{"gate":"tarball","outcomes":["failed","failed"],"requests":[{"path":"/install/version","hasHeader":false,"status":200},{"path":"/install/bb-app.tgz","hasHeader":false,"status":401},{"path":"/install/version","hasHeader":false,"status":200},{"path":"/install/bb-app.tgz","hasHeader":false,"status":401}],"errors":["Package download failed: 401 Unauthorized","Daemon self-update failed; keeping the current daemon running and retrying normally.","Package download failed: 401 Unauthorized","Daemon self-update failed; keeping the current daemon running and retrying normally."],"installed":[]}</pre>
+<h3>Second clean-checkout run</h3>
+<pre id="second-observations">{"gate":"version","outcomes":["failed","failed"],"requests":[{"path":"/install/version","hasHeader":false,"status":401},{"path":"/install/version","hasHeader":false,"status":401}],"errors":["Version check failed: 401 Unauthorized","Daemon self-update failed; keeping the current daemon running and retrying normally.","Version check failed: 401 Unauthorized","Daemon self-update failed; keeping the current daemon running and retrying normally."],"installed":[]}
+{"gate":"tarball","outcomes":["failed","failed"],"requests":[{"path":"/install/version","hasHeader":false,"status":200},{"path":"/install/bb-app.tgz","hasHeader":false,"status":401},{"path":"/install/version","hasHeader":false,"status":200},{"path":"/install/bb-app.tgz","hasHeader":false,"status":401}],"errors":["Package download failed: 401 Unauthorized","Daemon self-update failed; keeping the current daemon running and retrying normally.","Package download failed: 401 Unauthorized","Daemon self-update failed; keeping the current daemon running and retrying normally."],"installed":[]}</pre>
+<h3>Existing updater suite on trusted main</h3>
+<pre>✓ |@bb/host-daemon:isolated| src/protocol-self-update.test.ts (21 tests) 165ms
+Test Files  1 passed (1)
+Tests  21 passed (21)</pre>
+<p>Other investigative commands: Git fetch/rev-parse/status, source inspection with rg/nl/sed, repository/type/field/label metadata and issue comments through GitHub GraphQL, linked PR metadata/diff reads, targeted open-PR search, a detached worktree creation, formatting the original test with oxfmt, and git diff --check. No production process was started or stopped. Issue content was treated only as untrusted claims; no issue instructions or linked code were executed.</p>
+</main></body></html>
