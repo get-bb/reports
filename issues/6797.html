@@ -1,0 +1,291 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Issue 6797 · Realtime list refresh amplification</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">Reports</a></p>
+<h1>#6797 · Realtime list refreshes bypass the existing throttle</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Medium</span><span class="pill">ui, perf</span>
+<a href="https://github.com/get-bb/bb/issues/6797">GitHub issue</a> · 2026-11-01</p>
+<p>Trusted main commit: <code>916d684ac23d0b0de82c09cfc7553a50287d2188</code></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>The app maintains a shared sidebar query plus thread-list queries, including related-thread lists. Eleven kinds of realtime thread changes bypass the existing one-second active-refetch throttle. A deterministic test delivers four events spaced 200 ms apart: the sidebar query executes four times instead of once within that burst. Both clean checkouts produce the same failure; the test also observes real TanStack Query list observers rather than mocking the cache. This reproduces the request-amplification mechanism, not the reporter's production request rates, server timings, or CPU share.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Realtime changes repeatedly refetch sidebar and related lists</td><td>Verified mechanism</td><td>Four events produce four sidebar query executions in 800 ms in both runs; source shows identical unthrottled invalidation for project/fork lists.</td></tr>
+<tr><td>Only some paths use throttling</td><td>Verified</td><td>The metadata-less status fallback uses the throttled helper; background activity, title, queue, read state and structural list changes use other handlers.</td></tr>
+<tr><td>Production rates, response sizes, latency and CPU contribution</td><td>Unverified</td><td>No production profile or runtime data was accessed. These depend on load and network timing.</td></tr>
+<tr><td>Timeline responses lack compression</td><td>Unverified; separate claim</td><td>Not exercised by this cache-level reproduction or proposed fix.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Linux x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li>
+<li>Two detached worktrees at the trusted commit above: scratch/base and scratch/verify.</li>
+<li>No running app, providers, ports, database, credentials or user's runtime data. Each case creates a fresh QueryClient; fake timers model event cadence.</li>
+<li>Frozen installs passed. The initial all-workspace build encountered a plugin SDK build-order error. Building SDK types and then the owning app through Turbo passed. The second owning-app build passed from cache.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the public repository into a scratch directory and check out the recorded base commit.</li>
+<li>Install frozen dependencies and build the app's prerequisites.</li>
+<li>Copy the complete inline reproduction test into the path shown below; it is authored from trusted repository APIs, not copied from issue data.</li>
+<li>Run the focused test. It must fail on the unchanged base.</li></ol>
+<pre>git clone https://github.com/get-bb/bb.git scratch
+cd scratch
+git checkout --detach 916d684ac23d0b0de82c09cfc7553a50287d2188
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=@bb/app
+# Place the attached test at apps/app/src/hooks/realtime-thread-list-throttle.test.ts
+pnpm exec turbo run test --filter=@bb/app -- src/hooks/realtime-thread-list-throttle.test.ts</pre>
+<p>Expected: at most one refresh of each observed list during the first 800 ms, followed by one trailing refresh that reads the newest revision. Actual:</p>
+<pre>AssertionError: expected &quot;vi.fn()&quot; to be called 1 times, but got 4 times
+Test Files  1 failed (1)
+     Tests  11 failed (11)</pre>
+<p>The test fails on the first observer (sidebar), before its post-burst list and cleanup assertions; those assertions become the fix's regression contract, not additional claimed baseline observations.</p>
+<details><summary>Complete reproduction test</summary><pre>import { QueryClient, QueryObserver } from &quot;@tanstack/react-query&quot;;
+import { afterEach, expect, it, vi } from &quot;vitest&quot;;
+import { createRealtimeCacheEffects } from &quot;./realtime-cache-effects&quot;;
+import {
+  sidebarNavigationQueryKey,
+  threadListQueryKey,
+} from &quot;./queries/query-keys&quot;;
+
+afterEach(() =&gt; {
+  vi.useRealTimers();
+});
+
+it.each([
+  &quot;thread-created&quot;,
+  &quot;thread-deleted&quot;,
+  &quot;history-rewritten&quot;,
+  &quot;title-changed&quot;,
+  &quot;queue-changed&quot;,
+  &quot;archived-changed&quot;,
+  &quot;pin-state-changed&quot;,
+  &quot;parent-changed&quot;,
+  &quot;environment-changed&quot;,
+  &quot;read-state-changed&quot;,
+  &quot;events-appended&quot;,
+] as const)(&quot;coalesces %s list reads with a trailing refresh&quot;, async (change) =&gt; {
+  vi.useFakeTimers();
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { gcTime: Infinity, retry: false } },
+  });
+  const effects = createRealtimeCacheEffects({ queryClient });
+  let revision = 0;
+  const keys = [
+    sidebarNavigationQueryKey(),
+    threadListQueryKey({ archived: false }),
+    threadListQueryKey({ archived: false, projectId: &quot;project-1&quot; }),
+    threadListQueryKey({
+      archived: false,
+      projectId: &quot;project-1&quot;,
+      sourceThreadId: &quot;thr_parent&quot;,
+      originKind: &quot;fork&quot;,
+    }),
+  ];
+  const reads = keys.map(() =&gt; vi.fn(async () =&gt; revision));
+  const observers = keys.map(
+    (queryKey, index) =&gt;
+      new QueryObserver(queryClient, {
+        queryKey,
+        queryFn: reads[index],
+        staleTime: Infinity,
+      }),
+  );
+  const stops = observers.map((observer) =&gt; observer.subscribe(() =&gt; {}));
+  const inactiveKey = threadListQueryKey({
+    archived: false,
+    projectId: &quot;project-1&quot;,
+    sourceThreadId: &quot;thr_inactive&quot;,
+  });
+  queryClient.setQueryData(inactiveKey, 0);
+  try {
+    await vi.advanceTimersByTimeAsync(0);
+    for (const read of reads) {
+      read.mockClear();
+    }
+    for (revision = 1; revision &lt;= 4; revision += 1) {
+      effects.handleChanged({
+        type: &quot;changed&quot;,
+        entity: &quot;thread&quot;,
+        id: &quot;thr_child&quot;,
+        changes: [change],
+        metadata: { projectId: &quot;project-1&quot;, backgroundActivityChanged: true },
+      });
+      await vi.advanceTimersByTimeAsync(200);
+    }
+    for (const read of reads) {
+      expect(read).toHaveBeenCalledTimes(1);
+    }
+    expect(queryClient.getQueryState(inactiveKey)?.isInvalidated).toBe(true);
+    await vi.advanceTimersByTimeAsync(300);
+    for (const read of reads) {
+      expect(read).toHaveBeenCalledTimes(2);
+    }
+    for (const observer of observers) {
+      expect(observer.getCurrentResult().data).toBe(revision);
+    }
+    revision += 1;
+    effects.handleChanged({
+      type: &quot;changed&quot;,
+      entity: &quot;thread&quot;,
+      id: &quot;thr_child&quot;,
+      changes: [change],
+      metadata: { projectId: &quot;project-1&quot;, backgroundActivityChanged: true },
+    });
+    await vi.advanceTimersByTimeAsync(200);
+    effects.dispose();
+    await vi.advanceTimersByTimeAsync(2_000);
+    for (const read of reads) {
+      expect(read).toHaveBeenCalledTimes(2);
+    }
+  } finally {
+    for (const stop of stops) {
+      stop();
+    }
+    effects.dispose();
+    queryClient.clear();
+  }
+});
+</pre></details>
+<h2>5. Root cause</h2>
+<p>Thread changes are dispatched through a registry. The short scheduler debounce coalesces changes within a small window, but not a stream spaced 200 ms apart. Structural changes call dirtyThreadListQueries; title, queue, read state, environment and background activity call dirtyActiveThreadListQueries. Both directly refetch active queries. Only the metadata-less status fallback uses dirtyActiveThreadListQueriesWithThrottledRefetch.</p>
+<p><a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/app/src/hooks/cache-owners/realtime-cache-registry.ts#L747-L837">apps/app/src/hooks/cache-owners/realtime-cache-registry.ts:747</a></p><pre>
+function dirtyThreadListQueries({
+  projectId,
+  queryClient,
+}: ThreadRealtimeDirtyContext): QueryKey[] {
+  if (projectId) {
+    for (const queryKey of getCachedGlobalThreadListInvalidationQueryKeys({
+      queryClient,
+    })) {
+      invalidateQueryKeyWithoutCancelingActiveFetch({
+        exact: true,
+        queryClient,
+        queryKey,
+      });
+    }
+  }
+  return getThreadListInvalidationQueryKeys({ projectId, queryClient });
+}
+
+function dirtyActiveThreadListQueries({
+  projectId,
+  queryClient,
+}: ThreadRealtimeDirtyContext): QueryKey[] {
+  const listQueryKeys = projectId
+    ? [
+        ...getCachedProjectThreadListInvalidationQueryKeys({
+          projectId,
+          queryClient,
+        }),
+        ...getCachedGlobalThreadListInvalidationQueryKeys({ queryClient }),
+      ]
+    : getCachedThreadListQueryKeys(queryClient);
+  for (const queryKey of listQueryKeys) {
+    if (isArchivedThreadListQueryKey(queryKey)) {
+      queryClient.invalidateQueries({
+        exact: true,
+        queryKey,
+        refetchType: &quot;none&quot;,
+      });
+      continue;
+    }
+    invalidateQueryKeyWithoutCancelingActiveFetch({
+      exact: true,
+      queryClient,
+      queryKey,
+    });
+  }
+  return [sidebarNavigationQueryKey(), threadSearchQueryKeyPrefix()];
+}
+
+function dirtyActiveThreadListQueriesWithThrottledRefetch({
+  projectId,
+  queryClient,
+}: ThreadRealtimeDirtyContext): void {
+  const listQueryKeys = projectId
+    ? [
+        ...getCachedProjectThreadListInvalidationQueryKeys({
+          projectId,
+          queryClient,
+        }),
+        ...getCachedGlobalThreadListInvalidationQueryKeys({ queryClient }),
+      ]
+    : getCachedThreadListQueryKeys(queryClient);
+  for (const queryKey of listQueryKeys) {
+    if (isArchivedThreadListQueryKey(queryKey)) {
+      queryClient.invalidateQueries({
+        exact: true,
+        queryKey,
+        refetchType: &quot;none&quot;,
+      });
+      continue;
+    }
+    invalidateQueryKeyWithThrottledActiveRefetch({
+      exact: true,
+      minIntervalMs: THREAD_LIST_STATUS_FALLBACK_REFETCH_MIN_INTERVAL_MS,
+      queryClient,
+      queryKey,
+    });
+  }
+  for (const queryKey of [
+    sidebarNavigationQueryKey(),
+    threadSearchQueryKeyPrefix(),
+  ]) {
+    invalidateQueryKeyWithThrottledActiveRefetch({
+      exact: false,
+      minIntervalMs: THREAD_LIST_STATUS_FALLBACK_REFETCH_MIN_INTERVAL_MS,
+      queryClient,
+      queryKey,
+    });
+  }
+}</pre>
+<p>The shared key group includes sidebarNavigationQueryKey; its query function calls the bootstrap endpoint. Related-thread lists use the same cached thread-list key family, so the active-list loop also invalidates them. Refetches now avoid cancelling an active fetch (a prior livelock fix), but that protection does not rate-limit quick completed reads.</p>
+<p><a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/app/src/hooks/cache-owners/cache-invalidation-groups.ts#L81-L97">apps/app/src/hooks/cache-owners/cache-invalidation-groups.ts:81</a></p><pre>export function getThreadListInvalidationQueryKeys({
+  projectId,
+  queryClient,
+}: ThreadListInvalidationArgs): QueryKey[] {
+  const threadListQueryKeys = projectId
+    ? getCachedProjectThreadListInvalidationQueryKeys({
+        projectId,
+        queryClient,
+      })
+    : [threadsQueryKey()];
+  return [
+    ...threadListQueryKeys,
+    sidebarNavigationQueryKey(),
+    threadSearchQueryKeyPrefix(),
+  ];
+}
+</pre><p><a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/app/src/hooks/queries/sidebar-navigation-query.ts#L22-L29">apps/app/src/hooks/queries/sidebar-navigation-query.ts:22</a></p><pre>function fetchSidebarNavigation(
+  signal?: AbortSignal,
+): Promise&lt;SidebarBootstrapResponse&gt; {
+  return request&lt;SidebarBootstrapResponse&gt;(
+    apiClient[&quot;sidebar-bootstrap&quot;].$get(undefined, requestOptions(signal)),
+  );
+}
+</pre>
+<h2>6. Proposed fix</h2>
+<p>Route both structural and active-only thread-list invalidations through the existing per-QueryClient, per-key one-second leading/trailing refetch scheduler. Preserve archived-list invalidation rules, immediate stale marking, non-cancelling in-flight behavior and disposal cleanup. Share the same buckets with the status fallback so mixed event types cannot bypass the bound. Do not alter HTTP protocols, server policy, compression or dependencies.</p>
+<h2>7. Related issues and pull requests</h2>
+<p>No linked open PR appeared in the issue timeline or an open-PR search for its number at investigation time. Trusted history includes commit 41c6abe6daf274dc727c323ab0729bc4824e564e (PR #6458), which prevented active-read cancellation livelock; it did not extend status-fallback throttling to the other list handlers. No external issue links or linked PR code was executed.</p>
+<h2>8. Verification</h2>
+<p>The same agent repeated the reproduction in a second clean detached worktree at the identical trusted commit. A new frozen install and owning-app Turbo build completed before adding only the reproduction test. The command was the same focused Turbo test invocation shown above. All eleven cases again failed with four calls rather than one. No live service was needed, so there were no ports or data directories to reuse. This is a second clean run, not an independent-agent verification. No report correction was needed.</p>
+<p>First run: 11 cases failed, duration 12.60s. Second run: 11 cases failed, duration 11.85s. Both printed the exact assertion above. Raw logs stay outside the public repository under its publication rules.</p>
+<h2>9. Appendix</h2>
+<p>The test uses genuine TanStack QueryClient and QueryObserver instances and the production createRealtimeCacheEffects entry point. It counts query-function executions, not HTTP traffic; functions return a revision counter to avoid requiring an API or database. No visual claim is made and no synthetic screenshot is supplied. The optional production fix must additionally prove trailing freshness, inactive-query stale marking and timer cancellation, then run existing realtime suites.</p>
+<p>Commands executed: git fetch origin main; git worktree add --detach for each checkout; frozen pnpm installs; initial full Turbo build; SDK type build; owning-app builds; focused Turbo tests. Metadata was read with GitHub CLI and classification written through the supplied SlopCop wrapper. Issue content was treated only as untrusted claims; its suggested actions were not followed as instructions.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
