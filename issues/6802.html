@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #6802 Plugin update checks lack per-plugin failure isolation</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main><p class="meta"><a href="../">← reports</a></p>
+<h1>#6802 · Plugin update checks lack per-plugin failure isolation</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Medium priority</span><span class="pill">Low effort</span><span class="pill">plugins · cli</span>
+<a href="https://github.com/get-bb/bb/issues/6802">GitHub issue</a><span>2026-11-02 · base <code>916d684ac23d0b0de82c09cfc7553a50287d2188</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>An installed plugin whose Git source disappears makes the shared update-check API return HTTP 422 without a results array, even with a healthy installed plugin. This is not an installation failure: both plugins install successfully before one source directory is moved away. A real Git process rejects the source lookup, and the update worker lets that rejection escape its shared Promise.all. Branch selectors and semantic-version ranges both reproduce the failure. The same agent repeated the test in a second clean checkout before testing a small per-plugin isolation repair.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>One unreachable Git source aborts the complete check</td><td class="ok">Verified</td><td>Both selector cases return 422 rather than a results array containing unavailable and current entries.</td></tr>
+<tr><td>Failure affects healthy plugins too</td><td class="ok">Verified at the API response</td><td>The other local Git source remains intact. It has no result in the failed response. Some concurrent worker persistence may still complete; this is not a claim that all stored results are erased.</td></tr>
+<tr><td>The Git lookup rejection escapes the worker</td><td class="ok">Verified</td><td>Real Git against a moved local repository, plus the trusted source chain below.</td></tr>
+<tr><td>CLI, Settings and periodic checks share the defective operation</td><td>Source-traced; not separately run live</td><td>CLI → SDK → check route; settings query → same SDK method; periodic task → same service method.</td></tr>
+<tr><td>Specific macOS SSH-credential failure</td><td>Not separately exercised</td><td>Linux local-source removal reproduces the same nonzero Git-command rejection without any credentials or external remote.</td></tr>
+</table>
+<h2>3. Environment</h2>
+<ul><li>Public get-bb/bb, trusted origin/main at <code>916d684ac23d0b0de82c09cfc7553a50287d2188</code>; unchanged production code in both reproduction checkouts.</li>
+<li>Linux x86_64, Node v22.19.0, pnpm 9.15.0, Git 2.39.5, Vitest 4.1.1.</li>
+<li>Real migrated SQLite via createMigratedConnection; genuine temporary Git repositories and plugin installation/builds.</li>
+<li>No listening application server, no real user store, credentials or provider session. Hono handles the request in process; the test harness creates and removes fresh temporary data directories for each case and each checkout.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the trusted public repository and select the recorded commit:
+<pre>git clone --branch main https://github.com/get-bb/bb.git bb-6802-repro
+cd bb-6802-repro
+git checkout 916d684ac23d0b0de82c09cfc7553a50287d2188
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/server</pre></li>
+<li>Insert the test below inside the existing <code>describe("plugin update service and routes", ...)</code> block in <code>apps/server/test/services/plugins/plugin-update.test.ts</code>, immediately before the existing offline-npm-registry test. It deliberately reuses that file's real installation, database, route and taggedRepo fixtures.
+<pre>  it.each([&quot;main&quot;, &quot;semver:^1.0.0&quot;])(
+    &quot;keeps healthy plugin results when the git remote for %s is unavailable&quot;,
+    async (selector) =&gt; {
+      const tagged = await taggedRepo();
+      await service.install(`git:${tagged}@${selector}`, { kind: &quot;root&quot; });
+      const offline = join(workDir, &quot;offline&quot;);
+      await rename(tagged, offline);
+
+      const response = await app.request(&quot;/plugins/updates/check&quot;, {
+        method: &quot;POST&quot;,
+        headers: { &quot;content-type&quot;: &quot;application/json&quot; },
+        body: &quot;{}&quot;,
+      });
+      expect({
+        status: response.status,
+        ...(await response.json()),
+      }).toMatchObject({
+        status: 200,
+        results: [
+          {
+            id: &quot;tagged&quot;,
+            outcome: &quot;unavailable&quot;,
+            detail: expect.stringContaining(&quot;git ls-remote failed&quot;),
+          },
+          { id: &quot;updater&quot;, outcome: &quot;current&quot; },
+        ],
+      });
+      expect(service.listUpdateResults()).toMatchObject([
+        { id: &quot;tagged&quot;, outcome: &quot;unavailable&quot; },
+        { id: &quot;updater&quot;, outcome: &quot;current&quot; },
+      ]);
+
+      await rename(offline, tagged);
+      await expect(service.checkForUpdates(&quot;tagged&quot;)).resolves.toMatchObject([
+        { id: &quot;tagged&quot;, outcome: &quot;current&quot; },
+      ]);
+    },
+  );
+
+</pre></li>
+<li>Run the focused regression on unchanged production code:
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-update.test.ts -t 'keeps healthy plugin results'</pre></li></ol>
+<p><strong>Expected:</strong> HTTP 200 with two ordered results: tagged/unavailable including the Git error, updater/current. Both entries should be persisted, and restoring the source should make the next targeted check return current.</p>
+<p><strong>Actual:</strong> HTTP 422; both parameterized cases fail before persistence/recovery assertions can run. The following is the verbatim assertion output (ANSI styling omitted):</p>
+<pre>@bb/server:test:  FAIL  |@bb/server:isolated| test/services/plugins/plugin-update.test.ts &gt; plugin update service and routes &gt; keeps healthy plugin results when the git remote for main is unavailable
+@bb/server:test:  FAIL  |@bb/server:isolated| test/services/plugins/plugin-update.test.ts &gt; plugin update service and routes &gt; keeps healthy plugin results when the git remote for semver:^1.0.0 is unavailable
+@bb/server:test: AssertionError: expected { status: 422, …(1) } to match object { status: 200, results: [ …(2) ] }
+@bb/server:test: (1 matching property omitted from actual)
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test:   {
+@bb/server:test: -   &quot;results&quot;: [
+@bb/server:test: -     {
+@bb/server:test: -       &quot;detail&quot;: StringContaining &quot;git ls-remote failed&quot;,
+@bb/server:test: -       &quot;id&quot;: &quot;tagged&quot;,
+@bb/server:test: -       &quot;outcome&quot;: &quot;unavailable&quot;,
+@bb/server:test: -     },
+@bb/server:test: -     {
+@bb/server:test: -       &quot;id&quot;: &quot;updater&quot;,
+@bb/server:test: -       &quot;outcome&quot;: &quot;current&quot;,
+@bb/server:test: -     },
+@bb/server:test: -   ],
+@bb/server:test: -   &quot;status&quot;: 200,
+@bb/server:test: +   &quot;status&quot;: 422,
+@bb/server:test:   }
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/plugins/plugin-update.test.ts:453:10
+@bb/server:test:     451|         status: response.status,
+@bb/server:test:     452|         ...(await response.json()),
+@bb/server:test:     453|       }).toMatchObject({
+@bb/server:test:        |          ^
+@bb/server:test:     454|         status: 200,
+@bb/server:test:     455|         results: [
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+@bb/server:test: 
+@bb/server:test: 
+
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  2 failed | 31 skipped (33)
+@bb/server:test:    Start at  01:08:56
+@bb/server:test:    Duration  16.31s (transform 5.57s, setup 1.77s, import 5.45s, tests 4.08s, environment 0ms)
+@bb/server:test: </pre>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/server/src/services/plugins/install-sources.ts#L687-L707">runInstallCommand</a> rejects nonzero process exits, retaining the stderr tail:</p>
+<pre>      if (code === 0) {
+        resolve();
+        return;
+      }
+      const tail = stderr.trim().slice(-1000);
+      reject(
+        new Error(
+          `${command} ${args[0]} failed (exit ${code ?? &quot;signal&quot;})${tail ? `: ${tail}` : &quot;&quot;}`,
+        ),
+      );
+    });</pre>
+<p>The <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/server/src/services/plugins/update-resolver.ts#L444-L482">Git ref lookup</a> and <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/server/src/services/plugins/update-resolver.ts#L524-L544">semver tag listing</a> await that command without converting failures to an unavailable resolution. The service <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/server/src/services/plugins/plugin-updates.ts#L473-L512">checkRows worker</a> awaits resolution before persistence with no per-row error conversion:</p>
+<pre>          const resolution = await resolveUpdateForRow({
+            row: current,
+            npmRun: npmRunForRow(current),
+          });
+          const checked = checkEntryFromResolution(
+            current.id,
+            installedUpdateVersion(current),
+            resolution,
+          );
+          persistUpdateEntry(checked);
+          return checked;</pre>
+<p>Any rejection escapes the lifecycle lock and rejects the Promise.all sweep. The <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/server/src/routes/plugins.ts#L667-L683">HTTP route</a> catches that aggregate failure and sends 422, not partial results. A successful sibling can still have its state persisted; Promise.all does not cancel its work.</p>
+<p>Other callers: <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/cli/src/commands/plugin.ts#L1326-L1338">CLI outdated</a> calls <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/packages/sdk/src/areas/plugins.ts#L623-L632">SDK checkUpdates</a>; <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/app/src/components/settings/UpdatesSettingsSection.tsx#L1962-L1965">Settings Updates</a> uses the update-check query; <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/server/src/services/plugins/plugin-updates.ts#L451-L470">periodic checker</a> calls the same service and logs a sweep failure. These are source-level implications, not separately observed live CLI/UI runs.</p>
+<p>History inspection attributes the unguarded worker resolution to <code>ba2e359bc2a</code>; the recorded main still contains it. No linked open pull request was found in the issue timeline or the open-PR search at investigation time.</p>
+<h2>6. Proposed fix</h2>
+<p>Catch only the per-row resolveUpdateForRow call in checkRows. Convert the thrown value to the existing unavailable resolution with its message, then pass it through the normal check-entry conversion and persistence path. Leave lifecycle/database failure handling outside that catch and leave actual update execution unchanged. No public contract, protocol or stored-data shape changes are needed.</p>
+<p>The local candidate changes two files, 55 total added/deleted text lines (16 production and 39 tests). The regression is table-driven over branch and semver selectors, checks the shared route, persisted results and recovery after the source returns. Both cases pass with the candidate repair.</p>
+<h2>7. Verification</h2>
+<p>The same agent created a second detached checkout from the recorded trusted commit, installed frozen dependencies and built the server there. Only the authored regression test was copied in; no production fix was copied. The second checkout used fresh test-created repositories and data directories and no ports.</p>
+<pre>git worktree add --detach SECOND_CHECKOUT 916d684ac23d0b0de82c09cfc7553a50287d2188
+# Copy only the authored test into the same tracked test path.
+cd SECOND_CHECKOUT
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/server
+pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-update.test.ts -t 'keeps healthy plugin results'</pre>
+<p>The second run also failed exactly the two cases with HTTP 422 instead of 200. No correction to the root-cause finding was needed. This is a repeat by the same agent, not an independent investigation.</p>
+<pre>@bb/server:test:  FAIL  |@bb/server:isolated| test/services/plugins/plugin-update.test.ts &gt; plugin update service and routes &gt; keeps healthy plugin results when the git remote for main is unavailable
+@bb/server:test:  FAIL  |@bb/server:isolated| test/services/plugins/plugin-update.test.ts &gt; plugin update service and routes &gt; keeps healthy plugin results when the git remote for semver:^1.0.0 is unavailable
+@bb/server:test: AssertionError: expected { status: 422, …(1) } to match object { status: 200, results: [ …(2) ] }
+@bb/server:test: (1 matching property omitted from actual)
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test:   {
+@bb/server:test: -   &quot;results&quot;: [
+@bb/server:test: -     {
+@bb/server:test: -       &quot;detail&quot;: StringContaining &quot;git ls-remote failed&quot;,
+@bb/server:test: -       &quot;id&quot;: &quot;tagged&quot;,
+@bb/server:test: -       &quot;outcome&quot;: &quot;unavailable&quot;,
+@bb/server:test: -     },
+@bb/server:test: -     {
+@bb/server:test: -       &quot;id&quot;: &quot;updater&quot;,
+@bb/server:test: -       &quot;outcome&quot;: &quot;current&quot;,
+@bb/server:test: -     },
+@bb/server:test: -   ],
+@bb/server:test: -   &quot;status&quot;: 200,
+@bb/server:test: +   &quot;status&quot;: 422,
+@bb/server:test:   }
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/plugins/plugin-update.test.ts:453:10
+@bb/server:test:     451|         status: response.status,
+@bb/server:test:     452|         ...(await response.json()),
+@bb/server:test:     453|       }).toMatchObject({
+@bb/server:test:        |          ^
+@bb/server:test:     454|         status: 200,
+@bb/server:test:     455|         results: [
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+@bb/server:test: 
+@bb/server:test: 
+
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  2 failed | 31 skipped (33)
+@bb/server:test:    Start at  01:09:16
+@bb/server:test:    Duration  11.09s (transform 5.15s, setup 1.50s, import 5.07s, tests 2.72s, environment 0ms)
+@bb/server:test: </pre>
+<h2>8. Related issues</h2>
+<p>No duplicate or linked open pull request was identified in the bounded searches performed for this issue. This report addresses error isolation, not release selection policy.</p>
+<h2>9. Appendix and safety limits</h2>
+<p>All issue data was treated as untrusted evidence. No issue-provided command, script, patch, branch or URL was executed or fetched. The reproduction was authored from trusted repository fixtures; it neither contacts the alleged failing remote nor requires SSH. Raw logs, the test diff and the prepared brief remain outside this public report repository. The public reproduction artifact is the complete inline test above, in accordance with this site's no-repro-files policy.</p>
+<p>Validation performed: frozen installs and server builds in both checkouts; focused baseline twice (two expected failures each); focused candidate (two passes). The full server plugin subsystem suite passed 585 tests across 58 files with the candidate repair, and the server Turbo typecheck passed. The lint task selection had no server lint script; no separate lint success is claimed. Changed files were formatted with the existing oxfmt configuration and git diff --check passed.</p>
+<p>Inspection commands included git log and git blame for the owner, issue field/timeline queries, open pull-request search, source reads, git diff --numstat origin/main, and git diff --check. No production instance was started, modified or stopped.</p>
+</main></body></html>
