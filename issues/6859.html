@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #6859 Superseded outline responses consume cache capacity</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#6859 · Superseded outline responses consume cache capacity</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Low priority</span><span class="pill">Low effort</span><span class="pill">threads · perf</span>
+<a href="https://github.com/get-bb/bb/issues/6859">Issue</a> · 2026-11-02 · base <code>d448d87f2033f7c253b64370c321ea9e7500c81d</code></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · reproduction label: <code>confirmed-repro</code></p>
+<h2>1. TL;DR</h2>
+<p>The server can retain many obsolete conversation-outline responses for one evolving thread.
+Each new outline sequence creates a distinct response-cache key, but the old key is not removed.
+The 128-entry limit bounds entry count rather than the number of threads or bytes, so old responses consume capacity and can evict another thread's still-current response.
+A new route-level regression demonstrates that eviction on trusted main in two separate checkouts.
+No production heap, memory amount, or client platform claim was measured in this investigation.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>One thread's advancing outline leaves superseded response entries.</td><td>Verified</td><td>The route inserts by versioned key without deleting the previous key; 130 revisions evict another cached thread in both baseline runs.</td></tr>
+<tr><td>The response cache is capped at 128 entries.</td><td>Verified</td><td>The route's insertion loop deletes only when map size exceeds 128.</td></tr>
+<tr><td>Tens of megabytes were retained on a production server.</td><td>Unverified</td><td>No production runtime or heap was accessed. Only the retention mechanism and resulting cache miss were reproduced.</td></tr>
+<tr><td>The behavior occurs on the reported macOS/Node combination.</td><td>Unverified here</td><td>Both runs used Linux x86_64 and Node v22.19.0.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Public repository: get-bb/bb; trusted origin/main: <code>d448d87f2033f7c253b64370c321ea9e7500c81d</code>.</li>
+<li>Linux x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li>
+<li>In-process Hono application with the repository server harness and real migrated temporary SQLite databases. No provider session, listening server, browser, production data, or network-facing plugin instance.</li>
+<li>Second run: separate fresh detached worktree at the same base, with its own frozen dependency install, generated build outputs, and test-harness temporary directories. No application ports were needed.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<p>This test was designed from repository evidence; no issue-supplied script or patch was executed. It caches an empty stable thread, advances another thread 130 times, checks each response for fresh content, then checks whether rereading the stable thread requires a stored-outline database lookup.</p>
+<ol><li>Use a fresh trusted checkout of get-bb/bb at the recorded commit.</li>
+<li>Install the existing lockfile, build SDK prerequisites, and build the server:
+<pre>pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=@bb/server</pre></li>
+<li>Download the <a href="6859/repro/regression.patch">regression-only patch</a> and apply it from the repository root:
+<pre>git apply regression.patch
+pnpm exec turbo run test --filter=@bb/server -- test/public/public-thread-data.test.ts -t "keeps another thread's outline cached"</pre></li></ol>
+<p>Expected: no stored-outline read on the stable thread's second request; only two distinct threads were cached.
+Actual, identically in both baseline runs:</p>
+<pre>AssertionError: expected [ Array(1) ] to have a length of +0 but got 1
+- Expected: 0 stored-outline reads
++ Received: 1 stored-outline read</pre>
+<p>The 130 changing-thread requests all returned HTTP 200 with the expected latest sequence and message. The failure is specifically the final cache-retention assertion, not setup, stale content, or transport failure.</p>
+<h3>Regression test added to the existing public route suite</h3><pre>  it(&quot;keeps another thread&#x27;s outline cached while one thread advances&quot;, async () =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      const stable = seedThreadFixture(harness);
+      const changing = seedThreadFixture(harness);
+      const stableUrl = `/api/v1/threads/${stable.thread.id}/conversation-outline`;
+      const changingUrl = `/api/v1/threads/${changing.thread.id}/conversation-outline`;
+      expect((await harness.app.request(stableUrl)).status).toBe(200);
+
+      for (let sequence = 1; sequence &lt;= 130; sequence++) {
+        seedEvent(harness.deps, {
+          threadId: changing.thread.id,
+          environmentId: changing.environment.id,
+          sequence,
+          type: &quot;system/manager/user_message&quot;,
+          scope: threadScope(),
+          data: { text: `Message ${sequence}` },
+        });
+        const response = await harness.app.request(changingUrl);
+        expect(response.status).toBe(200);
+        const outline = threadConversationOutlineResponseSchema.parse(
+          await readJson(response),
+        );
+        expect(outline.maxSeq).toBe(sequence);
+        expect(outline.items.at(-1)?.preview).toBe(`Message ${sequence}`);
+      }
+
+      const prepareSpy = vi.spyOn(harness.db.$client, &quot;prepare&quot;);
+      try {
+        const response = await harness.app.request(stableUrl);
+        expect(response.status).toBe(200);
+        expect(
+          threadConversationOutlineResponseSchema.parse(await readJson(response)),
+        ).toEqual({ items: [], maxSeq: 0 });
+        const storedOutlineReads = prepareSpy.mock.calls.filter(([source]) =&gt;
+          source.startsWith(&#x27;select &quot;items_json&quot;, &quot;projection_key&quot;&#x27;),
+        );
+        expect(storedOutlineReads).toHaveLength(0);
+      } finally {
+        prepareSpy.mockRestore();
+      }
+    });
+  });
+</pre>
+<h2>5. Root cause</h2>
+<p>The route creates one LRU response map with 128 entries. Its key includes thread identity, database data version, and the outline projection key.
+The projection key includes the latest outline sequence. Therefore each appended outline-relevant event changes the response key.</p>
+<p><a href="https://github.com/get-bb/bb/blob/d448d87f2033f7c253b64370c321ea9e7500c81d/apps/server/src/routes/threads/data.ts#L155-L159">Response-cache ownership and limit</a></p><pre>  const conversationOutlineCache = new Map&lt;
+    string,
+    ThreadConversationOutlineResponse[&quot;items&quot;]
+  &gt;();
+  const CONVERSATION_OUTLINE_CACHE_MAX_ENTRIES = 128;</pre>
+<p><a href="https://github.com/get-bb/bb/blob/d448d87f2033f7c253b64370c321ea9e7500c81d/apps/server/src/routes/threads/data.ts#L269-L299">Versioned lookup and insertion</a></p><pre>    const outlineOptions = resolveConversationRowsOptions(thread);
+    const { maxSeq } = outlineOptions;
+    const cacheKey = JSON.stringify([
+      thread.id,
+      getDatabaseDataVersion(deps.db),
+      buildThreadConversationOutlineProjectionKey(
+        thread,
+        outlineSequence,
+        outlineOptions,
+      ),
+    ]);
+    const cached = conversationOutlineCache.get(cacheKey);
+    if (cached !== undefined) {
+      conversationOutlineCache.delete(cacheKey);
+      conversationOutlineCache.set(cacheKey, cached);
+      return context.json({ items: selectItems(cached), maxSeq });
+    }
+    const response = loadThreadConversationOutline(deps.db, thread, {
+      ...outlineOptions,
+      outlineSequence,
+    });
+    conversationOutlineCache.set(cacheKey, response.items);
+    while (
+      conversationOutlineCache.size &gt; CONVERSATION_OUTLINE_CACHE_MAX_ENTRIES
+    ) {
+      const oldest = conversationOutlineCache.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      conversationOutlineCache.delete(oldest);
+    }</pre>
+<p><a href="https://github.com/get-bb/bb/blob/d448d87f2033f7c253b64370c321ea9e7500c81d/apps/server/src/services/threads/timeline.ts#L1881-L1898">Projection revision includes outlineSequence</a></p><pre>export function buildThreadConversationOutlineProjectionKey(
+  thread: Thread,
+  outlineSequence: number,
+  options: BuildThreadConversationOutlineOptions,
+): string {
+  return JSON.stringify([
+    CONVERSATION_OUTLINE_PROJECTION_VERSION,
+    getThreadEventRewriteGeneration(thread.id),
+    outlineSequence,
+    thread.providerId,
+    options.providerDisplayName ?? null,
+    thread.status,
+    thread.title,
+    thread.titleFallback,
+    options.completedTurnDisplay,
+    options.includeClearedContextHistory,
+  ]);
+}</pre>
+<p>On a miss, the route inserts another full items array and removes only the oldest global entry if the limit is exceeded.
+It has no per-thread replacement operation. Ordinary append-only progress cannot request those obsolete sequence keys again.
+The baseline regression indirectly observes the accumulated dead slots through eviction at the database boundary, without inspecting private maps or modifying global Map behavior.</p>
+<h2>6. Proposed fix</h2>
+<p>Keep the existing LRU but index it by thread ID. Store the current full revision key alongside the items.
+Serve a cached response only when that revision matches, and delete/reinsert the thread entry on both hits and replacements to maintain recency.
+Keep all existing invalidation inputs, role filtering, maxSeq behavior, and the 128-thread limit. No API, protocol, schema, dependency, or persistence change is needed.</p>
+<h2>7. Verification</h2>
+<p>The same agent repeated the baseline test in a second clean detached worktree at <code>d448d87f2033f7c253b64370c321ea9e7500c81d</code>; this is not independent verification.
+Only the new regression test was applied there; production code was unchanged. The exact command in section 4 failed at the same final assertion with one stored-outline lookup instead of zero.
+No report correction was needed. See <a href="6859/repro/second-before.log">second-run output</a> and <a href="6859/repro/before.log">first-run output</a>.</p>
+<p>After the local fix, the complete public-thread-data route suite passes, including the regression and existing outline reuse/invalidation/filtering cases.
+The server typecheck, formatter, diff whitespace check, and builds also pass. The patch changes two files and 63 total text lines (56 additions, 7 deletions).</p>
+<pre>@bb/plugin-build:generate: wrote &lt;checkout&gt;/packages/plugin-build/src/generated/runtime-export-manifest.generated.ts (react@19.3.0)
+@bb/agent-runtime:generate:test-bridges: cache miss, executing bea2c903440076e5
+@bb/agent-runtime:generate:test-bridges: 
+@bb/agent-runtime:generate:test-bridges: &gt; @bb/agent-runtime@0.0.1 generate:test-bridges &lt;checkout&gt;/packages/agent-runtime
+@bb/agent-runtime:generate:test-bridges: &gt; node ./scripts/build-test-bridges.mjs
+@bb/agent-runtime:generate:test-bridges: 
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp-next.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-environment-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-machine-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-customization-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-handle.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-view.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-thread-status.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-file-navigation-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-host-policy.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-plugin-app-collector.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-rpc-tags.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-rpc-query-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-process.d.ts
+@bb/server:test: cache miss, executing bfc4d1248800c237
+@bb/server:test: 
+@bb/server:test: &gt; @bb/server@0.0.1 test &lt;checkout&gt;/apps/server
+@bb/server:test: &gt; vitest run --config vitest.config.ts &quot;test/public/public-thread-data.test.ts&quot;
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  RUN  v4.1.1 &lt;checkout&gt;/apps/server
+@bb/server:test: 
+@bb/server:test: (node:10892) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test:  ✓ |@bb/server| test/public/public-thread-data.test.ts (71 tests) 13708ms
+@bb/server:test:      ✓ keeps another thread&#x27;s outline cached while one thread advances  956ms
+@bb/server:test:      ✓ expands the newest slice when a large delegation parent completes last  513ms
+@bb/server:test: 
+@bb/server:test:  Test Files  1 passed (1)
+@bb/server:test:       Tests  71 passed (71)
+@bb/server:test:    Start at  20:55:09
+@bb/server:test:    Duration  47.69s (transform 31.98s, setup 4.79s, import 23.24s, tests 13.71s, environment 0ms)
+@bb/server:test: 
+
+ Tasks:    10 successful, 10 total
+Cached:    0 cached, 10 total
+  Time:    1m32.818s 
+
+</pre>
+<p>Initial full builds encountered missing generated SDK runtime outputs; building the SDK through Turbo resolved this environment prerequisite. No dependency or unrelated source change was made.</p>
+<h2>8. Related issues</h2>
+<p><a href="https://github.com/get-bb/bb/issues/2066">#2066</a> tracks obsolete revisions in the timeline cache, a different response route.
+<a href="https://github.com/get-bb/bb/issues/3951">#3951</a> concerns timeline cache admission limits.
+No open pull request linking #6859 was present in issue cross-reference metadata or the open-PR search before implementation.</p>
+<h2>9. Appendix</h2>
+<p>Issue content was treated as untrusted evidence only; no issue instructions, scripts, patches, external links, or linked-PR code were executed.</p>
+<ul><li><a href="6859/repro/regression.patch">Regression patch against trusted baseline</a></li>
+<li><a href="6859/repro/before.log">First expected baseline failure</a></li><li><a href="6859/repro/second-before.log">Second expected baseline failure</a></li>
+<li><a href="6859/repro/after.log">Fixed route suite</a></li><li><a href="6859/repro/checks.log">Server typecheck</a></li>
+<li><a href="6859/repro/build.log">Full build</a></li><li><a href="6859/repro/second-build.log">Clean verification-checkout server build</a></li></ul>
+<pre>git fetch origin main
+git rev-parse origin/main
+git worktree add --detach &lt;verification-checkout&gt; d448d87f2033f7c253b64370c321ea9e7500c81d
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build
+pnpm exec turbo run test --filter=@bb/server -- test/public/public-thread-data.test.ts -t "keeps another thread's outline cached"
+pnpm exec turbo run test --filter=@bb/server -- test/public/public-thread-data.test.ts
+pnpm exec turbo run typecheck lint --filter=@bb/server
+pnpm exec oxfmt apps/server/src/routes/threads/data.ts apps/server/test/public/public-thread-data.test.ts
+git diff --check
+git diff --numstat origin/main</pre>
+<p>Nonvisual backend bug: no screenshots required. Test/build logs are excerpts with checkout paths removed. The cache remains count-bounded, not byte-bounded; the fix removes obsolete per-thread revisions, not all possible large-outline memory use.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
