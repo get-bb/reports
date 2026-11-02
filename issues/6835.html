@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #6835 Synchronous event persistence blocks timers</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#6835 · Synchronous event persistence blocks timers during SQLite waits</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High</span><span class="pill">Effort: High</span><span class="pill">host · threads · perf</span><a href="https://github.com/get-bb/bb/issues/6835">GitHub issue</a><span>2026-11-02 · base <code>93411e8e6afad9a8cf50244a2cd9f468543f859e</code></span></p>
+<p><strong>Verdict: <span class="v-partial">PARTIALLY REPRODUCED</span></strong> · <strong>Root-cause confidence: high for synchronous event-loop blocking; unverified for the reported cold-read I/O attribution.</strong></p>
+
+<h2>1. TL;DR</h2>
+<p>Database work on the server's JavaScript thread can prevent unrelated timers and request handlers from running while SQLite waits. Two clean-source runs at the same trusted main commit demonstrate this mechanism: a worker holds a real SQLite write lock for 700 ms while the server's event-append transaction runs, and a 20 ms timer fires after 739.2 ms and 739.1 ms. This is a controlled contention experiment, not a reproduction of multi-gigabyte cold reads or the reported 15–18 second outages. Main already contains the relevant covering index and incremental pruning, including a zero busy timeout during pruning. Those mitigations do not make the remaining synchronous database operations asynchronous.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Claim or hypothesis</th><th>Status</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>Slow SQLite work can stall unrelated server event-loop work.</td><td class="ok">Verified mechanism</td><td>The real daemon-event persistence boundary delays a 20 ms timer to approximately 739 ms under a controlled writer lock in both runs.</td></tr>
+<tr><td>A missing thread/turn index explains the observed query time.</td><td class="no">Not supported on current main</td><td>The migrated schema already has <code>events_thread_turn_type_item_sequence_idx</code>. SQLite chooses it as a covering index for the thread/turn type lookup; the assertion passes twice. The user's installed database was not inspected.</td></tr>
+<tr><td>Pruning still needs incremental, bounded batches.</td><td class="no">Already implemented on current main</td><td>Live and background batch sizes are 32 and 500, respectively. Existing tests exercise resumable cursors and bounded probes. Row limits do not guarantee a wall-clock I/O deadline.</td></tr>
+<tr><td>Pruning waits on a competing writer for seconds.</td><td class="no">Not reproduced on current main</td><td>Pruning temporarily sets the busy timeout to zero. Both fresh tests observe a lock error in less than 150 ms and restoration of the normal 5000 ms timeout.</td></tr>
+<tr><td>Multi-gigabyte database reads caused the specific reported outages and daemon failures.</td><td class="unv">Unverified</td><td>No original database, original logs, macOS workload, cold-page experiment, or daemon network reproduction was used. The synthetic fixture is small and the demonstrated wait is a write-lock wait, not a disk read.</td></tr>
+</tbody></table>
+
+<h2>3. Environment and trust</h2>
+<ul><li>Public repository <code>get-bb/bb</code>, trusted origin/main commit <code>93411e8e6afad9a8cf50244a2cd9f468543f859e</code>; the current checkout and a new detached worktree both began at that commit with no tracked changes.</li>
+<li>Linux x86_64 under gVisor, kernel 4.19.0-gvisor; Node.js v22.19.0; pnpm 9.15.0; Vitest 4.1.1; better-sqlite3 12.10.0.</li>
+<li>No application server, live provider, or host daemon was launched. No ports were used. Every test creates and deletes its own temporary SQLite fixture under the OS temporary directory. No real user database was read.</li>
+<li>The schema comes from <code>createMigratedConnection()</code>, serialized to a new file so a real worker connection can contend with it. Production connection defaults, including WAL and the 5000 ms busy timeout, remain unchanged.</li>
+<li>Issue content was treated as untrusted claims. No issue-supplied code or linked branch was executed. The reproduction is newly authored from trusted repository contracts.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol><li>Obtain the trusted repository and pin the tested main commit:
+<pre>git clone https://github.com/get-bb/bb.git bb-6835-first
+cd bb-6835-first
+git checkout --detach 93411e8e6afad9a8cf50244a2cd9f468543f859e
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build</pre>
+The first broad build hit a missing SDK-dist build-order race. Building SDK types after the SDK runtime build completed, then retrying the normal build succeeded: 72 tasks successful. No source change or dependency was needed.</li>
+<li>Save <a href="#reproduction-test">the complete inline reproduction</a> as <code>packages/db/test/issue-6835-repro.test.ts</code> and run:
+<pre>pnpm exec turbo run test --filter=@bb/db -- --reporter=verbose test/issue-6835-repro.test.ts</pre>
+The test opens a real migrated file-backed WAL database, starts a worker that holds <code>BEGIN IMMEDIATE</code> for 700 ms, schedules a 20 ms timer, and runs the same immediate transaction plus daemon-event append function used by the server route.</li>
+<li id="first-output">Expected responsiveness contract: the heartbeat should run within 150 ms despite another connection holding the write lock. Actual first-run output:
+<pre>event-insert-heartbeat-ms 739.2
+AssertionError: expected 739.225034 to be less than 150
+Test Files  1 failed (1)
+Tests  1 failed | 2 passed (3)</pre>
+The expected failure is exclusively the heartbeat assertion, after one event has been successfully persisted. Both the covering-index assertion and non-waiting-pruning assertions pass.</li></ol>
+<details id="reproduction-test"><summary>Complete reproduction test</summary><pre>import { mkdtempSync, rmSync, writeFileSync } from &quot;node:fs&quot;;
+import { createRequire } from &quot;node:module&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { performance } from &quot;node:perf_hooks&quot;;
+import { Worker } from &quot;node:worker_threads&quot;;
+import { describe, expect, it } from &quot;vitest&quot;;
+import { threadScope } from &quot;@bb/domain&quot;;
+import { createConnection } from &quot;../src/connection.js&quot;;
+import { createMigratedConnection } from &quot;../src/testing.js&quot;;
+import { noopNotifier } from &quot;../src/notifier.js&quot;;
+import { upsertHost } from &quot;../src/data/hosts.js&quot;;
+import { createProject } from &quot;../src/data/projects.js&quot;;
+import { createThread } from &quot;../src/data/threads.js&quot;;
+import { appendDaemonEventsInTransaction } from &quot;../src/data/events.js&quot;;
+import { advanceThreadPruning } from &quot;../src/data/thread-pruning.js&quot;;
+
+function fixture() {
+  const directory = mkdtempSync(join(tmpdir(), &quot;bb-6835-&quot;));
+  const filename = join(directory, &quot;fixture.sqlite&quot;);
+  const template = createMigratedConnection();
+  try {
+    writeFileSync(filename, template.$client.serialize());
+  } finally {
+    template.$client.close();
+  }
+  const db = createConnection(filename);
+  const host = upsertHost(db, noopNotifier, { name: &quot;reproduction&quot; });
+  const { project } = createProject(db, noopNotifier, {
+    name: &quot;reproduction&quot;,
+    source: { type: &quot;local_path&quot;, hostId: host.id, path: directory },
+  });
+  const thread = createThread(db, noopNotifier, {
+    projectId: project.id,
+    providerId: &quot;codex&quot;,
+  });
+  return {
+    db,
+    filename,
+    thread,
+    close() {
+      db.$client.close();
+      rmSync(directory, { recursive: true, force: true });
+    },
+  };
+}
+
+async function withWriterLock(filename: string, work: () =&gt; Promise&lt;void&gt;) {
+  const worker = new Worker(
+    `const { parentPort, workerData } = require(&quot;node:worker_threads&quot;);
+const Database = require(workerData.modulePath);
+const db = new Database(workerData.filename);
+db.exec(&quot;BEGIN IMMEDIATE&quot;);
+parentPort.postMessage(&quot;locked&quot;);
+setTimeout(() =&gt; {
+  db.exec(&quot;COMMIT&quot;);
+  db.close();
+}, 700);`,
+    {
+      eval: true,
+      workerData: {
+        filename,
+        modulePath: createRequire(import.meta.url).resolve(&quot;better-sqlite3&quot;),
+      },
+    },
+  );
+  try {
+    await new Promise&lt;void&gt;((resolve, reject) =&gt; {
+      worker.once(&quot;message&quot;, () =&gt; resolve());
+      worker.once(&quot;error&quot;, reject);
+    });
+    await work();
+  } finally {
+    await worker.terminate();
+  }
+}
+
+describe(&quot;issue 6835 isolated SQLite reproduction&quot;, () =&gt; {
+  it(&quot;already has a covering index for a thread and turn type lookup&quot;, () =&gt; {
+    const instance = fixture();
+    try {
+      const plan = instance.db.$client
+        .prepare(&quot;EXPLAIN QUERY PLAN SELECT type FROM events WHERE thread_id = ? AND turn_id = ?&quot;)
+        .all(instance.thread.id, &quot;turn&quot;);
+      console.log(&quot;query-plan&quot;, JSON.stringify(plan));
+      expect(JSON.stringify(plan)).toContain(
+        &quot;COVERING INDEX events_thread_turn_type_item_sequence_idx&quot;,
+      );
+    } finally {
+      instance.close();
+    }
+  });
+
+  it(&quot;already skips a contended live pruning transaction&quot;, async () =&gt; {
+    const instance = fixture();
+    try {
+      await withWriterLock(instance.filename, async () =&gt; {
+        const startedAt = performance.now();
+        expect(() =&gt; advanceThreadPruning(instance.db, {
+          threadId: instance.thread.id,
+        })).toThrow(/locked/);
+        const elapsed = performance.now() - startedAt;
+        console.log(&quot;pruning-lock-wait-ms&quot;, elapsed.toFixed(1));
+        expect(elapsed).toBeLessThan(150);
+        expect(instance.db.$client.pragma(&quot;busy_timeout&quot;, { simple: true })).toBe(5000);
+      });
+    } finally {
+      instance.close();
+    }
+  });
+
+  it(&quot;keeps a 20 ms heartbeat responsive during a contended event insert&quot;, async () =&gt; {
+    const instance = fixture();
+    try {
+      await withWriterLock(instance.filename, async () =&gt; {
+        const startedAt = performance.now();
+        const heartbeat = new Promise&lt;number&gt;((resolve) =&gt; {
+          setTimeout(() =&gt; resolve(performance.now() - startedAt), 20);
+        });
+        const inserted = instance.db.transaction(
+          (transaction) =&gt; appendDaemonEventsInTransaction(transaction, [{
+            threadId: instance.thread.id,
+            environmentId: null,
+            providerThreadId: null,
+            itemId: null,
+            itemKind: null,
+            parentToolCallId: null,
+            scope: threadScope(),
+            type: &quot;thread/identity&quot;,
+            data: JSON.stringify({ providerThreadId: &quot;synthetic-provider-thread&quot; }),
+          }]),
+          { behavior: &quot;immediate&quot; },
+        );
+        expect(inserted.acceptedEvents).toHaveLength(1);
+        const delay = await heartbeat;
+        console.log(&quot;event-insert-heartbeat-ms&quot;, delay.toFixed(1));
+        expect(delay).toBeLessThan(150);
+      });
+    } finally {
+      instance.close();
+    }
+  });
+});
+</pre></details>
+
+<h2>5. Root cause</h2>
+<p>The daemon-events route synchronously enters an immediate SQLite transaction before returning to the event loop. Its actual call boundary is <a href="https://github.com/get-bb/bb/blob/93411e8e6afad9a8cf50244a2cd9f468543f859e/apps/server/src/internal/events.ts#L1213-L1218">internal/events.ts:1213–1218</a>:</p>
+<pre>appendResult = deps.db.transaction(
+  (tx) =&gt; appendDaemonEventsInTransaction(tx, eventInputs),
+  { behavior: &quot;immediate&quot; },
+);</pre>
+<p><a href="https://github.com/get-bb/bb/blob/93411e8e6afad9a8cf50244a2cd9f468543f859e/packages/db/src/connection.ts#L287-L300">createConnection</a> constructs a synchronous better-sqlite3 database and sets <code>busy_timeout = 5000</code>. The transaction wrapper invokes the caller directly (<a href="https://github.com/get-bb/bb/blob/93411e8e6afad9a8cf50244a2cd9f468543f859e/packages/db/src/connection.ts#L340-L346">connection.ts:340–346</a>). A contended <code>BEGIN IMMEDIATE</code> therefore waits in the same thread that must run the timer. The reproduction releases that lock from a worker so progress does not depend on the blocked thread. Merely putting an <code>await</code> around a synchronous call would not move the database work off-thread.</p>
+<p>This proves a mechanism capable of contributing to stalls, not the cause of the specific long SELECT timings. A single lock wait is bounded by the configured timeout; this experiment does not establish why the reported stalls exceeded it. WAL readers normally coexist with a writer. Slow reads, storage latency, page faults, and longer sequences of synchronous calls require their own evidence.</p>
+<p>The thread/turn/type covering index is already defined at <a href="https://github.com/get-bb/bb/blob/93411e8e6afad9a8cf50244a2cd9f468543f859e/packages/db/src/schema.ts#L844-L850">schema.ts:844–850</a> and installed by real migrations. The query-plan test asserts that SQLite selects it for the type lookup. Adding a redundant index is not justified by this reproduction.</p>
+<p>Pruning already uses persistent progress, <a href="https://github.com/get-bb/bb/blob/93411e8e6afad9a8cf50244a2cd9f468543f859e/packages/db/src/data/thread-pruning.ts#L39-L40">32/500 batch limits</a>, and <a href="https://github.com/get-bb/bb/blob/93411e8e6afad9a8cf50244a2cd9f468543f859e/packages/db/src/data/thread-pruning.ts#L420-L439">a temporary zero busy timeout with restoration</a>. The server calls it synchronously at <a href="https://github.com/get-bb/bb/blob/93411e8e6afad9a8cf50244a2cd9f468543f859e/apps/server/src/services/system/event-pruning.ts#L65-L76">event-pruning.ts:65–76</a>. Bounded rows and no lock waiting reduce contention but cannot guarantee that an individual disk operation returns quickly.</p>
+
+<h2>6. Proposed fix and simple-fix decision</h2>
+<p>Preserve the existing index and bounded pruning. To guarantee that slow storage cannot stop server timers, design asynchronous database ownership: for example, a dedicated database worker with explicit request scheduling and transaction boundaries. Preserve ordering, commit notifications, synchronous internal assumptions, and shutdown behavior; then test both locked writes and cold reads while an unrelated request or heartbeat remains responsive.</p>
+<p><strong>No automatic fix or pull request:</strong> moving this synchronous database boundary off-thread requires an architecture decision and coordinated contracts. That fails the simple-fix criteria. Adding another index requires a migration and is unsupported by the observed access path; simply making a function async would not address the cause. The exact large-database read stall was also not reproduced. No fix branch was created or pushed.</p>
+<p>No open pull request linked to #6835 was present in the issue's cross-reference metadata or the open-PR search at investigation time. No linked pull-request code was checked out.</p>
+
+<h2 id="second-output">7. Verification: second clean run by the same agent</h2>
+<p>A separate detached worktree, <code>&lt;temporary-root&gt;/verify</code>, was created from the full base SHA above. Its clean status and HEAD were checked before copying only the authored test. A separate frozen install and the identical Turbo reproduction command were run there. The fixture was newly generated and the worker/SQLite connections were new; no data file or running instance was shared.</p>
+<pre>event-insert-heartbeat-ms 739.1
+AssertionError: expected 739.0952010000001 to be less than 150
+Test Files  1 failed (1)
+Tests  1 failed | 2 passed (3)</pre>
+<p>This is a repeated check by the same agent, not independent verification. An initial draft fixture omitted required event fields and failed with an unrelated SQL syntax error; it was corrected to the production daemon-event append contract before either final recorded run. No production source was changed. The final verdict remains partial because neither run reproduces cold reads, macOS conditions, or multi-second daemon disconnects.</p>
+
+<h2>8. Related issues</h2>
+<p>The repository search surfaced <a href="https://github.com/get-bb/bb/issues/5270">#5270</a>, which concerns a different external SQLite-reader failure, and <a href="https://github.com/get-bb/bb/issues/4943">#4943</a>, which concerns documentation of SQLite access from plugins. Neither was used as causal evidence here. This experiment holds the competing connection in another worker, not another SQLite library in the server thread. No duplicate or equivalent fix was established.</p>
+
+<h2 id="existing-checks">9. Appendix: checks and artifacts</h2>
+<p>Existing connection, event persistence, query-plan, and pruning tests pass unmodified:</p>
+<pre>pnpm exec turbo run test --filter=@bb/db -- --reporter=verbose test/query-plans.test.ts test/data/thread-pruning.test.ts test/connection.test.ts test/data/events.test.ts
+
+Test Files  4 passed (4)
+Tests  187 passed (187)</pre>
+<p>Existing pruning tests include lock contention, timeout restoration, resumable cursors, and bounded probes; these do not establish a wall-clock storage-latency bound. Full sanitized logs remain in the local investigation evidence directory, outside this public repository. The complete test and essential exact output are inline so no unpublished file is needed to repeat the experiment.</p>
+<ul><li><a href="#reproduction-test">Complete authored reproduction test</a></li><li><a href="#first-output">First expected failure</a></li><li><a href="#second-output">Second clean expected failure</a></li><li><a href="#existing-checks">187 existing tests passing</a></li></ul>
+<p>Repository metadata and installed dependency versions were read locally and with GitHub read APIs. Writes to issue classifications and report publication use the supplied SlopCop GitHub command. No screenshots apply to this nonvisual concurrency defect.</p>
+</main></body></html>
