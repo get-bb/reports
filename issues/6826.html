@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #6826 · Retry admission accumulates recovery turns</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:980px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  .meta { color:var(--muted); font-size:14px; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; border:1px solid var(--line); }
+  table { border-collapse:collapse; width:100%; font-size:14px; }
+  td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+  pre { background:white; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#6826 · Retry admission accumulates recovery turns</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: Medium</span> <span class="pill">Effort: Medium</span> <span class="pill">providers · threads · provider-retry</span></p>
+<p class="meta"><a href="https://github.com/get-bb/bb/issues/6826">GitHub issue</a> · 2026-11-02 · trusted base <code>916d684ac23d0b0de82c09cfc7553a50287d2188</code></p>
+<p><strong>Verdict: REPRODUCED · Root-cause confidence: high · Reproduction label: confirmed-repro</strong></p>
+
+<h2>1. TL;DR</h2>
+<p>A thread with a future recovery retry still admits another message as a new turn. If that message also fails, retry admission permits another queued recovery because its request ID differs. Three distinct failures on one thread produced three pending retries, then three separate recovery turns. When the provider had accepted each input, all three rows contained the same continuation nudge; when it had accepted none, the three rows retained three different inputs. The mechanism reproduced twice against unchanged production code in clean trusted checkouts; production fleet quantities and actual subscription behavior were not tested.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Different failed requests can accumulate retries in one thread.</td><td>Verified</td><td>Both acceptance cases have three live rows after three failures.</td></tr>
+<tr><td>The pending rows become separate recovery turns.</td><td>Verified</td><td>After advancing the due sweep and simulating successful completion, three additional client/turn/requested events exist and no rows remain.</td></tr>
+<tr><td>Accepted input produces repeated continuation nudges.</td><td>Verified</td><td>The accepted case stores three identical agent-only continuation blocks.</td></tr>
+<tr><td>Later input can be admitted despite an outstanding future retry.</td><td>Verified</td><td>The real dispatch checkpoint returns dispatched for both additional messages.</td></tr>
+<tr><td>Reported production counts and provider-specific timing.</td><td>Unverified</td><td>No production runtime data, subscription credentials, or live provider sessions were used.</td></tr>
+<tr><td>Status lacks an aggregate per-thread count.</td><td>Verified by source inspection only</td><td>The CLI maps one text line per queued row or returns a flat retries array; no aggregate count is emitted.</td></tr>
+</table>
+
+<h2>3. Environment</h2>
+<ul>
+<li>Public repository get-bb/bb, trusted origin/main commit 916d684ac23d0b0de82c09cfc7553a50287d2188.</li>
+<li>Linux x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li>
+<li>Two detached worktrees at the identical commit, each installed with the frozen lockfile and built from repository code.</li>
+<li>The repository's withTestHarness creates real migrated SQLite databases and fresh temporary harness directories per test. No database mock.</li>
+<li>No persistent dev app, external HTTP listener, live provider, or production instance was used. Provider acceptance and quota events were synthetic; the dispatch, persistence, lifecycle, and queue-drain implementations were real.</li>
+</ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol>
+<li>Fetch trusted main, create a clean detached worktree, and install/build it:
+<pre>git fetch origin main
+git worktree add --detach /tmp/repro-6826-base 916d684ac23d0b0de82c09cfc7553a50287d2188
+cd /tmp/repro-6826-base
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build</pre>
+<p>The first all-package build initially encountered missing SDK dist entrypoints; explicitly building the SDK and repeating the normal build resolved this prerequisite in both checkouts.</p></li>
+<li>Apply the inline regression patch below from the worktree root. It uses the existing owning suite's fixtures and helpers, not an independently reimplemented queue.</li>
+<li>Run:
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/threads/turn-failed-retry.test.ts -t 'issue 6826'</pre></li>
+<li>The test starts a normal thread, schedules a future retry after failure, then submits and fails two more distinct messages before the reset. It repeats the scenario with accepted input and with never-accepted input. It advances only the test queue clock and simulates successful provider completion to drain the rows.</li>
+</ol>
+<p><strong>Expected:</strong> one coalesced pending recovery and one recovery turn, retaining all never-accepted messages. <strong>Actual:</strong> three pending rows and three recovery turns in each case. These are expected failing regression assertions, not a passing fix.</p>
+<pre>@bb/server:test: {"accepted":true,"pendingRows":3,"content":[[{"type":"text","text":"Please continue.","mentions":[],"visibility":"agent-only"}],[{"type":"text","text":"Please continue.","mentions":[],"visibility":"agent-only"}],[{"type":"text","text":"Please continue.","mentions":[],"visibility":"agent-only"}]]}
+@bb/server:test: {"accepted":true,"recoveryTurns":3,"remainingRows":0}
+@bb/server:test: {"accepted":false,"pendingRows":3,"content":[[{"type":"text","text":"Do the thing","mentions":[],"visibility":"agent-only"}],[{"type":"text","text":"Additional input 1","mentions":[],"visibility":"agent-only"}],[{"type":"text","text":"Additional input 2","mentions":[],"visibility":"agent-only"}]]}
+@bb/server:test: {"accepted":false,"recoveryTurns":3,"remainingRows":0}
+@bb/server:test: AssertionError: expected [ …(3) ] to have a length of 1 but got 3
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  2 failed | 13 skipped (15)</pre>
+<p>Exact regression patch, including the authored test, to apply to <code>apps/server/test/threads/turn-failed-retry.test.ts</code> (copy its contents into a local patch and run <code>git apply</code>):</p>
+<pre>diff --git a/apps/server/test/threads/turn-failed-retry.test.ts b/apps/server/test/threads/turn-failed-retry.test.ts
+index 081d020eb0..e707b663df 100644
+--- a/apps/server/test/threads/turn-failed-retry.test.ts
++++ b/apps/server/test/threads/turn-failed-retry.test.ts
+@@ -26,6 +26,7 @@ import { runQueuedMessageDispatch } from "../../src/services/threads/queued-mess
+ import { toThreadQueuedMessage } from "../../src/services/threads/thread-queued-messages.js";
+ import { buildTurnFailedEvent } from "../../src/services/threads/turn-failed.js";
+ import { retryFailedTurn } from "../../src/services/threads/turn-retry.js";
++import { attemptDispatch } from "../../src/services/threads/dispatch-attempt.js";
+ import {
+   seedEnvironment,
+   seedEvent,
+@@ -320,6 +321,85 @@ async function sweepPastResume(harness: TestAppHarness): Promise&lt;void&gt; {
+ }
+ 
+ describe("the turn.failed announcement", () =&gt; {
++  it.each([true, false])(
++    "issue 6826 keeps one recovery row across distinct failures (accepted=%s)",
++    async (accepted) =&gt; {
++      await withTestHarness(async (harness) =&gt; {
++        const { environment, thread } = seedFailableThread(
++          harness,
++          "host-6826",
++        );
++        const sendAt = Date.now() + 60_000;
++        for (const index of [0, 1, 2]) {
++          if (index &gt; 0) {
++            const delivery = await attemptDispatch(harness.deps, {
++              thread: requireThread(harness, thread.id),
++              payload: {
++                mode: "queue-if-active",
++                input: [{ type: "text", text: `Additional input ${index}`, mentions: [] }],
++              },
++              source: { kind: "inline" },
++              queuePayload: { kind: "message" },
++              pluginSubmission: null,
++              origin: null,
++              originPluginId: null,
++              startedOnBehalfOf: null,
++              trigger: "user",
++            });
++            expect(delivery.kind).toBe("dispatched");
++          }
++          const requestId = lastTurnRequest(harness, thread.id).requestId;
++          if (accepted) {
++            seedInputAccepted(harness, {
++              environmentId: environment.id,
++              threadId: thread.id,
++              requestId,
++            });
++          }
++          seedRateLimitFailure(harness, {
++            environmentId: environment.id,
++            threadId: thread.id,
++            resetsAtMs: sendAt,
++          });
++          failThread(harness, thread.id);
++          const failed = buildTurnFailedEvent(harness.db, thread.id);
++          expect(failed?.inputAccepted).toBe(accepted);
++          await retryFailedTurn(harness.deps, {
++            thread: requireThread(harness, thread.id),
++            request: { turnRequestId: requestId, sendAt, reason: "Quota recovery" },
++          });
++        }
++        const rows = queuedRows(harness, thread.id);
++        console.log(JSON.stringify({ accepted, pendingRows: rows.length, content: rows.map((row) =&gt; row.content) }));
++        const requestsBeforeRecovery = turnRequests(harness, thread.id).length;
++        for (let completed = 0; completed &lt; 3; completed += 1) {
++          await sweepPastResume(harness);
++          applyLoggedThreadLifecycleEvent(harness.deps, {
++            event: { type: "run.succeeded" },
++            threadId: thread.id,
++          });
++          await runQueuedMessageDispatch(harness.deps, {
++            kind: "thread-ready",
++            threadId: thread.id,
++          });
++        }
++        const recoveryTurns = turnRequests(harness, thread.id).length - requestsBeforeRecovery;
++        console.log(JSON.stringify({ accepted, recoveryTurns, remainingRows: queuedRows(harness, thread.id).length }));
++        expect(rows).toHaveLength(1);
++        expect(recoveryTurns).toBe(1);
++        if (!accepted) {
++          expect(rows.flatMap((row) =&gt; row.content)).toEqual(
++            expect.arrayContaining([
++              expect.objectContaining({ text: "Do the thing" }),
++              expect.objectContaining({ text: "Additional input 1" }),
++              expect.objectContaining({ text: "Additional input 2" }),
++            ]),
++          );
++        }
++      });
++    },
++  );
++
+   it("carries the failed turn's ids and the provider's failure facts", async () =&gt; {
+     await withTestHarness(async (harness) =&gt; {
+       const { environment, requestId, thread } = seedFailableThread(</pre>
+
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/server/src/services/threads/turn-retry.ts#L185-L249">retryFailedTurn</a> derives an original request ID from the most recent failed turn and uses <code>thread.id:originalRequestId</code> as its in-flight key. Its persistent duplicate check calls <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/packages/db/src/data/queued-thread-messages.ts#L2217-L2238">hasQueuedRetryOfTurnRequest</a>, whose WHERE clause matches both thread ID and retryOfTurnRequestId. This correctly rejects a second live retry of the same original request, including claimed rows, but does not combine different original requests.</p>
+<pre>const originalRequestId = chain.originalRequestId;
+const inFlightKey = `${thread.id}:${originalRequestId}`;
+if (
+  retriesInFlight.has(inFlightKey) ||
+  hasQueuedRetryFor(deps, { threadId: thread.id, originalRequestId })
+) {
+  throw new ApiError(409, "retry_already_queued", ...);
+}</pre>
+<p>Every later message admitted by the <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/server/src/services/threads/dispatch-attempt.ts#L283-L291">dispatch checkpoint</a> receives a fresh original request ID. The <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/plugins/provider-retry/server.ts#L93-L155">built-in failure listener</a> independently asks to retry each eligible failure; it has no pending-thread coalescing step. The test directly exercises that shared retry admission service, rather than mocking it.</p>
+<p><a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/server/src/services/threads/turn-retry.ts#L107-L133">retryInput</a> deliberately replaces accepted input with a continuation nudge, but replays never-accepted input. Thus accepted failures accumulate indistinguishable nudges while rejected inputs accumulate distinct payloads. Each enqueue starts with <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/packages/db/src/data/queued-thread-messages.ts#L845-L853">groupWithNext: false</a>, and the <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/server/src/services/threads/queued-messages.ts#L477-L518">drain</a> submits each separate group as a turn. The repeated-turn symptom follows directly.</p>
+<p>The <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/plugins/provider-retry/src/cli.ts#L100-L130">status command</a> lists flat rows rather than per-thread aggregates. That is a separate diagnostics enhancement, not the cause of accumulation.</p>
+
+<h2>6. Proposed fix and simple-fix safety</h2>
+<p>A safe solution needs thread-level coordination among compatible pending recoveries, preservation of every never-accepted input in order, and a claim-safe handoff to the drain. Repeated accepted-input nudges can be redundant; newly rejected input is not. Simply widening the duplicate check to thread ID would suppress recovery of new inputs, while concatenating everything into one row loses input-group boundaries and retry provenance.</p>
+<p>No automatic fix PR is safe under the decision-free simple-fix rule. Existing retries <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/server/src/services/threads/turn-retry.ts#L147-L162">preserve the failed turn's model, reasoning level, service tier, and permission mode</a>, and <a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/packages/db/src/data/queued-thread-messages.ts#L500-L517">existing queue grouping explicitly requires matching execution tuples</a>. A thread may change execution settings between failures. Choosing which route/tuple and original retry chain owns a combined recovery is a product-policy decision; an unconditional per-thread guard is not a lossless fix.</p>
+<p>Next step: define the compatible execution envelope and recovery provenance, then extend this regression with mixed acceptance, changed execution tuples, concurrent claim/admission, and preserved input-group ordering. No production source was edited, no fix branch was pushed, and no pull request was opened. GitHub timeline and open-PR search showed no linked open PR during this run.</p>
+
+<h2>7. Verification</h2>
+<p>The same agent repeated the reproduction in a second clean detached worktree at the recorded trusted commit. A separate frozen install and normal build ran before applying the identical authored regression patch. The test harness created fresh temporary data directories and databases; no shared runtime data or production listener was accessed. This is a second clean run, not independent-agent verification.</p>
+<pre>git worktree add --detach /tmp/repro-6826-verify 916d684ac23d0b0de82c09cfc7553a50287d2188
+cd /tmp/repro-6826-verify
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build
+git apply /tmp/regression-6826.patch
+pnpm exec turbo run test --filter=@bb/server -- test/threads/turn-failed-retry.test.ts -t 'issue 6826'</pre>
+<pre>@bb/server:test: {"accepted":true,"pendingRows":3,"content":[[{"type":"text","text":"Please continue.","mentions":[],"visibility":"agent-only"}],[{"type":"text","text":"Please continue.","mentions":[],"visibility":"agent-only"}],[{"type":"text","text":"Please continue.","mentions":[],"visibility":"agent-only"}]]}
+@bb/server:test: {"accepted":true,"recoveryTurns":3,"remainingRows":0}
+@bb/server:test: {"accepted":false,"pendingRows":3,"content":[[{"type":"text","text":"Do the thing","mentions":[],"visibility":"agent-only"}],[{"type":"text","text":"Additional input 1","mentions":[],"visibility":"agent-only"}],[{"type":"text","text":"Additional input 2","mentions":[],"visibility":"agent-only"}]]}
+@bb/server:test: {"accepted":false,"recoveryTurns":3,"remainingRows":0}
+@bb/server:test: AssertionError: expected [ …(3) ] to have a length of 1 but got 3
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  2 failed | 13 skipped (15)</pre>
+<p>Both variants failed at the intended row-count assertion, after the logs also recorded three recovery turns. No production-code correction or change to the final finding was needed after the second run. <code>git diff --check</code> passed for the authored regression patch.</p>
+
+<h2>8. Related issues</h2>
+<p><a href="https://github.com/get-bb/bb/issues/6172">#6172</a> concerns re-evaluating provider retries when account-pool availability changes. It is adjacent routing policy, not evidence that the distinct-request accumulation is fixed.</p>
+
+<h2>9. Appendix and limits</h2>
+<p>Issue content was treated only as untrusted claims. Suggested actions in the issue were not executed; all executable evidence was authored from trusted main code and its existing test fixtures. No external issue-supplied URL, script, branch, or linked PR code was fetched or run.</p>
+<p>The complete regression is embedded above; raw local logs and the patch remain outside the public reports repository, following its publication rules. The source test suite uses real migrated SQLite and a synthetic host transport, so this establishes server admission and drain behavior without asserting provider-network fidelity. Optional proactive queueing and a new per-thread count are unimplemented proposals rather than prerequisites for the verified verdict.</p>
+<p>Validation of the unmodified existing retry tests: <code>pnpm exec turbo run test --filter=@bb/server -- test/threads/turn-failed-retry.test.ts -t '^(?!.*issue 6826)'</code>.</p>
+<pre>@bb/server:test:  Test Files  1 passed (1)
+@bb/server:test:       Tests  13 passed | 2 skipped (15)</pre>
+</main></body></html>
