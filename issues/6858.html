@@ -1,0 +1,158 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Report · #6858 Retired plugin route state remains reachable after reload</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main><p class="meta"><a href="../">← reports</a></p><h1>#6858 · Retired plugin route state remains reachable after reload</h1><p class="meta"><span class="pill">Bug</span><span class="pill">Medium priority</span><span class="pill">Low effort</span><span class="pill">plugins · perf · confirmed-repro</span><a href="https://github.com/get-bb/bb/issues/6858">GitHub issue</a></p><p class="meta">November 2, 2026 · trusted main <code>d448d87f2033f7c253b64370c321ea9e7500c81d</code></p><p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p><h2>1. TL;DR</h2><p>A plugin reload stops the old instance but leaves its route-owned objects reachable. A new test installs a real plugin, reloads it three times, forces garbage collection through the local Node inspector, and checks weak references to four separately created payloads. Trusted main retains all four payloads in two clean-checkout runs, rather than only the current payload. The failure helper closes over the previous instance even though it needs only a boolean. Capturing that boolean instead releases the three retired payloads while the current HTTP route continues working.</p><h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr><tr><td>Repeated reload retains old instance-owned state</td><td class="ok">Verified</td><td>Both trusted-base runs report [true, true, true, true] for payload reachability after collection.</td></tr><tr><td>The previous-instance closure is responsible</td><td class="ok">Verified</td><td>Changing only the failure helper to capture a boolean makes the regression pass; disposal code and module loading are unchanged.</td></tr><tr><td>Production heap size, macOS behavior, and other reload entry points</td><td class="unv">Unverified here</td><td>No production data or heap snapshot was accessed. Linux/Node 22 and the real plugin-service reload boundary were exercised. Disable/enable and version changes were not measured.</td></tr></table><h2>3. Environment</h2><ul><li>Public repository get-bb/bb, trusted main commit <code>d448d87f2033f7c253b64370c321ea9e7500c81d</code>.</li><li>Linux x86_64, kernel 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li><li>No provider, live BB instance, browser, or listening socket. Tests use createTestAppHarness and a migrated temporary SQLite database.</li><li>Each run creates and removes a fresh temporary data directory; the second run uses a separate detached clean worktree.</li></ul><h2>4. Minimal reproduction</h2><ol><li>Check out trusted main at the recorded commit and install frozen dependencies:<pre>git checkout d448d87f2033f7c253b64370c321ea9e7500c81d
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk --filter=@bb/server</pre></li><li>Save the linked test at <code>apps/server/test/services/plugins/plugin-reload-collection.test.ts</code>. It is newly authored from repository runtime and harness evidence, not copied from the issue.</li><li>Run from the repository root:<pre>pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-reload-collection.test.ts</pre></li></ol><p>Expected reachability: only the fourth (current) payload remains. Actual assertion on unchanged main, verbatim:</p><pre>AssertionError: expected [ true, true, true, true ] to deeply equal [ false, false, false, true ]</pre><p><a href="6858/repro/plugin-reload-collection.test.ts">Download reproduction test</a>. The payloads are intentionally small: this checks liveness, not a noisy process-memory estimate, and does not depend on retaining a module-level allocation.</p><pre>import { mkdir, writeFile } from &quot;node:fs/promises&quot;;
+import { Session } from &quot;node:inspector&quot;;
+import { join } from &quot;node:path&quot;;
+import { setTimeout } from &quot;node:timers/promises&quot;;
+import { expect, it, vi } from &quot;vitest&quot;;
+import { createTestAppHarness } from &quot;../../helpers/test-app.js&quot;;
+
+it(&quot;releases retired route state while keeping the current plugin active&quot;, async () =&gt; {
+  const references: WeakRef&lt;object&gt;[] = [];
+  const harness = await createTestAppHarness();
+  const inspector = new Session();
+  try {
+    inspector.connect();
+    vi.stubGlobal(&quot;__bbObserveReloadPayload&quot;, (payload: object) =&gt; {
+      references.push(new WeakRef(payload));
+    });
+    const root = join(harness.config.dataDir, &quot;collection-fixture&quot;);
+    await mkdir(root);
+    await writeFile(
+      join(root, &quot;package.json&quot;),
+      JSON.stringify({
+        name: &quot;bb-plugin-collection-fixture&quot;,
+        version: &quot;0.1.0&quot;,
+        bb: {
+          name: &quot;Collection fixture&quot;,
+          description: &quot;Exercises retired plugin state collection.&quot;,
+          branding: { icon: &quot;Zap&quot; },
+          server: &quot;./server.ts&quot;,
+        },
+      }),
+    );
+    await writeFile(
+      join(root, &quot;server.ts&quot;),
+      `export default function plugin(bb) {
+        const payload = { value: 42 };
+        globalThis.__bbObserveReloadPayload(payload);
+        bb.http.route(&quot;GET&quot;, &quot;/value&quot;, context =&gt; context.json(payload));
+      }`,
+    );
+    expect((await harness.pluginService.installPath(root)).status).toBe(
+      &quot;running&quot;,
+    );
+    for (let reload = 0; reload &lt; 3; reload++) {
+      expect(
+        await harness.pluginService.reload(&quot;collection-fixture&quot;),
+      ).toMatchObject({
+        ok: true,
+      });
+    }
+    for (let collection = 0; collection &lt; 3; collection++) {
+      await setTimeout(0);
+      await new Promise&lt;void&gt;((resolve, reject) =&gt; {
+        inspector.post(&quot;HeapProfiler.collectGarbage&quot;, (error) =&gt; {
+          if (error) reject(error);
+          else resolve();
+        });
+      });
+    }
+    expect(references).toHaveLength(4);
+    expect(
+      references.map((reference) =&gt; reference.deref() !== undefined),
+    ).toEqual([false, false, false, true]);
+    const response = await harness.app.request(
+      &quot;http://127.0.0.1/api/v1/plugins/collection-fixture/http/value&quot;,
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ value: 42 });
+  } finally {
+    inspector.disconnect();
+    try {
+      await harness.cleanup();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  }
+});
+</pre><h2>5. Root cause</h2><p>The runtime reads the previous LoadedPlugin and the nested pre-factory failure function references that object. The new plugin API receives callbacks created in the same activation. That retained closure context can therefore keep the previous LoadedPlugin, whose handle includes the retired HTTP route handler and payload, reachable. Each replacement repeats the link. This explanation is supported by trusted source and the narrowly controlled fail/pass change; a heap snapshot was not taken in this investigation.</p><p><a href="https://github.com/get-bb/bb/blob/d448d87f2033f7c253b64370c321ea9e7500c81d/apps/server/src/services/plugins/plugin-runtime.ts#L1684-L1698">plugin-runtime.ts:1684</a></p><pre>    const previous = loaded.get(row.id);
+    function failBeforeFactory(
+      status: PluginRuntimeStatus,
+      detail: string,
+    ): string {
+      if (previous !== undefined) {
+        setStatus(row.id, &quot;running&quot;, `reload failed: ${detail}`);
+        logger.warn(
+          `plugin ${row.id} reload failed (kept previous instance): ${detail}`,
+        );
+        return `${detail} (${PREVIOUS_INSTANCE_KEPT})`;
+      }
+      setStatus(row.id, status, detail);
+      logger.warn(`plugin ${row.id} not loaded (${status}): ${detail}`);
+      return detail;</pre><p><a href="https://github.com/get-bb/bb/blob/d448d87f2033f7c253b64370c321ea9e7500c81d/apps/server/src/services/plugins/plugin-runtime.ts#L1753-L1775">plugin-runtime.ts:1753</a></p><pre>    const handle = createPluginApi({
+      recordPluginUse: () =&gt; capturePluginUse(deps, row.id),
+      pluginId: row.id,
+      logger: deps.logger,
+      db: deps.db,
+      dataDir: deps.dataDir,
+      getSdk: () =&gt; boundSdk,
+      getMachineEnrollments: () =&gt; {
+        if (!context.machineEnrollments)
+          throw new Error(
+            &quot;Machine enrollment is unavailable in this plugin host&quot;,
+          );
+        return context.machineEnrollments.forOwner(row.id);
+      },
+      getAppUrl: deps.getAppUrl ?? (() =&gt; null),
+      getLoopbackBaseUrl: () =&gt; boundLoopbackBaseUrl,
+      rpcCaller: rpcCallers.issue(row.id),
+      invalidateRpc: (tags) =&gt; deps.hub.notifyPluginChanged(row.id, tags),
+      whileRpcWatched: (method, handler) =&gt; {
+        const active = new Map&lt;string, AbortController&gt;();
+        const isWatchedRead = (target: PluginReadSubscriptionTarget) =&gt;
+          target.pluginId === row.id &amp;&amp; target.method === method;
+        const stop = deps.hub.onWatchedTargets([&quot;plugin-read&quot;], (change) =&gt; {</pre><p><a href="https://github.com/get-bb/bb/blob/d448d87f2033f7c253b64370c321ea9e7500c81d/apps/server/src/services/plugins/plugin-runtime.ts#L2063-L2083">plugin-runtime.ts:2063</a></p><pre>    if (previous !== undefined) {
+      await disposePluginInstance(previous);
+      const hungAfterDispose = hungServices.get(row.id);
+      if (hungAfterDispose !== undefined &amp;&amp; hungAfterDispose.size &gt; 0) {
+        for (const rollback of rollbackGenerations.reverse()) rollback();
+        loaded.delete(row.id);
+        deps.sharedPorts?.clearDeclarationsForOwner(row.id);
+        discardCandidate(plugin);
+        return hungServicesDetail(hungAfterDispose);
+      }
+      releaseMutableRoots(
+        [...previous.moduleRootUrls].filter(
+          (rootUrl) =&gt; !candidateModuleRootUrls.has(rootUrl),
+        ),
+      );
+    }
+    disposeUnavailableProviderRegistrations(row.id);
+    deps.hub.notifyPluginChanged(row.id, null);
+    loaded.set(row.id, plugin);
+    appBundles.set(row.id, appBundleCandidate.snapshot);
+    if (hostArtifactCandidate === null) hostArtifacts.delete(row.id);</pre><p>Disposal invalidates the old handle and stops work; it does not make an otherwise strongly reachable object collectable. The relevant code is <a href="https://github.com/get-bb/bb/blob/d448d87f2033f7c253b64370c321ea9e7500c81d/apps/server/src/services/plugins/plugin-api.ts#L1422-L1425">the API method retaining its options callback</a>, <a href="https://github.com/get-bb/bb/blob/d448d87f2033f7c253b64370c321ea9e7500c81d/apps/server/src/services/plugins/plugin-api.ts#L1492">the retained route records</a>, and <a href="https://github.com/get-bb/bb/blob/d448d87f2033f7c253b64370c321ea9e7500c81d/apps/server/src/services/plugins/plugin-runtime.ts#L2121-L2168">instance disposal</a>.</p><h2>6. Proposed fix and verification</h2><p>Keep the previous instance available locally for disposal and rollback, but compute <code>const isReload = previous !== undefined</code> and let the failure helper capture only that boolean. This preserves failed-reload behavior without introducing mutable lifecycle state, public APIs, or protocol changes. The production patch is two added lines and one removed line in the existing plugin runtime.</p><p>The focused regression passes after the change, including a successful response from the current route. Existing plugin tests and the server typecheck/build were run through Turbo:</p><pre>@bb/server:test:  Test Files  59 passed (59)
+@bb/server:test:       Tests  588 passed (588)
+ Tasks:    10 successful, 10 total</pre><h2>7. Verification: second clean run</h2><p>The same agent created a second clean detached worktree at the exact base commit, installed frozen dependencies, built the SDK/server, and copied only the newly authored regression test. Production code remained unmodified; git status showed only the untracked test. The exact command below failed for the same four-live-payload assertion. This is a repeat clean run, not an independent-agent verification.</p><pre>pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-reload-collection.test.ts</pre><p><a href="6858/repro/verify-final-baseline.log">Second-run log</a>. No verdict correction was needed.</p><h2>8. Related issues and pull requests</h2><p>No linked open pull request was present in issue timeline metadata or the issue-number PR search before implementation. <a href="https://github.com/get-bb/bb/issues/4159">#4159</a> concerns module-graph retention; this regression instead observes per-factory route payload liveness and is corrected without changing module loading. The production/macOS measurements in the issue are not used as evidence here.</p><h2>9. Appendix</h2><p>Issue content was treated as untrusted claims. No issue-provided command, test, patch, linked branch, or external URL was executed or fetched. Repository and numeric issue identity came from the trusted caller.</p><p>Initial all-package build encountered an already-unbuilt SDK runtime entry in the GitHub plugin; the SDK runtime build and relevant server build then succeeded. No dependency was added.</p><ul><li><a href="6858/repro/baseline.log">baseline.log</a></li><li><a href="6858/repro/verify-final-baseline.log">verify-final-baseline.log</a></li><li><a href="6858/repro/fixed-focused.log">fixed-focused.log</a></li><li><a href="6858/repro/plugin-suite.log">plugin-suite.log</a></li><li><a href="6858/repro/checks.log">checks.log</a></li></ul><p>Validation commands, in addition to the frozen installs and reproduction commands above:</p><pre>pnpm exec turbo run build
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec oxfmt apps/server/test/services/plugins/plugin-reload-collection.test.ts apps/server/src/services/plugins/plugin-runtime.ts
+pnpm exec turbo run test --filter=@bb/server -- test/services/plugins
+pnpm exec turbo run lint typecheck build --filter=@bb/server
+git diff --check</pre><p>No visual claim is made, so screenshots are not applicable.</p></main></body></html>
