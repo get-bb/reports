@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #6825 Latest-state reads scan unrelated extension snapshots</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p><h1>#6825 · Latest-state reads scan unrelated extension snapshots</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High priority</span><span class="pill">High effort</span><span class="pill">threads · perf · confirmed-repro</span>
+<a href="https://github.com/get-bb/bb/issues/6825">Issue</a><span>November 2, 2026 · base <code>916d684ac23d0b0de82c09cfc7553a50287d2188</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>Looking for a thread state whose kind is missing or old still reads every newer extension-state snapshot for that thread. The earlier query rewrite removed repeated scans across the outer result set, but the remaining descending lookup does not have an indexed kind to seek to. With one synthetic thread and 6,000 unrelated 22 KB snapshots, the actual production function took 46.6–58.8 ms for an absent kind, versus about 0.1 ms when the newest row matched. The exact emitted SQL also consumed 48,053 SQLite VM instructions for the absent kind, increasing by eight instructions for every additional unrelated row. Both clean-checkout runs reproduced this behavior; the reported whole-server pause cadence and proxy resets were not tested.</p>
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>Current main retains the descending per-thread rewrite.</td><td class="ok">Verified</td><td>The production function uses VALUES, one scalar rowid lookup, LIMIT 1, and the forced partial index.</td></tr>
+<tr><td>Old or absent kinds cause work linear in unrelated state history.</td><td class="ok">Verified</td><td>64 → 1,024 → 6,000 snapshots: absent-kind VM steps 565 → 8,245 → 48,053, identically in both runs. Actual Node latency grows with history too.</td></tr>
+<tr><td>Newest matching kinds are cheap.</td><td class="ok">Verified</td><td>Latest-kind Node medians stay around 0.1–0.24 ms. Supplementary VM counts stay fixed at 1,418.</td></tr>
+<tr><td>Thread-list and timeline paths call the affected function.</td><td class="ok">Verified in source</td><td>Thread-list goal activity and four timeline head-state kinds use the same database read.</td></tr>
+<tr><td>The original database produces 0.6–1.4 second stalls every roughly two seconds and proxy 502s.</td><td class="unv">Unverified</td><td>No reporter database, production logs, provider process, reverse proxy, or live server was used. Reproduced the synchronous query amplification, not these exact deployment symptoms.</td></tr>
+<tr><td>The original database size, counts, and historical benchmark totals are accurate.</td><td class="unv">Unverified</td><td>Those deployment-specific numbers were not needed for the synthetic reproduction.</td></tr>
+</tbody></table>
+<h2>3. Environment</h2>
+<ul><li>Trusted public repository: get-bb/bb; origin/main base <code>916d684ac23d0b0de82c09cfc7553a50287d2188</code>. The historical origin remote redirects to this canonical repository.</li>
+<li>Linux x86_64, kernel 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; better-sqlite3 12.10.0 / SQLite 3.53.1.</li>
+<li>Supplementary exact-SQL instruction profiler: Python 3.13.9 standard-library SQLite 3.50.4. VM counts are from that runtime, not claimed as better-sqlite3 counters. Query results agree in both runtimes.</li>
+<li>Two newly created detached worktrees, <code>$WORK/base</code> and <code>$WORK/verify</code>, at the same full commit. Only the two reproduction files were added; tracked production sources stayed unchanged.</li>
+<li>Real migrated SQLite fixtures created with createMigratedConnection(), never a mock. Each test creates and removes a distinct temporary fixture directory. No live provider, application instance, network port, or user database was accessed.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Prepare trusted main at the recorded commit:<pre>BASE=916d684ac23d0b0de82c09cfc7553a50287d2188
+WORK=$(mktemp -d)
+git clone https://github.com/get-bb/bb.git &quot;$WORK/base&quot;
+cd &quot;$WORK/base&quot;
+git checkout --detach &quot;$BASE&quot;
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+</pre></li>
+<li>Save the complete TypeScript test and Python helper below at their displayed paths. No dependency installation beyond the frozen repository dependencies is needed; Python 3 with SQLite JSON support must be available.</li>
+<li>Run the focused reproduction, followed by the existing owner tests and typecheck:<pre>pnpm exec turbo run test --force --filter=@bb/db -- test/issue-6825-repro.test.ts
+pnpm exec turbo run test --filter=@bb/db -- test/data/events.test.ts test/query-plans.test.ts
+pnpm exec turbo run typecheck --filter=@bb/db</pre></li></ol>
+<p>The monorepo build was attempted in both worktrees. It stops in unrelated plugin packaging because the installed SDK runtime dist is absent. A build:types bootstrap did not supply that runtime. No packaging source was changed. The database test and typecheck Turbo pipelines run successfully despite this unrelated full-build failure; the new reproduction then fails only its intended scalability assertions.</p>
+<p><strong>Expected:</strong> newest, old, and absent-kind results remain correct, and adding thousands of unrelated snapshots does not add thousands of lookup steps. The regression allows a generous 1,000 additional VM instructions between 64 and 6,000 unrelated snapshots.</p>
+<p><strong>Actual:</strong> all result assertions pass (newest sequence N+1, oldest sequence 1, absent empty), but both work bounds fail:</p>
+<pre>AssertionError: expected 48053 to be less than or equal to 1565
+AssertionError: expected 48068 to be less than or equal to 1580</pre>
+<table><thead><tr><th>Unrelated snapshots</th><th>Missing steps</th><th>Old steps</th><th>Latest steps</th><th>Missing Node ms, run 1 / run 2</th><th>Old Node ms, run 1 / run 2</th></tr></thead><tbody>
+<tr><td>64</td><td>565</td><td>580</td><td>1,418</td><td>0.673 / 0.530</td><td>0.637 / 0.662</td></tr>
+<tr><td>1,024</td><td>8,245</td><td>8,260</td><td>1,418</td><td>9.017 / 7.194</td><td>9.582 / 9.441</td></tr>
+<tr><td>6,000</td><td>48,053</td><td>48,068</td><td>1,418</td><td>46.641 / 58.757</td><td>48.600 / 60.595</td></tr></tbody></table>
+<p>Each Node number is the median of five timed real-function calls after one warm-up. Synthetic JSON payloads contain distinct revisions and 22,000-character snapshots. Timings are observations, not the test's pass/fail criteria. The operation-count bound detects the bug without depending on machine speed.</p>
+<h3 id="repro-test">packages/db/test/issue-6825-repro.test.ts</h3><pre>import { execFileSync } from &quot;node:child_process&quot;;
+import { mkdtempSync, rmSync, writeFileSync } from &quot;node:fs&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { performance } from &quot;node:perf_hooks&quot;;
+import { expect, it } from &quot;vitest&quot;;
+import { threadScope } from &quot;@bb/domain&quot;;
+import { createMigratedConnection } from &quot;../src/testing.js&quot;;
+import { noopNotifier } from &quot;../src/notifier.js&quot;;
+import { upsertHost } from &quot;../src/data/hosts.js&quot;;
+import { createProject } from &quot;../src/data/projects.js&quot;;
+import { createThread } from &quot;../src/data/threads.js&quot;;
+import {
+  insertEvents,
+  listLatestThreadStateEventRowsByThreadIds,
+} from &quot;../src/data/events.js&quot;;
+
+it(&quot;bounds latest-state work independently of unrelated snapshot history&quot;, () =&gt; {
+  let statement = &quot;&quot;;
+  const db = createMigratedConnection();
+  const originalPrepare = db.$client.prepare.bind(db.$client);
+  Object.defineProperty(db.$client, &quot;prepare&quot;, {
+    configurable: true,
+    writable: true,
+    value: (source: string) =&gt; {
+      statement = source;
+      return originalPrepare(source);
+    },
+  });
+  const scratch = mkdtempSync(join(tmpdir(), &quot;bb-state-6825-&quot;));
+  try {
+    const host = upsertHost(db, noopNotifier, { name: &quot;state-repro-host&quot; });
+    const { project } = createProject(db, noopNotifier, {
+      name: &quot;state-repro-project&quot;,
+      source: { type: &quot;local_path&quot;, hostId: host.id, path: scratch },
+    });
+    const thread = createThread(db, noopNotifier, {
+      projectId: project.id,
+      providerId: &quot;codex&quot;,
+    });
+    const oldKind = &quot;repro/old&quot;;
+    const latestKind = &quot;repro/snapshots&quot;;
+    insertEvents(db, noopNotifier, [
+      {
+        threadId: thread.id,
+        sequence: 1,
+        type: &quot;thread/extensionState/updated&quot;,
+        scope: threadScope(),
+        itemId: null,
+        itemKind: null,
+        parentToolCallId: null,
+        data: JSON.stringify({ kind: oldKind, payload: { value: &quot;old&quot; } }),
+      },
+    ]);
+    const missingSteps: number[] = [];
+    const oldSteps: number[] = [];
+    let inserted = 0;
+    for (const history of [64, 1024, 6000]) {
+      insertEvents(
+        db,
+        noopNotifier,
+        Array.from({ length: history - inserted }, (_, offset) =&gt; ({
+          threadId: thread.id,
+          sequence: inserted + offset + 2,
+          type: &quot;thread/extensionState/updated&quot; as const,
+          scope: threadScope(),
+          itemId: null,
+          itemKind: null,
+          parentToolCallId: null,
+          data: JSON.stringify({
+            kind: latestKind,
+            payload: {
+              revision: inserted + offset,
+              snapshot: &quot;x&quot;.repeat(22_000),
+            },
+          }),
+        })),
+      );
+      inserted = history;
+      const cases = [
+        { label: &quot;latest&quot;, kind: latestKind, expected: [history + 1] },
+        { label: &quot;old&quot;, kind: oldKind, expected: [1] },
+        { label: &quot;missing&quot;, kind: &quot;repro/absent&quot;, expected: [] },
+      ];
+      const queries = cases.map(({ label, kind, expected }) =&gt; {
+        const elapsed: number[] = [];
+        for (let repeat = 0; repeat &lt; 6; repeat++) {
+          const start = performance.now();
+          const rows = listLatestThreadStateEventRowsByThreadIds(db, {
+            threadIds: [thread.id],
+            kind,
+          });
+          elapsed.push(performance.now() - start);
+          expect(rows.map((row) =&gt; row.sequence)).toEqual(expected);
+        }
+        const sql = statement;
+        const params = [kind, thread.id];
+        expect(db.$client.prepare(sql).all(...params)).toHaveLength(
+          expected.length,
+        );
+        const median = elapsed.slice(1).sort((left, right) =&gt; left - right)[2];
+        console.log(
+          `history=${history} case=${label} node_median_ms=${median?.toFixed(3)}`,
+        );
+        return { label, sql, params, expected };
+      });
+      const fixture = join(scratch, &quot;fixture.sqlite&quot;);
+      const queryFile = join(scratch, &quot;queries.json&quot;);
+      writeFileSync(fixture, db.$client.serialize());
+      writeFileSync(queryFile, JSON.stringify(queries));
+      const profile = execFileSync(
+        &quot;python3&quot;,
+        [
+          join(import.meta.dirname, &quot;issue-6825-profile.py&quot;),
+          fixture,
+          queryFile,
+        ],
+        { encoding: &quot;utf8&quot; },
+      );
+      console.log(`history=${history}\n${profile}`);
+      const missing = profile.match(/missing vm_steps=(\d+)/u);
+      const old = profile.match(/old vm_steps=(\d+)/u);
+      expect(missing).not.toBeNull();
+      expect(old).not.toBeNull();
+      missingSteps.push(Number(missing?.[1]));
+      oldSteps.push(Number(old?.[1]));
+    }
+    expect.soft(missingSteps[2]).toBeLessThanOrEqual(missingSteps[0]! + 1000);
+    expect.soft(oldSteps[2]).toBeLessThanOrEqual(oldSteps[0]! + 1000);
+  } finally {
+    Object.defineProperty(db.$client, &quot;prepare&quot;, {
+      configurable: true,
+      writable: true,
+      value: originalPrepare,
+    });
+    db.$client.close();
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}, 60_000);
+</pre>
+<h3 id="repro-helper">packages/db/test/issue-6825-profile.py</h3><pre>import json
+import sqlite3
+import sys
+
+database = sqlite3.connect(sys.argv[1])
+queries = json.load(open(sys.argv[2], encoding=&quot;utf-8&quot;))
+print(f&quot;python_sqlite={sqlite3.sqlite_version}&quot;)
+for query in queries:
+    steps = 0
+
+    def progress():
+        global steps
+        steps += 1
+        return 0
+
+    database.set_progress_handler(progress, 1)
+    cursor = database.execute(query[&quot;sql&quot;], query[&quot;params&quot;])
+    columns = [column[0] for column in cursor.description]
+    rows = cursor.fetchall()
+    database.set_progress_handler(None, 0)
+    sequences = [row[columns.index(&quot;sequence&quot;)] for row in rows]
+    assert sequences == query[&quot;expected&quot;], (sequences, query[&quot;expected&quot;])
+    print(f&#x27;{query[&quot;label&quot;]} vm_steps={steps} sequences={sequences}&#x27;)
+    if query[&quot;label&quot;] == &quot;missing&quot;:
+        plan = database.execute(&quot;EXPLAIN QUERY PLAN &quot; + query[&quot;sql&quot;], query[&quot;params&quot;])
+        print(&quot;plan=&quot; + &quot; | &quot;.join(row[3] for row in plan))
+database.close()
+</pre>
+<p>These are freshly authored from trusted repository code. The prepare wrapper records SQL and delegates to the real database unchanged; it is restored afterward. No SQLite function is replaced. The helper profiles the captured production SQL against the serialized real migrated fixture. Reproduction source and exact observations are inline because this reports repository prohibits separate test/script artifacts.</p>
+<h2>5. Root cause</h2>
+<p>The forced partial index keys only thread and sequence; kind remains a JSON predicate evaluated while scanning newer state rows. SQLite seeks to a thread, then walks candidates in descending sequence until the kind predicate accepts one. LIMIT 1 limits returned rows, not rejected rows visited. Every newer extension-state candidate must expose its JSON kind before SQLite can reject it; an absent kind exhausts that thread's state range. Cost is proportional to the number of candidates examined and the payload parsing work, not merely the number of requested threads.</p>
+<p><a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/packages/db/src/data/events.ts#L1530-L1533">packages/db/src/data/events.ts:1530</a></p><pre>      const kindPredicate = sql`(
+        candidate.type &lt;&gt; &#x27;thread/extensionState/updated&#x27;
+        OR json_extract(candidate.data, &#x27;$.kind&#x27;) = ${args.kind}
+      )`;</pre>
+<p><a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/packages/db/src/data/events.ts#L1542-L1555">packages/db/src/data/events.ts:1542</a></p><pre>          sql`${events}.rowid IN (
+        SELECT (
+          SELECT candidate.rowid
+          FROM ${events} AS candidate INDEXED BY events_thread_state_thread_sequence_idx
+          WHERE candidate.thread_id = requested.column1
+            AND candidate.type ${stateTypesPredicate}
+            AND ${kindPredicate}
+          ORDER BY candidate.sequence DESC
+          LIMIT 1
+        )
+        FROM (VALUES ${requestedThreads}) AS requested
+      )`,
+        )
+        .all();</pre>
+<p><a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/packages/db/src/schema.ts#L863-L867">packages/db/src/schema.ts:863</a></p><pre>    index(&quot;events_thread_state_thread_sequence_idx&quot;)
+      .on(table.threadId, table.sequence)
+      .where(
+        sql`${table.type} IN (&#x27;thread/goal/updated&#x27;, &#x27;thread/goal/cleared&#x27;, &#x27;thread/extensionState/updated&#x27;)`,
+      ),</pre>
+<p>The query plan still says SEARCH and uses the intended index. That only bounds the scan to a thread, not to a kind. Existing plan coverage seeds a native goal as the latest event, so each probe immediately succeeds and does not exercise the missing/old-kind history:</p>
+<p><a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/packages/db/test/query-plans.test.ts#L1880-L1896">packages/db/test/query-plans.test.ts:1880</a></p><pre>    });
+    insertEvents(
+      db,
+      noopNotifier,
+      [thread, otherThread].flatMap((stateThread, threadIndex) =&gt;
+        Array.from({ length: 64 }, (_, index) =&gt; ({
+          data: JSON.stringify(
+            index === 63
+              ? { goal: `goal-${threadIndex}` }
+              : { kind: &quot;other-plugin/state&quot;, payload: { index } },
+          ),
+          itemId: null,
+          itemKind: null,
+          parentToolCallId: null,
+          scope: threadScope(),
+          sequence: index + 1,
+          threadId: stateThread.id,</pre>
+<p>The server calls this synchronously on thread activity reads and several times for a timeline head. Repeated calls can therefore accumulate their scan costs on the event loop; the exact scheduling and proxy consequences were not reproduced.</p>
+<p><a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/server/src/services/threads/thread-runtime-display.ts#L392-L399">apps/server/src/services/threads/thread-runtime-display.ts:392</a></p><pre>function listPromptBannerActivityCandidateRows(
+  deps: ThreadPromptBannerDeps,
+  threads: readonly Thread[],
+): StoredEventRow[] {
+  const latestGoalRows = listLatestThreadStateEventRowsByThreadIds(deps.db, {
+    threadIds: threads.map((thread) =&gt; thread.id),
+    kind: LEGACY_CODEX_GOAL_EXTENSION_KIND,
+  });</pre>
+<p><a href="https://github.com/get-bb/bb/blob/916d684ac23d0b0de82c09cfc7553a50287d2188/apps/server/src/services/threads/timeline.ts#L933-L954">apps/server/src/services/threads/timeline.ts:933</a></p><pre>function listLatestTimelineHeadStateRows(
+  db: DbConnection,
+  threadId: string,
+): StoredEventRow[] {
+  return mergeStoredEventRowsById([
+    ...listLatestThreadStateEventRowsByThreadIds(db, {
+      threadIds: [threadId],
+      kind: LEGACY_CODEX_GOAL_EXTENSION_KIND,
+    }),
+    ...listLatestThreadStateEventRowsByThreadIds(db, {
+      threadIds: [threadId],
+      kind: THREAD_PROVIDER_COMMANDS_STATE_KIND,
+    }),
+    ...listLatestThreadStateEventRowsByThreadIds(db, {
+      threadIds: [threadId],
+      kind: THREAD_SESSION_OPTIONS_STATE_KIND,
+    }),
+    ...listLatestThreadStateEventRowsByThreadIds(db, {
+      threadIds: [threadId],
+      kind: THREAD_SESSION_OPTION_SELECTIONS_STATE_KIND,
+    }),
+    ...listTodoSnapshotEventRowsForThread(db, { threadId }),</pre>
+<h2>6. Proposed fix and automation boundary</h2>
+<p>Add an indexed, kind-aware state access path through the existing Drizzle schema and generated migration pipeline. Query native goal events and extension-state events of the requested kind separately, then pick the newest candidate by sequence so the current cross-type semantics remain intact. An expression or stored kind index must match the actual JSON expression and partial predicate. Verify absent kinds, old kinds, native update/clear precedence, variable batching, and migration behavior on existing databases. Index creation on large histories requires operational consideration.</p>
+<p><strong>No automatic fix or pull request:</strong> a kind-aware index is a schema/migration change, and a latest-state projection is a stored-data change. Both are explicitly excluded by the simple-fix rule. The report and failing regression are retained; no production patch or fix branch was pushed. Caching alone would not repair the first/cold lookup and introduces invalidation policy beyond a safe contained query fix.</p>
+<p>No open PR linking this issue was found in issue timeline metadata or the open-PR search during this run. No linked PR code was checked out or run.</p>
+<h2>7. Verification</h2>
+<p>The same agent repeated the reproduction, not an independent reviewer. The second worktree was created afresh at the exact trusted base; a new frozen install and full-build attempt preceded the copied reproduction. The helper creates a new fixture directory and a new migrated database each time, and <code>--force</code> prevents Turbo from replaying the first result.</p>
+<pre>git worktree add --detach &quot;$WORK/verify&quot; 916d684ac23d0b0de82c09cfc7553a50287d2188
+cd &quot;$WORK/verify&quot;
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build
+cp &quot;$WORK/base/packages/db/test/issue-6825-repro.test.ts&quot; packages/db/test/
+cp &quot;$WORK/base/packages/db/test/issue-6825-profile.py&quot; packages/db/test/
+git diff --exit-code
+pnpm exec turbo run test --force --filter=@bb/db -- test/issue-6825-repro.test.ts</pre>
+<p><strong>Result:</strong> identical VM counts and identical two intended assertion failures. Actual Node medians are reported separately above. No correction to the root-cause conclusion was needed. An initial harness attempt tried replaying redacted slow-query log text; that was discarded and corrected to capture the actual prepared SQL before either final run.</p>
+<p>Existing owner suites: <strong>145 tests passed across 2 files</strong> (events and query plans). <code>pnpm exec turbo run typecheck --filter=@bb/db</code> passed. Formatter and <code>git diff --check</code> passed. Production files were unchanged in both worktrees. A final origin/main fetch showed no later changes to the implicated query or schema.</p>
+<h2>8. Related history</h2>
+<p><a href="https://github.com/get-bb/bb/pull/4931">PR #4931</a>, trusted historical commit <code>ef570298ef45b39d837da0fcab0fb94ea086783b</code>, introduced the per-thread rowid seek. It addresses repeated outer rescanning but does not add kind to the index. This report concerns the remaining inner scan and does not reverse that earlier improvement.</p>
+<h2>9. Appendix — exact observations</h2>
+<h3>First trusted checkout</h3><pre>history=64 case=latest node_median_ms=0.238
+history=64 case=old node_median_ms=0.637
+history=64 case=missing node_median_ms=0.673
+history=64
+python_sqlite=3.50.4
+latest vm_steps=1418 sequences=[65]
+old vm_steps=580 sequences=[1]
+missing vm_steps=565 sequences=[]
+plan=SEARCH events USING INTEGER PRIMARY KEY (rowid=?) | LIST SUBQUERY 3 | CO-ROUTINE requested | SCAN CONSTANT ROW | SCAN requested | CORRELATED SCALAR SUBQUERY 1 | SEARCH candidate USING INDEX events_thread_state_thread_sequence_idx (thread_id=?) | CREATE BLOOM FILTER
+history=1024 case=latest node_median_ms=0.128
+history=1024 case=old node_median_ms=9.582
+history=1024 case=missing node_median_ms=9.017
+history=1024
+python_sqlite=3.50.4
+latest vm_steps=1418 sequences=[1025]
+old vm_steps=8260 sequences=[1]
+missing vm_steps=8245 sequences=[]
+plan=SEARCH events USING INTEGER PRIMARY KEY (rowid=?) | LIST SUBQUERY 3 | CO-ROUTINE requested | SCAN CONSTANT ROW | SCAN requested | CORRELATED SCALAR SUBQUERY 1 | SEARCH candidate USING INDEX events_thread_state_thread_sequence_idx (thread_id=?) | CREATE BLOOM FILTER
+history=6000 case=latest node_median_ms=0.112
+history=6000 case=old node_median_ms=48.600
+history=6000 case=missing node_median_ms=46.641
+history=6000
+python_sqlite=3.50.4
+latest vm_steps=1418 sequences=[6001]
+old vm_steps=48068 sequences=[1]
+missing vm_steps=48053 sequences=[]
+plan=SEARCH events USING INTEGER PRIMARY KEY (rowid=?) | LIST SUBQUERY 3 | CO-ROUTINE requested | SCAN CONSTANT ROW | SCAN requested | CORRELATED SCALAR SUBQUERY 1 | SEARCH candidate USING INDEX events_thread_state_thread_sequence_idx (thread_id=?) | CREATE BLOOM FILTER
+AssertionError: expected 48053 to be less than or equal to 1565
+AssertionError: expected 48068 to be less than or equal to 1580</pre>
+<h3>Second clean trusted checkout</h3><pre>history=64 case=latest node_median_ms=0.237
+history=64 case=old node_median_ms=0.662
+history=64 case=missing node_median_ms=0.530
+history=64
+python_sqlite=3.50.4
+latest vm_steps=1418 sequences=[65]
+old vm_steps=580 sequences=[1]
+missing vm_steps=565 sequences=[]
+plan=SEARCH events USING INTEGER PRIMARY KEY (rowid=?) | LIST SUBQUERY 3 | CO-ROUTINE requested | SCAN CONSTANT ROW | SCAN requested | CORRELATED SCALAR SUBQUERY 1 | SEARCH candidate USING INDEX events_thread_state_thread_sequence_idx (thread_id=?) | CREATE BLOOM FILTER
+history=1024 case=latest node_median_ms=0.114
+history=1024 case=old node_median_ms=9.441
+history=1024 case=missing node_median_ms=7.194
+history=1024
+python_sqlite=3.50.4
+latest vm_steps=1418 sequences=[1025]
+old vm_steps=8260 sequences=[1]
+missing vm_steps=8245 sequences=[]
+plan=SEARCH events USING INTEGER PRIMARY KEY (rowid=?) | LIST SUBQUERY 3 | CO-ROUTINE requested | SCAN CONSTANT ROW | SCAN requested | CORRELATED SCALAR SUBQUERY 1 | SEARCH candidate USING INDEX events_thread_state_thread_sequence_idx (thread_id=?) | CREATE BLOOM FILTER
+history=6000 case=latest node_median_ms=0.118
+history=6000 case=old node_median_ms=60.595
+history=6000 case=missing node_median_ms=58.757
+history=6000
+python_sqlite=3.50.4
+latest vm_steps=1418 sequences=[6001]
+old vm_steps=48068 sequences=[1]
+missing vm_steps=48053 sequences=[]
+plan=SEARCH events USING INTEGER PRIMARY KEY (rowid=?) | LIST SUBQUERY 3 | CO-ROUTINE requested | SCAN CONSTANT ROW | SCAN requested | CORRELATED SCALAR SUBQUERY 1 | SEARCH candidate USING INDEX events_thread_state_thread_sequence_idx (thread_id=?) | CREATE BLOOM FILTER
+AssertionError: expected 48053 to be less than or equal to 1565
+AssertionError: expected 48068 to be less than or equal to 1580</pre>
+<p>Scope: database-level reproduction and source tracing, not a live-server load test. Deployment log totals, database size, provider publish frequency, keep-alive tuning, proxy errors, and exact release-binary performance remain unverified. Issue content was treated solely as untrusted claims; no supplied script, patch, branch, or external resource was executed.</p>
+<p class="meta">Agent-generated report · SlopCop new-issue-autopilot · November 2, 2026</p>
+</main></body></html>
