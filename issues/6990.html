@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #6990 Transient upstream failures overwrite Claude session affinity</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#6990 · Transient upstream failures overwrite Claude session affinity</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Low</span><span class="pill">providers</span><span class="pill">provider-claude-code</span><span class="pill">confirmed-repro</span><a href="https://github.com/get-bb/bb/issues/6990">Issue</a><span>November 4, 2026</span></p>
+<p><strong>Verdict: REPRODUCED · Root-cause confidence: high.</strong> Both reproduction runs use trusted main commit <code>8d131a26dd17b589a06c3af3791d87a717c1eaef</code>. Production source is unchanged.</p>
+
+<h2>1. TL;DR</h2>
+<p>An established Claude conversation switches to a second pooled account when its first account encounters a temporary upstream failure. A successful fallback overwrites the conversation's stored affinity, so the next request stays on the fallback even after the original account recovers. The routing code remembers that an account was attempted, but does not remember whether it failed transiently or was genuinely unable to serve the account. Seven deterministic cases reproduce the missing retry and lost original pin in two clean checkouts. This verifies routing, not a cache-billing amount or a live provider outage.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Temporary HTTP failures immediately use another account.</td><td>Verified</td><td>408, 500, 502, 503, 504 and 529 each make exactly one attempt on the pinned account during the failed request, then succeed on the fallback.</td></tr>
+<tr><td>A connection failure follows the same route.</td><td>Verified at the failure boundary</td><td>An injected fetch exception is wrapped by the production connection-error path and produces the same routing result. No real network timeout is induced.</td></tr>
+<tr><td>The recovered original account is not selected again.</td><td>Verified</td><td>The third request for the same synthetic session uses the fallback in all seven cases, even though the original upstream handler now succeeds.</td></tr>
+<tr><td>The move is permanent.</td><td>Qualified</td><td>The replacement is stored, not a one-request detour. It is not literally forever: expiry, eviction, or another routing change can release or replace a binding. The reproduction does not wait for expiry.</td></tr>
+<tr><td>The move increases cache-write charges.</td><td>Unmeasured</td><td>No live account, cache, token usage, or billing data is used. The report establishes the unnecessary account change only.</td></tr>
+<tr><td>The issue is fixed by threshold-retention changes already on main.</td><td>Refuted for this failure path</td><td>Main includes the threshold-retention change; the seven transient-failure cases still reproduce.</td></tr>
+</table>
+
+<h2>3. Environment</h2>
+<ul>
+<li>Repository: public <code>get-bb/bb</code>; trusted <code>origin/main</code> at <code>8d131a26dd17b589a06c3af3791d87a717c1eaef</code>, re-fetched after verification with no newer account-pool changes.</li>
+<li>Linux 4.19.0-gvisor x86_64; Node v22.19.0; pnpm 9.15.0.</li>
+<li>Two synthetic API-key accounts in the repository's existing <code>affinityFixture</code>. All short account-key strings shown here are fixture literals, not credentials.</li>
+<li>The real Account Pooler plugin, hub, account store, affinity store and HTTP handler execute through the SDK test harness. Only the external upstream is simulated. No database mock is introduced.</li>
+<li>No live bb instance or enrolled account is used. The fixtures allocate fresh temporary directories with <code>mkdtemp</code> and dispose their services and data after each case. These focused cases start no TCP listener, so no application ports are involved.</li>
+<li>The first checkout completed the full Turbo build: 73 successful tasks. An initial cold-build attempt raced missing SDK runtime output in an unrelated plugin; repeating the unchanged build succeeded.</li>
+</ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol>
+<li>Clone only the trusted repository and select the recorded main commit:
+<pre>git clone --single-branch --branch main https://github.com/get-bb/bb.git bb-6990
+cd bb-6990
+git switch --detach 8d131a26dd17b589a06c3af3791d87a717c1eaef
+pnpm install --frozen-lockfile --prefer-offline</pre></li>
+<li>In <code>plugins/account-pool/src/server.test.ts</code>, inside <code>describe("session affinity")</code>, insert the following test immediately after <code>affinityFixture</code> and before the existing table-driven cursor test. This uses only helpers already present at the recorded commit.</li>
+<li>The first request establishes the original pin. The second temporarily makes the original account fail and lets the fallback answer. The third restores the original account before sending the same session again.</li>
+</ol>
+<pre>    it.each([408, 500, 502, 503, 504, 529, "disconnect"] as const)(
+      "issue 6990 preserves a recovered Claude pin after %s",
+      async (failure) =&gt; {
+        let unavailable = false;
+        const attempts: string[] = [];
+        const fixture = await affinityFixture("claude", async (_input, init) =&gt; {
+          const accountKey = new Headers(init?.headers).get("x-api-key") ?? "";
+          attempts.push(accountKey);
+          if (unavailable &amp;&amp; accountKey === "sk-first") {
+            if (failure === "disconnect")
+              throw new Error("simulated connection failure");
+            return Response.json({}, { status: failure });
+          }
+          return Response.json({});
+        });
+        const send = async () =&gt; {
+          const response = await fixture.host.harness.behavior.fetchHttp(
+            "POST",
+            "/v1/messages",
+            {
+              headers: authHeaders(fixture.key),
+              body: claudeBody("repro-session"),
+            },
+          );
+          expect(response.status).toBe(200);
+          await response.text();
+        };
+        await send();
+        expect(attempts).toEqual(["sk-first"]);
+        unavailable = true;
+        await send();
+        const outageAttempts = attempts.slice(1);
+        unavailable = false;
+        const recoveryStart = attempts.length;
+        await send();
+        expect
+          .soft(
+            attempts.slice(recoveryStart),
+            "the recovered account must serve the next request",
+          )
+          .toEqual(["sk-first"]);
+        expect
+          .soft(
+            outageAttempts.filter((accountKey) =&gt; accountKey === "sk-first")
+              .length,
+            "retry the pinned account before changing accounts",
+          )
+          .toBeGreaterThan(1);
+      },
+    );</pre>
+<p>Run through Turbo so test dependencies build first:</p>
+<pre>pnpm exec turbo run test --filter=bb-plugin-account-pool -- src/server.test.ts -t 'issue 6990'</pre>
+<p><strong>Expected:</strong> the recovered request attempts <code>["sk-first"]</code>, and the outage request attempts the pinned account more than once before fallback. The test deliberately does not prescribe a retry count or backoff duration.</p>
+<p><strong>Actual:</strong> the recovered request attempts <code>["sk-second"]</code>; the outage request attempts the original account only once. All three client requests return HTTP 200. The complete observed account sequence on unmodified production code is <code>["sk-first", "sk-first", "sk-second", "sk-second"]</code>.</p>
+<p>Verbatim assertion and summary excerpts, omitting runner prefixes and local file paths:</p>
+<pre>AssertionError: the recovered account must serve the next request: expected [ 'sk-second' ] to deeply equal [ 'sk-first' ]
+AssertionError: retry the pinned account before changing accounts: expected 1 to be greater than 1
+
+ Test Files  1 failed (1)
+      Tests  7 failed | 193 skipped (200)</pre>
+<p>The failed assertions are the expected reproduction result, not a test setup failure. A fix should make both assertions pass without changing the fixture's upstream simulation.</p>
+
+<h2>5. Root cause</h2>
+<ol>
+<li><a href="https://github.com/get-bb/bb/blob/8d131a26dd17b589a06c3af3791d87a717c1eaef/plugins/account-pool/src/hub.ts#L543-L544">The selected account is marked attempted before upstream execution</a>. That single set is later used to decide whether another account should replace its binding.</li>
+<li><a href="https://github.com/get-bb/bb/blob/8d131a26dd17b589a06c3af3791d87a717c1eaef/plugins/account-pool/src/hub.ts#L576-L597">Connection failures break the inner loop</a>. <a href="https://github.com/get-bb/bb/blob/8d131a26dd17b589a06c3af3791d87a717c1eaef/plugins/account-pool/src/hub.ts#L650-L736">HTTP transient statuses share a failover block with credential refusals</a>. Non-auth transient statuses do not take a same-account retry path.</li>
+<li><a href="https://github.com/get-bb/bb/blob/8d131a26dd17b589a06c3af3791d87a717c1eaef/plugins/account-pool/src/hub.ts#L992-L1025">The rebind predicate considers attempted membership sufficient</a>, except for a model-family quota detour:
+<pre>const rebind =
+  affinityKey !== null &amp;&amp;
+  !familyDetour(boundAccountId) &amp;&amp;
+  (bound === undefined ||
+    bound.account.id === selected.account.id ||
+    (binding === routing.binding &amp;&amp; attempted.has(bound.account.id)));</pre>
+There is no failure-reason distinction in that predicate.</li>
+<li><a href="https://github.com/get-bb/bb/blob/8d131a26dd17b589a06c3af3791d87a717c1eaef/plugins/account-pool/src/hub.ts#L736-L739">A successful fallback calls <code>selected.accept()</code></a>, which writes the fallback account into both the in-memory affinity map and <code>PoolAffinityStore</code>. <a href="https://github.com/get-bb/bb/blob/8d131a26dd17b589a06c3af3791d87a717c1eaef/plugins/account-pool/src/store.ts#L782-L789">The store upserts the account ID in SQLite</a>. This explains why the following request has no reason to return to the recovered account.</li>
+</ol>
+<p>The underlying defect is conflation of a temporary upstream detour with an account-specific routing disqualification. Merely adding a retry without preserving the original binding would leave the bug whenever a temporary outage outlasts those retries.</p>
+
+<h2>6. Proposed fix</h2>
+<p>Keep failure reasons in request-local routing state. For a pinned account, use bounded, cancellable retries for transient transport and server failures, respecting the pool's inline-wait limit and cancellation. If those retries exhaust, allow the request to complete on another account without replacing the established session binding. Keep authentication and account-wide quota refusals eligible for genuine rebinding. Preserve existing streaming rules: never replay an already-delivered response stream.</p>
+<p>Existing family-quota detour handling provides a local precedent. The exact backoff policy is not established by this reproduction. Important follow-up tests include cancellation during backoff, long Retry-After values, all-accounts failure, new sessions, family limits and credential refusals.</p>
+
+<h2>7. Linked PR</h2>
+<p><a href="https://github.com/get-bb/bb/pull/6991">PR #6991</a> is open and its GitHub closing-issue metadata explicitly includes #6990. Its metadata and diff were read as untrusted evidence; its branch was never checked out, copied into the reproduction, or executed.</p>
+<p><strong>Static assessment only:</strong> its hub diff introduces request-local transient-failure tracking, bounded same-account retries, and a rebind exclusion for transiently failing pinned accounts. This targets both mechanisms identified on trusted main. This report does not certify the PR's runtime correctness or its tests: all executed evidence comes from trusted main plus the independently written test shown above.</p>
+<p><strong>Fix disposition:</strong> no new fix branch or duplicate pull request is opened because an open PR already links to this issue. No production change is made by this investigation.</p>
+
+<h2>8. Related work</h2>
+<p>The trusted file history contains merged threshold-retention change <a href="https://github.com/get-bb/bb/pull/6849">#6849</a> at commit <code>efde6ff66</code>. That is a different route-selection condition; the base tested here already includes it. A model-family quota detour is also already exempt from permanent rebinding in the quoted predicate.</p>
+
+<h2>9. Verification</h2>
+<p>The same agent repeated the reproduction in a second clean detached worktree at the exact recorded main commit. The second worktree was clean before adding only the reproduction test. It received its own frozen install and Turbo dependency build. The fixtures created fresh temporary data for each case; no data, services, or HTTP listeners from the first run were reused. This is a second clean run, not independent-agent verification.</p>
+<table><tr><th>Check</th><th>Result</th></tr>
+<tr><td>First checkout, focused seven-case reproduction</td><td>Exit 1; 7 failed, 193 skipped; both assertions fail for every case.</td></tr>
+<tr><td>Second checkout, same command and test</td><td>Exit 1; 7 failed, 193 skipped; identical account-selection and retry-count failures.</td></tr>
+<tr><td>Second checkout, existing two-case routing control</td><td>Exit 0; 2 passed, 198 skipped. Existing tests explicitly expect fallback affinity after failures.</td></tr>
+<tr><td>Full build in first checkout</td><td>Exit 0 on retry; 73 successful tasks.</td></tr>
+<tr><td>Production source and whitespace</td><td>Only 55 test lines added in each checkout; no production diff; git diff --check passes.</td></tr>
+</table>
+<p>Control command:</p>
+<pre>pnpm exec turbo run test --filter=bb-plugin-account-pool -- src/server.test.ts -t 'keeps .*sessions and the pool cursor'</pre>
+<p>No report conclusion required correction after the second run. The limits are explicit: no live Claude Code process, real outage, actual timeout duration, cache-write charge, long-running expiry, or new production fix was tested.</p>
+
+<h2>10. Appendix and trust boundary</h2>
+<p>The report is nonvisual. The complete regression test and material output are inline; raw logs and the reproduction patch remain outside the public reports repository in local investigation evidence. No external issue links were fetched. Issue content was treated only as hypotheses; the test was authored from the trusted repository fixture and the hub routing code. No issue-provided commands, code, patches, branches, or linked PR tests were executed.</p>
+<p>Additional validation commands used in the respective temporary checkout:</p>
+<pre>pnpm exec turbo run build
+pnpm exec turbo run build --filter=bb-plugin-account-pool
+pnpm exec oxfmt plugins/account-pool/src/server.test.ts
+git diff --check
+git diff --numstat
+git fetch origin main
+git log --oneline HEAD..origin/main -- plugins/account-pool</pre>
+<p>Provider availability was not queried because reproduction uses only synthetic upstreams. No dev instance was launched, so no application server shutdown was needed; the test harness performed its normal service and temporary-data cleanup.</p>
+</main></body></html>
