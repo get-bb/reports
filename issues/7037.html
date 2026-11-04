@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7037 Agent OOM ranking and service policy</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7037 · Agent OOM ranking and service policy</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High priority</span><span class="pill">Effort: Medium</span><span class="pill">host</span><a href="https://github.com/get-bb/bb/issues/7037">GitHub issue</a><span>2026-11-04 · base <code>783a6062bd6f485597e66450a149069402780868</code></span></p>
+<p class="verdict v-partial">PARTIALLY REPRODUCED · Root-cause confidence: high for the observed policy gaps; host-wide OOM failure remains unverified.</p>
+
+<h2>1. TL;DR</h2>
+<p>Agent work is launched without an OOM-priority distinction from the runtime hosting it. A real bridge started through the trusted runtime has the same observed Linux OOM adjustment as its parent: both are zero here. Separately, running the actual machine installer in its isolated test fixture generates a systemd unit with no explicit OOM policy. These are distinct gaps: kernel victim preference and service-manager response. Both observations repeat in a second clean checkout, but no memory exhaustion or live service interruption was induced.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Status</th><th>Evidence and limits</th></tr>
+<tr><td>Bridge work has the same OOM adjustment as its runtime.</td><td class="ok">Verified</td><td>A real bridge worker loading the trusted scripted-echo provider reports parent adjustment 0 and bridge adjustment 0 in both clean checkouts.</td></tr>
+<tr><td>The installed unit does not override the OOM policy.</td><td class="ok">Verified</td><td>The actual installer generates a unit with no OOMPolicy field in both fixture runs. This tests the artifact, not live systemd.</td></tr>
+<tr><td>A correctly chosen workload victim can still stop its entire service.</td><td class="unv">Documented, not exercised</td><td>systemd documents this consequence for OOMPolicy=stop. An unspecified policy follows the manager default, with an exception for delegated units. The reporter's effective setting was not independently queried.</td></tr>
+<tr><td>The kernel kills bb and interrupts other threads under distributed agent memory pressure.</td><td class="unv">Unverified end to end</td><td>No native-kernel OOM/cgroup test ran here. Equal adjustment alone does not guarantee a victim: memory accounting, eligibility, and OOM scope also matter.</td></tr>
+<tr><td>External provider CLIs and their tool descendants have the same adjustment.</td><td class="unv">Not directly observed</td><td>The trusted scripted provider exercises the actual bridge launch boundary; no authenticated external provider or tool tree was run.</td></tr></table>
+
+<h2>3. Environment</h2>
+<ul><li>Public repository get-bb/bb at trusted origin/main commit <code>783a6062bd6f485597e66450a149069402780868</code>.</li>
+<li>Linux <code>4.19.0-gvisor</code>, x86_64; Node <code>v22.19.0</code>; pnpm <code>9.15.0</code>; Vitest <code>4.1.1</code>.</li>
+<li>PID 1: dumb-init. systemctl is unavailable; cgroup mount is read-only. This sandbox cannot faithfully verify native kernel victim selection or systemd aftermath.</li>
+<li>No live BB instance, account, enrolled host, credentials, or persistent runtime data was used. No server ports were opened. The actual bridge and scripted provider were built from trusted source.</li>
+<li>Two initially clean, separate clones at the same commit, each with a frozen dependency install and full build. Each test creates fresh scratch workspace and installer fixture directories.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<p>This is a safe, bounded reproduction of policy gaps, not an OOM stress script. All test code was authored from trusted repository evidence; no issue script or linked-PR code was executed.</p>
+<ol><li>Prepare trusted source:
+<pre>git clone --branch main --single-branch https://github.com/get-bb/bb.git bb-7037-base
+cd bb-7037-base
+git checkout --detach 783a6062bd6f485597e66450a149069402780868
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build</pre></li>
+<li>Add <code>packages/agent-runtime/src/runtime.oom-ordering.test.ts</code> with this complete test:
+<pre>import { mkdtempSync, readFileSync, rmSync } from &quot;node:fs&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { expect, it } from &quot;vitest&quot;;
+import {
+  createScriptedEchoProcessLog,
+  createScriptedEchoRuntime,
+  waitForRuntimeState,
+} from &quot;./test/runtime-test-harness.js&quot;;
+
+it.runIf(process.platform === &quot;linux&quot;)(
+  &quot;oom contract: a running bridge is a higher-priority OOM victim than its runtime&quot;,
+  async () =&gt; {
+    const workspacePath = mkdtempSync(join(tmpdir(), &quot;bb-oom-contract-&quot;));
+    const processLog = createScriptedEchoProcessLog();
+    const runtime = createScriptedEchoRuntime({
+      runtime: { workspacePath, env: processLog.env, onEvent: () =&gt; {} },
+    });
+    try {
+      await runtime.ensureProvider({ providerId: &quot;fake&quot; });
+      await waitForRuntimeState({
+        label: &quot;actual bridge startup record&quot;,
+        predicate: () =&gt; processLog.read().some((entry) =&gt; /^spawn:\d+$/.test(entry)),
+      });
+      const startup = processLog.read().find((entry) =&gt; /^spawn:\d+$/.test(entry));
+      if (startup === undefined) throw new Error(&quot;Bridge startup was not recorded&quot;);
+      const bridgePid = Number(startup.split(&quot;:&quot;)[1]);
+      const runtimeAdjustment = Number(readFileSync(&quot;/proc/self/oom_score_adj&quot;, &quot;utf8&quot;));
+      const bridgeAdjustment = Number(readFileSync(`/proc/${bridgePid}/oom_score_adj`, &quot;utf8&quot;));
+      console.log(JSON.stringify({ runtimeAdjustment, bridgeAdjustment }));
+      expect(runtimeAdjustment).toBeLessThan(1000);
+      expect(bridgeAdjustment).toBeGreaterThan(runtimeAdjustment);
+    } finally {
+      await runtime.shutdown();
+      rmSync(workspacePath, { recursive: true, force: true });
+      rmSync(processLog.path, { force: true });
+    }
+  },
+);
+</pre></li>
+<li>Apply this test-only extension to the existing installer artifact fixture. It preserves the actual installer implementation and existing isolation:
+<pre>diff --git a/apps/server/test/app/install-machine-script.test.ts b/apps/server/test/app/install-machine-script.test.ts
+index 8696ed09d2..b214c29d2a 100644
+--- a/apps/server/test/app/install-machine-script.test.ts
++++ b/apps/server/test/app/install-machine-script.test.ts
+@@ -1641,3 +1641,3 @@ printf &#x27;%s\n&#x27; &quot;$*&quot; &gt;&gt;&quot;${join(fixture.dataDir, &quot;launchctl.log&quot;)}&quot;
+ 
+-  it(&quot;restarts an active Linux systemd user unit after replacing it&quot;, () =&gt; {
++  it(&quot;oom contract: restarts an active Linux systemd user unit after replacing it&quot;, () =&gt; {
+     const fixture = createFixture();
+@@ -1676,2 +1676,5 @@ printf &#x27;%s\n&#x27; &quot;$*&quot; &gt;&gt;&quot;${join(fixture.dataDir, &quot;launchctl.log&quot;)}&quot;
+     expect(unit).toContain(&quot;RestartSec=2&quot;);
++    const oomPolicy = unit.match(/^OOMPolicy=(.+)$/m)?.[1] ?? &quot;not specified&quot;;
++    console.log(JSON.stringify({ generatedUnitOomPolicy: oomPolicy }));
++    expect(oomPolicy).toBe(&quot;continue&quot;);
+     expect(unit).toContain(&quot;WantedBy=default.target&quot;);
+</pre></li>
+<li>Run each assertion separately, so an expected failure cannot cancel the other:
+<pre>pnpm exec turbo run test --filter=@bb/agent-runtime -- src/runtime.oom-ordering.test.ts
+pnpm exec turbo run test --filter=@bb/server -- test/app/install-machine-script.test.ts --testNamePattern 'oom contract'</pre></li></ol>
+<p><strong>Expected:</strong> the bridge has a strictly greater OOM adjustment than its runtime, and the generated service explicitly continues after a workload OOM kill. <strong>Actual diagnostic lines and assertion output, verbatim:</strong></p>
+<pre>{"runtimeAdjustment":0,"bridgeAdjustment":0}
+AssertionError: expected 0 to be greater than 0
+
+{"generatedUnitOomPolicy":"not specified"}
+Expected: "continue"
+Received: "not specified"</pre>
+<p>Both focused checks exit nonzero for the intended assertions, not startup or dependency failures. The runtime is shut down in a finally block. Repro code and output are embedded here because the reports repository forbids loose tests, patches, and logs.</p>
+
+<h2>5. Root cause</h2>
+<h3>Bridge launch does not distinguish agent work from its runtime</h3>
+<p><a href="https://github.com/get-bb/bb/blob/783a6062bd6f485597e66450a149069402780868/packages/agent-runtime/src/runtime-provider-process.ts#L372-L398">RuntimeProviderProcessManager.spawnProvider</a> launches the bridge using command, arguments, cwd, and environment, without changing OOM adjustment:</p>
+<pre>const managed = spawnManagedProcess({
+  command: processConfig.command,
+  args: processConfig.args,
+  cwd: this.args.workspacePath,
+  env,
+});
+const { child } = managed;</pre>
+<p><a href="https://github.com/get-bb/bb/blob/783a6062bd6f485597e66450a149069402780868/packages/process-utils/src/managed-process.ts#L21-L28">spawnManagedProcess</a> creates a process group for lifecycle handling, not an OOM priority class. The real bridge observation confirms unchanged adjustment at this boundary. <a href="https://docs.kernel.org/filesystems/proc.html#proc-pid-oom-adj-proc-pid-oom-score-adj-adjust-the-oom-killer-score">Linux proc documentation</a> describes how oom_score_adj affects victim selection. Leaving work at its runtime's adjustment supplies no explicit preference for sacrificing work to retain the runtime. This is not proof of which process a native kernel will choose.</p>
+<h3>Generated service delegates OOM response to manager defaults</h3>
+<p><a href="https://github.com/get-bb/bb/blob/783a6062bd6f485597e66450a149069402780868/apps/server/src/assets/install-machine.sh#L1166-L1181">The installer service definition</a> sets Restart=always and RestartSec=2, but no OOMPolicy. Running the installer confirms that omission in its actual output. <a href="https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#OOMPolicy=">systemd documents</a> that stop terminates the service after an OOM kill, whereas continue logs it and keeps the service running. Unspecified unit policy inherits the manager setting, subject to the Delegate exception; this investigation does not assume every manager uses stop.</p>
+<p>Restart behavior provides recovery after stopping, not isolation from a workload death. The server <a href="https://github.com/get-bb/bb/blob/783a6062bd6f485597e66450a149069402780868/apps/server/src/services/threads/thread-lifecycle.ts#L434-L444">maps daemon-restart interruption to a disconnected message</a>, consistent with the proposed chain. The complete kernel-to-multiple-thread outage chain was not executed.</p>
+
+<h2>6. Proposed fix, from first principles</h2>
+<p>At the Linux provider launch boundary, prefer agent work as an OOM victim without changing the parent runtime or breaking unsupported platforms. Ensure priority is established before descendants launch, and test both the direct child and descendant inheritance. Explicitly select continuing OOM behavior in generated systemd units while preserving recovery if the main daemon dies. Priority is not a memory limit or a guarantee that bb can never be killed.</p>
+<p>The next decisive experiment belongs on a disposable native Linux/systemd machine: use a bounded cgroup, distribute a fixed workload over child processes, verify the daemon remains responsive after a child OOM kill, then separately check recovery from a main-daemon kill. Never induce global OOM on a shared host.</p>
+
+<h2>7. Static PR review</h2>
+<h3><a href="https://github.com/get-bb/bb/pull/7039">PR #7039</a></h3>
+<p>GitHub metadata identifies an open PR against main that closes #7037. Reviewed head: <code>093c3349382374d4519d091f6cf404edaa7fb1e0</code>. The diff was read as untrusted data; the branch, tests, and production changes were never checked out or run.</p>
+<p>The diff proposes a Linux child-score helper called after bridge spawn and an explicit continuing service policy, with direct-child and artifact tests. <strong>Static verdict:</strong> addresses both observed policy gaps in principle; not a passing verification of the PR.</p>
+<p><strong>Residual validation concern, medium:</strong> the new call at <code>packages/agent-runtime/src/runtime-provider-process.ts:392</code> occurs after process creation. The shown diff contains no child-startup barrier. Verify descendants cannot launch before adjustment; direct-child assertions do not establish that ordering. This is an unverified scheduling risk, not an observed PR failure.</p>
+<p>No duplicate fix branch or PR was created: the existing open PR links this issue, and the end-to-end outage is only partially reproduced here.</p>
+
+<h2>8. Related issues</h2>
+<p><a href="https://github.com/get-bb/bb/issues/5553">#5553</a> concerns the daemon's own V8 heap exhaustion and watcher lifecycle, rather than the kernel selecting a victim among distributed agent work. It does not establish the kernel-OOM behavior in this report.</p>
+
+<h2>9. Verification</h2>
+<p>The same agent repeated the investigation in a second separately cloned, initially clean checkout at <code>783a6062bd6f485597e66450a149069402780868</code>, called <code>bb-7037-verify</code> here. Only the authored test file and installer-test extension were added; production source remained unchanged. Each checkout had its own frozen install, full trusted-source build, and fresh temporary test directories; no listening ports were needed.</p>
+<p>The second run used the two focused commands in section 4. Both assertions failed again with identical observations: runtime 0, bridge 0, generated OOM policy not specified. No correction to the findings was necessary. This is a repeat check by the same agent, not independent verification.</p>
+<table><tr><th>Check</th><th>First checkout</th><th>Second checkout</th></tr>
+<tr><td>Frozen install</td><td>Passed</td><td>Passed</td></tr>
+<tr><td>Full build after SDK bootstrap</td><td>73 tasks passed</td><td>73 tasks passed</td></tr>
+<tr><td>Real bridge ranking</td><td>Fails: 0 is not greater than 0</td><td>Fails: 0 is not greater than 0</td></tr>
+<tr><td>Actual generated service policy</td><td>Fails: not specified</td><td>Fails: not specified</td></tr>
+<tr><td>Native OOM/systemd aftermath</td><td>Not run</td><td>Not run</td></tr></table>
+
+<h2>10. Appendix</h2>
+<p>The initial full build failed because SDK runtime outputs were not yet present. Building SDK runtime/types through Turbo resolved that prerequisite, then all 73 full-build tasks succeeded. This preparation failure is not OOM evidence. An initial combined test invocation stopped on the runtime failure, so the installer was rerun separately; the second checkout ran separate focused commands.</p>
+<pre>git fetch origin main
+git rev-parse origin/main
+git status --porcelain
+uname -srmo
+node --version
+pnpm --version
+ps -p 1 -o comm=
+findmnt -n -o FSTYPE,OPTIONS /sys/fs/cgroup
+systemctl --user is-system-running
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec turbo run build build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build
+pnpm exec turbo run test --filter=@bb/agent-runtime --filter=@bb/server -- --testNamePattern 'oom contract'
+pnpm exec turbo run test --filter=@bb/server -- test/app/install-machine-script.test.ts --testNamePattern 'oom contract'
+
+Second clean checkout:
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build
+pnpm exec turbo run test --filter=@bb/agent-runtime -- src/runtime.oom-ordering.test.ts
+pnpm exec turbo run test --filter=@bb/server -- test/app/install-machine-script.test.ts --testNamePattern 'oom contract'</pre>
+<p>Issue prose, instructions, scripts, logs, and linked-PR changes were treated as untrusted claims. No issue-supplied command, script, patch, test, branch, or external URL was executed or fetched. Trusted repository source and newly authored tests were the only product code run. No live runtime data or environment dump is published.</p>
+</main></body></html>
