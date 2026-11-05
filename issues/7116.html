@@ -1,0 +1,500 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7116 Concurrent catalog bridge retirement</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head><body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7116 · Concurrent catalog bridge retirement</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High</span><span class="pill">Effort: Low</span><span class="pill">host · providers · provider-claude-code · confirmed-repro</span></p>
+<p class="meta"><a href="https://github.com/get-bb/bb/issues/7116">Issue #7116</a> · November 5, 2026 · trusted main <code>fa30b0a7dcdf745f7baf8e41721f754b7d3198fe</code></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> (runtime-level reproduction, not a live Claude session).</p>
+
+<h2>1. TL;DR</h2>
+<p>Two concurrent session starts can cancel one another before a user message reaches the provider. Different skill-root snapshots intentionally select different child bridge processes, even when the provider and bridge artifact are identical. The runtime incorrectly interprets an unregistered sibling process as an obsolete bridge and shuts it down. Two clean checkouts reproduce failed starts using the repository’s scripted echo bridge, while the identical-catalog controls succeed and deliver messages. Depending on scheduling, one or both starts fail; a clean child exit is a consequence of the runtime’s requested shutdown, not evidence of a healthy session.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Concurrent starts with different skill snapshots can lose sessions.</td><td class="ok">Verified</td><td>Both clean runs fail only the distinct-catalog test; starts reject with bridge-exit or missing-process errors.</td></tr>
+<tr><td>The runtime itself shuts down a newly launched sibling bridge.</td><td class="ok">Verified</td><td>Exit callbacks report <code>expected:true</code> during concurrent start, before explicit test cleanup; source shows the overly broad retirement predicate.</td></tr>
+<tr><td>Both commands always fail.</td><td>Not universal</td><td>Run A rejected both starts; run B fulfilled one and rejected the other. The race is real, but the number of victims is schedule-dependent.</td></tr>
+<tr><td>Composer Predictions and idle runtime replacement expose this in live Claude usage.</td><td class="unv">Not exercised</td><td>No live plugin, real provider login, production data, server turn rejection, or idle replacement was used. The test reproduces the exact underlying runtime path directly.</td></tr>
+<tr><td>Reported frequency, delay window, and SIGTERM variant.</td><td class="unv">Unverified here</td><td>These runs demonstrate code-0 exits and missing processes, not production timing or occurrence rates.</td></tr></table>
+
+<h2>3. Environment</h2>
+<ul><li>Trusted <code>origin/main</code>: <code>fa30b0a7dcdf745f7baf8e41721f754b7d3198fe</code>; re-fetched and unchanged during investigation.</li>
+<li>Linux 4.19.0-gvisor x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li>
+<li>Provider: repository-owned scripted echo test bridge, as actual child processes. No Claude CLI or credentials required.</li>
+<li>Two separate detached worktrees named <code>base-a</code> and <code>base-b</code> beneath a new temporary investigation directory. Each had a frozen dependency install and targeted Turbo build; no production source changes.</li>
+<li>No HTTP ports or bb instance. Each test allocates a new temporary workspace and bridge data directory, then shuts down its runtime and removes both directories.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone trusted main and select the recorded commit.</li><li>Install and build the runtime dependency graph.</li><li>Save the complete test shown below as <code>packages/agent-runtime/src/runtime.catalog-concurrency.test.ts</code> before running the final command.</li><li>Execute through Turbo with cache bypass:</li></ol>
+<pre>git clone https://github.com/get-bb/bb.git bb-7116-a
+cd bb-7116-a
+git checkout --detach fa30b0a7dcdf745f7baf8e41721f754b7d3198fe
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/agent-runtime
+pnpm exec turbo run test --filter=@bb/agent-runtime --force -- src/runtime.catalog-concurrency.test.ts
+</pre>
+<p>Expected: two passing cases; both sessions start and receive their echo. Actual: the shared-catalog case passes, but the distinct-catalog case fails before message delivery. The command exits 1, as expected for this regression on unchanged production code.</p>
+<pre>Run A: control PASS; distinct catalogs FAIL
+session outcomes [{"status":"rejected","reason":"Error: Provider \"fake\" is not running"},{"status":"rejected","reason":"ProviderProcessExitedError: Provider \"fake\" exited unexpectedly (code 0)"}]
+
+Run B: control PASS; distinct catalogs FAIL
+session outcomes [{"status":"fulfilled"},{"status":"rejected","reason":"ProviderProcessExitedError: Provider \"fake\" exited unexpectedly (code 0)"}]
+
+Both runs: Test Files 1 failed (1); Tests 1 failed | 1 passed (2)</pre>
+<p>The complete test and sanitized execution logs are embedded in this report. Raw evidence remains in local investigation storage, as required by the reports repository policy.</p>
+<details><summary>Complete reproduction test</summary><pre>import { mkdirSync, mkdtempSync, rmSync } from &quot;node:fs&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { expect, it } from &quot;vitest&quot;;
+import type { ThreadEvent } from &quot;@bb/domain&quot;;
+import { createAgentRuntime } from &quot;./runtime.js&quot;;
+import { promptTextInput } from &quot;./test/prompt-input.js&quot;;
+import {
+  createScriptedEchoLaunch,
+  fullRuntimeOptions,
+  waitForThreadAgentMessageText,
+} from &quot;./test/runtime-test-harness.js&quot;;
+
+it.each([false, true])(
+  &quot;keeps concurrent sessions usable with distinct catalogs: %s&quot;,
+  async (distinctCatalogs) =&gt; {
+    const workspacePath = mkdtempSync(join(tmpdir(), &quot;bb-catalog-concurrency-&quot;));
+    const bridgeLaunch = createScriptedEchoLaunch();
+    const events: ThreadEvent[] = [];
+    const runtime = createAgentRuntime({
+      workspacePath,
+      skillRoots: [],
+      onEvent: (event) =&gt; events.push(event),
+      onToolCall: async () =&gt; ({ contentItems: [], success: true }),
+      onProcessExit: (exit) =&gt; {
+        console.info(&quot;bridge exit&quot;, JSON.stringify(exit));
+      },
+    });
+    const skillPath = join(workspacePath, &quot;alternate-skills&quot;);
+    mkdirSync(skillPath);
+    const sessions = [
+      { threadId: &quot;catalog-empty&quot;, skillRoots: [] },
+      {
+        threadId: &quot;catalog-alternate&quot;,
+        skillRoots: distinctCatalogs
+          ? [{ id: &quot;alternate&quot;, path: skillPath, skills: [] }]
+          : [],
+      },
+    ];
+    try {
+      const results = await Promise.allSettled(
+        sessions.map((session) =&gt;
+          runtime.startThread({
+            ...session,
+            bridgeLaunch,
+            environmentId: &quot;env-catalog-test&quot;,
+            projectId: &quot;project-catalog-test&quot;,
+            providerId: &quot;fake&quot;,
+            options: fullRuntimeOptions,
+          }),
+        ),
+      );
+      console.info(
+        &quot;session outcomes&quot;,
+        JSON.stringify(
+          results.map((result) =&gt;
+            result.status === &quot;fulfilled&quot;
+              ? { status: result.status }
+              : { status: result.status, reason: String(result.reason) },
+          ),
+        ),
+      );
+      expect(results.map((result) =&gt; result.status)).toEqual([
+        &quot;fulfilled&quot;,
+        &quot;fulfilled&quot;,
+      ]);
+      for (const session of sessions) {
+        const text = `usable ${session.threadId}`;
+        await runtime.runTurn({
+          clientRequestId: &quot;creq_abcdefghjk&quot;,
+          threadId: session.threadId,
+          input: [promptTextInput({ text })],
+          options: fullRuntimeOptions,
+        });
+        await waitForThreadAgentMessageText({
+          events,
+          providerId: &quot;fake&quot;,
+          runtime,
+          text,
+          threadId: session.threadId,
+        });
+      }
+    } finally {
+      await runtime.shutdown();
+      rmSync(workspacePath, { recursive: true, force: true });
+      rmSync(bridgeLaunch.dataDir, { recursive: true, force: true });
+    }
+  },
+);
+</pre></details>
+
+<h2>5. Root cause</h2>
+<ol><li><a href="https://github.com/get-bb/bb/blob/fa30b0a7dcdf745f7baf8e41721f754b7d3198fe/packages/agent-runtime/src/runtime.ts#L365-L380">packages/agent-runtime/src/runtime.ts:365–380</a> appends a skill-root hash to the process key. Empty roots versus one alternate root therefore select different bridge processes of the same provider and launch.</li>
+<li><a href="https://github.com/get-bb/bb/blob/fa30b0a7dcdf745f7baf8e41721f754b7d3198fe/packages/agent-runtime/src/runtime-provider-process.ts#L246-L272">packages/agent-runtime/src/runtime-provider-process.ts:246–272</a> runs stale-bridge retirement after startup. It identifies candidates by different full process key, same provider, and zero currently registered threads:</li></ol>
+<pre>processKey !== args.processKey &amp;&amp;
+providerProcess.providerId === args.providerId &amp;&amp;
+providerProcess.identity.threadIds.size === 0
+</pre>
+<ol start="3"><li><a href="https://github.com/get-bb/bb/blob/fa30b0a7dcdf745f7baf8e41721f754b7d3198fe/packages/agent-runtime/src/runtime.ts#L1544-L1574">packages/agent-runtime/src/runtime.ts:1544–1574</a> awaits that retirement before registering the new thread. A concurrent bridge can therefore exist without a registered thread and still be required by a start in progress.</li>
+<li><a href="https://github.com/get-bb/bb/blob/fa30b0a7dcdf745f7baf8e41721f754b7d3198fe/packages/agent-runtime/src/runtime-provider-process.ts#L298-L328">packages/agent-runtime/src/runtime-provider-process.ts:298–328</a> marks the retirement as expected and terminates the selected child. The concurrent caller then finds a missing/exited process or receives rejection of its pending request.</li></ol>
+<p>The predicate confuses a different session catalog with a superseded bridge launch. The snapshot of candidates can also become stale before termination: a bridge can acquire a thread after it was selected. This explains why the visible failures and victim counts vary without requiring a provider crash.</p>
+
+<h2>6. Proposed fix</h2>
+<p>Retain and compare the existing bridge-launch fingerprint separately from the catalog-specific process key. A sibling using the same launch must not be treated as superseded solely because its skill snapshot differs. Preserve retirement of genuinely obsolete artifact/configuration launches and existing last-thread release behavior. The fingerprint implementation is already available at <a href="https://github.com/get-bb/bb/blob/fa30b0a7dcdf745f7baf8e41721f754b7d3198fe/packages/agent-runtime/src/bridge-launch-process-key.ts#L42-L53">packages/agent-runtime/src/bridge-launch-process-key.ts:42–53</a>.</p>
+<p>The inline test protects concurrent session usability at the runtime boundary, without mocks or new production seams. It should pass after the retirement discriminator is repaired. Existing coverage must continue to retire obsolete launch artifacts and preserve live sibling sessions.</p>
+
+<h2>7. PR review</h2>
+<h3><a href="https://github.com/get-bb/bb/pull/7117">PR #7117</a> — static review only</h3>
+<p>GitHub metadata confirms an open PR targeting main whose closing references include #7116. The inspected diff records a bridge-launch fingerprint on each process, excludes same-launch siblings from retirement, updates the obsolete-launch test fixture, and adds concurrent-catalog coverage. This addresses the verified discriminator error in the owning subsystem. No blocking finding was identified in this bounded static review; the PR branch was neither checked out nor executed, so post-fix behavior is not certified here.</p>
+<p>Inspected PR head: <code>78fca954fb3bfb51358fb621ad66d08dcec7b110</code>. Tests executed for this report are on trusted main plus the independent reproduction test only. <strong>No duplicate fix PR opened</strong> because the existing open PR already links this issue.</p>
+
+<h2>8. Related issues</h2>
+<p>This report isolates bridge retirement, not the surrounding environment-runtime replacement mechanism. Other issue claims were not separately investigated. The linked fix PR is recorded above; no external issue links or submitted scripts were executed.</p>
+
+<h2>9. Verification</h2>
+<p>The same agent repeated the reproduction in a second clean detached checkout at the identical trusted commit. Its tracked and untracked status was empty before adding the exact same test. Frozen install and targeted build succeeded; <code>pnpm exec turbo run test --filter=@bb/agent-runtime --force -- src/runtime.catalog-concurrency.test.ts</code> executed fresh rather than replaying cache. Result: one passing shared-catalog control and one failing distinct-catalog regression, with a provider exit while starting a session.</p>
+<p>Correction supported by the second run: do not claim both starts always fail. One failed in run B, both failed in run A. An initial test-authoring error used an invalid turn request ID; it was corrected to the repository’s valid request-ID format before the final runs published here. No production code changed to obtain either result.</p>
+<p>Existing <code>runtime.process-lifecycle.test.ts</code> and <code>runtime.skill-roots-capability.test.ts</code>: <strong>38 tests passed</strong>. Runtime package typecheck: <strong>passed</strong>. These results establish that the isolated regression is not a general bridge setup failure. This is a second run by the same agent, not independent review.</p>
+
+<h2>10. Appendix</h2>
+<ul><li><details><summary>Run A full validation log</summary><pre>• turbo 2.10.12
+
+   • Packages in scope: @bb/agent-runtime
+   • Running test in 1 packages
+   • Remote caching disabled, using shared worktree cache
+
+//:ensure-native-modules: cache bypass, force executing 765f6e8e9db08e4d
+@bb/templates:generate:plugin-scaffold: cache hit, replaying logs 43e74f8f90a240ed
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold &lt;investigation&gt;/base-a/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/process-utils:generate:profile-worker: cache hit, replaying logs 53cd812e8bad846b
+@bb/templates:generate:templates: cache hit, replaying logs c2d3f4837c0769ab
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker &lt;investigation&gt;/base-a/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+@bb/plugin-build:generate: cache hit, replaying logs d60fdd187c812e2c
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates &lt;investigation&gt;/base-a/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: &gt; @bb/plugin-build@0.0.1 generate &lt;investigation&gt;/base-a/packages/plugin-build
+@bb/plugin-build:generate: &gt; node ./scripts/generate-plugin-theme.mjs &amp;&amp; node ./scripts/generate-runtime-export-manifest.mjs
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: plugin-theme.generated.ts up to date
+@bb/plugin-build:generate: host-tailwind.css up to date
+@bb/plugin-build:generate: host-tailwind-version.ts up to date
+@bb/plugin-build:generate: wrote &lt;investigation&gt;/base-a/packages/plugin-build/src/generated/runtime-export-manifest.generated.ts (react@19.3.0)
+@bb/agent-runtime:generate:test-bridges: cache miss, executing 687da1250c4573bf
+@bb/agent-runtime:generate:test-bridges: 
+@bb/agent-runtime:generate:test-bridges: &gt; @bb/agent-runtime@0.0.1 generate:test-bridges &lt;investigation&gt;/base-a/packages/agent-runtime
+@bb/agent-runtime:generate:test-bridges: &gt; node ./scripts/build-test-bridges.mjs
+@bb/agent-runtime:generate:test-bridges: 
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules &lt;investigation&gt;/base-a
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+@bb/agent-runtime:test: cache miss, executing 889b7f2c95e957fc
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test: &gt; @bb/agent-runtime@0.0.1 test &lt;investigation&gt;/base-a/packages/agent-runtime
+@bb/agent-runtime:test: &gt; vitest run --config vitest.config.ts &quot;src/runtime.catalog-concurrency.test.ts&quot;
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test:  RUN  v4.1.1 &lt;investigation&gt;/base-a/packages/agent-runtime
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test: stdout | src/runtime.catalog-concurrency.test.ts &gt; keeps concurrent sessions usable with distinct catalogs: true
+@bb/agent-runtime:test: bridge exit {&quot;providerId&quot;:&quot;fake&quot;,&quot;threads&quot;:[],&quot;code&quot;:0,&quot;expected&quot;:true,&quot;signal&quot;:null,&quot;stderr&quot;:null}
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test: stdout | src/runtime.catalog-concurrency.test.ts &gt; keeps concurrent sessions usable with distinct catalogs: true
+@bb/agent-runtime:test: bridge exit {&quot;providerId&quot;:&quot;fake&quot;,&quot;threads&quot;:[{&quot;activeTurnId&quot;:null,&quot;pendingTurnStart&quot;:false,&quot;providerThreadId&quot;:null,&quot;threadId&quot;:&quot;catalog-alternate&quot;}],&quot;code&quot;:0,&quot;expected&quot;:true,&quot;signal&quot;:null,&quot;stderr&quot;:null}
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test: stdout | src/runtime.catalog-concurrency.test.ts &gt; keeps concurrent sessions usable with distinct catalogs: true
+@bb/agent-runtime:test: session outcomes [{&quot;status&quot;:&quot;rejected&quot;,&quot;reason&quot;:&quot;Error: Provider \&quot;fake\&quot; is not running&quot;},{&quot;status&quot;:&quot;rejected&quot;,&quot;reason&quot;:&quot;ProviderProcessExitedError: Provider \&quot;fake\&quot; exited unexpectedly (code 0)&quot;}]
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test:  ❯ |@bb/agent-runtime| src/runtime.catalog-concurrency.test.ts (2 tests | 1 failed) 989ms
+@bb/agent-runtime:test:    ✓ keeps concurrent sessions usable with distinct catalogs: false  522ms
+@bb/agent-runtime:test:    × keeps concurrent sessions usable with distinct catalogs: true 466ms
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test:  FAIL  |@bb/agent-runtime| src/runtime.catalog-concurrency.test.ts &gt; keeps concurrent sessions usable with distinct catalogs: true
+@bb/agent-runtime:test: AssertionError: expected [ &#x27;rejected&#x27;, &#x27;rejected&#x27; ] to deeply equal [ &#x27;fulfilled&#x27;, &#x27;fulfilled&#x27; ]
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test: - Expected
+@bb/agent-runtime:test: + Received
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test:   [
+@bb/agent-runtime:test: -   &quot;fulfilled&quot;,
+@bb/agent-runtime:test: -   &quot;fulfilled&quot;,
+@bb/agent-runtime:test: +   &quot;rejected&quot;,
+@bb/agent-runtime:test: +   &quot;rejected&quot;,
+@bb/agent-runtime:test:   ]
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test:  ❯ src/runtime.catalog-concurrency.test.ts:63:54
+@bb/agent-runtime:test:      61|         ),
+@bb/agent-runtime:test:      62|       );
+@bb/agent-runtime:test:      63|       expect(results.map((result) =&gt; result.status)).toEqual([
+@bb/agent-runtime:test:        |                                                      ^
+@bb/agent-runtime:test:      64|         &quot;fulfilled&quot;,
+@bb/agent-runtime:test:      65|         &quot;fulfilled&quot;,
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test:  Test Files  1 failed (1)
+@bb/agent-runtime:test:       Tests  1 failed | 1 passed (2)
+@bb/agent-runtime:test:    Start at  12:01:12
+@bb/agent-runtime:test:    Duration  2.35s (transform 818ms, setup 0ms, import 1.14s, tests 989ms, environment 0ms)
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/agent-runtime#test:  ERROR  command (&lt;investigation&gt;/base-a/packages/agent-runtime) /usr/local/bin/pnpm run test src/runtime.catalog-concurrency.test.ts exited (1)
+
+ Tasks:    6 successful, 7 total
+Cached:    4 cached, 7 total
+  Time:    4.177s 
+Failed:    @bb/agent-runtime#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details></li><li><details><summary>Run B full validation log</summary><pre>• turbo 2.10.12
+
+   • Packages in scope: @bb/agent-runtime
+   • Running test in 1 packages
+   • Remote caching disabled, using shared worktree cache
+
+//:ensure-native-modules: cache bypass, force executing 765f6e8e9db08e4d
+@bb/templates:generate:plugin-scaffold: cache bypass, force executing 43e74f8f90a240ed
+@bb/plugin-build:generate: cache bypass, force executing d60fdd187c812e2c
+@bb/templates:generate:templates: cache bypass, force executing c2d3f4837c0769ab
+@bb/process-utils:generate:profile-worker: cache bypass, force executing 53cd812e8bad846b
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates &lt;investigation&gt;/base-b/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules &lt;investigation&gt;/base-b
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: &gt; @bb/plugin-build@0.0.1 generate &lt;investigation&gt;/base-b/packages/plugin-build
+@bb/plugin-build:generate: &gt; node ./scripts/generate-plugin-theme.mjs &amp;&amp; node ./scripts/generate-runtime-export-manifest.mjs
+@bb/plugin-build:generate: 
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold &lt;investigation&gt;/base-b/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker &lt;investigation&gt;/base-b/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+//:ensure-native-modules: [ensure-native-modules] Detached hardlinked better-sqlite3 binary before verification
+@bb/plugin-build:generate: plugin-theme.generated.ts up to date
+@bb/plugin-build:generate: host-tailwind.css up to date
+@bb/plugin-build:generate: host-tailwind-version.ts up to date
+@bb/plugin-build:generate: wrote &lt;investigation&gt;/base-b/packages/plugin-build/src/generated/runtime-export-manifest.generated.ts (react@19.3.0)
+@bb/agent-runtime:generate:test-bridges: cache bypass, force executing 687da1250c4573bf
+@bb/agent-runtime:generate:test-bridges: 
+@bb/agent-runtime:generate:test-bridges: &gt; @bb/agent-runtime@0.0.1 generate:test-bridges &lt;investigation&gt;/base-b/packages/agent-runtime
+@bb/agent-runtime:generate:test-bridges: &gt; node ./scripts/build-test-bridges.mjs
+@bb/agent-runtime:generate:test-bridges: 
+@bb/agent-runtime:test: cache bypass, force executing 889b7f2c95e957fc
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test: &gt; @bb/agent-runtime@0.0.1 test &lt;investigation&gt;/base-b/packages/agent-runtime
+@bb/agent-runtime:test: &gt; vitest run --config vitest.config.ts &quot;src/runtime.catalog-concurrency.test.ts&quot;
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test:  RUN  v4.1.1 &lt;investigation&gt;/base-b/packages/agent-runtime
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test: stdout | src/runtime.catalog-concurrency.test.ts &gt; keeps concurrent sessions usable with distinct catalogs: true
+@bb/agent-runtime:test: bridge exit {&quot;providerId&quot;:&quot;fake&quot;,&quot;threads&quot;:[],&quot;code&quot;:0,&quot;expected&quot;:true,&quot;signal&quot;:null,&quot;stderr&quot;:null}
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test: stdout | src/runtime.catalog-concurrency.test.ts &gt; keeps concurrent sessions usable with distinct catalogs: true
+@bb/agent-runtime:test: session outcomes [{&quot;status&quot;:&quot;fulfilled&quot;},{&quot;status&quot;:&quot;rejected&quot;,&quot;reason&quot;:&quot;ProviderProcessExitedError: Provider \&quot;fake\&quot; exited unexpectedly (code 0)&quot;}]
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test:  ❯ |@bb/agent-runtime| src/runtime.catalog-concurrency.test.ts (2 tests | 1 failed) 1002ms
+@bb/agent-runtime:test:    ✓ keeps concurrent sessions usable with distinct catalogs: false  524ms
+@bb/agent-runtime:test:    × keeps concurrent sessions usable with distinct catalogs: true 476ms
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test:  FAIL  |@bb/agent-runtime| src/runtime.catalog-concurrency.test.ts &gt; keeps concurrent sessions usable with distinct catalogs: true
+@bb/agent-runtime:test: AssertionError: expected [ &#x27;fulfilled&#x27;, &#x27;rejected&#x27; ] to deeply equal [ &#x27;fulfilled&#x27;, &#x27;fulfilled&#x27; ]
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test: - Expected
+@bb/agent-runtime:test: + Received
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test:   [
+@bb/agent-runtime:test:     &quot;fulfilled&quot;,
+@bb/agent-runtime:test: -   &quot;fulfilled&quot;,
+@bb/agent-runtime:test: +   &quot;rejected&quot;,
+@bb/agent-runtime:test:   ]
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test:  ❯ src/runtime.catalog-concurrency.test.ts:63:54
+@bb/agent-runtime:test:      61|         ),
+@bb/agent-runtime:test:      62|       );
+@bb/agent-runtime:test:      63|       expect(results.map((result) =&gt; result.status)).toEqual([
+@bb/agent-runtime:test:        |                                                      ^
+@bb/agent-runtime:test:      64|         &quot;fulfilled&quot;,
+@bb/agent-runtime:test:      65|         &quot;fulfilled&quot;,
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test:  Test Files  1 failed (1)
+@bb/agent-runtime:test:       Tests  1 failed | 1 passed (2)
+@bb/agent-runtime:test:    Start at  12:01:40
+@bb/agent-runtime:test:    Duration  2.35s (transform 811ms, setup 0ms, import 1.14s, tests 1.00s, environment 0ms)
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/agent-runtime#test:  ERROR  command (&lt;investigation&gt;/base-b/packages/agent-runtime) /usr/local/bin/pnpm run test src/runtime.catalog-concurrency.test.ts exited (1)
+
+ Tasks:    6 successful, 7 total
+Cached:    0 cached, 7 total
+  Time:    6.449s 
+Failed:    @bb/agent-runtime#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details></li><li><details><summary>38 passing existing tests</summary><pre>• turbo 2.10.12
+
+   • Packages in scope: @bb/agent-runtime
+   • Running test in 1 packages
+   • Remote caching disabled, using shared worktree cache
+
+@bb/plugin-build:generate: cache miss, executing f672116bef389eeb
+@bb/process-utils:generate:profile-worker: cache miss, executing 725aaca9eedab7d4
+@bb/templates:generate:plugin-scaffold: cache miss, executing 70820795a5444706
+//:ensure-native-modules: cache bypass, force executing 1a8987207bd20eac
+@bb/templates:generate:templates: cache miss, executing 7efebe7c20336785
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: &gt; @bb/plugin-build@0.0.1 generate &lt;investigation&gt;/base-a/packages/plugin-build
+@bb/plugin-build:generate: &gt; node ./scripts/generate-plugin-theme.mjs &amp;&amp; node ./scripts/generate-runtime-export-manifest.mjs
+@bb/plugin-build:generate: 
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold &lt;investigation&gt;/base-a/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules &lt;investigation&gt;/base-a
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker &lt;investigation&gt;/base-a/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates &lt;investigation&gt;/base-a/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/plugin-build:generate: plugin-theme.generated.ts up to date
+@bb/plugin-build:generate: host-tailwind.css up to date
+@bb/plugin-build:generate: host-tailwind-version.ts up to date
+@bb/plugin-build:generate: wrote &lt;investigation&gt;/base-a/packages/plugin-build/src/generated/runtime-export-manifest.generated.ts (react@19.3.0)
+@bb/agent-runtime:generate:test-bridges: cache miss, executing 3c345df6d8c2c56d
+@bb/agent-runtime:generate:test-bridges: 
+@bb/agent-runtime:generate:test-bridges: &gt; @bb/agent-runtime@0.0.1 generate:test-bridges &lt;investigation&gt;/base-a/packages/agent-runtime
+@bb/agent-runtime:generate:test-bridges: &gt; node ./scripts/build-test-bridges.mjs
+@bb/agent-runtime:generate:test-bridges: 
+@bb/agent-runtime:test: cache miss, executing ffc9450b6ba7bebc
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test: &gt; @bb/agent-runtime@0.0.1 test &lt;investigation&gt;/base-a/packages/agent-runtime
+@bb/agent-runtime:test: &gt; vitest run --config vitest.config.ts &quot;src/runtime.process-lifecycle.test.ts&quot; &quot;src/runtime.skill-roots-capability.test.ts&quot;
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test:  RUN  v4.1.1 &lt;investigation&gt;/base-a/packages/agent-runtime
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test:  ✓ |@bb/agent-runtime| src/runtime.skill-roots-capability.test.ts (3 tests) 1708ms
+@bb/agent-runtime:test:      ✓ starts a thread on a bridge that does not declare skills.configure, without sending the request  772ms
+@bb/agent-runtime:test:      ✓ selects a bridge by the session&#x27;s skill snapshot without replacing sibling sessions  933ms
+@bb/agent-runtime:test:  ✓ |@bb/agent-runtime:isolated| src/runtime.process-lifecycle.test.ts (35 tests) 12449ms
+@bb/agent-runtime:test:      ✓ ranks provider processes ahead of bb for the out-of-memory killer  455ms
+@bb/agent-runtime:test:      ✓ retires a threadless bridge process superseded by a new artifact hash  911ms
+@bb/agent-runtime:test:      ✓ keeps an old-hash bridge process that still owns a thread  842ms
+@bb/agent-runtime:test:      ✓ waits for provider retirement before starting a same-key replacement  839ms
+@bb/agent-runtime:test:      ✓ does not wait for stalled replacement initialization during full shutdown  475ms
+@bb/agent-runtime:test:      ✓ waits for an exited provider to finalize before replacing it  1119ms
+@bb/agent-runtime:test:      ✓ starts a single replacement for concurrent callers after an exit  1108ms
+@bb/agent-runtime:test:      ✓ cuts off inherited provider output before starting a replacement  1370ms
+@bb/agent-runtime:test:      ✓ treats shutdown process errors as expected without carrying state to replacement processes  831ms
+@bb/agent-runtime:test:      ✓ gives a changed declaration its own bridge process at the same artifact hash  839ms
+@bb/agent-runtime:test:      ✓ fails fast when the bridge artifact does not exist  341ms
+@bb/agent-runtime:test: 
+@bb/agent-runtime:test:  Test Files  2 passed (2)
+@bb/agent-runtime:test:       Tests  38 passed (38)
+@bb/agent-runtime:test:    Start at  12:01:47
+@bb/agent-runtime:test:    Duration  14.24s (transform 2.15s, setup 0ms, import 3.06s, tests 14.16s, environment 0ms)
+@bb/agent-runtime:test: 
+
+ Tasks:    7 successful, 7 total
+Cached:    0 cached, 7 total
+  Time:    18.332s 
+
+</pre></details></li><li><details><summary>Passing typecheck</summary><pre>• turbo 2.10.12
+
+   • Packages in scope: @bb/agent-runtime
+   • Running typecheck in 1 packages
+   • Remote caching disabled, using shared worktree cache
+
+@bb/templates:generate:templates: cache hit, replaying logs 015a6c1b249fd886
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates &lt;trusted-checkout&gt;
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/templates:generate:plugin-scaffold: cache hit, replaying logs 040dd1c720ef4fc6
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold &lt;trusted-checkout&gt;
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/process-utils:generate:profile-worker: cache hit, replaying logs 76af9d5b420c9490
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker &lt;investigation&gt;/base-a/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+@bb/plugin-build:generate: cache hit, replaying logs 938790f5efadc613
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: &gt; @bb/plugin-build@0.0.1 generate &lt;trusted-checkout&gt;
+@bb/plugin-build:generate: &gt; node ./scripts/generate-plugin-theme.mjs &amp;&amp; node ./scripts/generate-runtime-export-manifest.mjs
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: wrote packages/plugin-build/src/generated/plugin-theme.generated.ts
+@bb/plugin-build:generate: wrote packages/plugin-build/src/generated/host-tailwind.css
+@bb/plugin-build:generate: wrote packages/plugin-build/src/generated/host-tailwind-version.ts
+@bb/plugin-build:generate: wrote &lt;trusted-checkout&gt; (react@19.3.0)
+@bb/agent-runtime:typecheck: cache miss, executing 64af34de99c95e23
+@bb/agent-runtime:typecheck: 
+@bb/agent-runtime:typecheck: &gt; @bb/agent-runtime@0.0.1 typecheck &lt;investigation&gt;/base-a/packages/agent-runtime
+@bb/agent-runtime:typecheck: &gt; tsrs --noEmit
+@bb/agent-runtime:typecheck: 
+
+ Tasks:    5 successful, 5 total
+Cached:    4 cached, 5 total
+  Time:    1.313s 
+
+</pre></details></li></ul><p>Additional commands actually run:</p><pre>pnpm exec turbo run test --filter=@bb/agent-runtime -- src/runtime.process-lifecycle.test.ts src/runtime.skill-roots-capability.test.ts
+pnpm exec turbo run typecheck --filter=@bb/agent-runtime</pre><p>Test value: concurrent session usability is the observable invariant; overly broad retirement is the credible regression. Existing skill-root coverage starts sessions sequentially and misses the overlap. The new test uses the established bridge fixture and introduces no production seam.</p>
+<p>Local checkout paths in logs are replaced with neutral placeholders. No screenshots are needed for this nonvisual runtime failure. Trust boundary: issue text and PR diff were evidence only; no issue-supplied command, code, branch, or external URL was run. Only trusted main and the independently authored test executed.</p>
+</main></body></html>
