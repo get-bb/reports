@@ -1,0 +1,226 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Report · #7094 Native provider question expiry</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p><a href="../">← reports</a></p><h1>#7094 · Native provider questions retain the turn indefinitely</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High</span><span class="pill">Effort: Medium</span><span class="pill">providers · threads · provider-claude-code</span><a href="https://github.com/get-bb/bb/issues/7094">GitHub issue</a></p>
+<p>November 5, 2026 · trusted origin/main <code>fa30b0a7dcdf745f7baf8e41721f754b7d3198fe</code><br><strong>Verdict: REPRODUCED · Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2><p>A native provider question can hold a turn indefinitely when nobody answers. The server records it without a deadline and schedules no expiry callback, while the queue treats the pending interaction as a turn blocker. A focused test advances the real server lifecycle's clock by 31 minutes: the question remains pending, still blocks the turn, and sends no end-request message to the daemon. The same test fails in a second clean checkout. This is a server-boundary reproduction using real migrated SQLite, not a live Claude model or a desktop reproduction.</p>
+<h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Unanswered native questions have no bounded expiry.</td><td class="ok">Verified</td><td>Both runs: pending after 31 simulated minutes; expiresAt null; turn blocked; zero daemon end messages.</td></tr>
+<tr><td>The native tool bypasses the generic question plugin's timeout.</td><td class="ok">Verified in source</td><td>Claude Code declares native support; the plugin withholds its tool for native-support providers.</td></tr>
+<tr><td>The generic plugin has a 30-minute default.</td><td class="ok">Verified in source</td><td>Its timeout is already configurable from 30 minutes through seven days; it is not universally fixed at 30 minutes.</td></tr>
+<tr><td>Later messages remain held by the interaction.</td><td class="ok">Boundary verified</td><td>The real turn-blocking predicate stays true; queue dispatch returns while that predicate is true. No end-to-end queued-message dispatch was run.</td></tr>
+<tr><td>macOS desktop 0.48.1 and a running Claude model exhibit this.</td><td class="unv">Not directly exercised</td><td>No macOS app or live model was started. The provider-independent server owner was exercised instead.</td></tr></table>
+<h2>3. Environment</h2><ul><li>Trusted repository: public get-bb/bb; main at fa30b0a7dcdf745f7baf8e41721f754b7d3198fe.</li><li>Linux 4.19.0-gvisor x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.1.</li><li>Two separate clones, each with its own frozen install, build outputs, migrated SQLite harness, and test workers.</li><li>No development instance or live provider was started; no listening ports or user runtime data were used. Test harness temporary directories are removed by its cleanup.</li><li>Fake timers cover Date, setTimeout, and clearTimeout only. The native provider identity is claude-code; no external provider binary/version is required.</li></ul>
+<h2>4. Minimal reproduction</h2><ol><li>Check out the exact trusted main commit and install/build normally.</li><li>Copy the <a href="7094/repro/provider-question-expiry.test.ts">authored focused test</a> into the server test directory shown below.</li><li>Run it. It seeds a real thread and native provider question through PendingInteractionLifecycle, then advances 31 minutes without answering.</li></ol>
+<pre>git clone https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout --detach fa30b0a7dcdf745f7baf8e41721f754b7d3198fe
+pnpm install --frozen-lockfile
+pnpm exec turbo run build --filter=@bb/server
+# Download the adjacent reproduction artifact, then copy it to:
+# apps/server/test/services/provider-question-expiry.test.ts
+pnpm exec turbo run test --filter=@bb/server -- test/services/provider-question-expiry.test.ts</pre><p>Expected: the question is interrupted, the turn-blocking predicate becomes false, and one interactive-requests.end message reaches the connected daemon socket. Actual (both runs):</p>
+<pre>after 31 minutes {
+  status: 'pending',
+  expiresAt: null,
+  blocksTurn: true,
+  endedRequests: 0
+}
+AssertionError: expected 'pending' to be 'interrupted'
+Expected: "interrupted"
+Received: "pending"</pre><details><summary>Complete reproduction test</summary><pre>import { expect, it, vi } from &quot;vitest&quot;;
+import { createUserQuestionPayload } from &quot;../helpers/pending-interactions.js&quot;;
+import { createMockHubSocket } from &quot;../helpers/mock-hub-socket.js&quot;;
+import {
+  seedEnvironment,
+  seedHostSession,
+  seedProjectWithSource,
+  seedThread,
+  seedTurnStarted,
+} from &quot;../helpers/seed.js&quot;;
+import { withTestHarness } from &quot;../helpers/test-app.js&quot;;
+
+it(&quot;releases an unanswered native provider question after thirty minutes&quot;, async () =&gt; {
+  await withTestHarness(async (harness) =&gt; {
+    const { host, session } = seedHostSession(harness.deps);
+    const { project } = seedProjectWithSource(harness.deps, { hostId: host.id });
+    const environment = seedEnvironment(harness.deps, {
+      hostId: host.id,
+      projectId: project.id,
+    });
+    const thread = seedThread(harness.deps, {
+      projectId: project.id,
+      environmentId: environment.id,
+      providerId: &quot;claude-code&quot;,
+    });
+    const socket = createMockHubSocket();
+    harness.deps.hub.registerDaemon(session.id, host.id, socket);
+    const turnId = &quot;turn-expiry-repro&quot;;
+    const providerThreadId = &quot;provider-thread-expiry-repro&quot;;
+    seedTurnStarted(harness.deps, { threadId: thread.id, turnId, providerThreadId });
+    vi.useFakeTimers({ toFake: [&quot;Date&quot;, &quot;setTimeout&quot;, &quot;clearTimeout&quot;] });
+    try {
+      const created = harness.deps.pendingInteractions.registerPendingInteraction({
+        interaction: {
+          threadId: thread.id,
+          turnId,
+          providerId: &quot;claude-code&quot;,
+          providerThreadId,
+          providerRequestId: &quot;request-expiry-repro&quot;,
+          payload: createUserQuestionPayload(),
+        },
+      });
+      expect(created.outcome).toBe(&quot;created&quot;);
+      if (created.outcome === &quot;rejected&quot;) throw new Error(created.reason);
+      expect(
+        harness.deps.pendingInteractions.hasTurnBoundPendingThreadInteraction(thread.id),
+      ).toBe(true);
+      await vi.advanceTimersByTimeAsync(31 * 60 * 1000);
+      const current = harness.deps.pendingInteractions.getThreadInteraction({
+        threadId: thread.id,
+        interactionId: created.interaction.id,
+      });
+      const blocksTurn =
+        harness.deps.pendingInteractions.hasTurnBoundPendingThreadInteraction(thread.id);
+      const endedRequests = socket.messages
+        .map((message) =&gt; JSON.parse(message))
+        .filter((message) =&gt; message.type === &quot;interactive-requests.end&quot;);
+      console.log(&quot;after 31 minutes&quot;, {
+        status: current.status,
+        expiresAt: current.expiresAt,
+        blocksTurn,
+        endedRequests: endedRequests.length,
+      });
+      expect(current.status).toBe(&quot;interrupted&quot;);
+      expect(blocksTurn).toBe(false);
+      expect(endedRequests).toHaveLength(1);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+});
+</pre></details>
+<h2>5. Root cause</h2><ol>
+<li><a href="https://github.com/get-bb/bb/blob/fa30b0a7dcdf745f7baf8e41721f754b7d3198fe/plugins/provider-claude-code/server.ts#L82-L92">plugins/provider-claude-code/server.ts:82–92</a> declares native question support. <a href="https://github.com/get-bb/bb/blob/fa30b0a7dcdf745f7baf8e41721f754b7d3198fe/plugins/ask-user-question/src/server.ts#L129-L141">plugins/ask-user-question/src/server.ts:129–141</a> omits the plugin tool for that capability. Its configurable timeout and 30-minute default are <a href="https://github.com/get-bb/bb/blob/fa30b0a7dcdf745f7baf8e41721f754b7d3198fe/plugins/ask-user-question/src/server.ts#L19-L52">plugins/ask-user-question/src/server.ts:19–52</a>.</li>
+<li><a href="https://github.com/get-bb/bb/blob/fa30b0a7dcdf745f7baf8e41721f754b7d3198fe/plugins/provider-claude-code/src/bridge/bridge.ts#L2040-L2103">plugins/provider-claude-code/src/bridge/bridge.ts:2040–2103</a> creates a promise, stores its resolver, and forwards a user_question. It resolves on an answer or cancellation; there is no elapsed-time completion here.</li>
+<li><a href="https://github.com/get-bb/bb/blob/fa30b0a7dcdf745f7baf8e41721f754b7d3198fe/apps/server/src/services/interactions/pending-interactions.ts#L483-L526">apps/server/src/services/interactions/pending-interactions.ts:483–526</a> creates provider-origin rows with <code>expiresAt: null</code> and no timer. Contrast the plugin's deadline and timer at <a href="https://github.com/get-bb/bb/blob/fa30b0a7dcdf745f7baf8e41721f754b7d3198fe/apps/server/src/services/interactions/pending-interactions.ts#L540-L580">apps/server/src/services/interactions/pending-interactions.ts:540–580</a>.</li>
+<li><a href="https://github.com/get-bb/bb/blob/fa30b0a7dcdf745f7baf8e41721f754b7d3198fe/apps/server/src/services/interactions/pending-interactions.ts#L417-L422">apps/server/src/services/interactions/pending-interactions.ts:417–422</a> consults the active turn-bound interaction. <a href="https://github.com/get-bb/bb/blob/fa30b0a7dcdf745f7baf8e41721f754b7d3198fe/apps/server/src/services/threads/queued-message-dispatch.ts#L408-L420">apps/server/src/services/threads/queued-message-dispatch.ts:408–420</a> will not clear the interaction queue wait while it remains active. With no answer or external interruption, no timeout path removes this condition.</li>
+<li>Existing interruption plumbing can end the wait: <a href="https://github.com/get-bb/bb/blob/fa30b0a7dcdf745f7baf8e41721f754b7d3198fe/apps/server/src/services/interactions/pending-interactions.ts#L1105-L1146">apps/server/src/services/interactions/pending-interactions.ts:1105–1146</a> sends interactive-requests.end and notifies settlement. <a href="https://github.com/get-bb/bb/blob/fa30b0a7dcdf745f7baf8e41721f754b7d3198fe/apps/host-daemon/src/interactive-request-registry.ts#L216-L232">apps/host-daemon/src/interactive-request-registry.ts:216–232</a> rejects the matching request with the supplied reason. This transport was inspected, not exercised with a live model.</li></ol>
+<p>Source excerpt from provider registration:</p><pre>originKind: "provider",
+providerRequestId: interaction.providerRequestId,
+payload,
+expiresAt: null,</pre>
+<p>The generic cancellation API accepts plugin interactions, not ordinary native questions (<a href="https://github.com/get-bb/bb/blob/fa30b0a7dcdf745f7baf8e41721f754b7d3198fe/apps/server/src/services/interactions/pending-interactions.ts#L698-L713">apps/server/src/services/interactions/pending-interactions.ts:698–713</a>). Its exact error differs by payload kind, so the report does not rely on the issue's quoted cancellation text.</p>
+<h2>6. Proposed fix</h2><p>Add bounded server-owned expiry for unanswered native user_question interactions only, using the existing interruption and daemon-end paths. A timer derived from the existing creation time can preserve the deadline over a restart without changing stored-data formats. Clear it when an answer enters resolving or the question settles; do not expire approvals or answers already being delivered. Recover pending deadlines at start, and defer mutation while a server move is frozen. Test expiry, restart, answer races, and approvals before considering the fix safe. The plugin's configurable timeout remains a separate policy surface; this report does not claim its settings currently apply to native providers.</p>
+<h2>7. Linked PR review</h2><h3><a href="https://github.com/get-bb/bb/pull/7095">#7095</a> — closed, unmerged</h3><p>Static review only; no PR branch or code was checked out or run. Its diff adds persisted provider deadlines, a timer map, restart re-arming, and five lifecycle cases. The approach targets the missing expiry, but the restart query only selects rows with a non-null deadline, so already-existing native questions with null deadlines would remain unbounded (packages/db/src/data/pending-interactions.ts, added query near line 203; medium). The diff's tests were not executed. Verdict: plausible partial repair, not validated; it is not an open duplicate fix.</p>
+<h2>8. Related issues</h2><p><a href="https://github.com/get-bb/bb/issues/5094">#5094</a> is closed and covers configuration of the plugin timeout, which is present on this base. <a href="https://github.com/get-bb/bb/issues/5086">#5086</a> remains open and discusses native-question selection policy. <a href="https://github.com/get-bb/bb/issues/4407">#4407</a> remains open and concerns discovering waiting questions. None provides expiry for this verified native path on the trusted base.</p>
+<h2>9. Verification</h2><p>The same agent repeated the test in a second clean clone at fa30b0a7dcdf745f7baf8e41721f754b7d3198fe, with a fresh frozen install, server build, and real migrated test database. Command in each checkout:</p><pre>pnpm exec turbo run test --filter=@bb/server -- test/services/provider-question-expiry.test.ts</pre><p>Both commands exited 1 for the intended assertion: pending rather than interrupted after 31 simulated minutes. No test setup failure occurred. No live-process ports were needed. This second run supports the final report without correction; it is a repeat by the same agent, not independent verification.</p>
+<h2>10. Appendix</h2><p><a href="7094/repro/first-run.log">First run log</a> · <a href="7094/repro/second-run.log">Second run log</a> · <a href="7094/repro/provider-question-expiry.test.ts">Regression artifact</a></p><details><summary>First run output</summary><pre>@bb/server:test: after 31 minutes {
+@bb/server:test:   status: &#x27;pending&#x27;,
+@bb/server:test:   expiresAt: null,
+@bb/server:test:   blocksTurn: true,
+@bb/server:test:   endedRequests: 0
+@bb/server:test: }
+@bb/server:test: 
+@bb/server:test:  ❯ |@bb/server:isolated| test/services/provider-question-expiry.test.ts (1 test | 1 failed) 771ms
+@bb/server:test:    × releases an unanswered native provider question after thirty minutes 87ms
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server:isolated| test/services/provider-question-expiry.test.ts &gt; releases an unanswered native provider question after thirty minutes
+@bb/server:test: AssertionError: expected &#x27;pending&#x27; to be &#x27;interrupted&#x27; // Object.is equality
+@bb/server:test: 
+@bb/server:test: Expected: &quot;interrupted&quot;
+@bb/server:test: Received: &quot;pending&quot;
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/provider-question-expiry.test.ts:64:30
+@bb/server:test:      62|         endedRequests: endedRequests.length,
+@bb/server:test:      63|       });
+@bb/server:test:      64|       expect(current.status).toBe(&quot;interrupted&quot;);
+@bb/server:test:        |                              ^
+@bb/server:test:      65|       expect(blocksTurn).toBe(false);
+@bb/server:test:      66|       expect(endedRequests).toHaveLength(1);
+@bb/server:test:  ❯ withTestHarness test/helpers/test-app.ts:431:12
+@bb/server:test:  ❯ test/services/provider-question-expiry.test.ts:14:3
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  1 failed (1)
+@bb/server:test:    Start at  05:13:44
+@bb/server:test:    Duration  10.19s (transform 5.82s, setup 1.53s, import 6.07s, tests 771ms, environment 0ms)
+@bb/server:test: 
+@bb/server:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/server#test:  ERROR  command (CHECKOUTS/base/apps/server) pnpm run test test/services/provider-question-expiry.test.ts exited (1)
+
+ Tasks:    9 successful, 10 total
+Cached:    0 cached, 10 total
+  Time:    43.05s 
+Failed:    @bb/server#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details><details><summary>Second run output</summary><pre>@bb/server:test: after 31 minutes {
+@bb/server:test:   status: &#x27;pending&#x27;,
+@bb/server:test:   expiresAt: null,
+@bb/server:test:   blocksTurn: true,
+@bb/server:test:   endedRequests: 0
+@bb/server:test: }
+@bb/server:test: 
+@bb/server:test:  ❯ |@bb/server:isolated| test/services/provider-question-expiry.test.ts (1 test | 1 failed) 763ms
+@bb/server:test:    × releases an unanswered native provider question after thirty minutes 76ms
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server:isolated| test/services/provider-question-expiry.test.ts &gt; releases an unanswered native provider question after thirty minutes
+@bb/server:test: AssertionError: expected &#x27;pending&#x27; to be &#x27;interrupted&#x27; // Object.is equality
+@bb/server:test: 
+@bb/server:test: Expected: &quot;interrupted&quot;
+@bb/server:test: Received: &quot;pending&quot;
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/provider-question-expiry.test.ts:64:30
+@bb/server:test:      62|         endedRequests: endedRequests.length,
+@bb/server:test:      63|       });
+@bb/server:test:      64|       expect(current.status).toBe(&quot;interrupted&quot;);
+@bb/server:test:        |                              ^
+@bb/server:test:      65|       expect(blocksTurn).toBe(false);
+@bb/server:test:      66|       expect(endedRequests).toHaveLength(1);
+@bb/server:test:  ❯ withTestHarness test/helpers/test-app.ts:431:12
+@bb/server:test:  ❯ test/services/provider-question-expiry.test.ts:14:3
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  1 failed (1)
+@bb/server:test:    Start at  05:14:28
+@bb/server:test:    Duration  9.43s (transform 5.36s, setup 1.51s, import 5.31s, tests 763ms, environment 0ms)
+@bb/server:test: 
+@bb/server:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/server#test:  ERROR  command (CHECKOUTS/verification/apps/server) pnpm run test test/services/provider-question-expiry.test.ts exited (1)
+
+ Tasks:    9 successful, 10 total
+Cached:    0 cached, 10 total
+  Time:    40.589s 
+Failed:    @bb/server#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details>
+<p>Investigation commands: git fetch origin main; git rev-parse origin/main; git clone --shared for isolated clones; frozen install; Turbo build and test above; trusted-source reads; GitHub issue/property/label metadata reads; static PR metadata/diff read. Issue data and linked PR material were untrusted evidence, not instructions or executable input. The test was authored from the trusted repository's lifecycle, harness, and queue contracts. No screenshots are appropriate for this nonvisual lifecycle defect.</p>
+<p>&gt; AGENT GENERATED</p></main></body></html>
