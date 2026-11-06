@@ -1,0 +1,540 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7193 Cross-host retirement starvation</title>
+<style>
+:root{--canvas:#fafaf8;--ink:#1a1a1a;--muted:#666;--line:#e2e2de;--accent:#0052cc;--warn:#b26a00}
+body{margin:0;background:var(--canvas);color:var(--ink);font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:960px;margin:0 auto;padding:40px 24px 80px}h1{font-size:26px;line-height:1.25}h2{font-size:18px;margin-top:36px;padding-top:20px;border-top:1px solid var(--line)}h3{font-size:16px}.meta{color:var(--muted);font-size:14px}.pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;border:1px solid var(--line)}table{border-collapse:collapse;width:100%;font-size:14px}td,th{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);vertical-align:top}code,pre{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}pre{background:#fff;border:1px solid var(--line);border-radius:6px;padding:12px;overflow:auto}a{color:var(--accent)}.caveat{border-left:3px solid var(--warn);padding-left:14px}
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7193 · Cross-host retirement starvation</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: Medium</span> <span class="pill">Effort: Medium</span> <span class="pill">workspaces</span> · <a href="https://github.com/get-bb/bb/issues/7193">GitHub issue</a> · 2026-11-06</p>
+<p class="meta">Trusted base: <code>bcfdf1ca3c3a6ff60385ab323c5a551f943a0bff</code>, fetched from the target repository’s origin/main.</p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: medium</strong> · Reproduction label: <code>confirmed-repro</code></p>
+<h2>1. TL;DR</h2>
+<p>An unused environment can remain <code>ready / retiring</code> after its retirement deadline because the server stops checking deadlines while an unrelated environment removal is still running. The environment lifecycle sweep awaits every removal before releasing its periodic-job running flag. Later timer ticks skip the entire lifecycle job, even when the newly expired environment belongs to another host with an available cleanup slot. A deterministic server test reproduces this on trusted main in two clean source checkouts, and an additional diagnostic verifies that explicitly requesting cleanup bypasses the blocked periodic job. The scheduling defect is established; attributing the original Windows session to this trigger remains an inference.</p>
+<p class="caveat">Scope: this is a real server lifecycle/SQLite reproduction with a deliberately delayed provider callback, not an end-to-end Windows, Connect, shell-hook, or physical worktree-removal test. It seeds the post-deletion thread state. The original session was not inspected, and clock skew there remains unverified.</p>
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Reported behavior</th><th>Finding</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>A deleted thread’s environment can stay ready/retiring after its deadline.</td><td>Verified at the server boundary</td><td>The test uses a deleted, idle thread; a deadline expires while another host’s cleanup is pending. A subsequent periodic sweep leaves the target ready.</td></tr>
+<tr><td>Explicit environment cleanup starts teardown when the timer path does not.</td><td>Verified at the cleanup API boundary</td><td>The diagnostic confirms ready/retiring with an expired deadline, invokes POST /api/v1/environments/&lt;id&gt;/cleanup, receives 200, and observes destroyed while the other cleanup is still running.</td></tr>
+<tr><td>Windows 11, Connect, and the git-worktree provider are involved.</td><td>Unverified as prerequisites</td><td>The scheduling failure also occurs on Linux with the provider bridge. No Windows host was available or used.</td></tr>
+<tr><td>A physical directory persists for roughly fifteen minutes.</td><td>Unverified end to end</td><td>The server test controls Date only and does not create a real worktree or wait fifteen minutes. The stall lasts as long as the other removal remains unresolved.</td></tr>
+<tr><td>The symptom is intermittent, unlike a permanently failed teardown.</td><td>Supported mechanism; original timing unverified</td><td>The trigger requires a deadline to expire after enumeration while another removal is still in flight. The target has no teardown attempt yet.</td></tr>
+<tr><td>Clock skew might explain the observed timestamps.</td><td>Not needed for this reproduction</td><td>Both lifecycle checks use one controlled server clock. No conclusion about the original host/server clock relationship follows.</td></tr>
+</tbody></table>
+<h2>3. Environment</h2>
+<ul><li>Source: public get-bb/bb at the base commit above; no linked PR code was executed.</li><li>Linux 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; Vitest from the frozen lockfile.</li><li>Existing server harness with a real SQLite database copied from the migrated template via createMigratedConnection(). Each harness allocates its own temporary data directory and removes it afterward.</li><li>No live development server, production instance, agent turn, user runtime data, or external daemon was used. No listening ports were allocated. Harness configuration uses its existing test defaults, not a running shared service.</li><li>A synthetic environment provider holds one removal open on host B; an unused environment on host A has a 60-second retirement grace. Only Date is faked, so polling and event-loop yields still run.</li><li>Both frozen installs succeeded. Full Turbo build succeeded in both checkouts. The first full build needed the existing plugin SDK runtime/types built first; no dependency was added. Build-generated web route ordering changes were excluded from the proposed fix.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol>
+<li>Obtain trusted source, pin the base, and build using the normal tooling:<pre>git clone https://github.com/get-bb/bb.git bb-7193
+cd bb-7193
+git checkout --detach bcfdf1ca3c3a6ff60385ab323c5a551f943a0bff
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build</pre></li>
+<li>Append the complete report-authored test below to <code>apps/server/test/services/environments/provider-orchestration.test.ts</code>. It reuses that trusted file’s existing imports and top-level setup helper. Then run:
+<pre>
+pnpm exec turbo run test --filter=@bb/server -- test/services/environments/provider-orchestration.test.ts -t 'retires an expired environment while another host is still removing one'</pre></li>
+<li>The test prepares an environment, seeds its deleted idle thread, schedules retirement, and starts a removal on a second host. It advances the server clock beyond the first environment’s deadline and runs another real periodic sweep.</li>
+<li>Expected: the target becomes destroyed while the other host’s removal is still pending. Actual on main, in both checkouts:<pre>AssertionError: expected 'ready' to be 'destroyed'
+Expected: "destroyed"
+Received: "ready"
+Test Files  1 failed (1)
+Tests  1 failed | 74 skipped (75)</pre></li>
+</ol>
+<p>The test uses the existing suite’s <code>setup</code> helper, provider bridge, and real server harness. The complete added test is included here; its leading indentation is immaterial:</p>
+<pre>it(&quot;retires an expired environment while another host is still removing one&quot;, async () =&gt; {
+    vi.useFakeTimers({ toFake: [&quot;Date&quot;] });
+    await withTestHarness(async (harness) =&gt; {
+      let releaseRemoval = () =&gt; {};
+      const removalGate = new Promise&lt;void&gt;((resolve) =&gt; {
+        releaseRemoval = resolve;
+      });
+      let slowRemovalStarted = false;
+      const fixture = setup(harness, {
+        policy: { retireGraceMs: 60_000 },
+        remove: async ({ path }) =&gt; {
+          if (path === &quot;/tmp/slow-retirement&quot;) {
+            slowRemovalStarted = true;
+            await removalGate;
+          }
+          return { status: &quot;removed&quot; };
+        },
+      });
+      fixture.ask();
+      await fixture.settled();
+      const environmentId = fixture.attach();
+      harness.db
+        .update(threads)
+        .set({
+          environmentId,
+          status: &quot;idle&quot;,
+          archivedAt: Date.now(),
+          deletedAt: Date.now(),
+        })
+        .where(eq(threads.id, fixture.thread.id))
+        .run();
+      await sweepProviderEnvironment(harness.deps, environmentId);
+      const retireAt = getEnvironment(harness.db, environmentId)!.retireAt!;
+      const { host } = seedHostSession(harness.deps, {
+        id: &quot;host_slow_retirement&quot;,
+      });
+      const slowEnvironment = seedEnvironment(harness.deps, {
+        hostId: host.id,
+        projectId: fixture.context.project.id,
+        path: &quot;/tmp/slow-retirement&quot;,
+        environmentProviderId: fixture.record.provider.id,
+        environmentProviderPluginId: fixture.record.pluginId,
+      });
+      harness.db
+        .update(environments)
+        .set({ retireAt: Date.now() - 1 })
+        .where(eq(environments.id, slowEnvironment.id))
+        .run();
+      const deps = {
+        ...harness.deps,
+        pluginSchedules: harness.pluginService,
+        plugins: harness.pluginService,
+      };
+      const firstSweep = runPeriodicSweeps(deps);
+      try {
+        await expect.poll(() =&gt; slowRemovalStarted).toBe(true);
+        vi.setSystemTime(retireAt + 1);
+        await runPeriodicSweeps(deps);
+        await expect
+          .poll(() =&gt; getEnvironment(harness.db, environmentId)?.status, {
+            timeout: 1_000,
+          })
+          .toBe(&quot;destroyed&quot;);
+        expect(getEnvironment(harness.db, slowEnvironment.id)).toMatchObject({
+          teardownStatus: &quot;running&quot;,
+        });
+      } finally {
+        releaseRemoval();
+        await firstSweep;
+        await expect
+          .poll(() =&gt; getEnvironment(harness.db, slowEnvironment.id)?.status)
+          .toBe(&quot;destroyed&quot;);
+      }
+    });
+  });</pre>
+<h3>Explicit-cleanup diagnostic</h3>
+<p>In the second trusted checkout, a test-only diagnostic variant first asserts the observed expired ready/retiring state, then calls the real cleanup route and verifies successful removal while the slow host remains in teardown. Replace the regression test with the complete variant below and run the same focused command. This variant asserts the current defective behavior and is report evidence only, not a proposed regression test.</p>
+<details><summary>Complete explicit-cleanup diagnostic variant</summary><pre>it(&quot;retires an expired environment while another host is still removing one&quot;, async () =&gt; {
+    vi.useFakeTimers({ toFake: [&quot;Date&quot;] });
+    await withTestHarness(async (harness) =&gt; {
+      let releaseRemoval = () =&gt; {};
+      const removalGate = new Promise&lt;void&gt;((resolve) =&gt; {
+        releaseRemoval = resolve;
+      });
+      let slowRemovalStarted = false;
+      const fixture = setup(harness, {
+        policy: { retireGraceMs: 60_000 },
+        remove: async ({ path }) =&gt; {
+          if (path === &quot;/tmp/slow-retirement&quot;) {
+            slowRemovalStarted = true;
+            await removalGate;
+          }
+          return { status: &quot;removed&quot; };
+        },
+      });
+      fixture.ask();
+      await fixture.settled();
+      const environmentId = fixture.attach();
+      harness.db
+        .update(threads)
+        .set({
+          environmentId,
+          status: &quot;idle&quot;,
+          archivedAt: Date.now(),
+          deletedAt: Date.now(),
+        })
+        .where(eq(threads.id, fixture.thread.id))
+        .run();
+      await sweepProviderEnvironment(harness.deps, environmentId);
+      const retireAt = getEnvironment(harness.db, environmentId)!.retireAt!;
+      const { host } = seedHostSession(harness.deps, {
+        id: &quot;host_slow_retirement&quot;,
+      });
+      const slowEnvironment = seedEnvironment(harness.deps, {
+        hostId: host.id,
+        projectId: fixture.context.project.id,
+        path: &quot;/tmp/slow-retirement&quot;,
+        environmentProviderId: fixture.record.provider.id,
+        environmentProviderPluginId: fixture.record.pluginId,
+      });
+      harness.db
+        .update(environments)
+        .set({ retireAt: Date.now() - 1 })
+        .where(eq(environments.id, slowEnvironment.id))
+        .run();
+      const deps = {
+        ...harness.deps,
+        pluginSchedules: harness.pluginService,
+        plugins: harness.pluginService,
+      };
+      const firstSweep = runPeriodicSweeps(deps);
+      try {
+        await expect.poll(() =&gt; slowRemovalStarted).toBe(true);
+        vi.setSystemTime(retireAt + 1);
+        await runPeriodicSweeps(deps);
+        await expect
+          .poll(() =&gt; getEnvironment(harness.db, environmentId)?.status, {
+            timeout: 1_000,
+          })
+          .toBe(&quot;ready&quot;);
+        expect(toEnvironmentResponse(harness.db, getEnvironment(harness.db, environmentId)!)).toMatchObject({
+          status: &quot;ready&quot;,
+          lifecycle: { phase: &quot;retiring&quot;, retireAt },
+        });
+        expect(Date.now()).toBeGreaterThan(retireAt);
+        const cleanup = await harness.app.request(
+          `/api/v1/environments/${environmentId}/cleanup`,
+          { method: &quot;POST&quot; },
+        );
+        expect(cleanup.status).toBe(200);
+        await expect
+          .poll(() =&gt; getEnvironment(harness.db, environmentId)?.status)
+          .toBe(&quot;destroyed&quot;);
+        expect(getEnvironment(harness.db, slowEnvironment.id)).toMatchObject({
+          teardownStatus: &quot;running&quot;,
+        });
+      } finally {
+        releaseRemoval();
+        await firstSweep;
+        await expect
+          .poll(() =&gt; getEnvironment(harness.db, slowEnvironment.id)?.status)
+          .toBe(&quot;destroyed&quot;);
+      }
+    });
+  });</pre></details>
+<pre>@bb/server:test:  Test Files  1 passed (1)
+@bb/server:test:       Tests  1 passed | 74 skipped (75)
+@bb/server:test:    Duration  8.29s (transform 4.19s, setup 1.43s, import 4.31s, tests 736ms, environment 0ms)</pre>
+<h2>5. Root cause</h2>
+<ol>
+<li><a href="https://github.com/get-bb/bb/blob/bcfdf1ca3c3a6ff60385ab323c5a551f943a0bff/apps/server/src/services/environments/environment-engine.ts#L1134-L1159">sweepProviderLifecycles</a> enumerates candidates, starts each sweep, and waits for every returned promise:<pre>pending.push(sweepProviderEnvironment(deps, row.id).catch(...));
+await Promise.all(pending);</pre>The target’s first visit sees a future deadline, so it returns without removal. A different host’s removal remains pending.</li>
+<li><a href="https://github.com/get-bb/bb/blob/bcfdf1ca3c3a6ff60385ab323c5a551f943a0bff/apps/server/src/services/system/periodic-sweeps.ts#L137-L170">runPeriodicSweepJob</a> keeps its job-level running flag set until that entire promise resolves. Overlapping ticks return immediately for the running job:<pre>if (state.running) return;
+state.running = true;
+try { await job.run(...); }
+finally { state.running = false; }</pre>The snippets are shortened to show the control flow; see the permalink for the complete implementation.</li>
+<li>The <a href="https://github.com/get-bb/bb/blob/bcfdf1ca3c3a6ff60385ab323c5a551f943a0bff/apps/server/src/services/system/periodic-sweeps.ts#L550-L562">periodic job table</a> uses awaited environment sweeping, whereas the adjacent machine lifecycle job already uses background mode. Thus environment deadlines that expire during a long removal are not revisited by later ticks.</li>
+<li><a href="https://github.com/get-bb/bb/blob/bcfdf1ca3c3a6ff60385ab323c5a551f943a0bff/apps/server/src/services/environments/environment-response.ts#L103-L112">The environment response</a> calls any non-destroyed environment with a retirement timestamp and no teardown status <code>retiring</code>; it does not itself execute cleanup. This explains the visible expired ready/retiring state.</li>
+<li><a href="https://github.com/get-bb/bb/blob/bcfdf1ca3c3a6ff60385ab323c5a551f943a0bff/apps/server/src/services/environments/environment-engine.ts#L641-L685">Explicit removal</a> records teardown intent and invokes the environment’s own sweep, bypassing the periodic job’s running guard. The diagnostic confirms this distinction.</li>
+</ol>
+<p>Cleanup intentionally serializes operations on each host and caps concurrent cleanup globally. This reproduction uses two different hosts so it isolates job-level starvation rather than that deliberate per-host serialization. Teardown hooks can take up to fifteen minutes before transport grace, and provider removal can also be long-running; the exact blocker in the reported session is unknown.</p>
+<h2>6. Proposed fix</h2>
+<p>Add an internal background option to the environment lifecycle sweep and enable it only for periodic dispatch, matching the existing machine lifecycle pattern. The periodic job should enumerate and dispatch eligible work, then release its job-level running flag without waiting for slow removals. Preserve default awaited behavior for direct callers, existing per-environment operation deduplication, error logging, event-loop yielding, retry policy, and per-host cleanup serialization. Keep the existing enumeration counter independent of whether promises are awaited so background dispatch still yields every 25 candidates.</p>
+<p>The focused regression must fail before the repair and pass afterward; the existing environment orchestration, periodic-sweep, path-claim, provisioning, and public cleanup tests should remain green. No wire contract, persisted data, dependency, migration, or user-facing configuration change is needed.</p>
+<h2>7. Verification</h2>
+<p>The same agent created a second clean detached worktree at <code>bcfdf1ca3c3a6ff60385ab323c5a551f943a0bff</code>, ran a new frozen install and full build, and applied only the report-authored test patch. The harness created a fresh temporary SQLite/data directory for that run. The identical focused Turbo command failed for the identical reason: expected destroyed, received ready. This is a repeat verification by the same agent, not an independent investigation. No live ports were needed.</p>
+<p>The subsequent diagnostic variant additionally checks the explicit-cleanup workaround. No corrections to the scheduling finding were required; the report deliberately limits its conclusion to the reproduced server state and does not claim access to the reporter’s original runtime.</p>
+<p>Both baseline failures and the diagnostic output are included in the Appendix. The report repository intentionally publishes no raw test or log files; the self-contained HTML contains the test source and exact results.</p>
+<h2>8. Related issues and pull requests</h2>
+<p><a href="https://github.com/get-bb/bb/issues/4158">#4158</a> concerns interrupted teardown and retry/recovery behavior. Here the target has not entered teardown at all; its periodic retirement check is starved. GitHub cross-reference metadata and an open-PR search for #7193 found no linked open pull request during investigation. No PR branch or PR-supplied code was checked out or executed.</p>
+<h2>9. Appendix</h2>
+<p>Raw evidence is retained locally outside published git content. The excerpts below retain actual assertion output but replace private checkout paths with neutral labels. This is not a visual defect; no screenshot was fabricated.</p>
+<details><summary>First baseline failure</summary><pre>@bb/server:test: cache miss, executing a0c5123d5d16b5ed
+@bb/server:test: 
+@bb/server:test: &gt; @bb/server@0.0.1 test &lt;primary-checkout&gt;/apps/server
+@bb/server:test: &gt; vitest run --config vitest.config.ts &quot;test/services/environments/provider-orchestration.test.ts&quot; &quot;-t&quot; &quot;retires an expired environment while another host is still removing one&quot;
+@bb/server:test: 
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:21:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:21:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:21:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: 
+@bb/server:test:  RUN  v4.1.12 &lt;primary-checkout&gt;/apps/server
+@bb/server:test: 
+@bb/server:test: (node:8911) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test:  ❯ |@bb/server:isolated| test/services/environments/provider-orchestration.test.ts (75 tests | 1 failed | 74 skipped) 2927ms
+@bb/server:test:      ↓ limits cleanup globally and per host, and releases slots after failures
+@bb/server:test:      ↓ refuses a foreign path before setup and never hands it to cleanup
+@bb/server:test:      ↓ preserves the original plugin owner of a preparing environment
+@bb/server:test:      ↓ preserves the original plugin owner of a attached environment
+@bb/server:test:      ↓ persists verbose progress without broadcasting configuration changes
+@bb/server:test:      ↓ claim then terminal create failure never runs teardown in the original checkout
+@bb/server:test:      ↓ finalizes a workspace path already claimed by the same launch
+@bb/server:test:      ↓ runs teardown only for ownsPath=true, in provider order
+@bb/server:test:      ↓ runs teardown only for ownsPath=false, in provider order
+@bb/server:test:      ↓ reports teardown transport failure and still removes the environment
+@bb/server:test:      ↓ copies a path plugin out of a workspace before removing it
+@bb/server:test:      ↓ keeps a workspace when plugins inside it cannot be copied out
+@bb/server:test:      ↓ forwards teardown hook output only from the hook host while the hook runs
+@bb/server:test:      ↓ refuses new reuse admission while another environment preparation owns the checkout
+@bb/server:test:      ↓ refuses reuse admission while another environment preparation owns the checkout
+@bb/server:test:      ↓ refuses directory admission while another environment preparation owns the checkout
+@bb/server:test:      ↓ refuses restored dispatch admission while another environment preparation owns the checkout
+@bb/server:test:      ↓ retains a failed claim through cleanup and releases it only after removal
+@bb/server:test:      ↓ normalizes trailing slashes on claimed paths
+@bb/server:test:      ↓ preserves the attached path for live checkout exclusion
+@bb/server:test:      ↓ reserves a checkout before concurrent branch mutations until attachment
+@bb/server:test:      ↓ reuses a same-project worktree before checkout validation
+@bb/server:test:      ↓ queues same-host removal cleanup and waits for the bounded batch
+@bb/server:test:      ↓ queues same-host cancellation cleanup and waits for the bounded batch
+@bb/server:test:      ↓ runs one long create call and records the ready result
+@bb/server:test:      ↓ re-runs a persisted creating attempt with the same path key
+@bb/server:test:      ↓ persists progress reported from inside create
+@bb/server:test:      ↓ aborts create before removing everything under its path key
+@bb/server:test:      ↓ waits for an aborted create to stop before removing its path key
+@bb/server:test:      ↓ keeps failed creation terminal and retries explicitly on the same row
+@bb/server:test:      ↓ round-trips a private resource handle into remove
+@bb/server:test:      ↓ rejects a resource handle larger than 16 KiB
+@bb/server:test:      ↓ reserves a path until provider removal finishes
+@bb/server:test:      ↓ retries failed removal through timer
+@bb/server:test:      ↓ retries failed removal through explicit
+@bb/server:test:      ↓ rejects cleanup of an unmanaged checkout
+@bb/server:test:      ↓ rejects cleanup of a checkout attached by its provider without ownership
+@bb/server:test:      ↓ keeps retained environments until explicitly asked to clean up
+@bb/server:test:      ↓ cancels retirement when a live thread returns
+@bb/server:test:      ↓ waits for an archived runtime to stop before remove
+@bb/server:test:      ↓ removes an expired environment through the periodic sweep
+@bb/server:test:      × retires an expired environment while another host is still removing one 1326ms
+@bb/server:test:      ↓ allows provider source cleanup during project deletion with grace +0 and ownsPath true
+@bb/server:test:      ↓ allows provider source cleanup during project deletion with grace null and ownsPath true
+@bb/server:test:      ↓ allows provider source cleanup during project deletion with grace null and ownsPath false
+@bb/server:test:    ↓ keeps one environment identity from provider creation through removal
+@bb/server:test:    ↓ shares one removal operation between cancellation and lifecycle sweeps
+@bb/server:test:    ↓ recovers exhausted provider cleanup without an owned workspace (path absent=false)
+@bb/server:test:    ↓ recovers exhausted provider cleanup without an owned workspace (path absent=true)
+@bb/server:test:    ↓ skips environments blocked on a foreign plugin owner until that plugin provides them again
+@bb/server:test:    ↓ prepares a previously removed path without inheriting completed teardown
+@bb/server:test:    ↓ keeps reserved environments provisioning while a provider creates their workspace
+@bb/server:test:    ↓ keeps a shared workspace ready when its preparing owner cancels before attachment
+@bb/server:test:    ↓ serializes concurrent branchless checkout attaches until the first thread is bound
+@bb/server:test:      ↓ reuses a recorded path without create and preserves ownership true
+@bb/server:test:      ↓ reuses a recorded path without create and preserves ownership false
+@bb/server:test:      ↓ leaves an unrecorded path to provider creation
+@bb/server:test:      ↓ refuses an existing path in error state
+@bb/server:test:      ↓ refuses an existing path in cleanup state
+@bb/server:test:      ↓ refuses an existing path in foreign state
+@bb/server:test:      ↓ does not cancel an adopted checkout with a previous selection
+@bb/server:test:      ↓ hands a taken-over environment to retirement policy null when its thread cancels
+@bb/server:test:      ↓ hands a taken-over environment to retirement policy 60000 when its thread cancels
+@bb/server:test:      ↓ keeps a taken-over environment when creation finishes during cancellation
+@bb/server:test:      ↓ retires a cancelled thread's own ready environment after the grace period
+@bb/server:test:      ↓ keeps the existing cleanup metadata when creation races with another attachment
+@bb/server:test:      ↓ retains the real worktree provider cleanup behavior for owned=true
+@bb/server:test:      ↓ retains the real worktree provider cleanup behavior for owned=false
+@bb/server:test:    ↓ bounds ambiguous setup cleanup retries with {&quot;persisted&quot;:false,&quot;attached&quot;:false}
+@bb/server:test:    ↓ bounds ambiguous setup cleanup retries with {&quot;persisted&quot;:true,&quot;attached&quot;:false}
+@bb/server:test:    ↓ bounds ambiguous setup cleanup retries with {&quot;persisted&quot;:false,&quot;attached&quot;:true}
+@bb/server:test:    ↓ bounds ambiguous setup cleanup retries with {&quot;persisted&quot;:true,&quot;attached&quot;:true}
+@bb/server:test:    ↓ recovers interrupted cleanup only after a clear process inspection (persisted hook=false)
+@bb/server:test:    ↓ recovers interrupted cleanup only after a clear process inspection (persisted hook=true)
+@bb/server:test:    ↓ records the removed workspace when its thread is unarchived during removal
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server:isolated| test/services/environments/provider-orchestration.test.ts &gt; core environment orchestration &gt; retires an expired environment while another host is still removing one
+@bb/server:test: AssertionError: expected 'ready' to be 'destroyed' // Object.is equality
+@bb/server:test: 
+@bb/server:test: Expected: &quot;destroyed&quot;
+@bb/server:test: Received: &quot;ready&quot;
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/environments/provider-orchestration.test.ts:1813:12
+@bb/server:test:     1811|             timeout: 1_000,
+@bb/server:test:     1812|           })
+@bb/server:test:     1813|           .toBe(&quot;destroyed&quot;);
+@bb/server:test:        |            ^
+@bb/server:test:     1814|         expect(getEnvironment(harness.db, slowEnvironment.id)).toMatch…
+@bb/server:test:     1815|           teardownStatus: &quot;running&quot;,
+@bb/server:test:  ❯ withTestHarness test/helpers/test-app.ts:440:12
+@bb/server:test:  ❯ test/services/environments/provider-orchestration.test.ts:1753:5
+@bb/server:test: 
+@bb/server:test: Caused by: Error: Matcher did not succeed in time.
+@bb/server:test:  ❯ test/services/environments/provider-orchestration.test.ts:1809:9
+@bb/server:test:  ❯ withTestHarness test/helpers/test-app.ts:440:12
+@bb/server:test:  ❯ test/services/environments/provider-orchestration.test.ts:1753:5
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  1 failed | 74 skipped (75)
+@bb/server:test:    Start at  20:05:07
+@bb/server:test:    Duration  12.11s (transform 6.20s, setup 1.44s, import 5.86s, tests 2.93s, environment 0ms)
+@bb/server:test: 
+@bb/server:test:  ELIFECYCLE  Test failed. See above for more details.
+ Tasks:    9 successful, 10 total
+Cached:    0 cached, 10 total
+  Time:    41.911s 
+Failed:    @bb/server#test
+</pre></details>
+<details><summary>Second clean baseline failure</summary><pre>@bb/server:test: cache miss, executing a0c5123d5d16b5ed
+@bb/server:test: 
+@bb/server:test: &gt; @bb/server@0.0.1 test &lt;second-checkout&gt;/apps/server
+@bb/server:test: &gt; vitest run --config vitest.config.ts &quot;test/services/environments/provider-orchestration.test.ts&quot; &quot;-t&quot; &quot;retires an expired environment while another host is still removing one&quot;
+@bb/server:test: 
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:21:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:21:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:21:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: 
+@bb/server:test:  RUN  v4.1.12 &lt;second-checkout&gt;/apps/server
+@bb/server:test: 
+@bb/server:test: (node:9752) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test:  ❯ |@bb/server:isolated| test/services/environments/provider-orchestration.test.ts (75 tests | 1 failed | 74 skipped) 1809ms
+@bb/server:test:      ↓ limits cleanup globally and per host, and releases slots after failures
+@bb/server:test:      ↓ refuses a foreign path before setup and never hands it to cleanup
+@bb/server:test:      ↓ preserves the original plugin owner of a preparing environment
+@bb/server:test:      ↓ preserves the original plugin owner of a attached environment
+@bb/server:test:      ↓ persists verbose progress without broadcasting configuration changes
+@bb/server:test:      ↓ claim then terminal create failure never runs teardown in the original checkout
+@bb/server:test:      ↓ finalizes a workspace path already claimed by the same launch
+@bb/server:test:      ↓ runs teardown only for ownsPath=true, in provider order
+@bb/server:test:      ↓ runs teardown only for ownsPath=false, in provider order
+@bb/server:test:      ↓ reports teardown transport failure and still removes the environment
+@bb/server:test:      ↓ copies a path plugin out of a workspace before removing it
+@bb/server:test:      ↓ keeps a workspace when plugins inside it cannot be copied out
+@bb/server:test:      ↓ forwards teardown hook output only from the hook host while the hook runs
+@bb/server:test:      ↓ refuses new reuse admission while another environment preparation owns the checkout
+@bb/server:test:      ↓ refuses reuse admission while another environment preparation owns the checkout
+@bb/server:test:      ↓ refuses directory admission while another environment preparation owns the checkout
+@bb/server:test:      ↓ refuses restored dispatch admission while another environment preparation owns the checkout
+@bb/server:test:      ↓ retains a failed claim through cleanup and releases it only after removal
+@bb/server:test:      ↓ normalizes trailing slashes on claimed paths
+@bb/server:test:      ↓ preserves the attached path for live checkout exclusion
+@bb/server:test:      ↓ reserves a checkout before concurrent branch mutations until attachment
+@bb/server:test:      ↓ reuses a same-project worktree before checkout validation
+@bb/server:test:      ↓ queues same-host removal cleanup and waits for the bounded batch
+@bb/server:test:      ↓ queues same-host cancellation cleanup and waits for the bounded batch
+@bb/server:test:      ↓ runs one long create call and records the ready result
+@bb/server:test:      ↓ re-runs a persisted creating attempt with the same path key
+@bb/server:test:      ↓ persists progress reported from inside create
+@bb/server:test:      ↓ aborts create before removing everything under its path key
+@bb/server:test:      ↓ waits for an aborted create to stop before removing its path key
+@bb/server:test:      ↓ keeps failed creation terminal and retries explicitly on the same row
+@bb/server:test:      ↓ round-trips a private resource handle into remove
+@bb/server:test:      ↓ rejects a resource handle larger than 16 KiB
+@bb/server:test:      ↓ reserves a path until provider removal finishes
+@bb/server:test:      ↓ retries failed removal through timer
+@bb/server:test:      ↓ retries failed removal through explicit
+@bb/server:test:      ↓ rejects cleanup of an unmanaged checkout
+@bb/server:test:      ↓ rejects cleanup of a checkout attached by its provider without ownership
+@bb/server:test:      ↓ keeps retained environments until explicitly asked to clean up
+@bb/server:test:      ↓ cancels retirement when a live thread returns
+@bb/server:test:      ↓ waits for an archived runtime to stop before remove
+@bb/server:test:      ↓ removes an expired environment through the periodic sweep
+@bb/server:test:      × retires an expired environment while another host is still removing one 1219ms
+@bb/server:test:      ↓ allows provider source cleanup during project deletion with grace +0 and ownsPath true
+@bb/server:test:      ↓ allows provider source cleanup during project deletion with grace null and ownsPath true
+@bb/server:test:      ↓ allows provider source cleanup during project deletion with grace null and ownsPath false
+@bb/server:test:    ↓ keeps one environment identity from provider creation through removal
+@bb/server:test:    ↓ shares one removal operation between cancellation and lifecycle sweeps
+@bb/server:test:    ↓ recovers exhausted provider cleanup without an owned workspace (path absent=false)
+@bb/server:test:    ↓ recovers exhausted provider cleanup without an owned workspace (path absent=true)
+@bb/server:test:    ↓ skips environments blocked on a foreign plugin owner until that plugin provides them again
+@bb/server:test:    ↓ prepares a previously removed path without inheriting completed teardown
+@bb/server:test:    ↓ keeps reserved environments provisioning while a provider creates their workspace
+@bb/server:test:    ↓ keeps a shared workspace ready when its preparing owner cancels before attachment
+@bb/server:test:    ↓ serializes concurrent branchless checkout attaches until the first thread is bound
+@bb/server:test:      ↓ reuses a recorded path without create and preserves ownership true
+@bb/server:test:      ↓ reuses a recorded path without create and preserves ownership false
+@bb/server:test:      ↓ leaves an unrecorded path to provider creation
+@bb/server:test:      ↓ refuses an existing path in error state
+@bb/server:test:      ↓ refuses an existing path in cleanup state
+@bb/server:test:      ↓ refuses an existing path in foreign state
+@bb/server:test:      ↓ does not cancel an adopted checkout with a previous selection
+@bb/server:test:      ↓ hands a taken-over environment to retirement policy null when its thread cancels
+@bb/server:test:      ↓ hands a taken-over environment to retirement policy 60000 when its thread cancels
+@bb/server:test:      ↓ keeps a taken-over environment when creation finishes during cancellation
+@bb/server:test:      ↓ retires a cancelled thread's own ready environment after the grace period
+@bb/server:test:      ↓ keeps the existing cleanup metadata when creation races with another attachment
+@bb/server:test:      ↓ retains the real worktree provider cleanup behavior for owned=true
+@bb/server:test:      ↓ retains the real worktree provider cleanup behavior for owned=false
+@bb/server:test:    ↓ bounds ambiguous setup cleanup retries with {&quot;persisted&quot;:false,&quot;attached&quot;:false}
+@bb/server:test:    ↓ bounds ambiguous setup cleanup retries with {&quot;persisted&quot;:true,&quot;attached&quot;:false}
+@bb/server:test:    ↓ bounds ambiguous setup cleanup retries with {&quot;persisted&quot;:false,&quot;attached&quot;:true}
+@bb/server:test:    ↓ bounds ambiguous setup cleanup retries with {&quot;persisted&quot;:true,&quot;attached&quot;:true}
+@bb/server:test:    ↓ recovers interrupted cleanup only after a clear process inspection (persisted hook=false)
+@bb/server:test:    ↓ recovers interrupted cleanup only after a clear process inspection (persisted hook=true)
+@bb/server:test:    ↓ records the removed workspace when its thread is unarchived during removal
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server:isolated| test/services/environments/provider-orchestration.test.ts &gt; core environment orchestration &gt; retires an expired environment while another host is still removing one
+@bb/server:test: AssertionError: expected 'ready' to be 'destroyed' // Object.is equality
+@bb/server:test: 
+@bb/server:test: Expected: &quot;destroyed&quot;
+@bb/server:test: Received: &quot;ready&quot;
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/environments/provider-orchestration.test.ts:1813:12
+@bb/server:test:     1811|             timeout: 1_000,
+@bb/server:test:     1812|           })
+@bb/server:test:     1813|           .toBe(&quot;destroyed&quot;);
+@bb/server:test:        |            ^
+@bb/server:test:     1814|         expect(getEnvironment(harness.db, slowEnvironment.id)).toMatch…
+@bb/server:test:     1815|           teardownStatus: &quot;running&quot;,
+@bb/server:test:  ❯ withTestHarness test/helpers/test-app.ts:440:12
+@bb/server:test:  ❯ test/services/environments/provider-orchestration.test.ts:1753:5
+@bb/server:test: 
+@bb/server:test: Caused by: Error: Matcher did not succeed in time.
+@bb/server:test:  ❯ test/services/environments/provider-orchestration.test.ts:1809:9
+@bb/server:test:  ❯ withTestHarness test/helpers/test-app.ts:440:12
+@bb/server:test:  ❯ test/services/environments/provider-orchestration.test.ts:1753:5
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  1 failed | 74 skipped (75)
+@bb/server:test:    Start at  20:06:13
+@bb/server:test:    Duration  9.79s (transform 4.58s, setup 1.39s, import 4.80s, tests 1.81s, environment 0ms)
+@bb/server:test: 
+@bb/server:test:  ELIFECYCLE  Test failed. See above for more details.
+ Tasks:    9 successful, 10 total
+Cached:    8 cached, 10 total
+  Time:    12.075s 
+Failed:    @bb/server#test
+</pre></details>
+<details><summary>Explicit-cleanup diagnostic output</summary><pre>@bb/server:test: cache miss, executing 84c2da443ef591c9
+@bb/server:test: 
+@bb/server:test: &gt; @bb/server@0.0.1 test &lt;second-checkout&gt;/apps/server
+@bb/server:test: &gt; vitest run --config vitest.config.ts &quot;test/services/environments/provider-orchestration.test.ts&quot; &quot;-t&quot; &quot;retires an expired environment while another host is still removing one&quot;
+@bb/server:test: 
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:21:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:21:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:21:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: 
+@bb/server:test:  RUN  v4.1.12 &lt;second-checkout&gt;/apps/server
+@bb/server:test: 
+@bb/server:test: (node:10021) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test:  ✓ |@bb/server:isolated| test/services/environments/provider-orchestration.test.ts (75 tests | 74 skipped) 736ms
+@bb/server:test: 
+@bb/server:test:  Test Files  1 passed (1)
+@bb/server:test:       Tests  1 passed | 74 skipped (75)
+@bb/server:test:    Start at  20:07:21
+@bb/server:test:    Duration  8.29s (transform 4.19s, setup 1.43s, import 4.31s, tests 736ms, environment 0ms)
+@bb/server:test: 
+ Tasks:    10 successful, 10 total
+Cached:    8 cached, 10 total
+  Time:    10.508s 
+</pre></details>
+<p>Investigation commands included read-only GitHub issue/type/field/label and linked-PR queries; git fetch origin main; git rev-parse origin/main; source searches and line-numbered inspection of the linked files; git worktree add --detach at the recorded base; frozen installs; SDK runtime/types and full Turbo builds; and the focused test commands above. Classification writes used the supplied SlopCop identity wrapper. Issue content was treated only as untrusted claims; no issue-provided command, hook, external URL, branch, or patch was executed.</p>
+</main></body></html>
