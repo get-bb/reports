@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7233 Runtime glyph animation and main-thread rendering</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+<p><a href="../">Reports</a> · <a href="https://github.com/get-bb/bb/issues/7233">Issue #7233</a></p>
+<h1>#7233 · Runtime glyph animation and main-thread rendering</h1>
+<p class="meta">Bug · Priority: Medium · Effort: Low · ui, perf · November 7, 2026</p>
+<p>Trusted origin/main base: <code>e61446e15a0bb3e6df551e45c3aba5c5187ffad3</code></p>
+<p><strong>Verdict: PARTIALLY REPRODUCED</strong> · <strong>Root-cause confidence: medium</strong> · Reproduction label: <code>partial-repro</code></p>
+
+<h2>1. TL;DR</h2>
+<p>The runtime status glyph really does apply its spinning transform to the SVG itself. Rendering three actual ThreadStatusGlyph components from trusted main produced repeated main-thread style, prepaint, and layerization work; pausing their animations removed nearly all of that work. A second clean checkout produced the same result. However, this automation browser has GPU compositing disabled, and rotating an HTML container did not eliminate that work either. This supports the animation-work portion of the report, but cannot establish the SVG-specific hardware-compositor limitation, the reported high-refresh CPU costs, or the proposed fix.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Runtime animation targets the SVG</td><td>Verified</td><td>Actual DOM: three svg elements with data-icon=Loading and computed animation <code>1s linear infinite spin</code>; matches trusted source.</td></tr>
+<tr><td>Running animations create repeated main-thread rendering work</td><td>Verified in this environment</td><td>20 UpdateLayoutTree, PrePaint, and Layerize events in each four-second running sample; paused baseline had 0–1 style events and no PrePaint or Layerize.</td></tr>
+<tr><td>Moving rotation to HTML makes it compositor-only</td><td>Unverified</td><td>HTML control still produced 20 rendering events. CDP reports <code>gpu_compositing: disabled_software</code>, so this is not a valid hardware-compositor comparison.</td></tr>
+<tr><td>Large renderer CPU costs on a high-refresh physical display</td><td>Unverified</td><td>No matching physical display, browser version, or hybrid-GPU configuration. Measured renderer main-thread TaskDuration was about 20–23 ms per four seconds, not the reported process CPU measurement.</td></tr>
+<tr><td>Reduced-motion behavior is separate</td><td>Partially checked</td><td>The probe used reduced-motion=false, and source already includes motion-reduce:animate-none. This investigation did not re-test reduced-motion or offscreen behavior.</td></tr></table>
+
+<h2>3. Environment and isolation</h2>
+<ul><li>Two fresh detached worktrees of the same trusted base, referred to as <code>$WORK/base-one</code> and <code>$WORK/base-two</code>. Neither tracked production source tree was modified.</li>
+<li>Build environment: Linux x86-64, kernel 4.19.0-gvisor; Node 22.19.0; pnpm 9.15.0.</li>
+<li>Browser Automation plugin: isolated local headless Chrome 149.0.0.0 on Linux x86-64 with a fresh plugin-owned profile. Reduced motion was false.</li>
+<li>Browser GPU: ANGLE / SwiftShader; GPU compositing and rasterization disabled_software. LayerTree returned no composited layers.</li>
+<li>Each checkout generated its own self-contained local HTML file, transferred explicitly to the browser machine. No application server, host daemon, provider, account, user database, or real thread was used. No product data directory was needed. An initial Vite server used port 47331, but the browser could not reach the container loopback; all measurements instead used isolated local file URLs, with no network service port.</li>
+<li>The plugin's live preview remained attached for all variants. About five rendering updates per second were observed, not physical-display vsync. Do not extrapolate these timings to a normal visible desktop browser.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<p>This is an author-written probe of the real source component, not a script copied from the issue. Save the three source files below under apps/app. Save inline-probe.mjs and measure.js outside the checkout. The two control modes alter the rendered DOM only: one pauses the real animations; the other transfers their computed animation to the existing HTML containers and leaves the SVGs static.</p>
+<pre>BASE=e61446e15a0bb3e6df551e45c3aba5c5187ffad3
+WORK=$(mktemp -d)
+git fetch origin main
+git worktree add --detach "$WORK/base-one" "$BASE"
+cd "$WORK/base-one"
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=@bb/app
+
+# Save the three source files below, then:
+cd apps/app
+pnpm exec vite build --config 7233-probe.config.ts
+node /tmp/inline-probe.mjs "$PWD/7233-probe-dist" &gt; /tmp/issue-7233-one.html</pre>
+<p>The final Vite command deliberately builds only the investigative page, after the normal Turbo dependency builds. It is not a proposed repository build change.</p>
+<p>With Browser Automation installed, select the explicit browser host from <code>bb machine list --json</code>, set BROWSER_HOST to that ID, and open an isolated session. The browser may be on a different execution host, so transfer both files:</p>
+<pre>SESSION=$(bb browser-automation open --backend local --headless --machine "$BROWSER_HOST" --json | jq -r .id)
+bb file write /tmp/issue-7233-one.html --host "$BROWSER_HOST" --stdin &lt; /tmp/issue-7233-one.html
+bb file write /tmp/issue-7233-measure.js --host "$BROWSER_HOST" --stdin &lt; /tmp/measure.js
+bb browser-automation run "$SESSION" --script 'const page = await browser.getPage("main"); await page.goto("file:///tmp/issue-7233-one.html?mode=paused"); await page.waitForSelector("html[data-ready=true]");' --json
+bb browser-automation run "$SESSION" --script-file /tmp/issue-7233-measure.js --script-host "$BROWSER_HOST" --timeout 90s --json</pre>
+<p>Expected for the proposed optimization on a GPU-composited browser: the HTML control removes per-frame main-thread rendering while keeping rotation. Actual here: both moving variants produce rendering updates, whereas the paused baseline does not. That mismatch is why the verdict is partial, not confirmed.</p>
+<h3>apps/app/7233-probe.html</h3><pre>&lt;!doctype html&gt;
+&lt;html lang=&quot;en&quot;&gt;
+  &lt;head&gt;&lt;meta charset=&quot;UTF-8&quot;&gt;&lt;title&gt;Runtime glyph rendering probe&lt;/title&gt;&lt;/head&gt;
+  &lt;body&gt;&lt;div id=&quot;root&quot;&gt;&lt;/div&gt;&lt;script type=&quot;module&quot; src=&quot;/7233-probe.tsx&quot;&gt;&lt;/script&gt;&lt;/body&gt;
+&lt;/html&gt;
+</pre>
+<h3>apps/app/7233-probe.tsx</h3><pre>import { createRoot } from &quot;react-dom/client&quot;;
+import { ThreadStatusGlyph } from &quot;./src/components/thread/ThreadStatusGlyph&quot;;
+import &quot;./src/app.css&quot;;
+
+const mode = new URLSearchParams(location.search).get(&quot;mode&quot;) ?? &quot;original&quot;;
+document.body.style.cssText = &quot;padding:40px;font:16px system-ui;background:white;color:black&quot;;
+createRoot(document.getElementById(&quot;root&quot;)!).render(
+  &lt;main&gt;
+    &lt;h1&gt;Runtime glyph rendering probe&lt;/h1&gt;
+    &lt;p&gt;Mode: {mode}. Three real ThreadStatusGlyph components, no agent or server.&lt;/p&gt;
+    &lt;div id=&quot;glyphs&quot; style={{ display: &quot;flex&quot;, gap: 20 }}&gt;
+      {[0, 1, 2].map((index) =&gt; (
+        &lt;span key={index} className=&quot;inline-flex size-4 items-center justify-center&quot;&gt;
+          &lt;ThreadStatusGlyph indicator=&quot;runtime&quot; /&gt;
+        &lt;/span&gt;
+      ))}
+    &lt;/div&gt;
+  &lt;/main&gt;,
+);
+
+requestAnimationFrame(() =&gt; {
+  requestAnimationFrame(() =&gt; {
+    const animations = document.getAnimations();
+    if (mode === &quot;paused&quot;) {
+      for (const animation of animations) animation.pause();
+    }
+    if (mode === &quot;html-control&quot;) {
+      for (const animation of animations) {
+        if (!(animation.effect instanceof KeyframeEffect)) continue;
+        const target = animation.effect.target;
+        if (!(target instanceof SVGElement)) continue;
+        const parent = target.parentElement;
+        if (!parent) throw new Error(&quot;Missing glyph container&quot;);
+        const style = getComputedStyle(target);
+        parent.style.animation = style.animation;
+        target.style.animation = &quot;none&quot;;
+      }
+    }
+    document.documentElement.dataset.ready = &quot;true&quot;;
+  });
+});
+</pre>
+<h3>apps/app/7233-probe.config.ts</h3><pre>import { resolve } from &quot;node:path&quot;;
+import { defineConfig } from &quot;vite&quot;;
+import react from &quot;@vitejs/plugin-react&quot;;
+import tailwindcss from &quot;@tailwindcss/vite&quot;;
+import { sharedUiEnvSeam } from &quot;./vite-shared-ui-seam&quot;;
+import { pluginZodRuntime } from &quot;./vite-plugin-zod-runtime&quot;;
+
+export default defineConfig({
+  plugins: [pluginZodRuntime(), sharedUiEnvSeam(), react(), tailwindcss()],
+  resolve: {
+    conditions: [&quot;source&quot;],
+    alias: { &quot;@&quot;: resolve(import.meta.dirname, &quot;src&quot;) },
+  },
+  build: {
+    outDir: &quot;7233-probe-dist&quot;,
+    rollupOptions: { input: &quot;7233-probe.html&quot; },
+  },
+});
+</pre>
+<h3>inline-probe.mjs</h3><pre>import fs from &quot;node:fs&quot;;
+import path from &quot;node:path&quot;;
+
+const directory = process.argv[2];
+let html = fs.readFileSync(path.join(directory, &quot;7233-probe.html&quot;), &quot;utf8&quot;);
+html = html.replace(/&lt;script[^&gt;]*src=&quot;([^&quot;]+)&quot;[^&gt;]*&gt;&lt;\/script&gt;/g, (_, source) =&gt; {
+  const script = fs.readFileSync(path.join(directory, source), &quot;utf8&quot;);
+  return '&lt;script type=&quot;module&quot;&gt;' + script.replaceAll(&quot;&lt;/script&quot;, &quot;&lt;\/script&quot;) + &quot;&lt;/script&gt;&quot;;
+});
+html = html.replace(/&lt;link[^&gt;]*href=&quot;([^&quot;]+\.css)&quot;[^&gt;]*&gt;/g, (_, source) =&gt; {
+  return &quot;&lt;style&gt;&quot; + fs.readFileSync(path.join(directory, source), &quot;utf8&quot;) + &quot;&lt;/style&gt;&quot;;
+});
+process.stdout.write(html);
+</pre>
+<h3>measure.js</h3><pre>const page = await browser.getPage(&quot;main&quot;);
+const protocol = await page.createCDPSession();
+const fixture = page.url().split(&quot;?&quot;)[0];
+await protocol.send(&quot;Performance.enable&quot;);
+const results = [];
+for (const mode of [&quot;paused&quot;, &quot;original&quot;, &quot;html-control&quot;, &quot;original&quot;]) {
+  await page.goto(fixture + &quot;?mode=&quot; + mode);
+  await page.waitForSelector(&quot;html[data-ready=true]&quot;);
+  await new Promise(resolve =&gt; setTimeout(resolve, 1000));
+  const before = (await protocol.send(&quot;Performance.getMetrics&quot;)).metrics;
+  await page.tracing.start({ categories: [&quot;devtools.timeline&quot;, &quot;disabled-by-default-devtools.timeline&quot;, &quot;blink.animations&quot;] });
+  await new Promise(resolve =&gt; setTimeout(resolve, 4000));
+  const trace = JSON.parse(Buffer.from(await page.tracing.stop()).toString(&quot;utf8&quot;));
+  const after = (await protocol.send(&quot;Performance.getMetrics&quot;)).metrics;
+  const events = {};
+  for (const event of trace.traceEvents) {
+    if (![&quot;UpdateLayoutTree&quot;, &quot;PrePaint&quot;, &quot;Layerize&quot;, &quot;Paint&quot;, &quot;Commit&quot;, &quot;Layout&quot;].includes(event.name)) continue;
+    const entry = events[event.name] ??= { count: 0, milliseconds: 0 };
+    entry.count += 1;
+    entry.milliseconds += (event.dur ?? 0) / 1000;
+  }
+  const metrics = {};
+  for (const name of [&quot;TaskDuration&quot;, &quot;RecalcStyleCount&quot;, &quot;RecalcStyleDuration&quot;, &quot;LayoutCount&quot;]) {
+    metrics[name] = after.find(metric =&gt; metric.name === name).value - before.find(metric =&gt; metric.name === name).value;
+  }
+  results.push({ mode, seconds: 4, events, metrics });
+}
+await protocol.detach();
+console.log(JSON.stringify(results));
+</pre>
+
+<h2>5. Measurements</h2>
+<p>All windows are four seconds. TaskDuration is a CDP renderer-main-thread metric, not total renderer process CPU. Event counts are extracted from devtools.timeline traces. A fourth sample restores the original mode to detect drift.</p>
+<table><tr><th>Checkout</th><th>Sample and mode</th><th>UpdateLayoutTree</th><th>PrePaint</th><th>Layerize</th><th>TaskDuration delta</th></tr><tr><td>1</td><td>1: paused</td><td>0</td><td>0</td><td>0</td><td>1.541 ms</td></tr>
+<tr><td>1</td><td>2: original</td><td>20</td><td>20</td><td>20</td><td>20.939 ms</td></tr>
+<tr><td>1</td><td>3: html-control</td><td>20</td><td>20</td><td>20</td><td>21.402 ms</td></tr>
+<tr><td>1</td><td>4: original</td><td>20</td><td>20</td><td>20</td><td>19.900 ms</td></tr>
+<tr><td>2</td><td>1: paused</td><td>1</td><td>0</td><td>0</td><td>1.962 ms</td></tr>
+<tr><td>2</td><td>2: original</td><td>20</td><td>20</td><td>20</td><td>23.127 ms</td></tr>
+<tr><td>2</td><td>3: html-control</td><td>20</td><td>20</td><td>20</td><td>20.856 ms</td></tr>
+<tr><td>2</td><td>4: original</td><td>20</td><td>20</td><td>20</td><td>20.314 ms</td></tr></table>
+<h3>Verbatim structured measurements, checkout one</h3><pre>[
+  {
+    &quot;mode&quot;: &quot;paused&quot;,
+    &quot;seconds&quot;: 4,
+    &quot;events&quot;: {
+      &quot;Commit&quot;: {
+        &quot;count&quot;: 1,
+        &quot;milliseconds&quot;: 0.04
+      }
+    },
+    &quot;metrics&quot;: {
+      &quot;TaskDuration&quot;: 0.0015410000000000007,
+      &quot;RecalcStyleCount&quot;: 1,
+      &quot;RecalcStyleDuration&quot;: 0.00001299999999999999,
+      &quot;LayoutCount&quot;: 0
+    }
+  },
+  {
+    &quot;mode&quot;: &quot;original&quot;,
+    &quot;seconds&quot;: 4,
+    &quot;events&quot;: {
+      &quot;UpdateLayoutTree&quot;: {
+        &quot;count&quot;: 20,
+        &quot;milliseconds&quot;: 3.398
+      },
+      &quot;PrePaint&quot;: {
+        &quot;count&quot;: 20,
+        &quot;milliseconds&quot;: 1.857
+      },
+      &quot;Layerize&quot;: {
+        &quot;count&quot;: 20,
+        &quot;milliseconds&quot;: 0.086
+      },
+      &quot;Commit&quot;: {
+        &quot;count&quot;: 21,
+        &quot;milliseconds&quot;: 1.4099999999999997
+      }
+    },
+    &quot;metrics&quot;: {
+      &quot;TaskDuration&quot;: 0.020939,
+      &quot;RecalcStyleCount&quot;: 21,
+      &quot;RecalcStyleDuration&quot;: 0.0035389999999999996,
+      &quot;LayoutCount&quot;: 0
+    }
+  },
+  {
+    &quot;mode&quot;: &quot;html-control&quot;,
+    &quot;seconds&quot;: 4,
+    &quot;events&quot;: {
+      &quot;UpdateLayoutTree&quot;: {
+        &quot;count&quot;: 20,
+        &quot;milliseconds&quot;: 3.245
+      },
+      &quot;PrePaint&quot;: {
+        &quot;count&quot;: 20,
+        &quot;milliseconds&quot;: 1.2539999999999998
+      },
+      &quot;Layerize&quot;: {
+        &quot;count&quot;: 20,
+        &quot;milliseconds&quot;: 0.10000000000000002
+      },
+      &quot;Commit&quot;: {
+        &quot;count&quot;: 21,
+        &quot;milliseconds&quot;: 1.4860000000000004
+      }
+    },
+    &quot;metrics&quot;: {
+      &quot;TaskDuration&quot;: 0.021402000000000004,
+      &quot;RecalcStyleCount&quot;: 23,
+      &quot;RecalcStyleDuration&quot;: 0.0035740000000000004,
+      &quot;LayoutCount&quot;: 0
+    }
+  },
+  {
+    &quot;mode&quot;: &quot;original&quot;,
+    &quot;seconds&quot;: 4,
+    &quot;events&quot;: {
+      &quot;UpdateLayoutTree&quot;: {
+        &quot;count&quot;: 20,
+        &quot;milliseconds&quot;: 3.2260000000000004
+      },
+      &quot;PrePaint&quot;: {
+        &quot;count&quot;: 20,
+        &quot;milliseconds&quot;: 1.7090000000000003
+      },
+      &quot;Layerize&quot;: {
+        &quot;count&quot;: 20,
+        &quot;milliseconds&quot;: 0.14300000000000002
+      },
+      &quot;Commit&quot;: {
+        &quot;count&quot;: 21,
+        &quot;milliseconds&quot;: 1.3950000000000002
+      }
+    },
+    &quot;metrics&quot;: {
+      &quot;TaskDuration&quot;: 0.0199,
+      &quot;RecalcStyleCount&quot;: 22,
+      &quot;RecalcStyleDuration&quot;: 0.0034,
+      &quot;LayoutCount&quot;: 0
+    }
+  }
+]</pre>
+<h3>Verbatim structured measurements, checkout two</h3><pre>[
+  {
+    &quot;mode&quot;: &quot;paused&quot;,
+    &quot;seconds&quot;: 4,
+    &quot;events&quot;: {
+      &quot;Commit&quot;: {
+        &quot;count&quot;: 1,
+        &quot;milliseconds&quot;: 0.176
+      },
+      &quot;UpdateLayoutTree&quot;: {
+        &quot;count&quot;: 1,
+        &quot;milliseconds&quot;: 0.038
+      }
+    },
+    &quot;metrics&quot;: {
+      &quot;TaskDuration&quot;: 0.0019619999999999985,
+      &quot;RecalcStyleCount&quot;: 1,
+      &quot;RecalcStyleDuration&quot;: 0.000027000000000000114,
+      &quot;LayoutCount&quot;: 0
+    }
+  },
+  {
+    &quot;mode&quot;: &quot;original&quot;,
+    &quot;seconds&quot;: 4,
+    &quot;events&quot;: {
+      &quot;UpdateLayoutTree&quot;: {
+        &quot;count&quot;: 20,
+        &quot;milliseconds&quot;: 3.015
+      },
+      &quot;PrePaint&quot;: {
+        &quot;count&quot;: 20,
+        &quot;milliseconds&quot;: 1.809
+      },
+      &quot;Layerize&quot;: {
+        &quot;count&quot;: 20,
+        &quot;milliseconds&quot;: 0.16000000000000006
+      },
+      &quot;Commit&quot;: {
+        &quot;count&quot;: 21,
+        &quot;milliseconds&quot;: 1.3330000000000002
+      }
+    },
+    &quot;metrics&quot;: {
+      &quot;TaskDuration&quot;: 0.023126999999999995,
+      &quot;RecalcStyleCount&quot;: 23,
+      &quot;RecalcStyleDuration&quot;: 0.003271,
+      &quot;LayoutCount&quot;: 0
+    }
+  },
+  {
+    &quot;mode&quot;: &quot;html-control&quot;,
+    &quot;seconds&quot;: 4,
+    &quot;events&quot;: {
+      &quot;UpdateLayoutTree&quot;: {
+        &quot;count&quot;: 20,
+        &quot;milliseconds&quot;: 2.7439999999999993
+      },
+      &quot;PrePaint&quot;: {
+        &quot;count&quot;: 20,
+        &quot;milliseconds&quot;: 1.257
+      },
+      &quot;Layerize&quot;: {
+        &quot;count&quot;: 20,
+        &quot;milliseconds&quot;: 0.08000000000000002
+      },
+      &quot;Commit&quot;: {
+        &quot;count&quot;: 21,
+        &quot;milliseconds&quot;: 1.3150000000000004
+      }
+    },
+    &quot;metrics&quot;: {
+      &quot;TaskDuration&quot;: 0.020856,
+      &quot;RecalcStyleCount&quot;: 22,
+      &quot;RecalcStyleDuration&quot;: 0.0028439999999999997,
+      &quot;LayoutCount&quot;: 0
+    }
+  },
+  {
+    &quot;mode&quot;: &quot;original&quot;,
+    &quot;seconds&quot;: 4,
+    &quot;events&quot;: {
+      &quot;UpdateLayoutTree&quot;: {
+        &quot;count&quot;: 20,
+        &quot;milliseconds&quot;: 3.14
+      },
+      &quot;PrePaint&quot;: {
+        &quot;count&quot;: 20,
+        &quot;milliseconds&quot;: 1.7640000000000002
+      },
+      &quot;Layerize&quot;: {
+        &quot;count&quot;: 20,
+        &quot;milliseconds&quot;: 0.10500000000000002
+      },
+      &quot;Commit&quot;: {
+        &quot;count&quot;: 21,
+        &quot;milliseconds&quot;: 1.4240000000000004
+      }
+    },
+    &quot;metrics&quot;: {
+      &quot;TaskDuration&quot;: 0.020314000000000002,
+      &quot;RecalcStyleCount&quot;: 22,
+      &quot;RecalcStyleDuration&quot;: 0.0033010000000000005,
+      &quot;LayoutCount&quot;: 0
+    }
+  }
+]</pre>
+<p>LayerTree and SystemInfo checks used these additional Browser Automation statements after creating the page:</p>
+<pre>const protocol = await page.createCDPSession();
+await protocol.send("LayerTree.enable");
+protocol.on("LayerTree.layerTreeDidChange", event =&gt; console.log(event.layers));
+const system = await page.browser().target().createCDPSession();
+const info = await system.send("SystemInfo.getInfo");
+console.log(info.gpu.featureStatus);
+await system.detach();
+await protocol.detach();</pre>
+<pre>Relevant actual SystemInfo result:
+gpu_compositing: disabled_software
+rasterization: disabled_software
+LayerTree layers observed: []</pre>
+
+<h2>6. Root cause and source evidence</h2>
+<p><a href="https://github.com/get-bb/bb/blob/e61446e15a0bb3e6df551e45c3aba5c5187ffad3/apps/app/src/components/thread/ThreadStatusGlyph.tsx#L167-L178">ThreadStatusGlyph.tsx:167–178</a> selects the core Loading icon and puts <code>animate-spin motion-reduce:animate-none</code> on that icon. <a href="https://github.com/get-bb/bb/blob/e61446e15a0bb3e6df551e45c3aba5c5187ffad3/packages/shared-ui/src/components/ui/icon.tsx#L385-L403">icon.tsx:385–403</a> passes that className directly to HugeiconsIcon. The resulting real browser DOM confirms that the animation target is SVG, not an HTML rotation container.</p>
+<pre>case &quot;runtime&quot;:
+  return (
+    &lt;Icon
+      name=&quot;Loading&quot;
+      className={cn(
+        &quot;animate-spin motion-reduce:animate-none&quot;,
+        SIDEBAR_WORKING_STATUS_COLOR_CLASS,
+        iconSizeClass,
+      )}
+      aria-label={threadIndicatorLabel(indicator) ?? undefined}
+    /&gt;
+  );</pre>
+<p>The direct observation is that keeping this transform animation active drives repeated style/prepaint/layerization work in the tested software-rendering configuration. Pausing changes neither source markup nor application state and removes that work. This establishes animation causality in the probe, not an SVG-specific compositor failure. Because even the HTML control cannot use GPU compositing here, the deeper browser limitation remains unverified; claiming otherwise would overstate the evidence.</p>
+
+<h2>7. Verification in the second clean checkout</h2>
+<p>The same agent repeated the reproduction; this is not an independent-agent check. A second fresh detached worktree was created at the recorded full base commit. Frozen install and both scoped Turbo builds succeeded again. The same three author-written probe files were copied into that checkout, rebuilt there, and inlined into a separate HTML file; both generated files had identical SHA-256 digests. Tracked <code>git diff --exit-code</code> remained clean. The second page used its own local HTML path and no shared product data or port.</p>
+<p>The exact build and measurement commands above were repeated for base-two and issue-7233-two.html. Running the same measurement script produced the second table and structured output. Both original samples again had 20 style/prepaint/layerization events; the paused control had no prepaint/layerization; the HTML control again had 20. The final report therefore retains the partial verdict and explicitly excludes a validated wrapper fix.</p>
+
+<h2>8. Proposed next experiment and safe-fix decision</h2>
+<p>Repeat this A/B experiment on a GPU-composited, visible browser and record SystemInfo/LayerTree alongside the trace. If only the SVG variant has recurring main-thread rendering, move rotation to a properly sized HTML container in the runtime glyph, keeping the SVG static, its accessible label, and the reduced-motion override. Then add a focused regression at the rendering boundary that fails before and passes after the change and run the existing glyph tests.</p>
+<p>No pull request is opened. No open pull request linked to #7233 was found in the issue timeline or the open-PR number search. The proposed optimization does not improve the measured rendering-event regression in this GPU-disabled environment, so a focused pre-fix-fail/post-fix-pass proof is unavailable. A DOM-class assertion alone would not prove compositor behavior. The simple-fix gate therefore fails before any production patch, branch, commit, or push.</p>
+
+<h2>9. Existing checks and limitations</h2>
+<pre>pnpm exec turbo run test --filter=@bb/app -- src/components/thread/ThreadStatusGlyph.test.tsx
+Test Files  1 passed (1)
+Tests       21 passed (21)
+
+Both clean checkouts:
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=@bb/app
+Tasks: 5 successful, 5 total (app and dependency build)</pre>
+<p>The existing test verifies the animation and reduced-motion classes, not compositor scheduling. No test was changed, and no regression test is claimed to fail before or pass after a fix. An initial broad build in the original clean checkout failed because the GitHub plugin's SDK host/process dist outputs were missing; explicitly building the SDK first allowed the relevant app builds in both clean worktrees to pass. No unrelated build code was changed.</p>
+<p>No 144 Hz measurement, physical-GPU A/B result, process-level CPU reproduction, desktop-app result, macOS result, Windows result, or complete sidebar/thread user journey is claimed. No screenshot is included because this is a rendering-performance investigation, not a visible-pixel defect.</p>
+
+<h2>10. Related issues and trust boundary</h2>
+<p><a href="https://github.com/get-bb/bb/issues/3921">#3921</a> concerns reduced-motion/offscreen behavior; <a href="https://github.com/get-bb/bb/issues/4515">#4515</a> concerns residual animation activity. They were inspected through GitHub metadata for classification context, not treated as evidence of this root cause. Their code and scripts were not run.</p>
+<p>Issue content and comments were treated as untrusted claims. No issue-provided script, linked branch, patch, or external evidence URL was fetched or executed. Every executed product source file came from trusted origin/main; the only additions were the probe and build harness authored for this investigation. The report repository is public, and only this sanitized HTML and its summary metadata are published; raw evidence remains outside that repository.</p>
+</main></body></html>
