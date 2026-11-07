@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7256 Personal child environment eligibility</title>
+<style>
+:root{--canvas:#fafaf8;--ink:#1a1a1a;--muted:#666;--line:#e2e2de;--accent:#0052cc}
+body{margin:0;background:var(--canvas);color:var(--ink);font:16px/1.55 system-ui,sans-serif}
+main{max-width:900px;margin:auto;padding:40px 24px 80px}h1{font-size:26px;line-height:1.25}h2{font-size:18px;margin-top:36px;padding-top:20px;border-top:1px solid var(--line)}
+.meta{color:var(--muted);font-size:14px}.pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;border:1px solid var(--line)}
+table{border-collapse:collapse;width:100%;font-size:14px}td,th{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+code,pre{font:13px/1.5 ui-monospace,monospace}pre{background:#fff;border:1px solid var(--line);border-radius:6px;padding:12px;overflow:auto}a{color:var(--accent)}
+</style>
+</head>
+<body><main>
+<p><a href="../">← reports</a></p>
+<h1>#7256 · Personal child environment eligibility</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: Medium</span> <span class="pill">Effort: Low</span> <span class="pill">threads</span> <span class="pill">workspaces</span></p>
+<p class="meta"><a href="https://github.com/get-bb/bb/issues/7256">GitHub issue</a> · November 7, 2026 · Base <code>55135d1e5045d6c5d3c24f5a4d5556ed3e11cb00</code></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>A Personal thread can be attached to an ordinary directory, but the automatic child-placement policy still treats its environment as a reusable personal workspace. Thread creation then rejects the automatically selected environment with a 409 compatibility error. A regression at the real server thread-creation boundary reproduces this for default placement, personal workspace sugar, and an explicitly selected personal provider on the same machine. The same agent repeated all three failures in a second clean checkout. The proposed fix checks the stored environment's eligibility before automatic reuse and otherwise leaves normal workspace creation in charge.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>A Personal parent in an attached directory prevents child creation.</td><td>Verified</td><td>All three regression cases fail inside createThreadFromRequest with the reported compatibility error on unchanged main.</td></tr>
+<tr><td>Automatic reuse lacks a workspace guard.</td><td>Verified</td><td>The policy uses the parent's environment ID without checking provider metadata; the downstream reuse validator requires that metadata.</td></tr>
+<tr><td>Directory switching can produce an unmanaged Personal environment.</td><td>Verified in source</td><td>The directory-switch service creates an environment with the thread's project and environmentProvider: null.</td></tr>
+<tr><td>The old workspace disappears after five minutes; all listed CLI commands fail on macOS.</td><td>Not exercised</td><td>No live daemon, timer wait, desktop, provider session, or CLI transport was started. This report isolates the common server failure instead.</td></tr>
+<tr><td>A fresh request should never reuse a valid Personal parent workspace.</td><td>Existing behavior preserved</td><td>Changing that separate behavior would require a policy decision. This fix only stops automatic reuse of unsuitable environments.</td></tr>
+</table>
+<h2>3. Environment</h2>
+<ul><li>Trusted public get-bb/bb origin/main at the full base commit above.</li><li>Linux x86_64, Node v22.19.0, pnpm 9.15.0, Vitest 4.1.12.</li><li>Two separate temporary checkouts at the same base, each with its own frozen installation and repository test harness. Real migrated SQLite databases; no database mocks.</li><li>No application ports or persistent user data used. No agent-provider process started; the test registry supplies codex and a wait-only environment provider.</li><li>The normal full Turbo build passed all 73 tasks after building the SDK declarations. The initial build hit missing SDK output; the repository-prescribed build:types step resolved that prerequisite.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the trusted repository and check out the recorded base.</li><li>Apply the test-only patch below. It extends the existing environment-providers integration suite, using its migrated database and server helpers.</li><li>Install and run the filtered test:</li></ol>
+<pre>git clone https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout 55135d1e5045d6c5d3c24f5a4d5556ed3e11cb00
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run test --filter=@bb/server -- test/threads/environment-providers.test.ts -t 'attached-directory parent'</pre>
+<p><strong>Expected:</strong> all three child requests succeed, retain their parent link, and select a fresh personal-workspace provider intent on the primary machine rather than reuse the attached directory. The explicit-provider fixture includes an existing-machine selection, as required by the normal provider-placement contract.</p>
+<p><strong>Actual on unchanged production code, verbatim failure excerpt:</strong></p>
+<pre>Error: Personal project threads must reuse a personal workspace
+ ❯ assertReuseWorkspaceProjectCompatibility src/services/threads/thread-request-eligibility.ts:99:11
+ ❯ resolveReuseThreadRequestEnvironment src/services/threads/thread-request-eligibility.ts:176:3
+ ❯ resolveStableThreadRequestEnvironment src/services/threads/thread-request-eligibility.ts:215:14
+ ❯ createThreadFromRequest src/services/threads/thread-create.ts:749:9
+
+Test Files  1 failed (1)
+     Tests  3 failed | 68 skipped (71)</pre>
+<h3>Complete test-only reproduction patch</h3>
+<p>Save this block as a patch and apply it at the base checkout. All code here was authored from trusted repository fixtures, not copied from the issue. No extra dependency or production export is needed.</p>
+<pre>diff --git a/apps/server/test/threads/environment-providers.test.ts b/apps/server/test/threads/environment-providers.test.ts
+index 1fb5630eea..e551edba8a 100644
+--- a/apps/server/test/threads/environment-providers.test.ts
++++ b/apps/server/test/threads/environment-providers.test.ts
+@@ -942,6 +942,80 @@ describe("environment providers are asked inside provisioning", () =&gt; {
+     });
+   });
+ 
++  it.each([
++    { type: "project-default" as const },
++    {
++      type: "host" as const,
++      workspace: { type: "personal" as const },
++    },
++    {
++      type: "provider" as const,
++      environmentProviderId: "personal-workspace",
++      machine: {
++        type: "existing" as const,
++        hostId: "host-attached-personal-parent",
++      },
++      inputs: null,
++    },
++  ])(
++    "creates a fresh personal workspace for a $type child of an attached-directory parent",
++    async (environment) =&gt; {
++      await withTestHarness(async (harness) =&gt; {
++        installTargets([
++          {
++            id: "personal-workspace",
++            provision: () =&gt; ({
++              action: "wait",
++              reason: "Preparing workspace",
++            }),
++            requiresProjectless: true,
++          },
++        ]);
++        const { host } = seedHostSession(harness.deps, {
++          id: "host-attached-personal-parent",
++        });
++        seedPrimaryHost(harness.deps, host.id);
++        ensurePersonalProject(harness.db);
++        const attachedEnvironment = createEnvironment(harness.db, harness.hub, {
++          hostId: host.id,
++          projectId: PERSONAL_PROJECT_ID,
++          path: "/tmp/attached-personal-parent",
++          providerOwnsPath: false,
++          status: "ready",
++          environmentProvider: null,
++        });
++        const parent = seedThread(harness.deps, {
++          environmentId: attachedEnvironment.id,
++          projectId: PERSONAL_PROJECT_ID,
++          status: "idle",
++        });
++
++        const child = await createThreadFromRequest(harness.deps, {
++          environment,
++          input: textInput("Start child"),
++          origin: "cli",
++          parentThreadId: parent.id,
++          projectId: PERSONAL_PROJECT_ID,
++          providerId: "codex",
++          model: "requested-model",
++          startedOnBehalfOf: null,
++        });
++
++        expect(getThread(harness.db, child.id)?.parentThreadId).toBe(parent.id);
++        expect(
++          getThreadProvisionContext(harness.db, child.id)?.request
++            .environmentIntent,
++        ).toEqual({
++          type: "provider",
++          environmentProviderId: "personal-workspace",
++          machine: { type: "existing", hostId: host.id },
++          inputs: null,
++          selectionResolved: true,
++        });
++      });
++    },
++  );
++
+   it("opens the workspace-setup block and parks the thread starting on a wait", async () =&gt; {
+     await withTestHarness(async (harness) =&gt; {
+       const contexts: TestEnvironmentProviderContext[] = [];
+</pre>
+<h2>5. Root cause</h2>
+<ol>
+<li><a href="https://github.com/get-bb/bb/blob/55135d1e5045d6c5d3c24f5a4d5556ed3e11cb00/apps/server/src/services/threads/thread-environment-directory.ts#L222-L235">The directory-switch service</a> creates an ordinary environment with <code>providerOwnsPath: false</code> and <code>environmentProvider: null</code> in the Personal project.</li>
+<li><a href="https://github.com/get-bb/bb/blob/55135d1e5045d6c5d3c24f5a4d5556ed3e11cb00/apps/server/src/services/threads/thread-default-policy.ts#L394-L420">The Personal-parent branch</a> recognizes a personal request and automatically returns the parent's environment ID. Its only environment lookup is for an explicitly named machine; no check establishes that the parent still has a reusable personal workspace.</li>
+<li><a href="https://github.com/get-bb/bb/blob/55135d1e5045d6c5d3c24f5a4d5556ed3e11cb00/apps/server/src/services/threads/thread-request-eligibility.ts#L80-L104">The downstream compatibility check</a> requires a Personal environment to have a non-null environmentProviderId. The automatically chosen ordinary directory has none and therefore raises an ApiError with status 409.</li>
+<li><a href="https://github.com/get-bb/bb/blob/55135d1e5045d6c5d3c24f5a4d5556ed3e11cb00/apps/server/src/services/threads/thread-default-policy.ts#L320-L335">The normal default branch</a> can instead select the personal-workspace provider. The premature reuse return prevents reaching it.</li>
+</ol>
+<p>The bug is in policy selection, not in the compatibility validator. Relaxing the validator would permit an unintended environment kind; it is not necessary to fix spawning.</p>
+<h2>6. Proposed fix and checked result</h2>
+<p>Look up the parent's stored environment once. Automatically reuse it only if it is ready, still in the Personal project, has provider metadata, has no teardown in progress, and matches any requested existing machine. Otherwise fall through to the existing fresh-workspace path. Using the same non-null-provider criterion as the compatibility validator preserves support for custom Personal workspace providers.</p>
+<p>Keep all explicit reuse and path compatibility validation unchanged. Keep valid Personal-parent reuse and explicit other-machine placement unchanged. Correct the existing policy test fixture to include the personal provider metadata it claims to represent.</p>
+<p>With this small repair, the three regression cases and all related suites pass:</p>
+<pre>pnpm exec turbo run test --filter=@bb/server -- \
+  test/threads/environment-providers.test.ts \
+  test/threads/thread-default-policy.test.ts \
+  test/threads/thread-create-seed-without-run.test.ts \
+  test/threads/archive-pruned-environment.test.ts
+
+Test Files  4 passed (4)
+     Tests  126 passed (126)</pre>
+<p>Server Turbo lint/typecheck and git diff --check pass. The patch changes three files and 98 total text lines (93 additions, 5 deletions); production policy accounts for 15 of those changed lines. No protocol, dependency, schema, data, permission, or CLI contract change is needed.</p>
+<h2>7. Verification</h2>
+<p>The same agent repeated the reproduction in a second clean detached checkout at the exact base commit. Both checkouts had unchanged production code and the same final test patch; each ran a separate frozen installation and the filtered Turbo command from section 4. The first final run reported three failures in 8.21 seconds; the second final run reported three failures in 8.16 seconds. Both stopped at the same compatibility check. These are two direct runs by one agent, not independent verification.</p>
+<p>While validating the repair, the fixture was tightened to include the provider machine selection and to assert the normalized selectionResolved field. The final baseline runs were repeated after those fixture corrections. No root-cause claim changed. The test intentionally models the post-directory-switch database state rather than driving a real provider or waiting for retirement.</p>
+<h2>8. Related issues</h2>
+<p>No open pull request linked to issue #7256 was present in GitHub metadata during investigation. Existing same-machine and other-machine policy tests remain the placement contract; no unrelated issue behavior is assumed.</p>
+<h2>9. Appendix</h2>
+<p>The inline patch and exact filtered command are the repeatable evidence. Publication follows this site's no-raw-artifacts policy: no databases, logs, test files, diffs, or process scratch directories are committed. Full local logs retain the expected baseline failures and repaired-suite output.</p>
+<p>The issue text was treated solely as untrusted claims. Suggested commands and fixes were not executed or copied. Only trusted main and locally authored changes were run. No live user instance was accessed.</p>
+<p>AGENT GENERATED</p>
+</main></body></html>
