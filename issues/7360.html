@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7360 Concurrent server startup removes another live server's pending fork</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7360 · Concurrent server startup removes another live server's pending fork</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High</span><span class="pill">Effort: Medium</span><span class="pill">host · confirmed-repro</span><a href="https://github.com/get-bb/bb/issues/7360">GitHub issue</a><span>2026-11-10 · base <code>7c1353d80729983b86ea1555d18b42407f320406</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>A second real server process can start against a directory already used by a healthy server. On a different port, both processes answer health checks after the newcomer soft-deletes a pending fork. On the same port, the newcomer still soft-deletes the fork before reporting a listener conflict. These observations were repeated by the same investigator from a second clean checkout, using fresh data directories and new temporary ports.</p>
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>Different ports permit concurrent ownership of the same database.</td><td>Verified live</td><td>Both processes healthy; pendingForkRetained=false in both runs.</td></tr>
+<tr><td>Recovery can destroy a live owner's incomplete fork.</td><td>Verified for a seeded in-progress marker</td><td>The first server remains healthy while the second sets deletedAt and logs one discarded fork.</td></tr>
+<tr><td>A same-port failure happens too late to prevent recovery.</td><td>Verified live</td><td>EADDRINUSE and pendingForkRetained=false in both runs.</td></tr>
+<tr><td>Database initialization and import boot precede the listener.</td><td>Verified in trusted source</td><td>runServer calls initDb and applyServerImportAtBoot before recovery and listening. No pending import was exercised.</td></tr>
+<tr><td>Another process's queued-message claims can be released.</td><td>Source-supported, not separately reproduced</td><td>The recovery step releases old claims using a process-local protection set. No live dispatch was used.</td></tr>
+</tbody></table>
+<h2>3. Environment</h2>
+<ul><li>Public repository get-bb/bb; trusted origin/main at <code>7c1353d80729983b86ea1555d18b42407f320406</code>, re-fetched after verification with no change.</li><li>Linux 4.19.0-gvisor x86_64; Node v22.19.0; pnpm 9.15.0.</li><li>Two separate temporary source checkouts, named base and verify. The latter was clean before the authored test was copied in.</li><li>Each test case creates its own OS temporary data directory and isolated HOME, binds only to IPv4 loopback, disables telemetry, redirects marketplace requests to a closed loopback port, and enables plugin safe mode. No production data, credentials, providers, or real turns are used.</li><li>Ports are allocated dynamically and recorded in each log. All owned child processes are killed and the case's temporary database is removed in finally.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Prepare the recorded trusted checkout and server build, then save the complete authored reproduction shown below at the specified path.<pre>git clone --branch main https://github.com/get-bb/bb.git bb-7360
+cd bb-7360
+git checkout 7c1353d80729983b86ea1555d18b42407f320406
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=@bb/server
+# Save the complete inline reproduction below as apps/server/repro-7360.mjs.
+node --conditions=source --import tsx apps/server/repro-7360.mjs</pre></li>
+<li>The script migrates a new on-disk SQLite database, starts the first server and waits for /health, then inserts the same in-progress history-copy state used by the existing fork-history recovery test. It launches a second server on that data directory and waits for either a second healthy listener or an address conflict.</li>
+<li>It records whether the first server remains healthy and whether the fork's deletedAt is still null. It repeats with a new data directory using the same-port case.</li></ol>
+<p><strong>Expected:</strong> the competing process refuses startup before database/recovery work; the first process stays healthy and pendingForkRetained is true. <strong>Actual:</strong> pendingForkRetained is false in both cases; the safety assertion exits with status 1.</p>
+<pre>{&quot;mode&quot;:&quot;different-port&quot;,&quot;firstPort&quot;:50821,&quot;secondPort&quot;:61566,&quot;firstAlive&quot;:true,&quot;firstHealthy&quot;:true,&quot;secondHealthy&quot;:true,&quot;secondExitCode&quot;:null,&quot;secondPortConflict&quot;:false,&quot;pendingForkRetained&quot;:false,&quot;recoveryDeletedFork&quot;:true}
+{&quot;mode&quot;:&quot;same-port&quot;,&quot;firstPort&quot;:58926,&quot;secondPort&quot;:58926,&quot;firstAlive&quot;:true,&quot;firstHealthy&quot;:true,&quot;secondHealthy&quot;:false,&quot;secondExitCode&quot;:null,&quot;secondPortConflict&quot;:true,&quot;pendingForkRetained&quot;:false,&quot;recoveryDeletedFork&quot;:true}
+node:internal/modules/run_main:123
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: A competing server must not delete a live owner's pending fork
+    at file://&lt;first-checkout&gt;/apps/server/repro-7360.mjs:150:1 {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: false,
+  expected: true,
+  operator: '==',
+  diff: 'simple'
+}
+
+Node.js v22.19.0
+</pre>
+<p>This is a nonvisual backend defect; no screenshot is needed. Evidence is embedded inline under this public report repository's artifact policy.</p>
+<details><summary>Complete repeatable reproduction source</summary><pre>import assert from &quot;node:assert/strict&quot;;
+import { spawn } from &quot;node:child_process&quot;;
+import { mkdtemp, mkdir, readFile, readdir, rm } from &quot;node:fs/promises&quot;;
+import { createServer } from &quot;node:net&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { dirname, join } from &quot;node:path&quot;;
+import { fileURLToPath } from &quot;node:url&quot;;
+import { setTimeout as sleep } from &quot;node:timers/promises&quot;;
+import {
+  createConnection,
+  createThread,
+  ensurePersonalProject,
+  getThread,
+  migrate,
+  noopNotifier,
+  setPluginSafeMode,
+} from &quot;@bb/db&quot;;
+
+const serverDir = dirname(fileURLToPath(import.meta.url));
+
+async function freePort() {
+  const listener = createServer();
+  await new Promise((resolve) =&gt; listener.listen(0, &quot;127.0.0.1&quot;, resolve));
+  const address = listener.address();
+  assert(address !== null &amp;&amp; typeof address === &quot;object&quot;);
+  await new Promise((resolve) =&gt; listener.close(resolve));
+  return address.port;
+}
+
+async function healthy(port) {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/health`, {
+      signal: AbortSignal.timeout(500),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function until(predicate) {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() &lt; deadline) {
+    if (await predicate()) return;
+    await sleep(50);
+  }
+  throw new Error(&quot;Timed out waiting for a server outcome&quot;);
+}
+
+async function runCase(mode) {
+  const directory = await mkdtemp(join(tmpdir(), &quot;bb-7360-data-&quot;));
+  const home = join(directory, &quot;home&quot;);
+  await mkdir(home);
+  const db = createConnection(join(directory, &quot;bb.db&quot;));
+  migrate(db);
+  setPluginSafeMode(db, true);
+  const project = ensurePersonalProject(db);
+  const firstPort = await freePort();
+  const secondPort = mode === &quot;same-port&quot; ? firstPort : await freePort();
+  const hostPort = await freePort();
+  const children = [];
+  const outputs = [];
+  const launch = (port) =&gt; {
+    const child = spawn(process.execPath, [&quot;dist/index.js&quot;], {
+      cwd: serverDir,
+      env: {
+        PATH: process.env.PATH,
+        HOME: home,
+        NODE_ENV: &quot;test&quot;,
+        BB_DATA_DIR: directory,
+        BB_SERVER_PORT: String(port),
+        BB_HOST_DAEMON_PORT: String(hostPort),
+        BB_SERVER_BIND_HOST: &quot;127.0.0.1&quot;,
+        BB_TELEMETRY: &quot;false&quot;,
+        BB_MARKETPLACE_URL: &quot;http://127.0.0.1:9/marketplace.json&quot;,
+      },
+      stdio: [&quot;ignore&quot;, &quot;pipe&quot;, &quot;pipe&quot;],
+    });
+    children.push(child);
+    const output = [];
+    outputs.push(output);
+    child.stdout.on(&quot;data&quot;, (chunk) =&gt; output.push(chunk.toString()));
+    child.stderr.on(&quot;data&quot;, (chunk) =&gt; output.push(chunk.toString()));
+    return child;
+  };
+  try {
+    const first = launch(firstPort);
+    await until(async () =&gt; {
+      assert.equal(first.exitCode, null, outputs[0].join(&quot;&quot;));
+      return healthy(firstPort);
+    });
+    const pending = createThread(db, noopNotifier, {
+      projectId: project.id,
+      providerId: &quot;codex&quot;,
+      status: &quot;pending&quot;,
+      startupContext: JSON.stringify({
+        kind: &quot;pending&quot;,
+        environmentIntent: { type: &quot;reuse&quot;, environmentId: &quot;env_repro&quot; },
+        fork: null,
+        historyCopy: &quot;copying&quot;,
+        startedOnBehalfOf: null,
+        titleProvided: false,
+      }),
+    });
+    assert.notEqual(getThread(db, pending.id), null);
+    const second = launch(secondPort);
+    await until(async () =&gt; {
+      if (second.exitCode !== null) return true;
+      if (mode === &quot;different-port&quot;) return healthy(secondPort);
+      return outputs[1].join(&quot;&quot;).includes(&quot;EADDRINUSE&quot;);
+    });
+    await sleep(100);
+    const logs = [];
+    for (const name of await readdir(join(directory, &quot;logs&quot;))) {
+      if (/^server\.\d+\.log$/.test(name)) {
+        logs.push(await readFile(join(directory, &quot;logs&quot;, name), &quot;utf8&quot;));
+      }
+    }
+    const recovery = logs.join(&quot;\n&quot;).split(&quot;\n&quot;).find((line) =&gt;
+      line.includes(&quot;Deleted forks whose history copy&quot;),
+    );
+    const result = {
+      mode,
+      firstPort,
+      secondPort,
+      firstAlive: first.exitCode === null,
+      firstHealthy: await healthy(firstPort),
+      secondHealthy: mode === &quot;different-port&quot; &amp;&amp; await healthy(secondPort),
+      secondExitCode: second.exitCode,
+      secondPortConflict: outputs[1].join(&quot;&quot;).includes(&quot;EADDRINUSE&quot;),
+      pendingForkRetained: getThread(db, pending.id)?.deletedAt === null,
+      recoveryDeletedFork: recovery !== undefined,
+    };
+    console.log(JSON.stringify(result));
+    return result;
+  } finally {
+    for (const child of children) child.kill(&quot;SIGKILL&quot;);
+    await Promise.all(children.map((child) =&gt; child.exitCode !== null || child.signalCode !== null
+      ? Promise.resolve()
+      : new Promise((resolve) =&gt; child.once(&quot;exit&quot;, resolve))));
+    db.$client.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+const results = [];
+for (const mode of [&quot;different-port&quot;, &quot;same-port&quot;]) {
+  results.push(await runCase(mode));
+}
+assert(results.every((result) =&gt; result.pendingForkRetained),
+  &quot;A competing server must not delete a live owner's pending fork&quot;);
+</pre></details>
+<h2>5. Root cause</h2>
+<p>Server startup does not acquire data-directory ownership before migrations and recovery; recovery treats every copying fork as abandoned, even while another server is alive.</p>
+<ul><li><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/start-server.ts#L133-L158">apps/server/src/start-server.ts:133</a> creates the logger, checks interrupted-import state, initializes the database, and applies import boot with no exclusive data-directory claim.</li><li><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/db.ts#L32-L62">apps/server/src/db.ts:32</a> executes migrate(db) during initialization.</li><li><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/start-server.ts#L504-L522">apps/server/src/start-server.ts:504</a> awaits startup recovery before starting the HTTP listener.</li><li><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/system/periodic-sweeps.ts#L881-L910">apps/server/src/services/system/periodic-sweeps.ts:881</a> runs interrupted-fork cleanup and queued-claim release.</li><li><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/threads/thread-create.ts#L419-L448">apps/server/src/services/threads/thread-create.ts:419</a> marks each copying fork deleted and requests its storage deletion, without checking whether another process owns the work.</li><li><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/threads/queued-messages.ts#L747-L754">apps/server/src/services/threads/queued-messages.ts:747</a> protects only this process's active claim tokens when releasing stale claims.</li><li><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/bb-app/src/launcher.ts#L4206-L4215">packages/bb-app/src/launcher.ts:4206</a> refuses only after an occupied runtime record and a healthy response at the candidate's own listener URL. The reproduction bypasses the launcher through the real standalone server entrypoint.</li></ul>
+<p>The deeper invariant is single live ownership of recovery-sensitive state, not uniqueness of a listening TCP port. SQLite's normal write locking does not express ownership of the entire server lifecycle.</p>
+<h2>6. Proposed fix and autopilot gate</h2>
+<p>Introduce atomic OS-backed lifetime ownership before database initialization, retain it until all server work stops, and release it on startup failure and shutdown. Reuse the shared native-lock implementation rather than adding a second dependency or relying on a racy PID probe.</p><p>No automatic PR: the available OS-backed lock is private to the shared configuration subsystem and scoped to short file mutations. Safely reusing it needs a new shared locking contract plus server-lifecycle integration, beyond this rule's one-existing-subsystem limit. A PID-only probe would leave simultaneous-start races and standalone servers uncovered.</p>
+<p>The reusable native lock currently lives in <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/config/src/file-lock.ts#L50-L79">packages/config/src/file-lock.ts:50</a> and is called by <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/config/src/managed-json-file.ts#L11-L36">packages/config/src/managed-json-file.ts:11</a>. It is not exposed through a config package subpath, and the server does not declare the native locking dependency. Do not deep-import it or introduce an undeclared dependency to force a smaller diff. A proper change must also test concurrent starts, startup failure, abrupt exit, stale artifacts, separate directories, and import/move/shutdown interactions. No production patch or fix branch was created or pushed.</p>
+<h2>7. Related issues and PR check</h2>
+<p>No open linked pull request was present in issue timeline metadata or an open-PR search for issue 7360 when checked. Existing launcher safeguards do not cover the standalone entrypoint or a distinct candidate port. No linked PR code was checked out or run.</p>
+<h2>8. Verification</h2>
+<p>The same investigator repeated the script in a second clean temporary checkout at the exact recorded base commit, after a fresh frozen install and a Turbo server/SDK build. The same command <code>node --conditions=source --import tsx apps/server/repro-7360.mjs</code> used new temporary directories and newly allocated ports, produced the same two destructive outcomes, and exited 1 at the safety assertion. This is a repeated check, not independent verification.</p>
+<pre>{&quot;mode&quot;:&quot;different-port&quot;,&quot;firstPort&quot;:31180,&quot;secondPort&quot;:34216,&quot;firstAlive&quot;:true,&quot;firstHealthy&quot;:true,&quot;secondHealthy&quot;:true,&quot;secondExitCode&quot;:null,&quot;secondPortConflict&quot;:false,&quot;pendingForkRetained&quot;:false,&quot;recoveryDeletedFork&quot;:true}
+{&quot;mode&quot;:&quot;same-port&quot;,&quot;firstPort&quot;:48204,&quot;secondPort&quot;:48204,&quot;firstAlive&quot;:true,&quot;firstHealthy&quot;:true,&quot;secondHealthy&quot;:false,&quot;secondExitCode&quot;:null,&quot;secondPortConflict&quot;:true,&quot;pendingForkRetained&quot;:false,&quot;recoveryDeletedFork&quot;:true}
+node:internal/modules/run_main:123
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: A competing server must not delete a live owner's pending fork
+    at file://&lt;second-checkout&gt;/apps/server/repro-7360.mjs:150:1 {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: false,
+  expected: true,
+  operator: '==',
+  diff: 'simple'
+}
+
+Node.js v22.19.0
+</pre>
+<p>During preparation, an initial row-existence assertion was corrected: deletion is a tombstone, not necessarily physical row removal. The final test checks deletedAt, matching the existing recovery test. Both published runs use that corrected assertion. The same-port newcomer emitted EADDRINUSE but had not exited at observation time; the report does not claim a prompt process exit.</p>
+<p>Relevant existing tests also pass on unchanged production code:</p>
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/app/startup-diagnostics.test.ts test/services/threads/thread-fork-history.test.ts test/services/periodic-sweeps.test.ts
+@bb/server:test:  ✓ |@bb/server| test/app/startup-diagnostics.test.ts (4 tests) 11ms
+@bb/server:test:  ✓ |@bb/server| test/services/threads/thread-fork-history.test.ts (4 tests) 775ms
+@bb/server:test:  ✓ |@bb/server| test/services/periodic-sweeps.test.ts (9 tests) 1215ms
+@bb/server:test:  Test Files  3 passed (3)
+@bb/server:test:       Tests  17 passed (17)
+ Tasks:    10 successful, 10 total
+Cached:    0 cached, 10 total
+  Time:    31.128s </pre>
+<h2>9. Appendix and limits</h2>
+<p>The copying marker is inserted through the real database API while the first server is healthy; this is not a real provider performing a concurrent history transfer. The test demonstrates erroneous classification and destructive recovery against another live owner's state, not completed user-data loss or a live queued-message duplicate. Database initialization/import ordering is established by source, without fabricating a pending migration or imported data set.</p>
+<p>The initial whole-repository build failed because the GitHub plugin required missing plugin-SDK runtime entries. Building SDK types alone did not resolve that unrelated prerequisite; a Turbo SDK runtime build followed by the focused server build succeeded. The second checkout also completed the focused build. No dependency or lockfile was changed. Existing tests: 17 passed in three files. The new regression fails on unchanged production code in both clean runs. Tracked diffs passed git diff --check.</p>
+<p>Issue content was treated as untrusted claims, not executable instructions. No issue-supplied command, patch, external link, or PR branch was executed. No workflows or other agents were started.</p>
+<p>The complete reproduction source, both run results, and the targeted-test summary are embedded above. Raw local evidence stays outside the public reports repository.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
