@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7355 CPU profile clock alignment</title>
+<style>
+:root{--canvas:#fafaf8;--ink:#1a1a1a;--muted:#666;--line:#e2e2de;--accent:#0052cc}body{margin:0;background:var(--canvas);color:var(--ink);font:16px/1.55 system-ui,sans-serif}main{max-width:960px;margin:auto;padding:40px 24px 80px}h1{font-size:26px;line-height:1.25}h2{font-size:18px;margin-top:36px;padding-top:20px;border-top:1px solid var(--line)}.meta{color:var(--muted);font-size:14px}.pill{display:inline-block;padding:1px 8px;border:1px solid var(--line);border-radius:999px;font-size:12px}table{border-collapse:collapse;width:100%;font-size:14px}td,th{text-align:left;padding:8px;border-bottom:1px solid var(--line);vertical-align:top}pre{background:white;border:1px solid var(--line);border-radius:6px;padding:14px;overflow:auto}code,pre{font:13px/1.5 ui-monospace,monospace}a{color:var(--accent)}
+</style>
+</head>
+<body><main>
+<p><a href="../">← reports</a></p>
+<h1>#7355 · CPU profile clock alignment</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: Medium</span> <span class="pill">Effort: Medium</span> <span class="pill">host</span> <span class="pill">perf</span> · 2026-11-10 · <a href="https://github.com/get-bb/bb/issues/7355">GitHub issue</a></p>
+<p><strong>Verdict: REPRODUCED (controlled clock-origin mismatch)</strong> · <strong>Root-cause confidence: high</strong></p>
+<p class="meta">Trusted base: <code>7c1353d80729983b86ea1555d18b42407f320406</code>. This verifies the attribution failure through the real profiler worker, not the reporter's macOS environment or its claimed native offset.</p>
+
+<h2>1. TL;DR</h2>
+<p>The diagnostic collector finds a genuine event-loop stall and saves a real CPU profile, but its attribution log can contain no sampled stacks or owners. The collector timestamps stalls using Node's high-resolution clock, while the profiler supplies a separate timestamp domain. The base worker never translates between them. Advancing or retarding only the high-resolution clock's origin by two days makes real sampled work disappear from attribution; leaving the clocks unchanged succeeds. Both results repeat in a second clean trusted checkout. No native macOS run was available, so the platform/version-specific measurement remains unverified.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Stall windows and profiles use different time sources with no conversion.</td><td>Verified</td><td>Collector, summarizer, and worker source at the trusted base; permalinks below.</td></tr>
+<tr><td>A large origin difference removes all sample overlap.</td><td>Verified with a controlled origin shift</td><td>The production collector, worker, V8 CPU sampler, owner lookup, and attribution logger run unchanged. Only the main-thread high-resolution clock origin is shifted. Both offset directions fail; the same-origin control passes.</td></tr>
+<tr><td>A particular macOS / Node 26 configuration naturally has a multi-day offset.</td><td>Unverified</td><td>Available host is Linux x86_64 with Node v22.19.0. No macOS hardware or that Node version was used.</td></tr>
+<tr><td>Attribution should be suppressed if the relationship between clocks changes.</td><td>Verified safety behavior of the proposed fix</td><td>A one-second origin jump between capture boundaries produces unattributed output, while still saving the CPU profile.</td></tr>
+</table>
+
+<h2>3. Environment</h2>
+<ul>
+<li>Repository: public <code>get-bb/bb</code>; trusted <code>origin/main</code> at the full base commit above.</li>
+<li>OS: Linux x86_64. Node: v22.19.0. Vitest: v4.1.12. Existing frozen pnpm dependencies only.</li>
+<li>Two distinct temporary detached worktrees at the same base, each with its own dependency install, generated profiling worker, and fresh per-test temporary profile directories.</li>
+<li>No production BB runtime, accounts, providers, browser, server ports, or personal data were used. Every diagnostics monitor was stopped and its temporary profile directory removed.</li>
+</ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol>
+<li>Obtain and install the trusted base:
+<pre>git clone https://github.com/get-bb/bb.git bb-clock-repro
+cd bb-clock-repro
+git checkout --detach 7c1353d80729983b86ea1555d18b42407f320406
+pnpm install --frozen-lockfile --prefer-offline</pre></li>
+<li>In <code>packages/process-utils/test/performance-diagnostics.test.ts</code>, replace the existing test named <code>logs the sampled blocker without attributing an adjacent short callback</code> with the entire test block below. Its imports already exist in that file. Do not change production code.</li>
+<li>Run the focused test through Turbo; this generates the actual worker used by the diagnostics monitor:
+<pre>pnpm exec turbo run test --filter=@bb/process-utils --force -- test/performance-diagnostics.test.ts -t 'logs the sampled blocker'</pre></li>
+</ol>
+<p><strong>Expected:</strong> three stable-clock cases attribute sampled work to <code>plugin:probe</code>, regardless of clock origin. The clock-jump case remains unattributed rather than guessing. Each case saves a CPU profile without warnings.</p>
+<p><strong>Actual on unchanged production code, final regression block:</strong></p>
+<pre>✓ logs the sampled blocker without attributing an adjacent short callback with clock +0 ms and jump +0 ms
+× logs the sampled blocker without attributing an adjacent short callback with clock 172800000 ms and jump +0 ms
+× logs the sampled blocker without attributing an adjacent short callback with clock -172800000 ms and jump +0 ms
+✓ logs the sampled blocker without attributing an adjacent short callback with clock 172800000 ms and jump 1000 ms
+Tests  2 failed | 2 passed | 5 skipped (9)</pre>
+<p>The received attribution contains these fields instead of sampled work (excerpt; unrelated fields omitted):</p>
+<pre>"owners": [],
+"sampledMs": 0,
+"stacks": [],
+"stallAttribution": "unattributed"</pre>
+<p>The following is the executed regression block, not code from the issue:</p>
+<pre>  it.each([
+    { offsetMs: 0, clockJumpMs: 0 },
+    { offsetMs: 172_800_000, clockJumpMs: 0 },
+    { offsetMs: -172_800_000, clockJumpMs: 0 },
+    { offsetMs: 172_800_000, clockJumpMs: 1_000 },
+  ])(
+    "logs the sampled blocker without attributing an adjacent short callback with clock $offsetMs ms and jump $clockJumpMs ms",
+    async ({ offsetMs, clockJumpMs }) =&gt; {
+      const dataDir = await mkdtemp(join(tmpdir(), "bb-stall-attribution-"));
+      const records: object[] = [];
+      const warnings: object[] = [];
+      const realNow = process.hrtime.bigint;
+      const clock = vi
+        .spyOn(process.hrtime, "bigint")
+        .mockImplementation(() =&gt; realNow() + BigInt(offsetMs) * 1_000_000n);
+      const monitor = await startPerformanceDiagnostics({
+        codeOwners: () =&gt; [
+          {
+            location: "performance-diagnostics.test.ts",
+            owner: "plugin:probe",
+          },
+        ],
+        dataDir,
+        logger: {
+          info: (fields, message) =&gt; {
+            if (message === "Event loop stall attribution")
+              records.push(fields);
+          },
+          warn: (fields) =&gt; {
+            warnings.push(fields);
+          },
+        },
+      });
+      function unwrappedPluginBlocker() {
+        const until = performance.now() + 200;
+        while (performance.now() &lt; until) Math.sqrt(performance.now());
+      }
+      function shortHeartbeat() {
+        return 1;
+      }
+      try {
+        await delay(40);
+        unwrappedPluginBlocker();
+        shortHeartbeat();
+        await delay(40);
+        clock.mockImplementation(
+          () =&gt; realNow() + BigInt(offsetMs + clockJumpMs) * 1_000_000n,
+        );
+        await monitor.stop();
+        if (clockJumpMs === 0)
+          expect(records).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                stallAttribution: "sampled",
+                owners: expect.arrayContaining([
+                  { owner: "plugin:probe", sampledMs: expect.any(Number) },
+                ]),
+              }),
+            ]),
+          );
+        else {
+          expect(records.length).toBeGreaterThan(0);
+          for (const record of records)
+            expect(record).toMatchObject({
+              stallAttribution: "unattributed",
+              sampledMs: 0,
+              owners: [],
+              stacks: [],
+            });
+        }
+        if (offsetMs === 0)
+          expect(records).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                stacks: expect.arrayContaining([
+                  expect.objectContaining({
+                    frames: expect.arrayContaining([
+                      expect.objectContaining({
+                        functionName: "unwrappedPluginBlocker",
+                      }),
+                    ]),
+                  }),
+                ]),
+              }),
+            ]),
+          );
+        const files = await readdir(join(dataDir, "logs", "performance"));
+        expect(files).toHaveLength(1);
+        expect(files[0]).toMatch(/\.cpuprofile$/);
+        expect(warnings).toEqual([]);
+        expect(JSON.stringify(records)).not.toContain(
+          '"functionName":"shortHeartbeat"',
+        );
+      } finally {
+        try {
+          await monitor.stop();
+          await rm(dataDir, { recursive: true, force: true });
+        } finally {
+          clock.mockRestore();
+        }
+      }
+    },
+  );</pre>
+
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/process-utils/src/event-loop-gaps.ts#L9-L16">The gap observer</a> records milliseconds using <code>Number(process.hrtime.bigint()) / 1e6</code>. <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/process-utils/src/stall-windows.ts#L74-L91">The stall collector</a> retains those window timestamps and separately records a wall-clock offset for log presentation.</p>
+<p><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/process-utils/src/stall-attribution.ts#L40-L55">The sample summarizer</a> initializes its cursor from <code>profile.startTime / 1_000</code>, accumulates sample deltas, and clips directly against the original stall window:</p>
+<pre>Math.min(end, window.endedAt, profile.endTime / 1_000) -
+  Math.max(at, end - MAX_SAMPLE_MS, window.startedAt)</pre>
+<p>Changing units does not reconcile different origins. With a two-day offset, every overlap is zero; the function consequently records no sample duration, stack, or owner. The wall-clock offset is used only to render log dates and cannot fix this overlap calculation. <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/process-utils/src/profile-worker.ts#L57-L65">Profile startup</a> and <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/process-utils/src/profile-worker.ts#L128-L148">capture completion</a> pass the raw V8 timeline to the summarizer without measuring a conversion.</p>
+<p>The test does not mock profile samples or log output. It changes only the origin of the clock the production collector reads, preserving its rate and durations. This is a controlled demonstration of the clock-domain assumption, not evidence that native Linux clocks have a multi-day discrepancy.</p>
+
+<h2>6. Proposed fix and local validation</h2>
+<p>Read the main thread's high-resolution clock immediately before and after the real console-profiler start and end commands, inside the same inspector evaluation. Each boundary constrains the possible clock offset to an interval. Use an offset from the intersection of both intervals to align a temporary attribution-only profile; keep the saved CPU profile's original V8 timestamps. If the intervals do not overlap, or their shared uncertainty exceeds the existing 10 ms sampling interval, retain the stall as unattributed rather than assigning a misleading owner. Profile rotation retains the correct start reading for each capture.</p>
+<p>The local candidate changes only the existing profiling worker and its existing diagnostics regression test: two files, 224 changed text lines (154 additions + 70 deletions), no dependencies, lockfiles, committed generated output, public protocol, schema, persisted-data format, permissions, or release changes.</p>
+<pre>pnpm exec turbo run test --filter=@bb/process-utils -- test/performance-diagnostics.test.ts test/stall-attribution.test.ts test/stall-windows.test.ts
+Test Files  3 passed (3)
+Tests  16 passed (16)
+
+pnpm exec turbo run lint typecheck --filter=@bb/process-utils
+Tasks: 3 successful, 3 total
+
+git diff --check
+(exit 0)</pre>
+<p>These include the offset and clock-jump regressions, shutdown, real profile persistence, rotation, unrelated console captures, retention, startup failure handling, native/GC caller attribution, and capped sample weighting.</p>
+
+<h2>7. Verification</h2>
+<p>The same agent repeated the investigation in a second newly created detached worktree at the recorded base, with a separate frozen dependency install and fresh test-generated temporary directories. Production files remained byte-identical to trusted main; only the investigator-authored regression test was applied. No workflow or additional agent was used.</p>
+<p>The initial three-case test produced <code>2 failed | 1 passed | 5 skipped (8)</code> in both clean checkouts. The final four-case regression, rerun against unchanged production in the second checkout, produced <code>2 failed | 2 passed | 5 skipped (9)</code>. The failures are the stable positive and negative origin shifts; the zero-offset control succeeds. With the worker fix, all four cases and the relevant existing suites pass.</p>
+<p><strong>Correction during validation:</strong> V8 can inline the busy-loop function across repeated parameter cases. The final test retains the original named-frame assertion for the unshifted control and checks the stable plugin-owner attribution boundary for the additional offsets. A sampled, correctly owned stack that has an inlined function is not a clock-alignment failure. No native macOS result is claimed.</p>
+
+<h2>8. Related issues and PRs</h2>
+<p>No open linked pull request was present in the issue's connection/cross-reference metadata, and the open-PR search for issue 7355 was empty before implementation. Related issue <a href="https://github.com/get-bb/bb/issues/4162">#4162</a> concerns performance diagnostics more broadly; its scope is not the reproduced timestamp mismatch. Historical trusted change <a href="https://github.com/get-bb/bb/commit/867cd3c31c">867cd3c31c</a> introduced the sampled-stall attribution path.</p>
+
+<h2>9. Appendix and limits</h2>
+<p>The full package suite completed with 130 passing tests, 16 skipped, and one unrelated failure in the pre-existing native-provider toolchain test. Repeating that test alone on unchanged production in the second checkout reproduces the same failure: <code>Input must be provided either through stdin or as a prompt argument when using --print</code>. No provider credentials were read. The focused diagnostic suites and package lint/typecheck pass.</p>
+<p>The normal monorepo build was attempted in both base checkouts. It encounters unrelated plugin SDK runtime-resolution failures during plugin builds; generating SDK types does not resolve those runtime exports. This report does not claim a successful repository-wide build. The owning package's generated worker, tests, and static checks do run successfully. No unrelated build or provider test was modified.</p>
+<p>Raw logs and the regression patch remain in private thread storage, not this public reports repository. The executed regression is embedded above in accordance with this site's no-artifact-files policy. The issue's embedded commands and suggested patch were treated as untrusted claims; neither was executed or copied. No issue-provided URL was fetched, and no linked PR code was checked out.</p>
+</main></body></html>
