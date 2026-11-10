@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7344 Cancellation cleanup lacks adoption provenance</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main><p class="meta"><a href="../">← reports</a></p>
+<h1>#7344 · Cancellation cleanup lacks adoption provenance</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High priority</span><span class="pill">High effort</span><span class="pill">workspaces</span><span class="pill">confirmed-repro</span><a href="https://github.com/get-bb/bb/issues/7344">GitHub issue</a><span>2026-11-10 · base <code>7c1353d80729983b86ea1555d18b42407f320406</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>A thread can take over a workspace record that already exists and is still provisioning. Cancelling that thread invokes the provider's removal callback for the old workspace and records the workspace as destroyed, even with automatic retirement disabled. The equivalent ready-workspace control is preserved. The server loses the distinction between adoption and fresh allocation when it persists ownership. This is a deterministic service-level reproduction, not evidence of production frequency or actual filesystem data loss: the removal callback is a test double and deletes nothing.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>An unowned provisioning workspace at the returned path can be adopted.</td><td class="ok">Verified</td><td>The real provider preparation path changes the existing row's owner to the new thread and preserves its ID and provisioning status.</td></tr>
+<tr><td>Cancellation can remove the pre-existing workspace.</td><td class="ok">Verified</td><td>Both runs call remove once with the old path and instance key, then persist status=destroyed and teardownStatus=removed.</td></tr>
+<tr><td>The cancellation release guard treats ready and provisioning differently.</td><td class="ok">Verified</td><td>The ready control passes; the provisioning case fails two preservation assertions.</td></tr>
+<tr><td>This initial state occurs frequently in production.</td><td class="unv">Unverified</td><td>The initial database state is seeded. No production runtime data was accessed; frequency and the origin of orphan provisioning records were not established.</td></tr>
+<tr><td>A particular proposed patch safely fixes every lifecycle path.</td><td class="unv">Unverified</td><td>No issue-supplied patch was executed. No production fix was made.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Public repository get-bb/bb, trusted origin/main commit <code>7c1353d80729983b86ea1555d18b42407f320406</code>.</li>
+<li>Linux x86_64; Node v22.19.0; pnpm 9.15.0; workspace Vitest 4.1.12.</li>
+<li>Two separate temporary clones at the same recorded commit, each with its own frozen install and generated modules.</li>
+<li>The existing server test harness uses <code>createMigratedConnection()</code>, real migrated SQLite, fresh temporary data directories, and cleanup. No listening server or ports, real account, real provider process, or user's runtime data is required.</li>
+<li>Provider create/remove are in-process test callbacks registered through the existing provider bridge. The database, adoption transaction, cancellation, lifecycle sweep, and removal dispatch are production implementations.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the public trusted repository and check out the recorded base. Use a fresh checkout, not an issue or pull-request branch.</li>
+<li>Install and build. Building SDK runtime first avoids a clean-build ordering race observed on the first checkout.</li></ol>
+<pre>git clone https://github.com/get-bb/bb.git bb-7344
+cd bb-7344
+git checkout --detach 7c1353d80729983b86ea1555d18b42407f320406
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build</pre>
+<p>Insert this complete test case inside the existing <code>describe("existing-path provider selection", ...)</code> block in <code>apps/server/test/services/environments/provider-orchestration.test.ts</code>. It reuses that trusted file's setup, imports, and real database harness; it needs no new production export or dependency.</p>
+<pre>  it.each([&quot;ready&quot;, &quot;provisioning&quot;] as const)(
+    &quot;preserves a pre-existing %s workspace after adoption is cancelled&quot;,
+    async (status) =&gt;
+      withTestHarness(async (harness) =&gt; {
+        const remove = vi.fn&lt;PluginEnvironmentProviderDeclaration[&quot;remove&quot;]&gt;(
+          async () =&gt; ({ status: &quot;removed&quot; }),
+        );
+        const fixture = setup(harness, {
+          create: async () =&gt; ({
+            status: &quot;created&quot;,
+            path: &quot;/tmp/slopcop-7344-workspace&quot;,
+            ownsPath: true,
+          }),
+          remove,
+          policy: { retireGraceMs: null },
+        });
+        const existing = seedEnvironment(harness.deps, {
+          projectId: fixture.context.project.id,
+          hostId: fixture.host.id,
+          path: &quot;/tmp/slopcop-7344-workspace&quot;,
+          status,
+          providerOwnsPath: true,
+          environmentProviderId: fixture.record.provider.id,
+          environmentProviderPluginId: &quot;test&quot;,
+          environmentProviderInstanceKey: &quot;pre-existing-workspace&quot;,
+        });
+        expect(existing.ownerThreadId).toBeNull();
+        fixture.ask();
+        await fixture.settled();
+        expect(fixture.row()).toMatchObject({
+          id: existing.id,
+          status,
+          ownerThreadId: fixture.thread.id,
+        });
+        await cancelProviderEnvironmentCreation(harness.deps, fixture.thread.id);
+        await sweepProviderEnvironment(harness.deps, existing.id);
+        expect.soft(remove).not.toHaveBeenCalled();
+        expect.soft(getEnvironment(harness.db, existing.id)).toMatchObject({
+          status,
+          ownerThreadId: null,
+          claimPath: null,
+          teardownStatus: null,
+          retireAt: null,
+        });
+      }),
+  );
+</pre>
+<p>Run from the repository root:</p><pre>pnpm exec turbo run test --filter=@bb/server -- test/services/environments/provider-orchestration.test.ts -t &#x27;preserves a pre-existing&#x27;</pre>
+<p><strong>Expected:</strong> both cases pass; no removal callback, original status preserved, owner and cancellation metadata released. <strong>Actual, both clean runs:</strong> ready passes; provisioning invokes removal once and becomes destroyed/removed. Exit code 1 is the intended reproduction result.</p>
+<pre>ready control: PASS
+provisioning preservation: FAIL
+expected &quot;vi.fn()&quot; to not be called at all, but actually been called 1 times
+provider removal arguments: path=&quot;/tmp/slopcop-7344-workspace&quot;, pathKey=&quot;pre-existing-workspace&quot;, environment=null
+expected status=&quot;provisioning&quot;, teardownStatus=null, ownerThreadId=null
+received status=&quot;destroyed&quot;, teardownStatus=&quot;removed&quot;, ownerThreadId=&lt;adopting test thread&gt;
+Tests  1 failed | 1 passed | 76 skipped (78)</pre>
+<p>The callback is a spy returning a successful removal result. Its invocation and the destruction record are verified; no real directory is deleted. This nonvisual bug has no screenshot.</p>
+<details><summary>Exact test-only patch</summary><pre>diff --git a/apps/server/test/services/environments/provider-orchestration.test.ts b/apps/server/test/services/environments/provider-orchestration.test.ts
+index b2e87114cc..4b475204a2 100644
+--- a/apps/server/test/services/environments/provider-orchestration.test.ts
++++ b/apps/server/test/services/environments/provider-orchestration.test.ts
+@@ -2479,6 +2479,53 @@ describe(&quot;existing-path provider selection&quot;, () =&gt; {
+     }),
+   );
+ 
++  it.each([&quot;ready&quot;, &quot;provisioning&quot;] as const)(
++    &quot;preserves a pre-existing %s workspace after adoption is cancelled&quot;,
++    async (status) =&gt;
++      withTestHarness(async (harness) =&gt; {
++        const remove = vi.fn&lt;PluginEnvironmentProviderDeclaration[&quot;remove&quot;]&gt;(
++          async () =&gt; ({ status: &quot;removed&quot; }),
++        );
++        const fixture = setup(harness, {
++          create: async () =&gt; ({
++            status: &quot;created&quot;,
++            path: &quot;/tmp/slopcop-7344-workspace&quot;,
++            ownsPath: true,
++          }),
++          remove,
++          policy: { retireGraceMs: null },
++        });
++        const existing = seedEnvironment(harness.deps, {
++          projectId: fixture.context.project.id,
++          hostId: fixture.host.id,
++          path: &quot;/tmp/slopcop-7344-workspace&quot;,
++          status,
++          providerOwnsPath: true,
++          environmentProviderId: fixture.record.provider.id,
++          environmentProviderPluginId: &quot;test&quot;,
++          environmentProviderInstanceKey: &quot;pre-existing-workspace&quot;,
++        });
++        expect(existing.ownerThreadId).toBeNull();
++        fixture.ask();
++        await fixture.settled();
++        expect(fixture.row()).toMatchObject({
++          id: existing.id,
++          status,
++          ownerThreadId: fixture.thread.id,
++        });
++        await cancelProviderEnvironmentCreation(harness.deps, fixture.thread.id);
++        await sweepProviderEnvironment(harness.deps, existing.id);
++        expect.soft(remove).not.toHaveBeenCalled();
++        expect.soft(getEnvironment(harness.db, existing.id)).toMatchObject({
++          status,
++          ownerThreadId: null,
++          claimPath: null,
++          teardownStatus: null,
++          retireAt: null,
++        });
++      }),
++  );
++
+   it(&quot;does not cancel an adopted checkout with a previous selection&quot;, async () =&gt;
+     withTestHarness(async (harness) =&gt; {
+       const remove = vi.fn&lt;PluginEnvironmentProviderDeclaration[&quot;remove&quot;]&gt;(
+</pre></details>
+<h2>5. Root cause</h2>
+<ol><li><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/db/src/data/environments.ts#L551-L560">bindEnvironmentPath, lines 551–560</a> accepts existing ready or provisioning records, tombstones the reservation, and gives the existing record the new owner while retaining its status.</li>
+<li><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/environments/environment-engine.ts#L452-L506">creation adoption tracking, lines 452–506</a> tracks adoption only in a local variable used while applying the create result. <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/db/src/schema.ts#L526-L575">persisted environment fields, lines 526–575</a> contains ownership and lifecycle fields, but no durable adopted-versus-created provenance.</li>
+<li><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/environments/environment-engine.ts#L638-L665">cancellation, lines 638–665</a> marks the preparation for teardown and immediately sweeps it.</li>
+<li><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/environments/environment-engine.ts#L890-L944">release and cancellation guards, lines 890–944</a> releases an owned cancellation only for shared records or ready records with paths. The unshared provisioning record retains ownership and is classified as cancelled. The no-retirement policy check is explicitly bypassed for cancellations.</li>
+<li><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/environments/environment-engine.ts#L756-L799">provider removal and lifecycle destruction, lines 756–799</a> calls the provider with the old path and instance key, then records successful teardown and destruction.</li></ol>
+<pre>Release guard:
+(shared || (row.status === &quot;ready&quot; &amp;&amp; row.path !== null))
+
+Cancellation classification:
+const cancelled = row.ownerThreadId !== null &amp;&amp; row.teardownStatus !== null;
+
+Automatic-retirement exemption applies only when:
+!cancelled &amp;&amp; record.provider.policy.retireGraceMs === null &amp;&amp; row.status !== &quot;destroyed&quot;</pre>
+<p>The dangerous distinction is ownership of a temporary preparation claim versus ownership of an underlying pre-existing resource. The stored state does not explicitly preserve that distinction for subsequent cleanup or restart recovery.</p>
+<h2>6. Proposed fix and safety gate</h2>
+<p>Persist an explicit lifecycle provenance contract so cancellation can release an adoption claim without deleting a prior resource, while still removing a newly allocated provisioning resource. Define what happens to prior provisioning metadata, retirement policy, restart recovery, attachment, and machine removal. Add paired adoption-versus-fresh-allocation cancellation tests, including a restart boundary. A durable provenance field would require a schema migration and stored-data semantics; rejecting all provisioning adoption instead would change admission policy. Neither is a safe automatic change under this rule.</p>
+<p><strong>No fix branch or pull request:</strong> the simple-fix gate prohibits schema/migration/stored-data changes and product-policy decisions. Extending the release predicate to every provisioning path cannot distinguish adoption from a fresh allocation that must still be cleaned up. No production code was changed or pushed.</p>
+<h2>7. Verification</h2>
+<p>The same agent repeated the reproduction in a second clean temporary trusted checkout at the full recorded SHA. This is a repeated clean verification, not an independent-agent review. The second checkout started with no tracked changes, installed its own dependencies, built the SDK then all 73 build tasks, and applied only the authored test patch. Each case created a fresh migrated database and temporary data directory; no ports were needed. The exact focused command was the command in section 4.</p>
+<p><strong>Second result:</strong> exit 1, ready control passes and provisioning fails for the same removal invocation and destroyed/removed state. No correction to the root-cause finding was needed. The pre-existing provider orchestration suite was also run without the new regression test; its result is recorded in the appendix.</p>
+<h2>8. Linked pull requests and related issues</h2>
+<p>No open pull request was linked by cross-reference metadata or found by the issue-number pull-request search during this investigation. A targeted related-issue search found no verified duplicate; no unrelated issue is claimed as supporting evidence.</p>
+<h2>9. Appendix</h2>
+<p>Classification: Bug / High priority (possible destructive cleanup) / High effort (durable lifecycle data contract) / workspaces. No pre-existing classification values were replaced.</p>
+<p>Trust boundary: issue content included suggested implementation instructions. They were treated only as untrusted claims; no supplied code, script, test, branch, or external link was executed. Only trusted origin/main and this agent's test changes ran.</p>
+<p>Build note: the first full build initially raced plugin builds against the SDK runtime and failed because SDK dist/process.js and dist/host.js were missing. The unmodified build rerun passed all 73 tasks. The second checkout built SDK runtime first, then the full build passed. This unrelated ordering issue was not patched.</p>
+<h3>Baseline existing-suite output</h3><pre>@bb/server:test:  Test Files  1 passed (1)
+@bb/server:test:       Tests  76 passed (76)
+@bb/server:test:    Duration  17.70s (transform 5.19s, setup 1.57s, import 5.05s, tests 9.22s, environment 0ms)
+</pre>
+<h3>First reproduction failure output</h3><pre>@bb/server:test:  FAIL  |@bb/server:isolated| test/services/environments/provider-orchestration.test.ts &gt; existing-path provider selection &gt; preserves a pre-existing provisioning workspace after adoption is cancelled
+@bb/server:test: AssertionError: expected &quot;vi.fn()&quot; to not be called at all, but actually been called 1 times
+@bb/server:test: 
+@bb/server:test: Received:
+@bb/server:test: 
+@bb/server:test:   1st vi.fn() call:
+@bb/server:test: 
+@bb/server:test:     Array [
+@bb/server:test:       Object {
+@bb/server:test:         &quot;attempt&quot;: 1,
+@bb/server:test:         &quot;environment&quot;: null,
+@bb/server:test:         &quot;hostId&quot;: &quot;host_test&quot;,
+@bb/server:test:         &quot;path&quot;: &quot;/tmp/slopcop-7344-workspace&quot;,
+@bb/server:test:         &quot;pathKey&quot;: &quot;pre-existing-workspace&quot;,
+@bb/server:test:         &quot;report&quot;: Object {
+@bb/server:test:           &quot;log&quot;: [Function log],
+@bb/server:test:           &quot;step&quot;: [Function log],
+@bb/server:test:         },
+@bb/server:test:         &quot;resource&quot;: null,
+@bb/server:test:         &quot;signal&quot;: AbortSignal {
+@bb/server:test:           Symbol(kEvents): Map {},
+@bb/server:test:           Symbol(events.maxEventTargetListeners): 0,
+@bb/server:test:           Symbol(events.maxEventTargetListenersWarned): false,
+@bb/server:test:           Symbol(kHandlers): Map {},
+@bb/server:test:           Symbol(kAborted): false,
+@bb/server:test:           Symbol(kReason): undefined,
+@bb/server:test:           Symbol(kComposite): false,
+@bb/server:test:         },
+@bb/server:test:       },
+@bb/server:test:     ]
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test: Number of calls: 1
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/environments/provider-orchestration.test.ts:2518:33
+@bb/server:test:     2516|         await cancelProviderEnvironmentCreation(harness.deps, fixture.…
+@bb/server:test:     2517|         await sweepProviderEnvironment(harness.deps, existing.id);
+@bb/server:test:     2518|         expect.soft(remove).not.toHaveBeenCalled();
+@bb/server:test:        |                                 ^
+@bb/server:test:     2519|         expect.soft(getEnvironment(harness.db, existing.id)).toMatchOb…
+@bb/server:test:     2520|           status,
+@bb/server:test:  ❯ withTestHarness test/helpers/test-app.ts:444:12
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server:isolated| test/services/environments/provider-orchestration.test.ts &gt; existing-path provider selection &gt; preserves a pre-existing provisioning workspace after adoption is cancelled
+@bb/server:test: AssertionError: expected { id: &#x27;env_TEST&#x27;, …(28) } to match object { status: &#x27;provisioning&#x27;, …(4) }
+@bb/server:test: (26 matching properties omitted from actual)
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test:   {
+@bb/server:test:     &quot;claimPath&quot;: null,
+@bb/server:test: -   &quot;ownerThreadId&quot;: null,
+@bb/server:test: +   &quot;ownerThreadId&quot;: &quot;thr_TEST&quot;,
+@bb/server:test:     &quot;retireAt&quot;: null,
+@bb/server:test: -   &quot;status&quot;: &quot;provisioning&quot;,
+@bb/server:test: -   &quot;teardownStatus&quot;: null,
+@bb/server:test: +   &quot;status&quot;: &quot;destroyed&quot;,
+@bb/server:test: +   &quot;teardownStatus&quot;: &quot;removed&quot;,
+@bb/server:test:   }
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/environments/provider-orchestration.test.ts:2519:62
+@bb/server:test:     2517|         await sweepProviderEnvironment(harness.deps, existing.id);
+@bb/server:test:     2518|         expect.soft(remove).not.toHaveBeenCalled();
+@bb/server:test:     2519|         expect.soft(getEnvironment(harness.db, existing.id)).toMatchOb…
+@bb/server:test:        |                                                              ^
+@bb/server:test:     2520|           status,
+@bb/server:test:     2521|           ownerThreadId: null,
+@bb/server:test:  ❯ withTestHarness test/helpers/test-app.ts:444:12
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  1 failed | 1 passed | 76 skipped (78)
+@bb/server:test:    Start at  11:53:13
+@bb/server:test:    Duration  9.82s (transform 5.20s, setup 1.65s, import 5.35s, tests 911ms, environment 0ms)
+@bb/server:test: 
+@bb/server:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/server#test:  ERROR  command (CHECKOUT/apps/server) /usr/local/bin/pnpm run test test/services/environments/provider-orchestration.test.ts -t preserves a pre-existing exited (1)
+
+ Tasks:    9 successful, 10 total
+Cached:    0 cached, 10 total
+  Time:    41.964s 
+Failed:    @bb/server#test
+
+ ERROR  run failed: command  exited (1)
+</pre>
+<h3>Second clean reproduction failure output</h3><pre>@bb/server:test:  FAIL  |@bb/server:isolated| test/services/environments/provider-orchestration.test.ts &gt; existing-path provider selection &gt; preserves a pre-existing provisioning workspace after adoption is cancelled
+@bb/server:test: AssertionError: expected &quot;vi.fn()&quot; to not be called at all, but actually been called 1 times
+@bb/server:test: 
+@bb/server:test: Received:
+@bb/server:test: 
+@bb/server:test:   1st vi.fn() call:
+@bb/server:test: 
+@bb/server:test:     Array [
+@bb/server:test:       Object {
+@bb/server:test:         &quot;attempt&quot;: 1,
+@bb/server:test:         &quot;environment&quot;: null,
+@bb/server:test:         &quot;hostId&quot;: &quot;host_test&quot;,
+@bb/server:test:         &quot;path&quot;: &quot;/tmp/slopcop-7344-workspace&quot;,
+@bb/server:test:         &quot;pathKey&quot;: &quot;pre-existing-workspace&quot;,
+@bb/server:test:         &quot;report&quot;: Object {
+@bb/server:test:           &quot;log&quot;: [Function log],
+@bb/server:test:           &quot;step&quot;: [Function log],
+@bb/server:test:         },
+@bb/server:test:         &quot;resource&quot;: null,
+@bb/server:test:         &quot;signal&quot;: AbortSignal {
+@bb/server:test:           Symbol(kEvents): Map {},
+@bb/server:test:           Symbol(events.maxEventTargetListeners): 0,
+@bb/server:test:           Symbol(events.maxEventTargetListenersWarned): false,
+@bb/server:test:           Symbol(kHandlers): Map {},
+@bb/server:test:           Symbol(kAborted): false,
+@bb/server:test:           Symbol(kReason): undefined,
+@bb/server:test:           Symbol(kComposite): false,
+@bb/server:test:         },
+@bb/server:test:       },
+@bb/server:test:     ]
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test: Number of calls: 1
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/environments/provider-orchestration.test.ts:2518:33
+@bb/server:test:     2516|         await cancelProviderEnvironmentCreation(harness.deps, fixture.…
+@bb/server:test:     2517|         await sweepProviderEnvironment(harness.deps, existing.id);
+@bb/server:test:     2518|         expect.soft(remove).not.toHaveBeenCalled();
+@bb/server:test:        |                                 ^
+@bb/server:test:     2519|         expect.soft(getEnvironment(harness.db, existing.id)).toMatchOb…
+@bb/server:test:     2520|           status,
+@bb/server:test:  ❯ withTestHarness test/helpers/test-app.ts:444:12
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server:isolated| test/services/environments/provider-orchestration.test.ts &gt; existing-path provider selection &gt; preserves a pre-existing provisioning workspace after adoption is cancelled
+@bb/server:test: AssertionError: expected { id: &#x27;env_TEST&#x27;, …(28) } to match object { status: &#x27;provisioning&#x27;, …(4) }
+@bb/server:test: (26 matching properties omitted from actual)
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test:   {
+@bb/server:test:     &quot;claimPath&quot;: null,
+@bb/server:test: -   &quot;ownerThreadId&quot;: null,
+@bb/server:test: +   &quot;ownerThreadId&quot;: &quot;thr_TEST&quot;,
+@bb/server:test:     &quot;retireAt&quot;: null,
+@bb/server:test: -   &quot;status&quot;: &quot;provisioning&quot;,
+@bb/server:test: -   &quot;teardownStatus&quot;: null,
+@bb/server:test: +   &quot;status&quot;: &quot;destroyed&quot;,
+@bb/server:test: +   &quot;teardownStatus&quot;: &quot;removed&quot;,
+@bb/server:test:   }
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/environments/provider-orchestration.test.ts:2519:62
+@bb/server:test:     2517|         await sweepProviderEnvironment(harness.deps, existing.id);
+@bb/server:test:     2518|         expect.soft(remove).not.toHaveBeenCalled();
+@bb/server:test:     2519|         expect.soft(getEnvironment(harness.db, existing.id)).toMatchOb…
+@bb/server:test:        |                                                              ^
+@bb/server:test:     2520|           status,
+@bb/server:test:     2521|           ownerThreadId: null,
+@bb/server:test:  ❯ withTestHarness test/helpers/test-app.ts:444:12
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  1 failed | 1 passed | 76 skipped (78)
+@bb/server:test:    Start at  11:57:58
+@bb/server:test:    Duration  9.44s (transform 5.02s, setup 1.61s, import 5.06s, tests 892ms, environment 0ms)
+@bb/server:test: 
+@bb/server:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/server#test:  ERROR  command (CHECKOUT/apps/server) /usr/local/bin/pnpm run test test/services/environments/provider-orchestration.test.ts -t preserves a pre-existing exited (1)
+
+ Tasks:    9 successful, 10 total
+Cached:    0 cached, 10 total
+  Time:    40.745s 
+Failed:    @bb/server#test
+
+ ERROR  run failed: command  exited (1)
+</pre>
+<p>Raw local evidence and the test patch are retained outside the public reports repository. Public output embeds the complete patch and sanitized excerpts rather than publishing raw logs or private paths. The test's workspace path is a fixed synthetic value; randomized fixture identifiers and checkout locations are replaced in excerpts.</p>
+<p>Repository operations: fetch trusted main; clone it twice; frozen install; Turbo SDK/full builds; the existing focused-suite run; apply the test-only patch; the focused reproduction command in each checkout; inspect trusted source and history; git diff --check. No live production inspection or destructive filesystem action occurred.</p>
+<p>&gt; AGENT GENERATED</p></main></body></html>
