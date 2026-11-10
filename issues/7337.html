@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Report · #7337 Reconnect retries storage deletion after cleanup has completed</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7337 · Reconnect retries storage deletion after cleanup has completed</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High priority</span><span class="pill">Low effort</span><span class="pill">host · threads · perf</span><a href="https://github.com/get-bb/bb/issues/7337">GitHub issue</a><span>2026-11-10 · base <code>7c1353d80729983b86ea1555d18b42407f320406</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> for redundant reconnect commands. The reported macOS process counts and outage duration were not measured here.</p>
+<h2>1. TL;DR</h2>
+<p>Deleting a thread removes its host storage before a budgeted database purge removes the thread row. Reconnecting a host incorrectly treats those retained rows as unfinished storage cleanup, even when the database already records successful removal. A regression test using the real server reconciliation path and migrated SQLite database emits two deletion requests when only one thread still needs cleanup. The same result occurs for all five eligible lifecycle states in two clean trusted checkouts. The daemon-side process-scanning path explains the amplification risk, but this Linux investigation does not establish the reported macOS outage duration.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Reconnect repeats cleanup for storage already marked deleted.</td><td class="ok">Verified by execution</td><td>All five regression cases fail on trusted main: completed and pending rows both generate deletion RPCs.</td></tr>
+<tr><td>Queued purges do not suppress the duplicate command.</td><td class="ok">Verified by execution</td><td>Idle and error cases explicitly retain a purge request; the duplicate still appears.</td></tr>
+<tr><td>Distinct thread deletions can fan out without a shared cap.</td><td>Verified by inspection</td><td>The guard is keyed by thread ID, while each deletion helper is started without awaiting it.</td></tr>
+<tr><td>Each macOS cleanup necessarily scans two to ten times.</td><td>Qualified</td><td>Each lookup starts a fresh lsof on non-Linux Unix. The kill loop makes up to ten lookups, but exits after the first lookup if there are no matching processes. An already absent directory can therefore incur only one scan.</td></tr>
+<tr><td>Hundreds of lsof processes cause 15–20 second stalls and 30 second timeouts.</td><td class="unv">Not measured</td><td>No macOS host or live bulk-deletion incident was used. These timings and process counts remain reporter observations.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Trusted public repository: get-bb/bb. Base: <code>7c1353d80729983b86ea1555d18b42407f320406</code>, fetched from main on 2026-11-10.</li><li>Linux x86_64, kernel 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.12.</li><li>Two separate temporary checkouts, called <code>BASE</code> and <code>VERIFY</code> below; both initially detached at the recorded commit.</li><li>Real migrated SQLite copies via the existing server test harness. Every case receives a fresh temporary data directory. No listener, real provider, production data, runtime credential, or browser is used; no network port is required.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Create a clean checkout of the trusted commit and install/build the server with existing dependencies:
+<pre>git clone https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout --detach 7c1353d80729983b86ea1555d18b42407f320406
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/server</pre></li>
+<li>Save the complete test below as <code>apps/server/test/public/public-thread-reconnect-storage.test.ts</code>.</li>
+<li>Run <code>pnpm exec turbo run test --filter=@bb/server -- test/public/public-thread-reconnect-storage.test.ts</code>.</li>
+<li>Expected: only the still-pending thread generates a storage-delete command. Actual: both the completed thread and pending thread generate commands, failing every case.</li></ol>
+<p>The positive control is important: the test waits for the genuinely pending deletion and acknowledges it, so a silent/disconnected transport cannot make the negative assertion pass. Idle/error cases model purge-queued rows; active/starting/stopping cases also test recovery before a purge request exists. The host transport is captured by the existing test harness; a real daemon is not launched.</p>
+<h3>Complete regression test</h3><pre>import {
+  getThread,
+  markThreadDeleted,
+  markThreadStorageDeleted,
+  requestThreadPurge,
+} from "@bb/db";
+import { expect, it } from "vitest";
+import { reconcileDaemonReportedThreads } from "../../src/services/threads/thread-lifecycle.js";
+import {
+  listQueuedCommands,
+  reportQueuedCommandSuccess,
+  waitForQueuedCommand,
+} from "../helpers/commands.js";
+import {
+  seedEnvironment,
+  seedHostSession,
+  seedProjectWithSource,
+  seedThread,
+} from "../helpers/seed.js";
+import { withTestHarness } from "../helpers/test-app.js";
+
+it.each(["idle", "error", "active", "starting", "stopping"] as const)(
+  "does not repeat completed storage deletion on reconnect for %s threads",
+  async (status) =&gt; {
+    await withTestHarness(async (harness) =&gt; {
+      const { host } = seedHostSession(harness.deps);
+      const { project } = seedProjectWithSource(harness.deps, {
+        hostId: host.id,
+      });
+      const environment = seedEnvironment(harness.deps, {
+        hostId: host.id,
+        projectId: project.id,
+      });
+      const completed = seedThread(harness.deps, {
+        projectId: project.id,
+        environmentId: environment.id,
+        status,
+      });
+      const pending = seedThread(harness.deps, {
+        projectId: project.id,
+        environmentId: environment.id,
+        status: "idle",
+      });
+      for (const thread of [completed, pending]) {
+        markThreadDeleted(harness.db, harness.deps.hub, {
+          threadId: thread.id,
+        });
+      }
+      markThreadStorageDeleted(harness.db, { threadId: completed.id });
+      if (status === "idle" || status === "error") {
+        requestThreadPurge(harness.db, {
+          now: Date.now(),
+          threadId: completed.id,
+        });
+      }
+
+      await reconcileDaemonReportedThreads(harness.deps, {
+        hostId: host.id,
+        activeThreadIds: [],
+        undeliveredEventThreadIds: [],
+        sameDaemonInstance: false,
+      });
+      const retry = await waitForQueuedCommand(
+        harness,
+        ({ command }) =&gt;
+          command.type === "thread.storage.delete" &amp;&amp;
+          command.threadId === pending.id,
+      );
+      const commands = listQueuedCommands(harness, "thread.storage.delete");
+      await reportQueuedCommandSuccess(harness, retry, {
+        providerCheckpointId: null,
+      });
+      expect(commands).toEqual([
+        expect.objectContaining({ threadId: pending.id }),
+      ]);
+      expect(getThread(harness.db, completed.id)?.storageDeletedAt).not.toBeNull();
+    });
+  },
+);
+</pre>
+<h3>First run — verbatim assertion and summary lines</h3><pre>@bb/server:test: AssertionError: expected [ { …(3) }, { …(3) } ] to deeply equal [ ObjectContaining{…} ]
+@bb/server:test: AssertionError: expected [ { …(3) }, { …(3) } ] to deeply equal [ ObjectContaining{…} ]
+@bb/server:test: AssertionError: expected [ { …(3) }, { …(3) } ] to deeply equal [ ObjectContaining{…} ]
+@bb/server:test: AssertionError: expected [ { …(3) }, { …(3) } ] to deeply equal [ ObjectContaining{…} ]
+@bb/server:test: AssertionError: expected [ { …(3) }, { …(3) } ] to deeply equal [ ObjectContaining{…} ]
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  5 failed (5)
+@bb/server:test:    Duration  7.88s (transform 4.14s, setup 1.20s, import 4.23s, tests 931ms, environment 0ms)</pre>
+<p>Exit status: 1. The failing array assertion contains one extra <code>thread.storage.delete</code> for the completed-storage thread in every case.</p>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/internal/session-owner-side-effects.ts#L148-L153">Host session attachment invokes reconciliation</a> with the reported active thread IDs. <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/threads/thread-lifecycle.ts#L2362-L2404">Reconciliation selects retained deleted rows</a> across active, idle, error, starting and stopping states, but neither selects nor checks their storage-deletion timestamp. It then requests host cleanup for every deleted row.</p>
+<pre>for (const thread of pendingThreads) {
+  if (thread.deletedAt !== null) {
+    requestThreadStorageDeletion(deps, thread, {
+      hostId: args.hostId,
+      id: thread.environmentId,
+    });
+    continue;
+  }
+}</pre>
+<p><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/threads/thread-lifecycle.ts#L1236-L1244">The in-flight guard deduplicates only the same thread</a>; it does not cap concurrent cleanup across distinct threads. <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/system/periodic-sweeps.ts#L439-L482">The periodic finalization sweep already checks storageDeletedAt</a> and finalizes completed cleanup instead of asking the host to repeat it. Purge-queued rows are excluded from that sweep but remain eligible for reconnect reconciliation.</p>
+<p><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/host-daemon/src/command-handlers/thread.ts#L62-L73">The daemon deletion handler scans process working directories before removing storage</a>. <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/process-utils/src/cwd-processes.ts#L45-L66">The Unix lsof scanner spawns a machine-wide lookup</a>, and <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/process-utils/src/cwd-processes.ts#L96-L118">Every list call chooses a fresh platform lookup before filtering directories</a>. <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/process-utils/src/cwd-processes.ts#L148-L181">The kill loop can repeat the lookup up to five rounds</a>. This makes redundant reconnect commands unnecessary host work, even if storage is already absent. No shared scan promise exists in this code.</p>
+<h2>6. Proposed fix</h2>
+<p>Select <code>storageDeletedAt</code> in reconnect reconciliation. For a deleted thread with completed cleanup, call the existing stopped-thread finalizer and continue; otherwise preserve the existing storage-delete retry. This removes the verified root cause while recovering finalization without a new protocol, stored-data format, or daemon policy. Keep the regression as a server lifecycle test.</p>
+<p>Cross-thread RPC throttling and shared platform scans would be separate hardening work. They are not required for the small reconnect fix, and this report does not claim to verify or ship them.</p>
+<h2>7. Verification</h2>
+<p>The same agent repeated the reproduction, not an independent reviewer. A second new checkout <code>VERIFY</code> was detached at the full base commit, received only the same new test, and used a separate dependency installation, build outputs, temporary migrated database files, and per-case temporary data directories. No port reuse occurs because these tests do not bind listeners.</p>
+<pre>cd VERIFY
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/server
+pnpm exec turbo run test --filter=@bb/server -- test/public/public-thread-reconnect-storage.test.ts</pre>
+<h3>Second run — verbatim assertion and summary lines</h3><pre>@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  5 failed (5)
+@bb/server:test:    Duration  15.33s (transform 11.67s, setup 5.20s, import 7.83s, tests 830ms, environment 0ms)
+@bb/server:test: AssertionError: expected [ { …(3) }, { …(3) } ] to deeply equal [ ObjectContaining{…} ]
+@bb/server:test: AssertionError: expected [ { …(3) }, { …(3) } ] to deeply equal [ ObjectContaining{…} ]
+@bb/server:test: AssertionError: expected [ { …(3) }, { …(3) } ] to deeply equal [ ObjectContaining{…} ]
+@bb/server:test: AssertionError: expected [ { …(3) }, { …(3) } ] to deeply equal [ ObjectContaining{…} ]
+@bb/server:test: AssertionError: expected [ { …(3) }, { …(3) } ] to deeply equal [ ObjectContaining{…} ]</pre>
+<p>Exit status: 1; the same five redundant-command failures recur. No correction to the server-side finding was necessary. The report qualifies the minimum lsof count: an empty match set takes one scan, not necessarily two.</p>
+<h3>Minimal fix verification</h3>
+<p>A local branch from the same freshly fetched trusted main adds five production lines: select the existing storage-deletion timestamp and finalize already-cleaned deleted rows before the RPC branch. Five new regression cases and 25 existing lifecycle/sweep tests pass (30 total across five files). The server typecheck passes. Formatting and whitespace checks pass. The patch contains 82 added text lines across two existing-server-subsystem files, with no deletions, binary files, dependency changes, generated files, migrations, protocol changes, or public API changes.</p>
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/public/public-thread-reconnect-storage.test.ts test/public/public-thread-lifecycle-ownership.test.ts test/public/public-thread-lifecycle-admission.test.ts test/services/periodic-sweeps.test.ts test/system/periodic-sweep-jobs.test.ts
+Test Files  5 passed (5)
+Tests  30 passed (30)
+
+pnpm exec turbo run typecheck --filter=@bb/server
+Tasks: 6 successful, 6 total
+
+pnpm exec oxfmt --check apps/server/src/services/threads/thread-lifecycle.ts apps/server/test/public/public-thread-reconnect-storage.test.ts
+All matched files use the correct format.
+
+git diff --check origin/main
+git diff --numstat origin/main
+5       0       apps/server/src/services/threads/thread-lifecycle.ts
+77      0       apps/server/test/public/public-thread-reconnect-storage.test.ts</pre>
+<p>The final checked-in regression omits the reproduction's redundant unchanged-timestamp assertion; its command-count assertion and all five lifecycle cases are unchanged. The fix intentionally does not add a cross-thread concurrency limit or change platform process enumeration.</p>
+<h2>8. Related issues and pull requests</h2>
+<p>Issue <a href="https://github.com/get-bb/bb/issues/6499">#6499</a> concerns daemon drops during server event-loop stalls; it is background context, not evidence of this defect. The target issue had no linked open pull request at investigation time; a separate open-PR search for the numeric issue also returned none. No pull-request code was executed.</p>
+<h2>9. Appendix</h2>
+<p>Both frozen installs and server builds succeeded before reproduction. Existing Vite native-config and SQLite experimental warnings were non-fatal. Full raw logs and the test source are retained locally outside this public reports repository; relevant verbatim lines and the complete repeatable test are inline above, as required by this site's artifact policy. No screenshots are needed for this nonvisual lifecycle bug.</p>
+<p>Issue text was treated solely as untrusted claims. Its proposed implementation was not executed; the test and minimal fix were derived from the trusted repository path. No real bulk deletion or production session was used.</p>
+<p>Read-only GitHub metadata established Type, Priority, Effort, labels and cross-references. Trusted source commands additionally included <code>git fetch origin main</code>, <code>git rev-parse origin/main</code>, <code>git log</code>, and source searches. All GitHub metadata writes use the designated SlopCop entrypoint.</p>
+</main></body></html>
