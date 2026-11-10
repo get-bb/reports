@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7350 Native transport failures leave requests pending</title>
+<style>
+:root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --ok:#0e8a16; }
+body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+.meta { color:var(--muted); font-size:14px; }
+.pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+.verdict { color:var(--ok); font-weight:600; }
+table { border-collapse:collapse; width:100%; font-size:14px; }
+td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<h1>#7350 · Native transport failures leave requests pending</h1>
+<p><span class="pill">Bug</span> <span class="pill">Priority: Medium</span> <span class="pill">Effort: Low</span> <span class="pill">mobile</span> <span class="pill">confirmed-repro</span></p>
+<p class="meta">2026-11-10 · <a href="https://github.com/get-bb/bb/issues/7350">Issue #7350</a> · trusted origin/main: <code>7c1353d80729983b86ea1555d18b42407f320406</code></p>
+<p class="verdict">REPRODUCED · Root-cause confidence: high</p>
+
+<h2>1. TL;DR</h2>
+<p>A page asking the native shell to share or copy content does not promptly learn that its message could not be sent. The generated bridge catches a synchronous transport exception, but leaves the request promise and deadline intact. A deterministic execution of the actual injected script keeps share pending for its configured 10-second deadline and clipboard pending for 30 seconds, before rejecting with a misleading timeout. Both the observed behavior and the failing regression test were repeated by the same agent in a second clean checkout. Actual device navigation was not exercised; this confirms the reported failure path, not its frequency on hardware.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>A synchronous native send failure is hidden from request callers.</td><td>Verified</td><td>The real injected script catches the thrown transport error; the promise remains pending after a microtask checkpoint.</td></tr>
+<tr><td>Normal requests wait 10 seconds; image clipboard requests wait 30 seconds.</td><td>Verified</td><td>Observed scheduled delays are 10000 and 30000 milliseconds. Executing those deadline callbacks rejects both with <code>native request timed out</code>.</td></tr>
+<tr><td>Navigation can trigger this transport failure.</td><td>Unverified</td><td>The test deliberately makes the WebView transport throw. No real WebView navigation or mobile hardware was tested.</td></tr>
+<tr><td>The submitter ran a regression locally.</td><td>Unverified</td><td>No submitter artifact was executed. New tests were designed from trusted repository code.</td></tr>
+</table>
+
+<h2>3. Environment</h2>
+<ul><li>Public repository <code>get-bb/bb</code>, full base SHA above; Linux x86_64, Node v22.19.0, pnpm 9.15.0, Vitest 4.1.12.</li>
+<li>Two separate source worktrees at the same fetched origin/main commit. Only a locally authored test was applied to the verification checkout; production sources stayed unchanged.</li>
+<li>Frozen workspace install: <code>pnpm install --frozen-lockfile --prefer-offline</code>. Package build: <code>pnpm exec turbo run build --filter=@bb/mobile-bridge</code> (this source-only package has no build task).</li>
+<li>No running BB instance, providers, ports, databases, credentials, or mobile hardware were used. Tests execute the generated script against a throwing WebView boundary and controlled timers.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol>
+<li>Clone the public target repository, check out <code>7c1353d80729983b86ea1555d18b42407f320406</code>, and run the frozen install above.</li>
+<li>Save the complete observer below as <code>observe.mjs</code> in the checkout root and execute <code>node --import tsx observe.mjs</code>. This exercises the generated injection script, not a reimplementation of its request logic.</li>
+<li>Expected: after a rejected send, the request is already rejected and no deadline remains. Actual, verbatim on both runs:</li>
+</ol>
+<pre>{"kind":"share","immediate":"pending","timers":1,"delayMs":10000}
+{"kind":"share","afterDeadline":"rejected","error":"native request timed out"}
+{"kind":"clipboard","immediate":"pending","timers":1,"delayMs":30000}
+{"kind":"clipboard","afterDeadline":"rejected","error":"native request timed out"}</pre>
+<p>The observer asserts the defective baseline behavior and exits 0 when it is present. It advances controlled deadline callbacks rather than sleeping for 40 seconds. The regression below instead asserts the corrected behavior and intentionally exits 1 before the fix.</p>
+<p>Save this regression patch as <code>regression.patch</code>, apply it to the base checkout with <code>git apply regression.patch</code>, then run the focused command below:</p>
+<details><summary>Complete regression patch</summary><pre>diff --git a/packages/mobile-bridge/test/inject.test.ts b/packages/mobile-bridge/test/inject.test.ts
+index 1a95071c25..6f453af395 100644
+--- a/packages/mobile-bridge/test/inject.test.ts
++++ b/packages/mobile-bridge/test/inject.test.ts
+@@ -149,6 +149,30 @@ describe("buildBridgeInjectionScript", () =&gt; {
+     await expect(promise).rejects.toThrow("share sheet unavailable");
+   });
+&#32;
++  it.each(["share", "clipboard"])(
++    "rejects a %s request immediately when the native transport throws",
++    async (kind) =&gt; {
++      vi.useFakeTimers();
++      try {
++        const { native, fakeWindow } = installBridge();
++        fakeWindow.ReactNativeWebView.postMessage = () =&gt; {
++          throw new Error("transport disconnected");
++        };
++        const rejected = vi.fn();
++        const promise = native.request(kind, { text: "hello" });
++        void promise.catch(rejected);
++        await Promise.resolve();
++        expect(rejected).toHaveBeenCalledWith(expect.any(Error));
++        await expect(promise).rejects.toThrow("native message could not be sent");
++        expect(vi.getTimerCount()).toBe(0);
++        expect(() =&gt; native.post({ type: "haptic", kind: "selection" })).not.toThrow();
++      } finally {
++        vi.clearAllTimers();
++        vi.useRealTimers();
++      }
++    },
++  );
++
+   it("times out a request the shell never answers", async () =&gt; {
+     vi.useFakeTimers();
+     try {
+</pre></details>
+<pre>pnpm exec turbo run test --filter=@bb/mobile-bridge -- --testNamePattern='native transport throws'</pre>
+<p>Actual pre-fix regression result, repeated in the clean second checkout:</p>
+<pre>AssertionError: expected "vi.fn()" to be called with arguments: [ Any&lt;Error&gt; ]
+Number of calls: 0
+Tests  2 failed | 40 skipped (42)
+exit status: 1</pre>
+<details><summary>Complete standalone observer</summary><pre>import assert from "node:assert/strict";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import { runInNewContext } from "node:vm";
+
+const sourceRoot = process.argv[2] ?? process.cwd();
+const { buildBridgeInjectionScript } = await import(
+  pathToFileURL(resolve(sourceRoot, "packages/mobile-bridge/src/inject.ts")).href
+);
+const handshake = {
+  bridgeVersion: 2,
+  appVersion: "0.39.0",
+  platform: "ios",
+  profileMode: "connect",
+  secureContext: true,
+  safeArea: { top: 59, right: 0, bottom: 34, left: 0 },
+  capabilities: ["share"],
+};
+
+for (const [kind, expectedDelay] of [["share", 10000], ["clipboard", 30000]]) {
+  const timers = new Map();
+  let nextTimer = 0;
+  const window = {
+    ReactNativeWebView: {
+      postMessage() {
+        throw new Error("transport disconnected");
+      },
+    },
+  };
+  runInNewContext(buildBridgeInjectionScript(handshake), {
+    window,
+    setTimeout(callback, delay) {
+      const timer = ++nextTimer;
+      timers.set(timer, { callback, delay });
+      return timer;
+    },
+    clearTimeout(timer) {
+      timers.delete(timer);
+    },
+  });
+  let settlement = "pending";
+  let errorMessage = null;
+  const observed = window.bb.native.request(kind, { text: "hello" }).then(
+    () =&gt; { settlement = "resolved"; },
+    (error) =&gt; {
+      settlement = "rejected";
+      errorMessage = error.message;
+    },
+  );
+  await Promise.resolve();
+  const scheduled = [...timers.values()];
+  console.log(JSON.stringify({ kind, immediate: settlement, timers: timers.size, delayMs: scheduled[0]?.delay ?? null }));
+  assert.equal(settlement, "pending");
+  assert.equal(scheduled.length, 1);
+  assert.equal(scheduled[0].delay, expectedDelay);
+  for (const [timer, entry] of timers) {
+    timers.delete(timer);
+    entry.callback();
+  }
+  await observed;
+  console.log(JSON.stringify({ kind, afterDeadline: settlement, error: errorMessage }));
+  assert.equal(settlement, "rejected");
+  assert.equal(errorMessage, "native request timed out");
+}</pre></details>
+
+<h2>5. Root cause</h2>
+<p>The fire-and-forget sender is also used by request/reply calls. In <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/mobile-bridge/src/inject.ts#L63-L70">inject.ts:63–70</a>, the sender catches every exception, so request callers cannot distinguish delivery failure from successful delivery. The request path <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/mobile-bridge/src/inject.ts#L143-L153">inject.ts:143–153</a> first creates a timeout and stores its resolve/reject pair, then invokes that swallowing sender. Since no response can follow a failed send, only the timeout eventually settles the promise.</p>
+<pre>var timer = setTimeout(function () {
+  delete pending[id];
+  reject(new Error("native request timed out"));
+}, kind === "clipboard" ? 30000 : 10000);
+pending[id] = { resolve: resolve, reject: reject, timer: timer };
+post({ type: "request", id: id, request: { kind: kind, payload: payload } });</pre>
+<p>The API's public <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/mobile-bridge/src/inject.ts#L4-L11">post signature returns void</a>. Fire-and-forget calls should stay non-throwing; request/reply calls need explicit failure cleanup without changing that signature or the wire format.</p>
+
+<h2>6. Proposed fix and local validation</h2>
+<p>Share a private throwing serializer/transport helper between the existing non-throwing post wrapper and request. Catch send errors in request itself, remove its pending record, cancel its deadline, and reject immediately. This keeps best-effort haptics harmless and preserves existing normal reply and timeout behavior.</p>
+<p>A local implementation changes two existing mobile-bridge files: 41 added lines and 6 deleted lines, 47 total. No dependency, generated output, protocol, schema, or stored data changes. The focused regression passes both cases after the repair. Existing successful replies, explicit native errors, fire-and-forget behavior, and 10/30-second unanswered-request cases are covered by the passing package suite.</p>
+<pre>pnpm exec turbo run test typecheck lint:type-aware --filter=@bb/mobile-bridge
+Test Files  3 passed (3)
+Tests  42 passed (42)
+Found 0 warnings and 0 errors.
+Tasks: 4 successful, 4 total
+git diff --check: clean</pre>
+
+<h2>7. Verification</h2>
+<p>The same agent repeated both checks in a second clean temporary checkout at the recorded base commit. That checkout received only the locally authored regression patch and a fresh frozen install. No dev service was started, so new ports and data directories were not required.</p>
+<pre>git worktree add --detach ../verification 7c1353d80729983b86ea1555d18b42407f320406
+cd ../verification
+pnpm install --frozen-lockfile --prefer-offline
+git apply regression.patch
+pnpm exec turbo run build --filter=@bb/mobile-bridge
+pnpm exec turbo run test --force --filter=@bb/mobile-bridge -- --testNamePattern='native transport throws'
+node --import tsx observe.mjs</pre>
+<p>The forced second regression run executes rather than replaying a cached result: two expected failures at the immediate-rejection assertion, exit 1. The second observer run exits 0 with identical pending/deadline output. Production code remained unchanged. Code permalinks were checked against that full base commit; no report correction was needed. This is repeat verification by one agent, not independent verification.</p>
+
+<h2>8. Related issues and pull requests</h2>
+<p>No linked open pull request was present in the issue cross-reference timeline, and an open-PR search for issue 7350 returned none before implementation. Related mobile-area issues were checked for classification conventions; none was used as evidence for this transport defect. No external issue-supplied link, patch, script, or branch was executed.</p>
+
+<h2>9. Appendix</h2>
+<p>The complete observer, regression patch, exact observed deadline output, and failing/passing test summaries are inline above. Raw logs remain in local evidence storage and are not published, in accordance with the reports repository's publication rules.</p>
+<pre>Focused post-fix result:
+Test Files  1 passed | 2 skipped (3)
+Tests  2 passed | 40 skipped (42)
+
+Commands also used:
+git fetch origin main
+git rev-parse origin/main
+git diff --check
+git diff --numstat origin/main
+pnpm exec oxfmt packages/mobile-bridge/test/inject.test.ts packages/mobile-bridge/src/inject.ts</pre>
+<p>Trust note: the issue included a proposed patch and asserted local testing. Both were treated solely as untrusted claims. The reproduction and implementation were authored from trusted target origin/main sources. Classification: Bug / Medium / Low / mobile; reproduction label: confirmed-repro.</p>
+</main></body></html>
