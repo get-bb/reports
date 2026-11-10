@@ -1,0 +1,145 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>#7348 · Session renewal failures are mistaken for browser failures</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p><h1>#7348 · Session renewal failures are mistaken for browser failures</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill high">High</span> <span class="pill">Effort: Low</span> <span class="pill">plugins</span> <a href="https://github.com/get-bb/bb/issues/7348">GitHub issue</a> · November 10, 2026 · base <code>7c1353d80729983b86ea1555d18b42407f320406</code></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · Reproduction label: <code>confirmed-repro</code></p>
+<h2>1. TL;DR</h2>
+<p>Browser Automation updates a session's expiry before and after executing a browser operation. A storage failure during the first update is treated as a browser failure: the server stops the session and, when cleanup persistence succeeds, sends a host close request. A failure only during the final update instead discards the successful execution result. Three fault-injection cases reproduce these outcomes on the trusted main commit, and the same agent repeated them in a second clean checkout. Catching renewal persistence failures locally preserves operation results and session usability without weakening startup or explicit cleanup failures.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>A renewal save failure can stop a healthy session.</td><td class="ok">Verified</td><td>The before-execution case rejects and makes one host close call despite a host that would succeed.</td></tr>
+<tr><td>The final renewal can replace the real execution result.</td><td class="ok">Verified</td><td>The after-execution case returns a persistence error instead of the host's successful result; no close is sent.</td></tr>
+<tr><td>A full disk closes the browser immediately.</td><td class="unv">Qualified</td><td>No disk was filled. With persistent injected write failures, cleanup also fails before the host close call, so the browser may remain running while the server has marked the session stopped. The one-shot failure does close it.</td></tr>
+<tr><td>Renewal has no active-record identity guard.</td><td class="unv">Source-only finding</td><td>The helper lacks such a guard. No separate inactive-record race was reproduced; the contained fix addresses the demonstrated persistence failure, not speculative lifecycle changes.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Public repository <code>get-bb/bb</code>; main at <code>7c1353d80729983b86ea1555d18b42407f320406</code>; Linux x86_64, Node v22.19.0, pnpm 9.15.0, Vitest 4.1.12.</li>
+<li>The real server plugin entry and RPC handlers are loaded through the repository's SDK testing harness. Only the host RPC and KV write boundary are controlled; no database is mocked.</li>
+<li>No browser, provider, production instance, user data directory, or network port was used. Each fixture has fresh plugin-local memory and lifecycle disposal.</li>
+<li>Frozen installs were performed in both checkouts. The primary whole-repository build initially hit missing SDK runtime outputs in the unrelated GitHub plugin; the targeted Turbo test task built the SDK and proceeded. Full plugin test, lint, and typecheck checks pass after the fix.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the trusted repository and detach at the recorded base; install the frozen dependency graph:
+<pre>git clone https://github.com/get-bb/bb.git bb-7348
+cd bb-7348
+git checkout --detach 7c1353d80729983b86ea1555d18b42407f320406
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build</pre>
+If the initial build lacks SDK runtime outputs, build them with <code>pnpm exec turbo run build --filter=@get-bb/plugin-sdk</code> before retrying the relevant task.</li>
+<li>Save the <a href="#regression">inline regression patch below</a> as <code>regression.patch</code> and apply it to the trusted base:
+<pre>git apply /path/to/regression.patch
+pnpm exec turbo run test --filter=bb-plugin-browser-automation -- server.test.ts -t 'renewal persistence'</pre></li>
+<li>The table-driven test opens a session successfully, then rejects one renewal write before execution, one after execution, or all writes. It asserts that the successful host result is preserved, no close is sent, and a subsequent operation remains usable.</li></ol>
+<p><strong>Expected:</strong> all three cases pass, returning <code>{ text: "done", images: [], exitCode: 0 }</code> with zero host close calls.</p>
+<p><strong>Actual on the unchanged production code:</strong> all three fail. The before case sends one close; the after and persistent cases send none but still reject. Verbatim excerpts:</p>
+<pre>FAIL  |bb-plugin-browser-automation| server.test.ts &gt; server session cleanup &gt; keeps a session usable when renewal persistence fails before execution
+-   "closes": 0,
++   "closes": 1,
++     "error": "experimental_PluginRpcCallError: renewal write unavailable",
+
+Test Files  1 failed (1)
+Tests  3 failed | 36 skipped (39)</pre>
+<p>Complete owner-boundary regression patch, including its test code:</p><pre id="regression">diff --git a/plugins/browser-automation/server.test.ts b/plugins/browser-automation/server.test.ts
+index 177eb1774e..55beba2dc1 100644
+--- a/plugins/browser-automation/server.test.ts
++++ b/plugins/browser-automation/server.test.ts
+@@ -553,6 +553,44 @@ describe(&quot;server session cleanup&quot;, () =&gt; {
+   const hostCalls = (h: Awaited&lt;ReturnType&lt;typeof setup&gt;&gt;, method: string) =&gt;
+     h.worker.mock.calls.filter(([call]) =&gt; call.method === method);
+ 
++  it.each([&quot;before&quot;, &quot;after&quot;, &quot;both&quot;] as const)(
++    &quot;keeps a session usable when renewal persistence fails %s execution&quot;,
++    async (failureAt) =&gt; {
++      const h = await setup();
++      const persist = vi.spyOn(h.bb.storage.kv, &quot;set&quot;);
++      try {
++        const session = await openLocal(h);
++        const storageError = new Error(&quot;renewal write unavailable&quot;);
++        if (failureAt === &quot;before&quot;) persist.mockRejectedValueOnce(storageError);
++        if (failureAt === &quot;both&quot;) persist.mockRejectedValue(storageError);
++        if (failureAt === &quot;after&quot;)
++          h.worker.mockImplementationOnce(async () =&gt; {
++            persist.mockRejectedValueOnce(storageError);
++            return { text: &quot;done&quot;, images: [], exitCode: 0 };
++          });
++        const input = { ...ownedBy(session.id), script: &quot;1&quot; };
++        const outcome = await h.harness.behavior.callRpc(&quot;run&quot;, input).then(
++          (result) =&gt; ({ result }),
++          (error: unknown) =&gt; ({ error: String(error) }),
++        );
++        expect({ outcome, closes: hostCalls(h, &quot;close&quot;).length }).toEqual({
++          outcome: { result: { text: &quot;done&quot;, images: [], exitCode: 0 } },
++          closes: 0,
++        });
++        persist.mockRestore();
++        await expect(h.harness.behavior.callRpc(&quot;run&quot;, input)).resolves.toEqual({
++          text: &quot;done&quot;,
++          images: [],
++          exitCode: 0,
++        });
++        expect((await listed(h, session.id))?.state).toBe(&quot;ready&quot;);
++      } finally {
++        persist.mockRestore();
++        await h.harness.lifecycle.dispose();
++      }
++    },
++  );
++
+   it(&quot;renews real operations beyond 30 minutes and closes after 30 minutes idle&quot;, async () =&gt; {
+     vi.useFakeTimers();
+     const h = await setup();
+</pre>
+<h2>5. Root cause</h2>
+<p>Renewal persistence rejects inside the browser execution error boundary, triggering session cleanup; a second renewal in finally can replace a successful result. The <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/plugins/browser-automation/server.ts#L383-L390">renewal helper</a> updates in-memory timestamps, then directly awaits the save. The <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/plugins/browser-automation/server.ts#L403-L425">execution try/catch/finally</a> puts the first renewal inside the same error boundary as the host operation and the second renewal in an unguarded finally block.</p>
+<pre>try {
+  await touch(record);
+  const result = await host.call(...);
+  return result;
+} catch (error) {
+  await finish(record, "stopped").catch(() =&gt; {});
+  throw error;
+} finally {
+  ...
+  if (current?.session.state === "ready") await touch(current);
+}</pre>
+<p><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/plugins/browser-automation/server.ts#L152-L178">Cleanup</a> marks the record stopped and saves before asking the host to close. Consequently, one-shot renewal failure can close the healthy browser, while a persistent outage can stop the server's session without reaching the host. These are different failure shapes, not evidence that the browser itself failed. Startup and explicit close writes remain intentionally outside the best-effort renewal behavior.</p>
+<h2>6. Proposed fix</h2>
+<p>Keep updating the in-memory activity deadline, but catch and warn on persistence failure within renewal itself. Let genuine host execution and cleanup errors follow their existing paths. This is a server-internal change: no public contract, wire field, database schema, dependency, permission boundary, or persisted record format changes. A failed renewal may leave an older persisted expiry until the next successful save; the live record remains authoritative during the current process.</p>
+<p>The implemented patch changes two files and 48 text lines total (47 additions, one deletion). Three focused cases pass after the repair; the plugin's complete existing suite and regressions pass: eight files, 105 tests. Turbo lint and typecheck also pass.</p>
+<h2>7. Verification</h2>
+<p>The same agent created a second fresh detached worktree at <code>7c1353d80729983b86ea1555d18b42407f320406</code> in a new temporary directory, performed a separate frozen install and build, and applied only the authored test patch. Production <code>server.ts</code> remained byte-identical to the trusted base. The same Turbo reproduction command again failed all three cases for the same assertion reasons. This is a repeated clean-checkout check by the same agent, not an independent reviewer.</p>
+<p>No ports or durable data were needed. The report qualifies the full-disk claim and leaves the inactive-record race unverified rather than claiming a browser integration reproduction. Verbatim second-run summary:</p>
+<pre>Test Files  1 failed (1)
+Tests  3 failed | 36 skipped (39)</pre>
+<h2>8. Related issues and pull requests</h2>
+<p>No open pull request linked to #7348 was found in the issue timeline or an open-PR search before the fix. Nearby browser-plugin reports were checked for classification conventions; none was evidence for this persistence failure.</p>
+<h2>9. Appendix</h2>
+<p>Raw logs remain in local evidence storage, not in this public repository. The inline patch above and these exact result summaries provide the repeatable public evidence.</p>
+<pre>Focused post-fix run:
+Test Files  1 passed (1)
+Tests  3 passed | 36 skipped (39)
+
+Full plugin validation:
+Test Files  8 passed (8)
+Tests  105 passed (105)
+Tasks:    10 successful, 10 total</pre>
+<pre>pnpm exec oxfmt plugins/browser-automation/server.ts plugins/browser-automation/server.test.ts
+pnpm exec turbo run test --filter=bb-plugin-browser-automation -- server.test.ts -t 'renewal persistence'
+pnpm exec turbo run test lint typecheck --filter=bb-plugin-browser-automation
+git diff --check
+git diff --numstat origin/main</pre>
+<p>Issue content was treated as untrusted claims. No issue-provided code, patch, script, linked branch, or external link was executed. The regression was authored from the trusted server implementation and its existing SDK test harness. Log checkout paths are redacted; no credentials or runtime data are included.</p>
+</main></body></html>
