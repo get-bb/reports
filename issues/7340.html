@@ -29,14 +29,14 @@
 <p class="meta">2026-11-10 · trusted base <code>7c1353d80729983b86ea1555d18b42407f320406</code></p>
 <p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
 <h2>1. TL;DR</h2>
-<p>The hourly retention job finds groups of old threads to archive or delete. Before processing each group it reads the complete thread catalog again, including unrelated threads. With 7,600 synthetic threads and 50 eligible roots for each action, one sweep issued 1,616 unfiltered thread-list requests and received 766,375 rows. A second clean checkout produced the same counts. The minimal snapshot-and-targeted-reread optimization reduced the load but failed two safety tests by dispatching actions after a newly attached hidden lifecycle dependent should have blocked them; that local prototype was reverted, not pushed.</p>
+<p>The hourly retention job finds groups of old threads to archive or delete. Before processing each group it reads the complete thread catalog again, including unrelated threads. With 7,600 synthetic threads and 50 eligible roots for each action, one sweep issued 1,616 unfiltered thread-list requests and received 766,375 rows. A second clean checkout produced the same counts. The minimal snapshot-and-targeted-reread optimization reduced the load but failed the archive safety test by dispatching an archive request after a newly attached hidden lifecycle dependent should have blocked it; that local prototype was reverted, not pushed.</p>
 <h2>2. Claims vs findings</h2>
 <table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
 <tr><td>Eligibility checks repeat full pagination before each selected group.</td><td>Verified</td><td>101 complete catalog scans: one initial scan plus 100 revalidation scans.</td></tr>
 <tr><td>A sweep can consider 50 archive and 50 delete groups.</td><td>Verified</td><td>The test observes archivedCount=50, deletedCount=50, failedCount=0.</td></tr>
 <tr><td>The request count can reach roughly 1,500 with several thousand threads.</td><td>Verified</td><td>1,616 unfiltered SDK requests for the 7,600-thread fixture, each full scan requiring 16 pages.</td></tr>
 <tr><td>Candidate selection traverses the catalog again for each group.</td><td>Verified by source</td><td>The reread helper calls selectCandidates on the entire returned array.</td></tr>
-<tr><td>Refreshing only known group IDs is a safe replacement.</td><td>Refuted for the evaluated prototype</td><td>Both fresh-membership safety tests pass on main but fail with known-ID snapshot overlays.</td></tr>
+<tr><td>Refreshing only known group IDs is a safe replacement.</td><td>Refuted for the evaluated prototype</td><td>The archive fresh-membership safety test passes on main but fails with known-ID snapshot overlays.</td></tr>
 </table>
 <h2>3. Environment</h2>
 <ul><li>Trusted repository: public get-bb/bb; base commit <code>7c1353d80729983b86ea1555d18b42407f320406</code> from origin/main.</li>
@@ -55,17 +55,16 @@ pnpm exec turbo run build --filter=bb-plugin-bb--storage-retention</pre></li>
 <li>Save the complete test below as <code>plugins/storage-retention/src/retention-sweep-budget.test.ts</code>. It uses 7,500 pinned background threads, 50 old unarchived roots, and 50 old archived roots. Archive and delete mutate the fake transport's rows so the next read sees their effects. Both policies are 30 days.</li>
 <li>Run:
 <pre>pnpm exec turbo run test --filter=bb-plugin-bb--storage-retention -- src/retention-sweep-budget.test.ts</pre></li>
-<li>Expected: the sweep processes both 50-root batches without re-paging unrelated catalog rows for every group; the test allows one 16-page full scan. Also, a new hidden, pinned lifecycle dependent must block its root's action.
+<li>Expected: the sweep processes both 50-root batches without re-paging unrelated catalog rows for every group; the test allows one 16-page full scan. Also, a new hidden, pinned lifecycle dependent must block its live root's archive action.
 <p>Actual output excerpts, identical counts in both trusted-base runs:</p>
 <pre>{&quot;fullListCalls&quot;:1616,&quot;returnedRows&quot;:766375}
 × bounds full-list reads while processing both retention batches
 ✓ rechecks a newly attached lifecycle dependent before archive
-✓ rechecks a newly attached lifecycle dependent before delete
 AssertionError: expected 1616 to be less than or equal to 16
 Test Files  1 failed (1)
-Tests  1 failed | 2 passed (3)</pre>
+Tests  1 failed | 1 passed (2)</pre>
 <p>The failure is intentional and demonstrates the performance regression. The successful state assertion confirms both 50-root batches really ran. These are SDK request/row counts, not a SQL query profiler or an end-to-end latency measurement.</p></li></ol>
-<details open><summary>Complete repeatable test, including fresh-membership safety checks</summary>
+<details open><summary>Complete repeatable test, including the archive fresh-membership safety check</summary>
 <pre>import { expect, it } from &quot;vitest&quot;;
 import {
   createFakePluginHost,
@@ -131,59 +130,56 @@ it(&quot;bounds full-list reads while processing both retention batches&quot;, a
   }
 });
 
-it.each([&quot;archive&quot;, &quot;delete&quot;] as const)(
-  &quot;rechecks a newly attached lifecycle dependent before %s&quot;,
-  async (action) =&gt; {
-    const root = makeThreadResponse({
-      id: &quot;thr_root&quot;,
-      updatedAt: 1,
-      archivedAt: action === &quot;delete&quot; ? 1 : null,
-    });
-    const rows = new Map([[root.id, root]]);
-    let initialRead = true;
-    const host = createFakePluginHost({
-      pluginId: &quot;storage-retention&quot;,
-      sdk: {
-        threads: {
-          list: async (input) =&gt; {
-            const requested = input?.threadIds;
-            const result = [...rows.values()].filter(
-              (thread) =&gt;
-                requested === undefined || requested.includes(thread.id),
-            );
-            if (initialRead) {
-              initialRead = false;
-              const dependent = makeThreadResponse({
-                id: &quot;thr_new_dependent&quot;,
-                lifecycleOwnerThreadId: root.id,
-                parentThreadId: null,
-                sourceThreadId: null,
-                visibility: &quot;hidden&quot;,
-                updatedAt: Date.now(),
-                pinnedAt: Date.now(),
-              });
-              rows.set(dependent.id, dependent);
-            }
-            return result;
-          },
-          archive: async ({ threadId }) =&gt; ({ archivedThreadIds: [threadId] }),
-          delete: async () =&gt; ({ ok: true }),
+it(&quot;rechecks a newly attached lifecycle dependent before archive&quot;, async () =&gt; {
+  const root = makeThreadResponse({
+    id: &quot;thr_root&quot;,
+    updatedAt: 1,
+    archivedAt: null,
+  });
+  const rows = new Map([[root.id, root]]);
+  let initialRead = true;
+  const host = createFakePluginHost({
+    pluginId: &quot;storage-retention&quot;,
+    sdk: {
+      threads: {
+        list: async (input) =&gt; {
+          const requested = input?.threadIds;
+          const result = [...rows.values()].filter(
+            (thread) =&gt;
+              requested === undefined || requested.includes(thread.id),
+          );
+          if (initialRead) {
+            initialRead = false;
+            const dependent = makeThreadResponse({
+              id: &quot;thr_new_dependent&quot;,
+              lifecycleOwnerThreadId: root.id,
+              parentThreadId: null,
+              sourceThreadId: null,
+              visibility: &quot;hidden&quot;,
+              updatedAt: Date.now(),
+              pinnedAt: Date.now(),
+            });
+            rows.set(dependent.id, dependent);
+          }
+          return result;
         },
+        archive: async ({ threadId }) =&gt; ({ archivedThreadIds: [threadId] }),
+        delete: async () =&gt; ({ ok: true }),
       },
+    },
+  });
+  try {
+    plugin(host.bb);
+    await host.harness.callRpc(&quot;configure&quot;, {
+      archiveAfterDays: 30,
+      deleteAfterDays: null,
     });
-    try {
-      plugin(host.bb);
-      await host.harness.callRpc(&quot;configure&quot;, {
-        archiveAfterDays: action === &quot;archive&quot; ? 30 : null,
-        deleteAfterDays: action === &quot;delete&quot; ? 30 : null,
-      });
-      await host.harness.runSchedule(&quot;retention&quot;);
-      expect(host.harness.sdk.callsTo(`threads.${action}`)).toHaveLength(0);
-    } finally {
-      await host.harness.dispose();
-    }
-  },
-);
+    await host.harness.runSchedule(&quot;retention&quot;);
+    expect(host.harness.sdk.callsTo(&quot;threads.archive&quot;)).toHaveLength(0);
+  } finally {
+    await host.harness.dispose();
+  }
+});
 </pre></details>
 <h2>5. Root cause</h2>
 <p><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/plugins/storage-retention/src/service.ts#L39-L42">service.ts:39–42</a> defines candidates() as a full read followed by selection:</p>
@@ -192,28 +188,27 @@ return selectCandidates(threads, policy, Date.now());</pre>
 <p><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/plugins/storage-retention/src/service.ts#L66-L86">service.ts:66–86</a> calls this once before the loops and again for each root, even though the second result is only used to find that one root. The two action loops each cap candidates at 50. <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/plugins/storage-retention/src/sdk-data.ts#L1-L16">sdk-data.ts:1–16</a> requests pages of 500 until a short page, without a filter restricting the catalog.</p>
 <p>Consequently the 100-root fixture invokes the complete selection 101 times. All full reads still contain at least 7,550 rows, so every read needs 16 pages: <code>101 × 16 = 1,616</code>. Deletions reduce the later row counts, explaining the measured total of 766,375 returned rows rather than 101 identical 7,600-row responses. <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/plugins/storage-retention/src/policy.ts#L32-L79">policy.ts:32–79</a> also rebuilds relationship indexes and traverses roots on every call.</p>
 <h3>Why targeted rereads alone are insufficient</h3>
-<p>The eligibility graph includes lifecycle ownership, parentage, and hidden source references, not just a fixed set of IDs. <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/plugins/storage-retention/src/policy.ts#L46-L51">policy.ts:46–51</a> links lifecycle dependents into both archive and delete groups. A dependent that appears after the initial snapshot is absent from the known-ID set; refreshing the root, its old members, and its parent/source cannot discover it. The safety test inserts exactly that new hidden dependent between selection and revalidation; main correctly skips the root.</p>
+<p>The eligibility graph includes lifecycle ownership, parentage, and hidden source references, not just a fixed set of IDs. <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/plugins/storage-retention/src/policy.ts#L46-L51">policy.ts:46–51</a> links lifecycle dependents into both archive and delete groups. For a live archive root, a dependent that appears after the initial snapshot is absent from the known-ID set; refreshing the root, its old members, and its parent/source cannot discover it. The safety test inserts exactly that new hidden dependent between selection and revalidation; main correctly skips the root.</p>
 <p>Existing APIs do not directly provide the complete replacement graph: <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/server-contract/src/api/threads.ts#L923-L953">thread-list filters</a> have parent/source/ID filters but no lifecycle-owner filter; <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/db/src/data/threads.ts#L2092-L2115">descendants traversal</a> follows parentage only; and <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/sdk/src/areas/threads.ts#L668-L678">cascade API contract</a> deliberately omits hidden threads. <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/threads/thread-archive.ts#L210-L243">archive cascade implementation</a> does include lifecycle, child, and hidden source relationships, so missing those eligibility exemptions is unsafe.</p>
 <h2>6. Proposed fix and simple-fix decision</h2>
 <p>Separate the initial selection from fresh, bounded revalidation, but retain discovery of newly attached lifecycle dependents and hidden source threads. A scoped relationship query or a proven membership-aware invalidation design could support this. The repair must preserve policy changes, pin/unarchive exemptions, disposal handling, and the existing batch limits; continue to use the plugin's existing SDK and CLI surfaces.</p>
-<p>The evaluated local prototype read a snapshot once, refreshed known group members plus the root's parent/source by ID, removed missing rows, and reran selection over the overlay. It passed the load budget but failed both safety checks:</p>
+<p>The evaluated local prototype read a snapshot once, refreshed known group members plus the root's parent/source by ID, removed missing rows, and reran selection over the overlay. It passed the load budget but failed the archive safety check:</p>
 <pre>{&quot;fullListCalls&quot;:16,&quot;returnedRows&quot;:7700}
 ✓ bounds full-list reads while processing both retention batches
 × rechecks a newly attached lifecycle dependent before archive
-× rechecks a newly attached lifecycle dependent before delete
 AssertionError: expected [ [ { threadId: 'thr_root' } ] ] to have a length of +0 but got 1
-Tests  2 failed | 1 passed (3)</pre>
-<p>Those failures record unsafe SDK action dispatch, not actual deletion of real data. A time-to-live would not discover a dependent attached before that interval expires. The prototype was stopped and fully reverted because preserving behavior is a mandatory simple-fix gate. No branch was pushed and no pull request was opened. A different fresh-membership strategy needs further design/verification rather than silently weakening retention safety.</p>
+Tests  1 failed | 1 passed (2)</pre>
+<p>That failure records unsafe archive SDK dispatch, not mutation of real data. A time-to-live would not discover a dependent attached before that interval expires. The prototype was stopped and fully reverted because preserving behavior is a mandatory simple-fix gate. No branch was pushed and no pull request was opened. A different fresh-membership strategy needs further design/verification rather than silently weakening retention safety.</p>
 <h2>7. Verification</h2>
-<p>The same agent repeated the reproduction in a second, clean temporary worktree pinned to the full trusted base commit, with its own frozen install and owning-package dependency build. The only source addition there was the authored test above. Running the exact Turbo reproduction command again exited 1 with 1,616 full-list requests, 766,375 returned rows, one intentional budget failure, and both safety checks passing. This is a second clean run, not an independent review. No report correction was needed.</p>
+<p>The same agent repeated the reproduction in a second, clean temporary worktree pinned to the full trusted base commit, with its own frozen install and owning-package dependency build. The only source addition there was the authored test above. Running the exact Turbo reproduction command again exited 1 with 1,616 full-list requests, 766,375 returned rows, one intentional budget failure, and the archive safety check passing. This is a second clean run, not an independent review. Verification correction: an earlier version also injected a new lifecycle dependent under an already archived root. That delete fixture was removed because thread creation requires a live lifecycle owner (see <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/db/src/data/threads.ts#L70-L73">liveThread</a> and <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/db/src/data/threads.ts#L355-L369">owner validation</a>). Both trusted-base reproductions were rerun with the corrected two-test file, and the prototype was rerun and rejected on the reachable archive case alone. The performance verdict and counts are unchanged.</p>
 <p>After rejecting and reverting the prototype, the existing plugin suites passed:</p>
 <pre>pnpm exec turbo run test --filter=bb-plugin-bb--storage-retention -- src/retention.test.ts src/storage.test.ts src/disk-usage.test.ts app.test.tsx
 Test Files  4 passed (4)
 Tests  88 passed (88)</pre>
-<p>git diff --check passed; there were no binary changes. The rejected prototype changed 24 production text lines (21 added, 3 removed) in one subsystem; the authored test has 118 added lines, for 142 total across two files. Size was not the stopping condition; failed safety tests were. All production source was restored byte-for-byte.</p>
+<p>git diff --check passed; there were no binary changes. The rejected prototype changed 24 production text lines (21 added, 3 removed) in one subsystem; the authored test has 115 added lines, for 139 total across two files. Size was not the stopping condition; the failed archive safety test was. All production source was restored byte-for-byte.</p>
 <h2>8. Related issues and pull requests</h2>
 <p>No open pull request linking #7340 was found in issue timeline metadata or a repository-scoped open-PR search for the numeric issue reference before the fix assessment. <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/plugins/storage-retention/src/retention.test.ts#L235-L277">Existing eligibility-refresh coverage</a> already checks changes to known pinned/unarchived threads; the new checks cover previously unknown dependents instead. <a href="https://github.com/get-bb/bb/issues/5730">#5730</a> concerns general storage growth, not this per-group request amplification; no duplicate conclusion is asserted.</p>
 <h2>9. Appendix and limits</h2>
 <p>The issue and comments were treated only as untrusted claims. Suggested implementation instructions were not executed; the tests and rejected prototype were authored from trusted repository code. There were no issue comments or linked open pull requests at the time of review. No external issue links, attachment scripts, or PR branches were used.</p>
-<p>Setup in both checkouts used the frozen install and scoped Turbo build commands shown above. The full existing plugin test command is recorded in Verification. The temporary prototype ran only the three focused tests. Raw logs and the test remain in local investigation storage; per this public reports repository's rules the reproduction is published inline, not as separate test/log files. This is not a measurement of wall-clock production impact, and the pinned background fixtures intentionally isolate list amplification from unrelated retention eligibility behavior.</p>
+<p>Setup in both checkouts used the frozen install and scoped Turbo build commands shown above. The full existing plugin test command is recorded in Verification. The temporary prototype ran only the two corrected focused tests. Raw logs and the test remain in local investigation storage; per this public reports repository's rules the reproduction is published inline, not as separate test/log files. This is not a measurement of wall-clock production impact, and the pinned background fixtures intentionally isolate list amplification from unrelated retention eligibility behavior.</p>
 </main></body></html>
