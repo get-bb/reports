@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Issue 7356 · Partial vacuum progress is omitted after contention</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main><p class="meta"><a href="../">← reports</a></p>
+<h1>#7356 · Partial vacuum progress is omitted after contention</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Low</span><span class="pill">Effort: Low</span><span class="pill">host</span>
+<a href="https://github.com/get-bb/bb/issues/7356">GitHub issue</a><span>November 10, 2026 · base <code>7c1353d80729983b86ea1555d18b42407f320406</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · Reproduction label: <code>confirmed-repro</code></p>
+<h2>1. TL;DR</h2>
+<p>The maintenance sweep can reclaim some free database pages and then encounter another writer before its next chunk.
+The completed work remains effective, but the sweep logs only a failure and omits all progress figures.
+An actual SQLite write lock reproduced this for both the core database and plugin-database entry points.
+Two clean checkouts at the same trusted main commit produced the same two failing assertions, while four failure-classification controls passed.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Maintenance reclaims pages in chunks.</td><td class="ok">Verified</td><td>First chunk reduced free pages from 2550 to 2294, and database bytes from 11333632 to 10285056.</td></tr>
+<tr><td>A competing writer can block a later chunk.</td><td class="ok">Verified</td><td>A second real connection acquires BEGIN IMMEDIATE after the first chunk; SQLite returns SQLITE_BUSY with message “database is locked”.</td></tr>
+<tr><td>The log discards earlier progress.</td><td class="ok">Verified</td><td>The single warning says “Incremental database vacuum failed” and contains err, but no result. Plugin logs preserve pluginId but also omit progress.</td></tr>
+<tr><td>This affects reporting rather than database integrity.</td><td class="ok">Verified within the reproduction</td><td>Earlier page reclamation remains visible; integrity_check returns ok after releasing the writer. This is not a proof for every possible database failure.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Public repository get-bb/bb; trusted origin/main commit <code>7c1353d80729983b86ea1555d18b42407f320406</code>, also verified through the repository GitHub commit API.</li>
+<li>Linux 4.19.0-gvisor; Node 22.19.0; pnpm 9.15.0; repository better-sqlite3 12.11.1; Vitest 4.1.12.</li>
+<li>Two new detached worktrees named base and verify, separate installations and file-backed SQLite databases. No live BB instance, provider session, HTTP ports, or user runtime data were used.</li>
+<li>Database seeds come from createMigratedConnection(), using the real migrations. The test uses the real WAL-checkpoint worker and a second real SQLite connection; no database mocks.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Create a clean checkout of the trusted commit and install the frozen dependencies:
+<pre>git clone https://github.com/get-bb/bb.git bb-7356
+cd bb-7356
+git checkout --detach 7c1353d80729983b86ea1555d18b42407f320406
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build</pre></li>
+<li>Save the exact test below as <code>apps/server/test/services/database-vacuum-contention.test.ts</code>. It seeds over 1024 free pages, delegates checkpoints to the real worker, and acquires a competing writer lock only after observing reclaimed pages. The other cases acquire a lock before any progress, or inject a non-SQLite checkpoint error.</li>
+<li>Run the existing server test task through Turbo:
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/services/database-vacuum-contention.test.ts</pre></li></ol>
+<p><strong>Expected:</strong> one stopped-early warning containing the initial and final successful page statistics after partial progress, no completed log, and unchanged failure handling for first-chunk contention and unrelated errors.</p>
+<p><strong>Actual on trusted main:</strong> exit 1; 2 failed, 4 passed. Only the core/plugin later-chunk cases fail. Before the failing log assertion, both show reclaimed pages and pass integrity_check.</p>
+<h3>Complete regression source</h3><pre>import Database from &quot;better-sqlite3&quot;;
+import { mkdtempSync, rmSync } from &quot;node:fs&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { describe, expect, it, vi } from &quot;vitest&quot;;
+import {
+  createConnection,
+  getDatabaseFreelistStats,
+  startWalCheckpointer,
+} from &quot;@bb/db&quot;;
+import { createMigratedConnection } from &quot;@bb/db/testing&quot;;
+import {
+  runDatabaseMaintenanceSweep,
+  runPluginDatabaseMaintenanceSweep,
+} from &quot;../../src/services/system/periodic-sweeps.js&quot;;
+
+describe.each([&quot;core&quot;, &quot;plugin&quot;] as const)(
+  &quot;%s vacuum contention&quot;,
+  (surface) =&gt; {
+    it.each([&quot;first chunk&quot;, &quot;later chunk&quot;, &quot;unexpected error&quot;] as const)(
+      &quot;reports %s without losing the outcome&quot;,
+      async (failure) =&gt; {
+        const directory = mkdtempSync(join(tmpdir(), &quot;bb-vacuum-contention-&quot;));
+        const databasePath = join(directory, &quot;maintenance.db&quot;);
+        const template = createMigratedConnection();
+        try {
+          await template.$client.backup(databasePath);
+        } finally {
+          template.$client.close();
+        }
+        const db = createConnection(databasePath);
+        const writer = new Database(databasePath);
+        const logger = {
+          debug: vi.fn(),
+          error: vi.fn(),
+          info: vi.fn(),
+          warn: vi.fn(),
+        };
+        const checkpointer = startWalCheckpointer({ logger });
+        checkpointer.attach(db.$client);
+        let interrupted = false;
+        try {
+          db.$client.exec(&quot;CREATE TABLE vacuum_payload (payload BLOB)&quot;);
+          const insert = db.$client.prepare(
+            &quot;INSERT INTO vacuum_payload VALUES (zeroblob(8192))&quot;,
+          );
+          db.$client.transaction(() =&gt; {
+            for (let row = 0; row &lt; 1200; row += 1) insert.run();
+          })();
+          db.$client.exec(&quot;DELETE FROM vacuum_payload&quot;);
+          const before = getDatabaseFreelistStats(db.$client);
+          expect(before.freelistCount).toBeGreaterThan(1024);
+          if (failure === &quot;first chunk&quot;) writer.exec(&quot;BEGIN IMMEDIATE&quot;);
+          const unexpectedError = new Error(&quot;Checkpoint interrupted&quot;);
+          const walCheckpointer = {
+            ...checkpointer,
+            async checkpoint(database: Database.Database): Promise&lt;void&gt; {
+              await checkpointer.checkpoint(database);
+              if (
+                failure !== &quot;first chunk&quot; &amp;&amp;
+                !interrupted &amp;&amp;
+                getDatabaseFreelistStats(database).freelistCount &lt;
+                  before.freelistCount
+              ) {
+                interrupted = true;
+                if (failure === &quot;unexpected error&quot;) throw unexpectedError;
+                writer.exec(&quot;BEGIN IMMEDIATE&quot;);
+              }
+            },
+          };
+
+          if (surface === &quot;core&quot;) {
+            await runDatabaseMaintenanceSweep({ db, logger, walCheckpointer });
+          } else {
+            await runPluginDatabaseMaintenanceSweep({
+              logger,
+              walCheckpointer,
+              plugins: {
+                listOpenPluginDatabases: () =&gt; [
+                  { database: db.$client, pluginId: &quot;contention-test&quot; },
+                ],
+              },
+            });
+          }
+
+          const after = getDatabaseFreelistStats(db.$client);
+          expect(after.freelistCount).toBeGreaterThan(0);
+          if (failure === &quot;first chunk&quot;) {
+            expect(after).toEqual(before);
+          } else {
+            expect(interrupted).toBe(true);
+            expect(after.freelistCount).toBeLessThan(before.freelistCount);
+          }
+          if (writer.inTransaction) writer.exec(&quot;ROLLBACK&quot;);
+          expect(db.$client.pragma(&quot;integrity_check&quot;, { simple: true })).toBe(
+            &quot;ok&quot;,
+          );
+          expect(logger.info).not.toHaveBeenCalled();
+          expect(logger.warn).toHaveBeenCalledExactlyOnceWith(
+            expect.objectContaining({
+              ...(surface === &quot;plugin&quot; ? { pluginId: &quot;contention-test&quot; } : {}),
+              err:
+                failure === &quot;unexpected error&quot;
+                  ? unexpectedError
+                  : expect.objectContaining({ code: &quot;SQLITE_BUSY&quot; }),
+              ...(failure === &quot;later chunk&quot;
+                ? { result: { before, after } }
+                : {}),
+            }),
+            failure === &quot;later chunk&quot;
+              ? &quot;Incremental database vacuum stopped early&quot;
+              : &quot;Incremental database vacuum failed&quot;,
+          );
+        } finally {
+          if (writer.inTransaction) writer.exec(&quot;ROLLBACK&quot;);
+          writer.close();
+          await checkpointer.stop();
+          db.$client.close();
+          rmSync(directory, { recursive: true, force: true });
+        }
+      },
+    );
+  },
+);
+</pre>
+<h3>First run: verbatim test output</h3><pre> ❯ |@bb/server| test/services/database-vacuum-contention.test.ts (6 tests | 2 failed) 947ms
+     ✓ reports first chunk without losing the outcome 195ms
+     × reports later chunk without losing the outcome 195ms
+     ✓ reports unexpected error without losing the outcome 78ms
+     ✓ reports first chunk without losing the outcome 189ms
+     × reports later chunk without losing the outcome 195ms
+     ✓ reports unexpected error without losing the outcome 88ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |@bb/server| test/services/database-vacuum-contention.test.ts &gt; core vacuum contention &gt; reports later chunk without losing the outcome
+AssertionError: expected &quot;vi.fn()&quot; to be called once with arguments: [ ObjectContaining{…}, …(1) ]
+
+Received:
+
+  1st vi.fn() call:
+
+  [
+-   ObjectContaining {
+-     &quot;err&quot;: ObjectContaining {
++   {
++     &quot;err&quot;: SqliteError {
++       &quot;message&quot;: &quot;database is locked&quot;,
+        &quot;code&quot;: &quot;SQLITE_BUSY&quot;,
+      },
+-     &quot;result&quot;: {
+-       &quot;after&quot;: {
+-         &quot;databaseBytes&quot;: 10285056,
+-         &quot;freelistBytes&quot;: 9396224,
+-         &quot;freelistCount&quot;: 2294,
+-         &quot;pageCount&quot;: 2511,
+-         &quot;pageSize&quot;: 4096,
+    },
+-       &quot;before&quot;: {
+-         &quot;databaseBytes&quot;: 11333632,
+-         &quot;freelistBytes&quot;: 10444800,
+-         &quot;freelistCount&quot;: 2550,
+-         &quot;pageCount&quot;: 2767,
+-         &quot;pageSize&quot;: 4096,
+-       },
+-     },
+-   },
+-   &quot;Incremental database vacuum stopped early&quot;,
++   &quot;Incremental database vacuum failed&quot;,
+  ]
+
+
+Number of calls: 1
+
+ ❯ test/services/database-vacuum-contention.test.ts:95:29
+     93|         expect(db.$client.pragma(&quot;integrity_check&quot;, { simple: true }))…
+     94|         expect(logger.info).not.toHaveBeenCalled();
+     95|         expect(logger.warn).toHaveBeenCalledExactlyOnceWith(
+       |                             ^
+     96|           expect.objectContaining({
+     97|             ...(surface === &quot;plugin&quot; ? { pluginId: &quot;contention-test&quot; }…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  |@bb/server| test/services/database-vacuum-contention.test.ts &gt; plugin vacuum contention &gt; reports later chunk without losing the outcome
+AssertionError: expected &quot;vi.fn()&quot; to be called once with arguments: [ ObjectContaining{…}, …(1) ]
+
+Received:
+
+  1st vi.fn() call:
+
+  [
+-   ObjectContaining {
+-     &quot;err&quot;: ObjectContaining {
++   {
++     &quot;err&quot;: SqliteError {
++       &quot;message&quot;: &quot;database is locked&quot;,
+        &quot;code&quot;: &quot;SQLITE_BUSY&quot;,
+      },
+      &quot;pluginId&quot;: &quot;contention-test&quot;,
+-     &quot;result&quot;: {
+-       &quot;after&quot;: {
+-         &quot;databaseBytes&quot;: 10285056,
+-         &quot;freelistBytes&quot;: 9396224,
+-         &quot;freelistCount&quot;: 2294,
+-         &quot;pageCount&quot;: 2511,
+-         &quot;pageSize&quot;: 4096,
+    },
+-       &quot;before&quot;: {
+-         &quot;databaseBytes&quot;: 11333632,
+-         &quot;freelistBytes&quot;: 10444800,
+-         &quot;freelistCount&quot;: 2550,
+-         &quot;pageCount&quot;: 2767,
+-         &quot;pageSize&quot;: 4096,
+-       },
+-     },
+-   },
+-   &quot;Incremental database vacuum stopped early&quot;,
++   &quot;Incremental database vacuum failed&quot;,
+  ]
+
+
+Number of calls: 1
+
+
+ ❯ test/services/database-vacuum-contention.test.ts:95:29
+     93|         expect(db.$client.pragma(&quot;integrity_check&quot;, { simple: true }))…
+     94|         expect(logger.info).not.toHaveBeenCalled();
+     95|         expect(logger.warn).toHaveBeenCalledExactlyOnceWith(
+       |                             ^
+     96|           expect.objectContaining({
+     97|             ...(surface === &quot;plugin&quot; ? { pluginId: &quot;contention-test&quot; }…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+ Test Files  1 failed (1)
+      Tests  2 failed | 4 passed (6)
+   Start at  12:10:39
+   Duration  6.89s (transform 2.74s, setup 1.62s, import 2.43s, tests 947ms, environment 0ms)</pre>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/system/periodic-sweeps.ts#L218-L249">The chunk loop</a> saves the first and last successful results, but returns them only on normal completion. There is no local handling for contention at the incremental-vacuum call:</p>
+<pre>    if (last !== null) {
+      await new Promise&lt;void&gt;((resolve) =&gt; setImmediate(resolve));
+    }
+    await walCheckpointer.checkpoint(client);
+    last = runIncrementalVacuum(client, {
+      maxPages: Math.min(
+        DATABASE_INCREMENTAL_VACUUM_CHUNK_PAGES,
+        DATABASE_INCREMENTAL_VACUUM_MAX_PAGES - vacuumedPages,
+      ),
+    });
+    await walCheckpointer.checkpoint(client);
+    first ??= last;
+    if (last.after.freelistCount === 0) {
+      break;
+    }
+  }
+  if (first === null || last === null) {
+    throw new Error(&quot;Incremental vacuum ran no chunks&quot;);
+  }
+  return { before: first.before, after: last.after };</pre>
+<p><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/db/src/data/maintenance.ts#L327-L344">runIncrementalVacuum</a> executes the actual SQLite pragma. Its <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/db/src/data/maintenance.ts#L151-L162">maintenance timeout wrapper</a> limits the busy wait to 100 milliseconds and restores the connection timeout afterward; it does not suppress errors.</p>
+<p>The exception therefore leaves the loop before its aggregated result is returned. <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/system/periodic-sweeps.ts#L274-L288">The outer handler</a> logs only the error as a failed run. The already completed pragma is not rolled back: chunks are separate synchronous operations, with an event-loop yield between them.</p>
+<p>Both <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/system/periodic-sweeps.ts#L291-L353">core and plugin maintenance</a> use that same reporting boundary, explaining the matching observations.</p>
+<h2>6. Proposed fix</h2>
+<p>Represent a later SQLITE_BUSY as an interrupted outcome carrying the first before statistics, last successful after statistics, and actual error. Let the existing reporting boundary log that outcome once as stopped early, retaining plugin identity and suppressing the completed log. Catch only the incremental-vacuum operation; first-chunk busy errors, checkpoint failures, and non-busy errors must retain the existing failure path. Keep the normal successful result unchanged. No database schema, stored data, public protocol, or dependency change is needed.</p>
+<h2>7. Related issues</h2>
+<p><a href="https://github.com/get-bb/bb/issues/5192">#5192</a> concerns vacuum-related server stalls, a different impact from lost partial-progress reporting. No open pull request linked to #7356 was found through the issue timeline or repository pull-request search at investigation time.</p>
+<h2>8. Verification</h2>
+<p>The same agent repeated the reproduction in a second clean detached checkout named verify at exactly <code>7c1353d80729983b86ea1555d18b42407f320406</code>, with its own frozen install, full build, new database directories, and SQLite connections. The command was identical to the first run. It again exited 1 with 2 failed and 4 passed: only the two partial-progress log assertions failed. This is a repeated clean reproduction, not independent-agent verification. No report correction was needed.</p>
+<pre> ❯ |@bb/server| test/services/database-vacuum-contention.test.ts (6 tests | 2 failed) 937ms
+     ✓ reports first chunk without losing the outcome 199ms
+     × reports later chunk without losing the outcome 198ms
+     ✓ reports unexpected error without losing the outcome 78ms
+     ✓ reports first chunk without losing the outcome 182ms
+     × reports later chunk without losing the outcome 195ms
+     ✓ reports unexpected error without losing the outcome 79ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |@bb/server| test/services/database-vacuum-contention.test.ts &gt; core vacuum contention &gt; reports later chunk without losing the outcome
+AssertionError: expected &quot;vi.fn()&quot; to be called once with arguments: [ ObjectContaining{…}, …(1) ]
+
+Received:
+
+  1st vi.fn() call:
+
+  [
+-   ObjectContaining {
+-     &quot;err&quot;: ObjectContaining {
++   {
++     &quot;err&quot;: SqliteError {
++       &quot;message&quot;: &quot;database is locked&quot;,
+        &quot;code&quot;: &quot;SQLITE_BUSY&quot;,
+      },
+-     &quot;result&quot;: {
+-       &quot;after&quot;: {
+-         &quot;databaseBytes&quot;: 10285056,
+-         &quot;freelistBytes&quot;: 9396224,
+-         &quot;freelistCount&quot;: 2294,
+-         &quot;pageCount&quot;: 2511,
+-         &quot;pageSize&quot;: 4096,
+    },
+-       &quot;before&quot;: {
+-         &quot;databaseBytes&quot;: 11333632,
+-         &quot;freelistBytes&quot;: 10444800,
+-         &quot;freelistCount&quot;: 2550,
+-         &quot;pageCount&quot;: 2767,
+-         &quot;pageSize&quot;: 4096,
+-       },
+-     },
+-   },
+-   &quot;Incremental database vacuum stopped early&quot;,
++   &quot;Incremental database vacuum failed&quot;,
+  ]
+
+
+Number of calls: 1
+
+ ❯ test/services/database-vacuum-contention.test.ts:95:29
+     93|         expect(db.$client.pragma(&quot;integrity_check&quot;, { simple: true }))…
+     94|         expect(logger.info).not.toHaveBeenCalled();
+     95|         expect(logger.warn).toHaveBeenCalledExactlyOnceWith(
+       |                             ^
+     96|           expect.objectContaining({
+     97|             ...(surface === &quot;plugin&quot; ? { pluginId: &quot;contention-test&quot; }…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  |@bb/server| test/services/database-vacuum-contention.test.ts &gt; plugin vacuum contention &gt; reports later chunk without losing the outcome
+AssertionError: expected &quot;vi.fn()&quot; to be called once with arguments: [ ObjectContaining{…}, …(1) ]
+
+Received:
+
+  1st vi.fn() call:
+
+  [
+-   ObjectContaining {
+-     &quot;err&quot;: ObjectContaining {
++   {
++     &quot;err&quot;: SqliteError {
++       &quot;message&quot;: &quot;database is locked&quot;,
+        &quot;code&quot;: &quot;SQLITE_BUSY&quot;,
+      },
+      &quot;pluginId&quot;: &quot;contention-test&quot;,
+-     &quot;result&quot;: {
+-       &quot;after&quot;: {
+-         &quot;databaseBytes&quot;: 10285056,
+-         &quot;freelistBytes&quot;: 9396224,
+-         &quot;freelistCount&quot;: 2294,
+-         &quot;pageCount&quot;: 2511,
+-         &quot;pageSize&quot;: 4096,
+    },
+-       &quot;before&quot;: {
+-         &quot;databaseBytes&quot;: 11333632,
+-         &quot;freelistBytes&quot;: 10444800,
+-         &quot;freelistCount&quot;: 2550,
+-         &quot;pageCount&quot;: 2767,
+-         &quot;pageSize&quot;: 4096,
+-       },
+-     },
+-   },
+-   &quot;Incremental database vacuum stopped early&quot;,
++   &quot;Incremental database vacuum failed&quot;,
+  ]
+
+
+Number of calls: 1
+
+ ❯ test/services/database-vacuum-contention.test.ts:95:29
+     93|         expect(db.$client.pragma(&quot;integrity_check&quot;, { simple: true }))…
+     94|         expect(logger.info).not.toHaveBeenCalled();
+     95|         expect(logger.warn).toHaveBeenCalledExactlyOnceWith(
+       |                             ^
+     96|           expect.objectContaining({
+     97|             ...(surface === &quot;plugin&quot; ? { pluginId: &quot;contention-test&quot; }…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  2 failed | 4 passed (6)
+   Start at  12:10:50
+   Duration  6.74s (transform 2.68s, setup 1.56s, import 2.40s, tests 937ms, environment 0ms)</pre>
+<h2>9. Appendix and limits</h2>
+<p>All root-cause links were checked against the recorded commit. The reproduction is nonvisual, so no screenshot is applicable. Extended SQLITE_BUSY variants are accounted for in the proposed prefix check but were not induced in this reproduction. A non-busy checkpoint failure is injected as an explicit control; actual contention always comes from SQLite itself.</p>
+<p>The first full build encountered a clean-install SDK build-order failure in the GitHub plugin. Building the existing SDK runtime first, then repeating the normal full build, passed all 73 build tasks in each checkout. No dependency was added or modified to address this setup issue.</p>
+<p>Repository policy keeps raw logs and test artifacts out of the public report repository, so the reproducible source and exact expected-versus-actual evidence are embedded above. Raw evidence is retained locally. Issue content was treated as untrusted claims only; no issue-supplied code, commands, or instructions were executed.</p>
+</main></body></html>
