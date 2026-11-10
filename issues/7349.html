@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>#7349 · Browser CLI loses session recovery guidance</title>
+<style>
+:root{--bg:#fafaf8;--fg:#1a1a1a;--muted:#666;--line:#e2e2de;--accent:#0052cc}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,sans-serif}
+main{max-width:960px;margin:auto;padding:32px 24px}h1{font-size:28px}h2{margin-top:30px;font-size:20px}
+a{color:var(--accent)}.meta{color:var(--muted)}.pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:1px 8px}
+table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:8px;border-bottom:1px solid var(--line);vertical-align:top}
+pre{background:white;border:1px solid var(--line);border-radius:6px;padding:12px;overflow:auto}code,pre{font:13px/1.5 ui-monospace,monospace}
+</style></head><body><main>
+<p><a href="../">← reports</a></p>
+<h1>#7349 · Browser CLI loses session recovery guidance</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: Low</span> <span class="pill">Effort: Low</span> <span class="pill">plugins</span> <span class="pill">cli</span> · 2026-11-10 · <a href="https://github.com/get-bb/bb/issues/7349">GitHub issue</a></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · Reproduction label: <code>confirmed-repro</code></p>
+<h2>1. TL;DR</h2>
+<p>When a browser session disappears or browser work is cancelled, the CLI should tell the caller to open a new session. The CLI instead emits the generic <code>command_failed</code> code without recovery guidance for three errors produced by its own host/process implementation. A focused regression exercises the real error mapper and CLI renderer with those trusted producer messages. All three cases fail on main in two separate clean checkouts; the existing stopped-session case and ownership-error control pass. This is a narrow error-reporting bug, not evidence of a new browser crash or data loss.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Worker-loss and short expiry errors lack the session error code and reopen hint.</td><td>Verified</td><td>Two regression cases receive <code>command_failed</code>, without <code>hint</code>.</td></tr>
+<tr><td>Cancelled/timed-out work lacks reopen and timeout guidance.</td><td>Verified</td><td>The third regression case receives the same generic error. Trusted host code closes the session when runtime work throws.</td></tr>
+<tr><td>The CLI supports increasing the timeout to 120 seconds.</td><td>Verified</td><td>The existing run options validate a maximum of 120,000 ms; no flag change is needed.</td></tr>
+<tr><td>A live browser restart or actual 30-second timeout causes this symptom.</td><td>Not exercised live</td><td>The reproduction injects producer errors at the CLI execution boundary. Producer text and lifecycle behavior are verified by source inspection, not a launched browser.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Trusted public <code>get-bb/bb</code> main: <code>7c1353d80729983b86ea1555d18b42407f320406</code>.</li>
+<li>Linux 4.19.0-gvisor x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.12.</li>
+<li>Separate temporary git worktrees, each installed with <code>pnpm install --frozen-lockfile --prefer-offline</code>.</li>
+<li>No server, browser, provider, port, application database, or user runtime data was used.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the trusted repository and check out the recorded main commit in a new directory.</li>
+<li>Install the frozen workspace dependencies, then apply the investigator-authored <a href="7349/repro/regression.patch">regression patch</a>. This changes only the existing CLI boundary test, not production code.</li>
+<li>Run these commands from the checkout root:</li></ol>
+<pre>git checkout --detach 7c1353d80729983b86ea1555d18b42407f320406
+pnpm install --frozen-lockfile --prefer-offline
+git apply /path/to/regression.patch
+pnpm exec turbo run test --filter=bb-plugin-browser-automation -- cli.test.ts</pre>
+<p>Expected: each session-loss case exits 1, preserves the original message, renders <code>session_unavailable</code> and an open-session hint in JSON and text. Cancellation/timeout also mentions <code>--timeout</code> and the 120-second limit.</p>
+<p>Actual, excerpted verbatim from the first run:</p>
+<pre>bb-plugin-browser-automation:test: - Expected
+bb-plugin-browser-automation:test: + Received
+bb-plugin-browser-automation:test: 
+bb-plugin-browser-automation:test:   {
+bb-plugin-browser-automation:test:     "error": {
+bb-plugin-browser-automation:test: -     "code": "session_unavailable",
+bb-plugin-browser-automation:test: -     "hint": StringContaining "bb browser-automation open",
+bb-plugin-browser-automation:test: +     "code": "command_failed",
+bb-plugin-browser-automation:test:       "message": "Session stopped, expired, or worker restarted; open a new session",
+bb-plugin-browser-automation:test:     },
+bb-plugin-browser-automation:test:     "ok": false,
+bb-plugin-browser-automation:test:   }
+bb-plugin-browser-automation:test:</pre>
+<p>All three failing cases receive the generic error code before their text/timeout assertions can run. Two existing-compatible session cases pass. Full test file, including its unchanged existing tests: <a href="7349/repro/cli.test.ts">cli.test.ts</a>.</p>
+<details><summary>Complete reproduction test file</summary><pre>import { describe, expect, it, vi } from "vitest";
+import type { PluginCliContext, PluginCliResult } from "@get-bb/plugin-sdk";
+import {
+  browserCliFailure,
+  createBrowserAutomationCli,
+  type BrowserCliRequest,
+} from "./cli.js";
+import { rpcContract } from "./contracts.js";
+
+const id = "1a12a3f1-12de-4fbb-a011-df0905678757";
+
+function cli() {
+  const execute = vi.fn(
+    async (
+      _request: BrowserCliRequest,
+      _ctx: PluginCliContext,
+    ): Promise&lt;PluginCliResult&gt; =&gt; ({
+      exitCode: 0,
+      stdout: "{}",
+    }),
+  );
+  const registration = createBrowserAutomationCli({ execute });
+  const invoke = (
+    argv: string[],
+    ctx: PluginCliContext = { threadId: "thread" },
+  ) =&gt; Promise.resolve(registration.run(argv, ctx));
+  const requestFor = async (argv: string[], ctx?: PluginCliContext) =&gt; {
+    const result = await invoke(argv, ctx);
+    expect(result.exitCode, result.stderr).toBe(0);
+    const call = execute.mock.calls.at(-1);
+    if (call === undefined) throw new Error("execute was not called");
+    return call[0];
+  };
+  return { registration, execute, invoke, requestFor };
+}
+
+describe("CLI boundaries", () =&gt; {
+  it("requires explicit backend, host, and headless selection", async () =&gt; {
+    const { invoke, requestFor, execute } = cli();
+    const missingHeadless = await invoke([
+      "open",
+      "--backend",
+      "local",
+      "--machine",
+      "host",
+    ]);
+    expect(missingHeadless.exitCode).toBe(1);
+    expect(missingHeadless.stderr).toContain("--headless");
+
+    const request = await requestFor([
+      "open",
+      "--backend",
+      "local",
+      "--machine",
+      "host",
+      "--headless",
+    ]);
+    expect(request.input.selection).toEqual({
+      backend: "local",
+      hostId: "host",
+    });
+
+    const badBackend = await invoke(["open", "--backend", "cloud"]);
+    expect(badBackend.exitCode).toBe(1);
+    expect(badBackend.stderr).toContain(
+      "invalid value 'cloud' for --backend. Expected one of: desktop, local",
+    );
+
+    const missingMachine = await invoke(["open", "--backend", "desktop"]);
+    expect(missingMachine.exitCode).toBe(1);
+    expect(missingMachine.stderr).toContain(
+      "missing required options: --machine",
+    );
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects ignored flags and both script sources", async () =&gt; {
+    const { invoke, execute } = cli();
+    const unknownFlag = await invoke(["list", "--headless"]);
+    expect(unknownFlag.stderr).toContain("unknown option '--headless'");
+
+    const bothScripts = await invoke([
+      "run",
+      id,
+      "--script",
+      "1",
+      "--script-file",
+      "a.js",
+      "--script-host",
+      "host",
+    ]);
+    expect(bothScripts.stderr).toContain("exactly one");
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("requires a script host for a script file", async () =&gt; {
+    const { invoke, requestFor } = cli();
+    const missingHost = await invoke(["run", id, "--script-file", "a.js"]);
+    expect(missingHost.stderr).toContain(
+      "--script-file requires --script-host",
+    );
+
+    const request = await requestFor([
+      "run",
+      id,
+      "--script-file",
+      "a.js",
+      "--script-host",
+      "host-1",
+    ]);
+    expect(request).toMatchObject({
+      scriptFile: "a.js",
+      scriptHost: "host-1",
+    });
+  });
+
+  it("preserves script strings and rejects a timeout outside the run boundary", async () =&gt; {
+    const { invoke, requestFor } = cli();
+    const request = await requestFor([
+      "run",
+      id,
+      "--script",
+      "await browser.getPage('main')",
+    ]);
+    expect(request.input.script).toBe("await browser.getPage('main')");
+    expect(request.input.timeoutMs).toBe(30_000);
+    expect(() =&gt; rpcContract.run.input.parse(request.input)).not.toThrow();
+
+    const tooSmall = await invoke([
+      "run",
+      id,
+      "--script",
+      "1",
+      "--timeout-ms",
+      "1",
+    ]);
+    expect(tooSmall.exitCode).toBe(1);
+    expect(tooSmall.stderr).toContain(
+      "invalid value '1' for --timeout-ms. Expected an integer between 1000 and 120000",
+    );
+  });
+
+  it("accepts --timeout as a duration and resolves bare numbers by range", async () =&gt; {
+    const { invoke, requestFor } = cli();
+    for (const [value, expected] of [
+      ["90s", 90_000],
+      ["2m", 120_000],
+      ["1500ms", 1500],
+      ["90", 90_000],
+      ["1500", 1500],
+    ] as const) {
+      const request = await requestFor([
+        "run",
+        id,
+        "--script",
+        "1",
+        "--timeout",
+        value,
+      ]);
+      expect(request.input.timeoutMs, value).toBe(expected);
+    }
+
+    const ambiguous = await invoke([
+      "run",
+      id,
+      "--script",
+      "1",
+      "--timeout",
+      "500",
+    ]);
+    expect(ambiguous.exitCode).toBe(1);
+    expect(ambiguous.stderr).toContain("invalid value '500' for --timeout");
+    expect(ambiguous.stderr).toContain("a bare number of seconds (1-120)");
+    expect(ambiguous.stderr).toContain(
+      "a bare number of milliseconds (1000-120000)",
+    );
+
+    const both = await invoke([
+      "run",
+      id,
+      "--script",
+      "1",
+      "--timeout",
+      "90s",
+      "--timeout-ms",
+      "5000",
+    ]);
+    expect(both.exitCode).toBe(1);
+    expect(both.stderr).toContain("cannot be combined");
+  });
+
+  it("parses preview sequence cursors and rejects invalid ones before dispatch", async () =&gt; {
+    const { invoke, requestFor } = cli();
+    expect((await requestFor(["preview", id])).input).toEqual({
+      threadId: "thread",
+      sessionId: id,
+      afterSequence: 0,
+    });
+    const request = await requestFor(["preview", id, "--after", "12"]);
+    expect(rpcContract.preview.input.parse(request.input).afterSequence).toBe(
+      12,
+    );
+
+    const notNumeric = await invoke(["preview", id, "--after", "soon"]);
+    expect(notNumeric.exitCode).toBe(1);
+    expect(notNumeric.stderr).toContain("invalid value 'soon' for --after");
+
+    const wrongFlag = await invoke(["preview", id, "--page", "main"]);
+    expect(wrongFlag.stderr).toContain("unknown option '--page'");
+  });
+
+  it("requires a session id and rejects a stray one", async () =&gt; {
+    const { invoke } = cli();
+    const missing = await invoke(["pages"]);
+    expect(missing.exitCode).toBe(1);
+    expect(missing.stderr).toContain(
+      "missing required arguments: &lt;session-id&gt;",
+    );
+
+    const unexpected = await invoke(["list", id]);
+    expect(unexpected.exitCode).toBe(1);
+    expect(unexpected.stderr).toContain(`unexpected argument '${id}'`);
+  });
+
+  it("documents the capture limits and every command", async () =&gt; {
+    const { registration, invoke, execute } = cli();
+    const top = await invoke(["--help"]);
+    expect(top.exitCode).toBe(0);
+    expect(top.stdout).toContain("bb browser-automation open");
+    expect(top.stdout).toContain("bb browser-automation screenshot");
+    expect(top.stdout).toContain(
+      "run, pages, and screenshot renew expiry to 30 minutes",
+    );
+    expect(top.stdout).toContain("capped at 8 hours from creation");
+    expect(top.stdout).toContain(
+      "non-renewable control lease/connection deadline",
+    );
+    expect(top.stdout).toContain("list and live preview do not renew expiry");
+
+    const runHelp = await invoke(["run", "--help"]);
+    expect(runHelp.exitCode).toBe(0);
+    expect(runHelp.stdout).toContain("at most 4 screenshots per run");
+    expect(runHelp.stdout).toContain("JPEG only, 500 KB combined");
+    expect(runHelp.stdout).toContain("--timeout &lt;duration&gt;");
+    expect(execute).not.toHaveBeenCalled();
+    expect(registration.commands?.map((command) =&gt; command.name)).toEqual([
+      "open",
+      "list",
+      "run",
+      "pages",
+      "screenshot",
+      "preview",
+      "stop",
+      "close",
+    ]);
+  });
+
+  it.each([
+    "Session stopped or expired; open a new session",
+    "Session stopped, expired, or worker restarted; open a new session",
+    "Session expired; open a new session",
+    "Session does not belong to this thread",
+    "Browser work cancelled or timed out",
+  ])("reports recovery guidance for %s in JSON and text", async (message) =&gt; {
+    const execute = vi.fn(async (): Promise&lt;PluginCliResult&gt; =&gt; {
+      throw browserCliFailure(new Error(message));
+    });
+    const registration = createBrowserAutomationCli({ execute });
+    const json = await registration.run(["pages", id, "--json"], {
+      threadId: "thread",
+    });
+    expect(json.exitCode).toBe(1);
+    expect(JSON.parse(json.stdout ?? "")).toEqual({
+      ok: false,
+      error: {
+        code: "session_unavailable",
+        message,
+        hint: expect.stringContaining("bb browser-automation open"),
+      },
+    });
+    expect(json.stderr).toContain(message);
+    expect(json.stderr).toContain("bb browser-automation open");
+
+    const text = await registration.run(["pages", id], { threadId: "thread" });
+    expect(text.exitCode).toBe(1);
+    expect(text.stdout).toBeUndefined();
+    expect(text.stderr).toContain(message);
+    expect(text.stderr).toContain("bb browser-automation open");
+    if (message === "Browser work cancelled or timed out") {
+      expect(JSON.parse(json.stdout ?? "").error.hint).toContain("--timeout");
+      expect(JSON.parse(json.stdout ?? "").error.hint).toContain("120 seconds");
+      expect(text.stderr).toContain("--timeout");
+      expect(text.stderr).toContain("120 seconds");
+    }
+  });
+
+  it("classifies capture-limit failures", () =&gt; {
+    expect(
+      browserCliFailure(
+        new Error("Combined screenshots exceed the 500 KB output budget"),
+      ),
+    ).toMatchObject({ code: "screenshot_limit" });
+    expect(browserCliFailure(new Error("host unreachable"))).toMatchObject({
+      code: "command_failed",
+    });
+  });
+});
+</pre></details>
+<h2>5. Root cause</h2>
+<p>The server CLI catches dispatch failures and routes them through <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/plugins/browser-automation/server.ts#L611-L613">browserCliFailure</a>. Its <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/plugins/browser-automation/cli.ts#L363-L381">session matcher</a> recognizes only one particular stopped/expired phrasing plus ownership errors. It falls through to the generic error for the other producer messages:</p>
+<pre>if (/stopped or expired|does not belong to this thread/u.test(message)) {
+  return new PluginCliError(message, {
+    code: "session_unavailable",
+    hint: REOPEN_HINT,
+  });
+}
+…
+return new PluginCliError(message, { code: "command_failed" });</pre>
+<ul><li><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/plugins/browser-automation/host.ts#L140-L154">Host availability</a> throws <code>Session stopped, expired, or worker restarted; open a new session</code>.</li>
+<li><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/plugins/browser-automation/host.ts#L216-L220">Host open</a> throws <code>Session expired; open a new session</code>.</li>
+<li><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/plugins/browser-automation/process.ts#L69-L87">Process abort</a> produces <code>Browser work cancelled or timed out</code>.</li>
+<li><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/plugins/browser-automation/host.ts#L257-L280">Host run</a> closes the session on an exception, so a cancelled process does require reopening.</li>
+<li><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/plugins/browser-automation/cli.ts#L211-L229">Run option validation</a> establishes the timeout ceiling.</li></ul>
+<p>The underlying fragility is string-based classification across the host/server boundary. This report does not propose changing that wire contract for a narrow recovery-hint fix.</p>
+<h2>6. Proposed fix</h2>
+<p>Recognize the host's stopped/expired session messages and the process cancellation message at the existing CLI error mapper. Preserve the message, error exit status, ownership behavior, screenshot-limit classification, and unknown-error fallback. Add the existing reopen hint, plus an optional larger <code>--timeout</code> suggestion capped at 120 seconds for cancellation/timeout. Extend the existing owner-boundary test table rather than adding a test-only export or duplicating a lower-level predicate test. Update the owning plugin skill to document the recovery hint.</p>
+<h2>7. Related issues</h2>
+<p>No open pull request was connected to this issue or returned by the issue-number PR search at investigation time. A related-issue search did not identify a duplicate of this narrow classification defect.</p>
+<h2>8. Verification</h2>
+<p>The same investigator repeated the reproduction in a second clean, detached worktree at the exact trusted base commit. Only the new test patch was applied; production files remained unchanged. A separate frozen install was run, followed by <code>pnpm exec turbo run test --filter=bb-plugin-browser-automation -- cli.test.ts</code>.</p>
+<p>First run: <strong>3 failed, 11 passed (14)</strong>. Second run: <strong>3 failed, 11 passed (14)</strong>, failing on the same missing session code/hint in all three cases. No correction to the root-cause finding was necessary. This is a repeated check by one investigator, not independent verification.</p>
+<h2>9. Appendix</h2>
+<p><a href="7349/repro/first-run.log">First full test log</a> · <a href="7349/repro/second-run.log">Second full test log</a> · <a href="7349/repro/regression.patch">Test-only patch</a></p>
+<p>Setup caveat: the first workspace-wide build stopped in the unrelated GitHub plugin because SDK process/host build artifacts were not yet present in a fresh install. The focused Turbo test dependency graph successfully built its prerequisites and executed the tests. The expected red regression is not a build/import/setup failure.</p>
+<p>Trust boundary: the issue's suggested changes and snippets were treated only as untrusted claims, not executed or copied. The test was authored after inspecting trusted main. No linked code, external issue-provided URL, real session, or credential was accessed.</p>
+<p>Classification rationale: Bug is unexpected recovery reporting; Low priority reflects a narrow defect with manual reopen/timeout workarounds; Low effort reflects a contained existing-subsystem change. No existing classification values were overwritten.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
