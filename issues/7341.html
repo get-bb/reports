@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7341 ACP lifecycle settlement</title>
+<style>
+:root{--canvas:#fafaf8;--ink:#1a1a1a;--muted:#666;--line:#e2e2de;--accent:#0052cc}
+body{margin:0;background:var(--canvas);color:var(--ink);font:16px/1.55 system-ui,sans-serif}
+main{max-width:950px;margin:auto;padding:40px 24px 80px}h1{font-size:26px;line-height:1.25}h2{font-size:18px;margin-top:36px;padding-top:20px;border-top:1px solid var(--line)}
+.meta{color:var(--muted);font-size:14px}.pill{display:inline-block;padding:1px 8px;border:1px solid var(--line);border-radius:999px;font-size:12px}
+table{border-collapse:collapse;width:100%;font-size:14px}td,th{text-align:left;vertical-align:top;padding:8px;border-bottom:1px solid var(--line)}
+pre,code{font:13px/1.5 ui-monospace,monospace}pre{overflow:auto;background:white;border:1px solid var(--line);border-radius:6px;padding:12px}a{color:var(--accent)}
+</style></head><body><main>
+<p><a href="../">← reports</a></p><h1>#7341 · ACP lifecycle boundaries discard unfinished tool state</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: Medium</span> <span class="pill">Effort: Low</span> <span class="pill">providers</span> <span class="pill">provider-acp</span><br>
+<a href="https://github.com/get-bb/bb/issues/7341">GitHub issue</a> · November 10, 2026 · base <code>7c1353d80729983b86ea1555d18b42407f320406</code></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>An ACP command can remain pending in the emitted timeline when a provider fails or announces a turn or compaction start before finishing that command. The translator forgets the command before emitting its completion, and does not close active assistant or reasoning text at these boundaries. Passing real translator output through the real delta assembler confirms that none of the three paths emits the expected completions. Six regression cases fail on the trusted main commit, and the same agent repeated all six failures in a second clean checkout. This report proves the provider-bridge event defect; it does not claim to have reproduced a live provider or a visible app hang.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Provider failure discards an active tool without completing it.</td><td>Verified</td><td>Only provider/error and turn/completed are emitted; neither the command nor active text gets item/completed.</td></tr>
+<tr><td>A turn-start or compaction-start notification discards active tool state.</td><td>Verified</td><td>Turn start emits no new assembled event for the already-open turn. Compaction start only emits the compaction item start. Both omit command settlement.</td></tr>
+<tr><td>Both text stream kinds are left unclosed at these boundaries.</td><td>Verified</td><td>Each boundary was tested separately with an active assistant message and with active reasoning. A later completion may still flush text for a non-error boundary, but the forgotten command is not recoverable from translator state.</td></tr>
+<tr><td>A later server/UI step may settle these items.</td><td>Unverified</td><td>No real app instance or server persistence was exercised. The assembler itself deletes non-thread-attached open items when finishing an errored turn.</td></tr>
+</table>
+<h2>3. Environment</h2>
+<ul><li>Public repository get-bb/bb; trusted origin/main commit <code>7c1353d80729983b86ea1555d18b42407f320406</code>.</li>
+<li>Linux 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.12; declared ACP SDK 1.9.0.</li>
+<li>Two separate temporary source checkouts at the same commit, each installed with the frozen lockfile. No running BB instance, account, external provider, network ports, database, or runtime data was used.</li>
+<li>Issue content was treated only as untrusted claims. No issue-supplied code, branch, external link, or test was executed.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the public repository and select the trusted base:
+<pre>git clone https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout --detach 7c1353d80729983b86ea1555d18b42407f320406
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/provider-bridge-acp</pre></li>
+<li>Save the following independently authored regression patch as <code>regression.diff</code> and apply it with <code>git apply regression.diff</code>. It adds a table to the existing translator/assembler integration tests and uses that file's existing harness. The table opens a command, starts one text stream, delivers a lifecycle notification, then requires completions with the original item identities and turn scope before any boundary event.</li></ol>
+<details open><summary>Complete reproduction test patch</summary><pre>diff --git a/packages/provider-bridge-acp/src/delta-translation.test.ts b/packages/provider-bridge-acp/src/delta-translation.test.ts
+index f78b65ea3d..22ea37fb34 100644
+--- a/packages/provider-bridge-acp/src/delta-translation.test.ts
++++ b/packages/provider-bridge-acp/src/delta-translation.test.ts
+@@ -508,6 +508,83 @@ describe(&quot;acp delta translation (bridge-shared invariants)&quot;, () =&gt; {
+ });
+ 
+ describe(&quot;acp delta translation (moved from the legacy adapter suite)&quot;, () =&gt; {
++  it.each(
++    [
++      { method: &quot;error&quot;, status: &quot;failed&quot; },
++      { method: ACP_TURN_STARTED_METHOD, status: &quot;interrupted&quot; },
++      { method: ACP_COMPACTION_STARTED_METHOD, status: &quot;interrupted&quot; },
++    ].flatMap((boundary) =&gt; [
++      {
++        ...boundary,
++        stream: &quot;agent_message_chunk&quot;,
++        item: { type: &quot;agentMessage&quot;, text: &quot;Partial response&quot; },
++      },
++      {
++        ...boundary,
++        stream: &quot;agent_thought_chunk&quot;,
++        item: { type: &quot;reasoning&quot;, content: [&quot;Partial response&quot;] },
++      },
++    ]),
++  )(
++    &quot;settles open work before $method with $stream&quot;,
++    ({ method, status, stream, item }) =&gt; {
++      const harness = createHarness();
++      harness.translate(turnStartedEvent());
++      const turnId = harness.openTurnId();
++      const commandEvents = harness.translate(
++        updateEvent({
++          sessionUpdate: &quot;tool_call&quot;,
++          toolCallId: &quot;running-command&quot;,
++          title: &quot;Long command&quot;,
++          kind: &quot;execute&quot;,
++          status: &quot;in_progress&quot;,
++          rawInput: { command: &quot;sleep 30&quot; },
++        }),
++      );
++      const textEvents = harness.translate(
++        updateEvent({
++          sessionUpdate: stream,
++          content: { type: &quot;text&quot;, text: &quot;Partial response&quot; },
++        }),
++      );
++      const commandStarted = commandEvents.find(
++        (event) =&gt; event.type === &quot;item/started&quot;,
++      );
++      const textStarted = textEvents.find(
++        (event) =&gt; event.type === &quot;item/started&quot;,
++      );
++      expect(commandStarted).toBeDefined();
++      expect(textStarted).toBeDefined();
++
++      const events = harness.translate({
++        jsonrpc: &quot;2.0&quot;,
++        method,
++        params: { threadId: THREAD_ID, message: &quot;Connection lost&quot; },
++      });
++
++      expect(events.slice(0, 2)).toMatchObject([
++        {
++          type: &quot;item/completed&quot;,
++          scope: turnScope(turnId),
++          item: { ...item, id: textStarted?.item.id },
++        },
++        {
++          type: &quot;item/completed&quot;,
++          scope: turnScope(turnId),
++          item: {
++            type: &quot;commandExecution&quot;,
++            id: commandStarted?.item.id,
++            command: &quot;sleep 30&quot;,
++            status,
++          },
++        },
++      ]);
++      expect(
++        completedItems(harness.translate(turnCompletedEvent(&quot;end_turn&quot;))),
++      ).toEqual([]);
++    },
++  );
++
+   function compactionStartedEvent(): ProviderRuntimeEvent {
+     return {
+       jsonrpc: &quot;2.0&quot;,
+</pre></details>
+<p>Run the focused regression:</p>
+<pre>pnpm exec turbo run test --filter=@bb/provider-bridge-acp -- src/delta-translation.test.ts -t 'settles open work before'</pre>
+<p><strong>Expected:</strong> six passing cases. Each boundary must emit item/completed for the active text and command first; the command status must be failed for provider failure or interrupted for turn/compaction start. Item IDs and turn scope must match the original starts. A later turn completion must not complete the same items again.</p>
+<p><strong>Actual, first run (verbatim Vitest summary, Turbo log prefix removed):</strong></p>
+<pre>Test Files  1 failed (1)
+     Tests  6 failed | 80 skipped (86)</pre>
+<p>Observed event types at the failing boundary, identical for either text stream:</p>
+<pre>provider failure:   ["provider/error", "turn/completed"]
+turn start:         []
+compaction start:   ["item/started"]
+expected prefix:    ["item/completed", "item/completed"]</pre>
+<h2>5. Root cause</h2>
+<p>The production bridge forwards notifications to the translator in <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/provider-bridge-acp/src/bridge/bridge.ts#L395-L415">bridge/bridge.ts</a>. The translator owns the merged tool-call state needed to construct a final tool result. Its <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/provider-bridge-acp/src/delta-translation.ts#L252-L260">clearThreadCalls</a> deletes that state without emitting any delta:</p>
+<pre>for (const [key] of threadCallEntries(context)) {
+  mergedToolCalls.delete(key);
+  injectedToolBindings.delete(key);
+}
+pendingInjectedCalls.delete(context?.threadId ?? "");</pre>
+<p>The <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/provider-bridge-acp/src/delta-translation.ts#L944-L955">provider-error path</a>, <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/provider-bridge-acp/src/delta-translation.ts#L963-L973">turn-start path</a>, and <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/provider-bridge-acp/src/delta-translation.ts#L995-L1011">compaction-start path</a> invoke that destructive reset directly. The existing <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/provider-bridge-acp/src/delta-translation.ts#L608-L637">flushOpenTurnWork</a> already closes both text channels and drains active tools into terminal deltas. Normal turn completion uses this mechanism, but the three reset paths bypass it.</p>
+<p>At the next layer, <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/provider-bridge-protocol/src/assembler/delta-assembler.ts#L1931-L1965">provider.error with settlesTurn</a> finishes the turn. <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/provider-bridge-protocol/src/assembler/delta-assembler.ts#L478-L492">finishTurn</a> removes non-thread-attached open items without inventing item completions. It therefore cannot recover the discarded command or finish its accumulated text after that reset. For start notifications, the assembler keeps the existing turn open, so the defect is missing settlement, not necessarily a new turn ID.</p>
+<h2>6. Proposed fix</h2>
+<p>Before destructive cleanup, flush open text and tool work using the existing helper and emit those deltas before the error or start deltas. Preserve pending injected-tool cleanup and turn-local file tracking. Use failed status for a provider failure and interrupted for replacement turn/compaction starts. This is a local translator correction, not a schema or public protocol change. The regression protects event completion, content, identity, status, scope, ordering, and no duplicate completion.</p>
+<h2>7. Related issues and pull requests</h2>
+<p>No linked or search-matched open pull request was found for #7341 at investigation time. Issue #6768 also concerns ACP translation, but addresses progress payload classification rather than lifecycle settlement and is not a duplicate.</p>
+<h2>8. Verification</h2>
+<p>The same agent created a second clean temporary checkout at <code>7c1353d80729983b86ea1555d18b42407f320406</code>; its initial git status was empty. It independently installed dependencies with the frozen lockfile, built the ACP package dependency graph, and applied only the newly authored regression test. Production files remained unchanged. The exact focused Turbo command above failed again:</p>
+<pre>Test Files  1 failed (1)
+     Tests  6 failed | 80 skipped (86)</pre>
+<p>Both runs failed at the item-completion assertion, not setup, dependency resolution, or malformed input. All six scenarios reached the intended boundary. No report correction was needed after the second run. This is repeated verification by one agent, not independent verification.</p>
+<h2>9. Appendix and limits</h2>
+<p>Public evidence is embedded in this page; raw logs and the authored patch stay in private thread storage rather than the public reports repository. No screenshots are appropriate for this non-visual boundary reproduction. The full source test suite and fix validation are tracked in the eventual pull request; this report records the unfixed baseline only.</p>
+<pre>git fetch origin main
+git rev-parse origin/main
+git status --porcelain
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/provider-bridge-acp
+pnpm exec turbo run test --filter=@bb/provider-bridge-acp -- src/delta-translation.test.ts -t 'settles open work before'</pre>
+</main></body></html>
