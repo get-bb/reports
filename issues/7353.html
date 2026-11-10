@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Report · #7353 Preserve the original send failure</title>
+<style>
+:root{--canvas:#fafaf8;--ink:#1a1a1a;--muted:#666;--line:#e2e2de;--accent:#0052cc}body{margin:0;background:var(--canvas);color:var(--ink);font:16px/1.55 system-ui,sans-serif}main{max-width:900px;margin:auto;padding:40px 24px 80px}h1{font-size:26px;line-height:1.25}h2{font-size:18px;margin-top:36px;padding-top:20px;border-top:1px solid var(--line)}.meta{color:var(--muted);font-size:14px}.pill{display:inline-block;padding:1px 8px;border:1px solid var(--line);border-radius:999px}table{border-collapse:collapse;width:100%;font-size:14px}td,th{padding:6px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}code,pre{font:13px ui-monospace,monospace}pre{background:#fff;border:1px solid var(--line);padding:12px;overflow:auto}a{color:var(--accent)}
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7353 · Preserve the original send failure</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Medium priority</span> <span class="pill">Low effort</span> <span class="pill">cli</span> · <a href="https://github.com/get-bb/bb/issues/7353">GitHub issue</a> · 2026-11-10 · base <code>7c1353d80729983b86ea1555d18b42407f320406</code></p>
+<p><strong>Verdict: REPRODUCED · Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>A failed message send can print an unrelated thread-lookup error instead of explaining that the workspace was destroyed. The CLI fetches thread metadata to add a recovery hint after receiving the original HTTP 409 error. If that secondary request fails, its rejection escapes and replaces the original diagnostic. A deterministic command/output regression reproduces this for HTTP 404, HTTP 503, and a rejected transport promise in two clean checkouts at the same trusted main commit.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>A failed recovery-metadata lookup masks the send failure.</td><td>Verified</td><td>Three failing assertions in each of two clean baseline runs; 19 existing tests pass.</td></tr>
+<tr><td>The non-restorable-provider hint lacks a ready command.</td><td>Verified, static only</td><td>The branch advises starting a new thread in prose. It does offer a way forward; adding a complete command is a separate convenience change.</td></tr>
+<tr><td>A real deletion or server-stop race triggers this path.</td><td>Not exercised live</td><td>Equivalent HTTP failures and connection rejection are injected at the existing CLI transport boundary. No claim is made about race frequency.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Trusted public repository: get-bb/bb; origin/main at the full commit above.</li><li>Linux x86_64; Node v22.19.0; pnpm 9.15.0.</li><li>Separate temporary clones named source and verify; frozen dependency installs in both.</li><li>No running bb instance, runtime data directory, real provider, or listening port. The existing test harness uses stubbed transport responses and the real SDK HTTP error decoder.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the trusted repository and select the recorded base:
+<pre>git clone https://github.com/get-bb/bb.git bb-7353
+cd bb-7353
+git checkout --detach 7c1353d80729983b86ea1555d18b42407f320406
+pnpm install --frozen-lockfile --prefer-offline</pre></li>
+<li>Download the <a href="7353/repro/regression.patch">regression patch</a> from this report, save it outside the checkout, and apply it. It only extends the existing command/output test:
+<pre>git apply ../regression.patch
+pnpm exec turbo run test --filter=@bb/cli -- src/__tests__/command-output/thread-tell.test.ts</pre></li>
+<li>Observe the original send error disappear:
+<pre>Expected: Error: HTTP 409: Thread environment is unavailable
+Actual (404): Error: HTTP 404: Thread lookup failed
+Actual (503): Error: HTTP 503: Thread lookup failed
+Actual (transport): Error: Thread lookup connection closed
+Tests: 3 failed | 19 passed (22)</pre></li></ol>
+<p>The complete <a href="7353/repro/thread-tell.test.ts">test file</a> includes the existing command registration and transport harness. Added regression:</p>
+<pre>  it.each([404, 503, "transport"] as const)(
+    "bb thread send preserves the send error when the hint lookup fails with %s",
+    async (failure) =&gt; {
+      stubServerApi({
+        "v1.threads.:id.$get": async () =&gt; {
+          if (failure === "transport") {
+            throw new Error("Thread lookup connection closed");
+          }
+          return new Response(
+            JSON.stringify({ message: "Thread lookup failed" }),
+            { status: failure, headers: { "Content-Type": "application/json" } },
+          );
+        },
+        "v1.threads.:id.send.$post": async () =&gt;
+          new Response(
+            JSON.stringify({
+              code: "thread_environment_unavailable",
+              message: "Thread environment is unavailable",
+              details: { reason: "destroyed", environmentStatus: "destroyed" },
+            }),
+            { status: 409, headers: { "Content-Type": "application/json" } },
+          ),
+      });
+      await expect(
+        runCommand(["thread", "send", "thread-gone", "hello"], register),
+      ).rejects.toThrow("process.exit:1");
+      expect(
+        vi.mocked(console.error).mock.calls.map((call) =&gt; String(call[0])),
+      ).toEqual(["Error: HTTP 409: Thread environment is unavailable"]);
+    },
+  );</pre>
+<h2>5. Root cause</h2>
+<p>The <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/cli/src/commands/thread/actions.ts#L740-L766">send catch block and hint builder</a> await a metadata request while already handling an error. The hint builder has no rejection handler around this line:</p>
+<pre>const { canRestoreEnvironment } = await sdk.threads.get({ threadId });</pre>
+<p>Consequently <code>throw await withRestoreEnvironmentHint(...)</code> rejects with the lookup failure rather than throwing its original argument. The <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/cli/src/action.ts#L41-L65">CLI action wrapper</a> prints that replacement error. The <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/lib/lifecycle-api-errors.ts#L55-L86">server error constructor</a> confirms the original 409 code, message, and destroyed status used by the regression. This is a diagnostic failure in the CLI, not proof that sending succeeded or that the server lost data.</p>
+<h2>6. Proposed fix</h2>
+<p>Make recovery metadata best effort. If the thread request rejects, return the original error unchanged; when it succeeds, retain the existing restore/non-restore hints. This needs no SDK, protocol, data, or permission change. Keep the optional ready-to-run new-thread command out of this minimal defect repair.</p>
+<h2>7. Verification</h2>
+<p>The same agent created a second clean clone at the exact recorded commit, checked its clean status, performed a new frozen install, and copied only the authored regression test. The same Turbo command produced the same three intended assertion failures and 19 passing existing cases. This is a repeat clean-checkout verification, not an independent review. No report correction was necessary.</p>
+<p><a href="7353/repro/baseline.log">First run log</a> · <a href="7353/repro/verification.log">Second run log</a>. Checkout prefixes are replaced with CHECKOUT_A and CHECKOUT_B in the public artifacts.</p>
+<h2>8. Related issues and pull requests</h2>
+<p>No open pull request linked to #7353 was present in the issue timeline or repository PR search during investigation. No separate issue is needed for this confirmed defect.</p>
+<h2>9. Appendix</h2>
+<p>The initial full monorepo build encountered an unbuilt Plugin SDK runtime prerequisite. The documented SDK build tasks were run before retrying. This environment setup failure is unrelated to the reproduced CLI assertions; the scoped tests build their upstream generated modules through Turbo.</p>
+<p>Issue-provided suggested code and commands were treated as untrusted data, not executed or copied. The regression and repair proposal were derived from the trusted main source and existing test boundary. No live account or user runtime data was accessed.</p>
+</main></body></html>
