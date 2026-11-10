@@ -1,0 +1,880 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7346 Plugin wait ownership</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7346 · Plugin wait ownership is replaced by hook order</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Medium priority</span><span class="pill">Low effort</span>
+<span class="pill">threads</span><span class="pill">plugins</span><a href="https://github.com/get-bb/bb/issues/7346">GitHub issue</a>
+<span>2026-11-10 · base <code>7c1353d80729983b86ea1555d18b42407f320406</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · Reproduction label: <code>confirmed-repro</code></p>
+<h2>1. TL;DR</h2>
+<p>Queued messages have one plugin holder, even when several plugins ask to wait. A plugin that submits a held message, or already holds a durable queued message, can lose that attribution to a different plugin merely because the other hook runs first. The dispatch pass collects all wait decisions but selects the first without considering either source of ownership. Two clean checkouts reproduce the wrong plugin and wrong leading reason using the actual send/recheck entry points and migrated SQLite. The repair preserves an owning plugin when it is still waiting, while retaining first-hook fallback for unowned messages or an owner that has stopped waiting.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>A submitting plugin loses ownership when another waiting hook precedes it.</td><td>Verified</td><td>The submission case expects drafts but receives limiter, in both clean runs.</td></tr>
+<tr><td>A durable queued holder is overwritten on recheck.</td><td>Verified</td><td>The durable case seeds a drafts-held row and rechecks through runQueuedMessageDispatch; the result is limiter.</td></tr>
+<tr><td>Holder-indexed queue lookup follows the wrong plugin.</td><td>Source-confirmed consequence</td><td>waitHolderFor derives the stored index directly from waitingOn.pluginId. The regression also asserts the real holder-indexed lookup after the repair.</td></tr>
+<tr><td>Unregister and orphan recovery can consequently operate on unintended rows.</td><td>Source-confirmed; not separately exercised</td><td>Both consumers use the persisted holder index. This report does not claim a separate live unregister/orphan reproduction.</td></tr>
+<tr><td>The UI presents the wrong reason.</td><td>Stored reason verified; visual presentation not exercised</td><td>The regression receives Capacity as the leading reason instead of Draft. No browser or screenshot claim is made.</td></tr>
+</table>
+<h2>3. Environment</h2>
+<ul><li>Public repository get-bb/bb, trusted origin/main commit <code>7c1353d80729983b86ea1555d18b42407f320406</code>; Linux x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.12.</li>
+<li>Two fresh detached Git worktrees named base and verify under one mktemp directory. Production code was unchanged for both reproduction runs.</li>
+<li>The existing withTestHarness creates isolated temporary data and real migrated SQLite databases. No user runtime database, actual provider session, or persistent development server was used. No application ports were exposed.</li>
+<li>A full base build initially hit an existing parallel SDK runtime/plugin build ordering race. After explicitly building SDK types and the runtime had completed, the unchanged full build passed all 73 tasks. No source repair was needed.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<p>Copy the complete regression patch below into a local file named <code>regression.patch</code>. It was authored from trusted repository entry points and fixtures and only adds a table-driven test to an existing owner-boundary suite. All reproduction material is inline, as required by this public report repository.</p>
+<ol><li>Create a clean checkout and prepare existing dependencies:<pre>git clone https://github.com/get-bb/bb.git issue-7346
+cd issue-7346
+git checkout --detach 7c1353d80729983b86ea1555d18b42407f320406
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build:types --filter=@get-bb/plugin-sdk</pre></li>
+<li>Apply the downloaded patch, then run:<pre>git apply /path/to/regression.patch
+pnpm exec turbo run test --filter=@bb/server -- test/threads/dispatch-hooks.test.ts -t 'keeps the waiting plugin owner'</pre></li>
+<li>Expected: submission and durable cases retain drafts, both fallback cases use limiter, and holder-filtered queries find the same queued row. Actual on unchanged production code:<pre>× keeps the waiting plugin owner for submission messages
+× keeps the waiting plugin owner for durable messages
+✓ keeps the waiting plugin owner for unowned messages
+✓ keeps the waiting plugin owner for released messages
+Tests  2 failed | 2 passed | 30 skipped (34)
+
+- Expected
++ Received
+  {
+    "kind": "plugin",
+-   "pluginId": "drafts",
+-   "reason": "Draft (also waiting on limiter: Capacity)",
++   "pluginId": "limiter",
++   "reason": "Capacity (also waiting on drafts: Draft)",
+  }</pre></li></ol>
+<details open><summary>Complete reproduction test patch</summary><pre id="regression-patch">diff --git a/apps/server/test/threads/dispatch-hooks.test.ts b/apps/server/test/threads/dispatch-hooks.test.ts
+index 71819255c6..5690da7d19 100644
+--- a/apps/server/test/threads/dispatch-hooks.test.ts
++++ b/apps/server/test/threads/dispatch-hooks.test.ts
+@@ -1177,6 +1177,82 @@ describe(&quot;message.dispatch grouped authors&quot;, () =&gt; {
+ });
+ 
+ describe(&quot;message.dispatch hooks on the queue drain&quot;, () =&gt; {
++  it.each([&quot;submission&quot;, &quot;durable&quot;, &quot;unowned&quot;, &quot;released&quot;] as const)(
++    &quot;keeps the waiting plugin owner for %s messages&quot;,
++    async (ownership) =&gt; {
++      await withTestHarness(async (harness) =&gt; {
++        const { thread } = seedRunnableThread(harness, {
++          hostId: &quot;host-wait-ownership&quot;,
++          status: &quot;idle&quot;,
++        });
++        const registry = emptyRegistry();
++        registry[&quot;message.dispatch&quot;].push(
++          {
++            pluginId: &quot;limiter&quot;,
++            handler: () =&gt; ({ action: &quot;wait&quot;, reason: &quot;Capacity&quot; }) as const,
++          },
++          {
++            pluginId: &quot;drafts&quot;,
++            handler: () =&gt;
++              ownership === &quot;released&quot;
++                ? ({ action: &quot;proceed&quot; } as const)
++                : ({ action: &quot;wait&quot;, reason: &quot;Draft&quot; } as const),
++          },
++        );
++        installHooks(registry);
++
++        if (ownership === &quot;durable&quot; || ownership === &quot;released&quot;) {
++          createQueuedThreadMessage(harness.db, harness.deps.hub, {
++            threadId: thread.id,
++            content: textInput(&quot;held work&quot;),
++            senderThreadId: null,
++            model: &quot;test-model&quot;,
++            reasoningLevel: &quot;medium&quot;,
++            permissionMode: &quot;auto&quot;,
++            serviceTier: &quot;default&quot;,
++            payload: { kind: &quot;inline&quot; },
++            waitingOn: { kind: &quot;plugin&quot;, pluginId: &quot;drafts&quot;, reason: &quot;Draft&quot; },
++            sendAt: null,
++            systemNotice: null,
++          });
++          await runQueuedMessageDispatch(harness.deps, { kind: &quot;plugin-recheck&quot; });
++        } else {
++          await acceptThreadSendRequest(harness.deps, {
++            payload: {
++              input: textInput(&quot;new work&quot;),
++              mode: &quot;auto&quot;,
++              ...(ownership === &quot;submission&quot;
++                ? { pluginSubmission: { pluginId: &quot;drafts&quot;, data: {} } }
++                : {}),
++            },
++            thread,
++          });
++        }
++
++        const ownerId =
++          ownership === &quot;submission&quot; || ownership === &quot;durable&quot;
++            ? &quot;drafts&quot;
++            : &quot;limiter&quot;;
++        const queued = onlyQueuedRow(harness, thread.id);
++        expect(queued.waitingOn).toEqual({
++          kind: &quot;plugin&quot;,
++          pluginId: ownerId,
++          reason:
++            ownerId === &quot;drafts&quot;
++              ? &quot;Draft (also waiting on limiter: Capacity)&quot;
++              : ownership === &quot;released&quot;
++                ? &quot;Capacity&quot;
++                : &quot;Capacity (also waiting on drafts: Draft)&quot;,
++        });
++        expect(
++          listQueuedThreadMessagesForApi(harness.db, {
++            waitHolder: `plugin:${ownerId}`,
++          }).map((row) =&gt; row.id),
++        ).toEqual([queued.id]);
++      });
++    },
++  );
++
+   it(&quot;uses the durable plugin wait after submission data expires&quot;, async () =&gt; {
+     await withTestHarness(async (harness) =&gt; {
+       const seen: unknown[] = [];
+</pre></details>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/threads/dispatch-hooks.ts#L440-L456">The hook pass</a> appends wait decisions in registration order, then chooses the holder solely by array position:</p>
+<pre>const waiter = waits[0];
+return { kind: "wait", waiter, additionalWaiters: waits.slice(1) };</pre>
+<p>The request already exposes queued rows and ephemeral submission metadata through <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/threads/dispatch-hooks.ts#L374-L377">the context builder</a>. <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/plugin-sdk/src/backend-contract.ts#L699-L718">The SDK contract</a> explains that queued rows retain their durable state, whereas submission metadata is null on retries. Ignoring both allows an unrelated earlier waiter to replace the existing holder.</p>
+<p><a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/threads/dispatch-attempt.ts#L696-L711">Dispatch-attempt persistence</a> takes the selected plugin and combined reason. <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/db/src/data/queued-thread-messages.ts#L2137-L2143">waitHolderFor</a> derives the persisted holder index from that plugin. <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/threads/queued-message-dispatch.ts#L519-L538">Plugin unregistration</a> clears rows by this index; <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/threads/queued-message-dispatch.ts#L631-L652">orphan recovery</a> also interprets it as the holding plugin. These are consequences of incorrect selection, not separate database or recovery defects.</p>
+<p>History: git blame attributes positional selection to commit <code>49dadc363ab</code> on September 1, 2026. No later trusted-main fix was present when the fix branch was created.</p>
+<h2>6. Proposed fix and verification</h2>
+<p>Resolve the preferred plugin from the first queued row's plugin wait, or otherwise the submitting plugin. Extract that plugin's first wait decision when present, falling back to the first wait if it is absent. Keep all remaining decisions in their original order. An owner that no longer waits must not suppress another plugin's wait. Remove the obsolete comment asserting that the first registered waiter always owns the row.</p>
+<p>The local repair touches only server dispatch selection and its existing regression suite: 95 changed text lines (88 additions, 7 deletions), two files, no dependency, lockfile, generated file, migration, public schema, protocol, or stored-data migration.</p>
+<p>Focused post-fix result: <code>4 passed | 30 skipped (34)</code>. Relevant dispatch/queue suites: <code>158 passed</code> across <code>9 files</code>. Turbo server typecheck and type-aware lint passed. The generic lint task has no server script, so the configured server lint:type-aware task was run explicitly. Full command output is inline below. No linked open PR existed in GitHub search, issue timeline, or closing-PR metadata before starting the repair. No untrusted PR branch or code was executed.</p>
+<h2>7. Verification: second clean reproduction</h2>
+<p>The same agent repeated the reproduction, not an independent reviewer. A second worktree at the exact same trusted commit was created before applying only the regression patch. It received its own frozen install and SDK build. The identical Turbo test command produced the same intended two ownership assertion failures and two passing fallback controls. No report correction was necessary after the final fixture was valid; earlier draft fixtures were corrected before either final evidence run.</p>
+<p>Each harness invocation uses newly allocated temporary test data. No persistent server was needed, so there were no reused application ports. Both clean-run outputs are inline in the Appendix. Paths in published output are normalized to generic temporary prefixes.</p>
+<h2>8. Related issues</h2>
+<p>A search for dispatch/wait reports returned #6172 and #3050, but their subjects concern retry availability and completion delivery rather than competing hook-holder selection. No duplicate of this verified ownership failure or linked open repair was identified.</p>
+<h2>9. Appendix</h2>
+<details><summary>repro-base.log</summary><pre>
+   • turbo 2.11.10
+   • Packages in scope: @bb/server
+   • Running test in 1 package
+   • Remote caching disabled, using shared worktree cache
+
+//:ensure-native-modules: cache bypass, force executing 316f0046a686a129
+@bb/server:generate:bb-official-marketplace: cache hit, replaying logs d69b6a5592228bcf
+@bb/process-utils:generate:profile-worker: cache hit, replaying logs e103847a21a659bd
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker /tmp/issue-7346/base/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+@bb/server:generate:bb-official-marketplace: 
+@bb/server:generate:bb-official-marketplace: &gt; @bb/server@0.0.1 generate:bb-official-marketplace /tmp/issue-7346/base/apps/server
+@bb/server:generate:bb-official-marketplace: &gt; node --conditions=source --import tsx scripts/generate-bb-official-marketplace.ts
+@bb/server:generate:bb-official-marketplace: 
+@bb/templates:generate:templates: cache hit, replaying logs 234833419fa1686b
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates /tmp/issue-7346/base/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/templates:generate:plugin-scaffold: cache hit, replaying logs 0c24dcfdc0dc254c
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold /tmp/issue-7346/base/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/plugin-build:generate: cache hit, replaying logs 0c637e775c15cf88
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: &gt; @bb/plugin-build@0.0.1 generate /tmp/issue-7346/base/packages/plugin-build
+@bb/plugin-build:generate: &gt; node ./scripts/generate-plugin-theme.mjs &amp;&amp; node ./scripts/generate-runtime-export-manifest.mjs
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: plugin-theme.generated.ts up to date
+@bb/plugin-build:generate: host-tailwind.css up to date
+@bb/plugin-build:generate: host-tailwind-version.ts up to date
+@bb/plugin-build:generate: wrote /tmp/issue-7346/base/packages/plugin-build/src/generated/runtime-export-manifest.generated.ts (react@19.3.1)
+@get-bb/plugin-sdk:build:types: cache hit, replaying logs 6a377dc25899adfc
+@get-bb/plugin-sdk:build: cache hit, replaying logs 0507c5b4ea008f8d
+@bb/agent-runtime:generate:test-bridges: cache hit, replaying logs 9dfedae0b5f917e9
+@bb/agent-runtime:generate:test-bridges: 
+@bb/agent-runtime:generate:test-bridges: &gt; @bb/agent-runtime@0.0.1 generate:test-bridges /tmp/issue-7346/base/packages/agent-runtime
+@bb/agent-runtime:generate:test-bridges: &gt; node ./scripts/build-test-bridges.mjs
+@bb/agent-runtime:generate:test-bridges: 
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build: &gt; @get-bb/plugin-sdk@0.6.138 build /tmp/issue-7346/base/packages/plugin-sdk
+@get-bb/plugin-sdk:build: &gt; node scripts/build-runtime.mjs
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build: Built 24 @get-bb/plugin-sdk runtime entries.
+@get-bb/plugin-sdk:build:types: 
+@get-bb/plugin-sdk:build:types: &gt; @get-bb/plugin-sdk@0.6.138 build:types /tmp/issue-7346/base/packages/plugin-sdk
+@get-bb/plugin-sdk:build:types: &gt; node --max-semi-space-size=128 --max-old-space-size=4096 scripts/build-bundled-dts.mjs
+@get-bb/plugin-sdk:build:types: 
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp-next.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-environment-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-machine-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-customization-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-handle.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-view.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-thread-status.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-file-navigation-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-host-policy.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-plugin-app-collector.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-rpc-tags.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-rpc-query-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-process.d.ts
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules /tmp/issue-7346/base
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+@bb/server:test: cache miss, executing a72a87c2ff5c48e7
+@bb/server:test: 
+@bb/server:test: &gt; @bb/server@0.0.1 test /tmp/issue-7346/base/apps/server
+@bb/server:test: &gt; vitest run --config vitest.config.ts &quot;test/threads/dispatch-hooks.test.ts&quot; &quot;-t&quot; &quot;keeps the waiting plugin owner&quot;
+@bb/server:test: 
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: &#x27;native&#x27;`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:22:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: &#x27;native&#x27;`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:22:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: &#x27;native&#x27;`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:22:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: 
+@bb/server:test:  RUN  v4.1.12 /tmp/issue-7346/base/apps/server
+@bb/server:test: 
+@bb/server:test: (node:9700) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test:  ❯ |@bb/server| test/threads/dispatch-hooks.test.ts (34 tests | 2 failed | 30 skipped) 929ms
+@bb/server:test:      ↓ passes plugin submission data through a new thread&#x27;s first dispatch
+@bb/server:test:      ↓ applies plugin policy before a future schedule
+@bb/server:test:      ↓ hands the hook the start intent&#x27;s host before an environment exists
+@bb/server:test:      ↓ re-decides a first message that lost the admission instead of calling it sent
+@bb/server:test:      ↓ queues a send whose thread changes twice under it, then drains it
+@bb/server:test:      ↓ runs every handler in install order and freezes the resolved tuple
+@bb/server:test:      ↓ names every waiter on the reason when a pass collects several
+@bb/server:test:      ↓ short-circuits the pass on reject with a 409 naming the plugin
+@bb/server:test:      ↓ runs one pass at a time so a counting handler never sees itself interleaved
+@bb/server:test:      ↓ commits a cleared first dispatch before the lock releases, so the next pass sees it
+@bb/server:test:      ↓ shows a warm follow-up&#x27;s admission only after its send lands, not inside the pass
+@bb/server:test:      ↓ leaves creation unchanged when no plugin answers the hook
+@bb/server:test:      ↓ hooks a steer into a live turn like any other dispatch
+@bb/server:test:      ↓ reads a message a user typed as user with no sender
+@bb/server:test:      ↓ reads a retry of a failed turn as system
+@bb/server:test:      ↓ reports the same author on a drained re-attempt as on the first
+@bb/server:test:      ↓ preserves a agent requester in the queued thread-start and hook
+@bb/server:test:      ↓ preserves a system requester in the queued thread-start and hook
+@bb/server:test:      ↓ reports the same origin on a drained re-attempt as on the first
+@bb/server:test:      ↓ leaves a drained follow-up send with no origin
+@bb/server:test:      ↓ still emits startedOnBehalfOf for a handler built against an older SDK
+@bb/server:test:      ↓ summarizes &#x27;human messages&#x27; with origins [ null, null ] and plugins [ null, null ] without splitting the group
+@bb/server:test:      ↓ summarizes &#x27;one agent&#x27; with origins [ &#x27;plugin&#x27;, &#x27;plugin&#x27; ] and plugins [ &#x27;drafts&#x27;, &#x27;drafts&#x27; ] without splitting the group
+@bb/server:test:      ↓ summarizes &#x27;different agents&#x27; with origins [ &#x27;plugin&#x27;, &#x27;plugin&#x27; ] and plugins [ &#x27;drafts&#x27;, &#x27;automations&#x27; ] without splitting the group
+@bb/server:test:      ↓ summarizes &#x27;agent then human&#x27; with origins [ &#x27;plugin&#x27;, null ] and plugins [ &#x27;drafts&#x27;, null ] without splitting the group
+@bb/server:test:      ↓ summarizes &#x27;human then agent&#x27; with origins [ &#x27;app&#x27;, &#x27;cli&#x27; ] and plugins [ null, null ] without splitting the group
+@bb/server:test:      ↓ summarizes &#x27;agent and system requesters&#x27; with origins [ null, &#x27;plugin&#x27; ] and plugins [ null, &#x27;drafts&#x27; ] without splitting the group
+@bb/server:test:      × keeps the waiting plugin owner for submission messages 97ms
+@bb/server:test:      × keeps the waiting plugin owner for durable messages 73ms
+@bb/server:test:      ✓ keeps the waiting plugin owner for unowned messages 58ms
+@bb/server:test:      ✓ keeps the waiting plugin owner for released messages 63ms
+@bb/server:test:      ↓ uses the durable plugin wait after submission data expires
+@bb/server:test:      ↓ returns the claimed row to the queue instead of consuming it when the pass waits
+@bb/server:test:      ↓ returns an ordinary row when its hook pass crosses a manual stop
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server| test/threads/dispatch-hooks.test.ts &gt; message.dispatch hooks on the queue drain &gt; keeps the waiting plugin owner for submission messages
+@bb/server:test:  FAIL  |@bb/server| test/threads/dispatch-hooks.test.ts &gt; message.dispatch hooks on the queue drain &gt; keeps the waiting plugin owner for durable messages
+@bb/server:test: AssertionError: expected { kind: &#x27;plugin&#x27;, …(2) } to deeply equal { kind: &#x27;plugin&#x27;, …(2) }
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test:   {
+@bb/server:test:     &quot;kind&quot;: &quot;plugin&quot;,
+@bb/server:test: -   &quot;pluginId&quot;: &quot;drafts&quot;,
+@bb/server:test: -   &quot;reason&quot;: &quot;Draft (also waiting on limiter: Capacity)&quot;,
+@bb/server:test: +   &quot;pluginId&quot;: &quot;limiter&quot;,
+@bb/server:test: +   &quot;reason&quot;: &quot;Capacity (also waiting on drafts: Draft)&quot;,
+@bb/server:test:   }
+@bb/server:test: 
+@bb/server:test:  ❯ test/threads/dispatch-hooks.test.ts:1237:34
+@bb/server:test:     1235|             : &quot;limiter&quot;;
+@bb/server:test:     1236|         const queued = onlyQueuedRow(harness, thread.id);
+@bb/server:test:     1237|         expect(queued.waitingOn).toEqual({
+@bb/server:test:        |                                  ^
+@bb/server:test:     1238|           kind: &quot;plugin&quot;,
+@bb/server:test:     1239|           pluginId: ownerId,
+@bb/server:test:  ❯ withTestHarness test/helpers/test-app.ts:444:12
+@bb/server:test:  ❯ test/threads/dispatch-hooks.test.ts:1183:7
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  2 failed | 2 passed | 30 skipped (34)
+@bb/server:test:    Start at  12:22:37
+@bb/server:test:    Duration  9.73s (transform 5.06s, setup 1.53s, import 5.42s, tests 929ms, environment 0ms)
+@bb/server:test: 
+@bb/server:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/server#test:  ERROR  command (/tmp/issue-7346/base/apps/server) /usr/local/bin/pnpm run test test/threads/dispatch-hooks.test.ts -t keeps the waiting plugin owner exited (1)
+
+ Tasks:    9 successful, 10 total
+Cached:    8 cached, 10 total
+  Time:    11.98s 
+Failed:    @bb/server#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details><details><summary>repro-verify.log</summary><pre>
+   • turbo 2.11.10
+   • Packages in scope: @bb/server
+   • Running test in 1 package
+   • Remote caching disabled, using shared worktree cache
+
+//:ensure-native-modules: cache bypass, force executing 316f0046a686a129
+@bb/templates:generate:plugin-scaffold: cache hit, replaying logs 0c24dcfdc0dc254c
+@bb/process-utils:generate:profile-worker: cache hit, replaying logs e103847a21a659bd
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold /tmp/issue-7346/base/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker /tmp/issue-7346/base/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+@bb/templates:generate:templates: cache hit, replaying logs 234833419fa1686b
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates /tmp/issue-7346/base/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/server:generate:bb-official-marketplace: cache hit, replaying logs d69b6a5592228bcf
+@bb/server:generate:bb-official-marketplace: 
+@bb/server:generate:bb-official-marketplace: &gt; @bb/server@0.0.1 generate:bb-official-marketplace /tmp/issue-7346/base/apps/server
+@bb/server:generate:bb-official-marketplace: &gt; node --conditions=source --import tsx scripts/generate-bb-official-marketplace.ts
+@bb/server:generate:bb-official-marketplace: 
+@bb/plugin-build:generate: cache hit, replaying logs 0c637e775c15cf88
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: &gt; @bb/plugin-build@0.0.1 generate /tmp/issue-7346/base/packages/plugin-build
+@bb/plugin-build:generate: &gt; node ./scripts/generate-plugin-theme.mjs &amp;&amp; node ./scripts/generate-runtime-export-manifest.mjs
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: plugin-theme.generated.ts up to date
+@bb/plugin-build:generate: host-tailwind.css up to date
+@bb/plugin-build:generate: host-tailwind-version.ts up to date
+@bb/plugin-build:generate: wrote /tmp/issue-7346/base/packages/plugin-build/src/generated/runtime-export-manifest.generated.ts (react@19.3.1)
+@bb/agent-runtime:generate:test-bridges: cache hit, replaying logs 9dfedae0b5f917e9
+@bb/agent-runtime:generate:test-bridges: 
+@bb/agent-runtime:generate:test-bridges: &gt; @bb/agent-runtime@0.0.1 generate:test-bridges /tmp/issue-7346/base/packages/agent-runtime
+@bb/agent-runtime:generate:test-bridges: &gt; node ./scripts/build-test-bridges.mjs
+@bb/agent-runtime:generate:test-bridges: 
+@get-bb/plugin-sdk:build:types: cache hit, replaying logs 6a377dc25899adfc
+@get-bb/plugin-sdk:build:types: 
+@get-bb/plugin-sdk:build:types: &gt; @get-bb/plugin-sdk@0.6.138 build:types /tmp/issue-7346/base/packages/plugin-sdk
+@get-bb/plugin-sdk:build:types: &gt; node --max-semi-space-size=128 --max-old-space-size=4096 scripts/build-bundled-dts.mjs
+@get-bb/plugin-sdk:build:types: 
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp-next.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-environment-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-machine-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-customization-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-handle.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-view.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-thread-status.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-file-navigation-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-host-policy.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-plugin-app-collector.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-rpc-tags.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-rpc-query-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-process.d.ts
+@get-bb/plugin-sdk:build: cache hit, replaying logs 0507c5b4ea008f8d
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build: &gt; @get-bb/plugin-sdk@0.6.138 build /tmp/issue-7346/base/packages/plugin-sdk
+@get-bb/plugin-sdk:build: &gt; node scripts/build-runtime.mjs
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build: Built 24 @get-bb/plugin-sdk runtime entries.
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules /tmp/issue-7346/verify
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+@bb/server:test: cache miss, executing 6989cb1c156caff2
+@bb/server:test: 
+@bb/server:test: &gt; @bb/server@0.0.1 test /tmp/issue-7346/verify/apps/server
+@bb/server:test: &gt; vitest run --config vitest.config.ts &quot;test/threads/dispatch-hooks.test.ts&quot; &quot;-t&quot; &quot;keeps the waiting plugin owner&quot;
+@bb/server:test: 
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: &#x27;native&#x27;`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:22:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: &#x27;native&#x27;`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:22:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: &#x27;native&#x27;`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:22:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: 
+@bb/server:test:  RUN  v4.1.12 /tmp/issue-7346/verify/apps/server
+@bb/server:test: 
+@bb/server:test: (node:9917) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test:  ❯ |@bb/server| test/threads/dispatch-hooks.test.ts (34 tests | 2 failed | 30 skipped) 933ms
+@bb/server:test:      ↓ passes plugin submission data through a new thread&#x27;s first dispatch
+@bb/server:test:      ↓ applies plugin policy before a future schedule
+@bb/server:test:      ↓ hands the hook the start intent&#x27;s host before an environment exists
+@bb/server:test:      ↓ re-decides a first message that lost the admission instead of calling it sent
+@bb/server:test:      ↓ queues a send whose thread changes twice under it, then drains it
+@bb/server:test:      ↓ runs every handler in install order and freezes the resolved tuple
+@bb/server:test:      ↓ names every waiter on the reason when a pass collects several
+@bb/server:test:      ↓ short-circuits the pass on reject with a 409 naming the plugin
+@bb/server:test:      ↓ runs one pass at a time so a counting handler never sees itself interleaved
+@bb/server:test:      ↓ commits a cleared first dispatch before the lock releases, so the next pass sees it
+@bb/server:test:      ↓ shows a warm follow-up&#x27;s admission only after its send lands, not inside the pass
+@bb/server:test:      ↓ leaves creation unchanged when no plugin answers the hook
+@bb/server:test:      ↓ hooks a steer into a live turn like any other dispatch
+@bb/server:test:      ↓ reads a message a user typed as user with no sender
+@bb/server:test:      ↓ reads a retry of a failed turn as system
+@bb/server:test:      ↓ reports the same author on a drained re-attempt as on the first
+@bb/server:test:      ↓ preserves a agent requester in the queued thread-start and hook
+@bb/server:test:      ↓ preserves a system requester in the queued thread-start and hook
+@bb/server:test:      ↓ reports the same origin on a drained re-attempt as on the first
+@bb/server:test:      ↓ leaves a drained follow-up send with no origin
+@bb/server:test:      ↓ still emits startedOnBehalfOf for a handler built against an older SDK
+@bb/server:test:      ↓ summarizes &#x27;human messages&#x27; with origins [ null, null ] and plugins [ null, null ] without splitting the group
+@bb/server:test:      ↓ summarizes &#x27;one agent&#x27; with origins [ &#x27;plugin&#x27;, &#x27;plugin&#x27; ] and plugins [ &#x27;drafts&#x27;, &#x27;drafts&#x27; ] without splitting the group
+@bb/server:test:      ↓ summarizes &#x27;different agents&#x27; with origins [ &#x27;plugin&#x27;, &#x27;plugin&#x27; ] and plugins [ &#x27;drafts&#x27;, &#x27;automations&#x27; ] without splitting the group
+@bb/server:test:      ↓ summarizes &#x27;agent then human&#x27; with origins [ &#x27;plugin&#x27;, null ] and plugins [ &#x27;drafts&#x27;, null ] without splitting the group
+@bb/server:test:      ↓ summarizes &#x27;human then agent&#x27; with origins [ &#x27;app&#x27;, &#x27;cli&#x27; ] and plugins [ null, null ] without splitting the group
+@bb/server:test:      ↓ summarizes &#x27;agent and system requesters&#x27; with origins [ null, &#x27;plugin&#x27; ] and plugins [ null, &#x27;drafts&#x27; ] without splitting the group
+@bb/server:test:      × keeps the waiting plugin owner for submission messages 99ms
+@bb/server:test:      × keeps the waiting plugin owner for durable messages 72ms
+@bb/server:test:      ✓ keeps the waiting plugin owner for unowned messages 60ms
+@bb/server:test:      ✓ keeps the waiting plugin owner for released messages 67ms
+@bb/server:test:      ↓ uses the durable plugin wait after submission data expires
+@bb/server:test:      ↓ returns the claimed row to the queue instead of consuming it when the pass waits
+@bb/server:test:      ↓ returns an ordinary row when its hook pass crosses a manual stop
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server| test/threads/dispatch-hooks.test.ts &gt; message.dispatch hooks on the queue drain &gt; keeps the waiting plugin owner for submission messages
+@bb/server:test:  FAIL  |@bb/server| test/threads/dispatch-hooks.test.ts &gt; message.dispatch hooks on the queue drain &gt; keeps the waiting plugin owner for durable messages
+@bb/server:test: AssertionError: expected { kind: &#x27;plugin&#x27;, …(2) } to deeply equal { kind: &#x27;plugin&#x27;, …(2) }
+@bb/server:test: 
+@bb/server:test: - Expected
+@bb/server:test: + Received
+@bb/server:test: 
+@bb/server:test:   {
+@bb/server:test:     &quot;kind&quot;: &quot;plugin&quot;,
+@bb/server:test: -   &quot;pluginId&quot;: &quot;drafts&quot;,
+@bb/server:test: -   &quot;reason&quot;: &quot;Draft (also waiting on limiter: Capacity)&quot;,
+@bb/server:test: +   &quot;pluginId&quot;: &quot;limiter&quot;,
+@bb/server:test: +   &quot;reason&quot;: &quot;Capacity (also waiting on drafts: Draft)&quot;,
+@bb/server:test:   }
+@bb/server:test: 
+@bb/server:test:  ❯ test/threads/dispatch-hooks.test.ts:1237:34
+@bb/server:test:     1235|             : &quot;limiter&quot;;
+@bb/server:test:     1236|         const queued = onlyQueuedRow(harness, thread.id);
+@bb/server:test:     1237|         expect(queued.waitingOn).toEqual({
+@bb/server:test:        |                                  ^
+@bb/server:test:     1238|           kind: &quot;plugin&quot;,
+@bb/server:test:     1239|           pluginId: ownerId,
+@bb/server:test:  ❯ withTestHarness test/helpers/test-app.ts:444:12
+@bb/server:test:  ❯ test/threads/dispatch-hooks.test.ts:1183:7
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  2 failed | 2 passed | 30 skipped (34)
+@bb/server:test:    Start at  12:22:43
+@bb/server:test:    Duration  9.55s (transform 5.04s, setup 1.64s, import 5.06s, tests 933ms, environment 0ms)
+@bb/server:test: 
+@bb/server:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/server#test:  ERROR  command (/tmp/issue-7346/verify/apps/server) /usr/local/bin/pnpm run test test/threads/dispatch-hooks.test.ts -t keeps the waiting plugin owner exited (1)
+
+ Tasks:    9 successful, 10 total
+Cached:    8 cached, 10 total
+  Time:    12.062s 
+Failed:    @bb/server#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details><details><summary>fix-focused.log</summary><pre>
+   • turbo 2.11.10
+   • Packages in scope: @bb/server
+   • Running test in 1 package
+   • Remote caching disabled, using shared worktree cache
+
+//:ensure-native-modules: cache bypass, force executing 316f0046a686a129
+@bb/process-utils:generate:profile-worker: cache hit, replaying logs e103847a21a659bd
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker /tmp/issue-7346/base/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+@bb/server:generate:bb-official-marketplace: cache hit, replaying logs d69b6a5592228bcf
+@bb/server:generate:bb-official-marketplace: 
+@bb/server:generate:bb-official-marketplace: &gt; @bb/server@0.0.1 generate:bb-official-marketplace /tmp/issue-7346/base/apps/server
+@bb/server:generate:bb-official-marketplace: &gt; node --conditions=source --import tsx scripts/generate-bb-official-marketplace.ts
+@bb/server:generate:bb-official-marketplace: 
+@bb/templates:generate:plugin-scaffold: cache hit, replaying logs 0c24dcfdc0dc254c
+@bb/templates:generate:templates: cache hit, replaying logs 234833419fa1686b
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold /tmp/issue-7346/base/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates /tmp/issue-7346/base/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/plugin-build:generate: cache hit, replaying logs 0c637e775c15cf88
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: &gt; @bb/plugin-build@0.0.1 generate /tmp/issue-7346/base/packages/plugin-build
+@bb/plugin-build:generate: &gt; node ./scripts/generate-plugin-theme.mjs &amp;&amp; node ./scripts/generate-runtime-export-manifest.mjs
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: plugin-theme.generated.ts up to date
+@bb/plugin-build:generate: host-tailwind.css up to date
+@bb/plugin-build:generate: host-tailwind-version.ts up to date
+@bb/plugin-build:generate: wrote /tmp/issue-7346/base/packages/plugin-build/src/generated/runtime-export-manifest.generated.ts (react@19.3.1)
+@bb/agent-runtime:generate:test-bridges: cache hit, replaying logs 9dfedae0b5f917e9
+@bb/agent-runtime:generate:test-bridges: 
+@bb/agent-runtime:generate:test-bridges: &gt; @bb/agent-runtime@0.0.1 generate:test-bridges /tmp/issue-7346/base/packages/agent-runtime
+@bb/agent-runtime:generate:test-bridges: &gt; node ./scripts/build-test-bridges.mjs
+@bb/agent-runtime:generate:test-bridges: 
+@get-bb/plugin-sdk:build:types: cache hit, replaying logs 6a377dc25899adfc
+@get-bb/plugin-sdk:build:types: 
+@get-bb/plugin-sdk:build:types: &gt; @get-bb/plugin-sdk@0.6.138 build:types /tmp/issue-7346/base/packages/plugin-sdk
+@get-bb/plugin-sdk:build:types: &gt; node --max-semi-space-size=128 --max-old-space-size=4096 scripts/build-bundled-dts.mjs
+@get-bb/plugin-sdk:build:types: 
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp-next.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-environment-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-machine-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-customization-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-handle.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-view.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-thread-status.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-file-navigation-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-host-policy.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-plugin-app-collector.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-rpc-tags.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-rpc-query-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-process.d.ts
+@get-bb/plugin-sdk:build: cache hit, replaying logs 0507c5b4ea008f8d
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build: &gt; @get-bb/plugin-sdk@0.6.138 build /tmp/issue-7346/base/packages/plugin-sdk
+@get-bb/plugin-sdk:build: &gt; node scripts/build-runtime.mjs
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build: Built 24 @get-bb/plugin-sdk runtime entries.
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules /tmp/issue-7346/base
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+@bb/server:test: cache miss, executing 6b095b7d9bdaa5b9
+@bb/server:test: 
+@bb/server:test: &gt; @bb/server@0.0.1 test /tmp/issue-7346/base/apps/server
+@bb/server:test: &gt; vitest run --config vitest.config.ts &quot;test/threads/dispatch-hooks.test.ts&quot; &quot;-t&quot; &quot;keeps the waiting plugin owner&quot;
+@bb/server:test: 
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: &#x27;native&#x27;`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:22:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: &#x27;native&#x27;`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:22:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: &#x27;native&#x27;`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:22:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: 
+@bb/server:test:  RUN  v4.1.12 /tmp/issue-7346/base/apps/server
+@bb/server:test: 
+@bb/server:test: (node:10290) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test:  ✓ |@bb/server| test/threads/dispatch-hooks.test.ts (34 tests | 30 skipped) 909ms
+@bb/server:test: 
+@bb/server:test:  Test Files  1 passed (1)
+@bb/server:test:       Tests  4 passed | 30 skipped (34)
+@bb/server:test:    Start at  12:23:32
+@bb/server:test:    Duration  9.39s (transform 5.00s, setup 1.60s, import 5.01s, tests 909ms, environment 0ms)
+@bb/server:test: 
+
+ Tasks:    10 successful, 10 total
+Cached:    8 cached, 10 total
+  Time:    11.669s 
+
+ WARNING  no output files found for task @bb/server#test. Please check your `outputs` key in `turbo.json`
+</pre></details><details><summary>fix-suites.log</summary><pre>
+   • turbo 2.11.10
+   • Packages in scope: @bb/server
+   • Running test in 1 package
+   • Remote caching disabled, using shared worktree cache
+
+//:ensure-native-modules: cache bypass, force executing b98cfa785ed5bd82
+@bb/plugin-build:generate: cache miss, executing 21507812319770e7
+@bb/server:generate:bb-official-marketplace: cache miss, executing 36e7dcbd484928e7
+@bb/process-utils:generate:profile-worker: cache miss, executing feab141d57117ef2
+@bb/templates:generate:plugin-scaffold: cache miss, executing 216a198824a5b8c0
+@bb/templates:generate:templates: cache miss, executing 54f94cc40e006f23
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: &gt; @bb/plugin-build@0.0.1 generate /tmp/issue-7346/base/packages/plugin-build
+@bb/plugin-build:generate: &gt; node ./scripts/generate-plugin-theme.mjs &amp;&amp; node ./scripts/generate-runtime-export-manifest.mjs
+@bb/plugin-build:generate: 
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates /tmp/issue-7346/base/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker /tmp/issue-7346/base/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold /tmp/issue-7346/base/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/server:generate:bb-official-marketplace: 
+@bb/server:generate:bb-official-marketplace: &gt; @bb/server@0.0.1 generate:bb-official-marketplace /tmp/issue-7346/base/apps/server
+@bb/server:generate:bb-official-marketplace: &gt; node --conditions=source --import tsx scripts/generate-bb-official-marketplace.ts
+@bb/server:generate:bb-official-marketplace: 
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules /tmp/issue-7346/base
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+@get-bb/plugin-sdk:build: cache miss, executing 0cd2c7eb6bede15c
+@get-bb/plugin-sdk:build:types: cache miss, executing a206d3613cee1ca2
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build: &gt; @get-bb/plugin-sdk@0.6.138 build /tmp/issue-7346/base/packages/plugin-sdk
+@get-bb/plugin-sdk:build: &gt; node scripts/build-runtime.mjs
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build:types: 
+@get-bb/plugin-sdk:build:types: &gt; @get-bb/plugin-sdk@0.6.138 build:types /tmp/issue-7346/base/packages/plugin-sdk
+@get-bb/plugin-sdk:build:types: &gt; node --max-semi-space-size=128 --max-old-space-size=4096 scripts/build-bundled-dts.mjs
+@get-bb/plugin-sdk:build:types: 
+@get-bb/plugin-sdk:build: Built 24 @get-bb/plugin-sdk runtime entries.
+@bb/plugin-build:generate: plugin-theme.generated.ts up to date
+@bb/plugin-build:generate: host-tailwind.css up to date
+@bb/plugin-build:generate: host-tailwind-version.ts up to date
+@bb/plugin-build:generate: wrote /tmp/issue-7346/base/packages/plugin-build/src/generated/runtime-export-manifest.generated.ts (react@19.3.1)
+@bb/agent-runtime:generate:test-bridges: cache miss, executing 714df5033625b292
+@bb/agent-runtime:generate:test-bridges: 
+@bb/agent-runtime:generate:test-bridges: &gt; @bb/agent-runtime@0.0.1 generate:test-bridges /tmp/issue-7346/base/packages/agent-runtime
+@bb/agent-runtime:generate:test-bridges: &gt; node ./scripts/build-test-bridges.mjs
+@bb/agent-runtime:generate:test-bridges: 
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp-next.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-environment-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-machine-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-customization-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-handle.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-view.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-thread-status.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-file-navigation-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-host-policy.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-plugin-app-collector.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-rpc-tags.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-rpc-query-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-process.d.ts
+@bb/server:test: cache miss, executing 6298df44c0b21453
+@bb/server:test: 
+@bb/server:test: &gt; @bb/server@0.0.1 test /tmp/issue-7346/base/apps/server
+@bb/server:test: &gt; vitest run --config vitest.config.ts &quot;test/threads/dispatch-hooks.test.ts&quot; &quot;test/threads/dispatcher-paths.test.ts&quot; &quot;test/threads/thread-send-dispatch.test.ts&quot; &quot;test/threads/thread-turn-dispatch.test.ts&quot; &quot;test/threads/requested-queue-drain.test.ts&quot; &quot;test/threads/queue-drain-failure.test.ts&quot; &quot;test/threads/queued-message-update.test.ts&quot; &quot;test/threads/system-notice-dispatch.test.ts&quot; &quot;test/threads/parent-system-message-dispatch.test.ts&quot;
+@bb/server:test: 
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: &#x27;native&#x27;`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:22:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: &#x27;native&#x27;`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:22:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: &#x27;native&#x27;`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:22:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: 
+@bb/server:test:  RUN  v4.1.12 /tmp/issue-7346/base/apps/server
+@bb/server:test: 
+@bb/server:test: (node:11113) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test: (node:11127) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test: (node:11148) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test: (node:11141) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test: (node:11120) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test: (node:11155) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test: (node:11134) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test:  ✓ |@bb/server| test/threads/thread-turn-dispatch.test.ts (1 test) 982ms
+@bb/server:test: (node:11106) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test: (node:11105) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/server:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/server:test:  ✓ |@bb/server| test/threads/parent-system-message-dispatch.test.ts (2 tests) 1263ms
+@bb/server:test:  ✓ |@bb/server| test/threads/queued-message-update.test.ts (8 tests) 1686ms
+@bb/server:test:  ✓ |@bb/server| test/threads/queue-drain-failure.test.ts (11 tests) 1818ms
+@bb/server:test:  ✓ |@bb/server| test/threads/dispatcher-paths.test.ts (12 tests) 2054ms
+@bb/server:test:  ✓ |@bb/server:isolated| test/threads/system-notice-dispatch.test.ts (15 tests) 2243ms
+@bb/server:test:  ✓ |@bb/server| test/threads/dispatch-hooks.test.ts (34 tests) 3540ms
+@bb/server:test:  ✓ |@bb/server:isolated| test/threads/requested-queue-drain.test.ts (23 tests) 2861ms
+@bb/server:test:  ✓ |@bb/server| test/threads/thread-send-dispatch.test.ts (52 tests) 5408ms
+@bb/server:test: 
+@bb/server:test:  Test Files  9 passed (9)
+@bb/server:test:       Tests  158 passed (158)
+@bb/server:test:    Start at  12:24:30
+@bb/server:test:    Duration  17.42s (transform 55.39s, setup 19.41s, import 64.76s, tests 21.86s, environment 1ms)
+@bb/server:test: 
+
+ Tasks:    10 successful, 10 total
+Cached:    0 cached, 10 total
+  Time:    48.705s 
+
+ WARNING  no output files found for task @bb/server#test. Please check your `outputs` key in `turbo.json`
+</pre></details><details><summary>fix-static.log</summary><pre>
+   • turbo 2.11.10
+   • Packages in scope: @bb/server
+   • Running lint, typecheck in 1 package
+   • Remote caching disabled, using shared worktree cache
+
+@bb/server:generate:bb-official-marketplace: cache hit, replaying logs 101994fc50c307bc
+@bb/templates:generate:plugin-scaffold: cache hit, replaying logs 82746e15e01c03e2
+@bb/server:generate:bb-official-marketplace: 
+@bb/server:generate:bb-official-marketplace: &gt; @bb/server@0.0.1 generate:bb-official-marketplace /tmp/checkout
+@bb/server:generate:bb-official-marketplace: &gt; node --conditions=source --import tsx scripts/generate-bb-official-marketplace.ts
+@bb/server:generate:bb-official-marketplace: 
+@bb/templates:generate:templates: cache hit, replaying logs 68a495b11eeeb264
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold /tmp/checkout
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/plugin-build:generate: cache hit, replaying logs 1c8ff8d4d894bf1d
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates /tmp/checkout
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: &gt; @bb/plugin-build@0.0.1 generate /tmp/checkout
+@bb/plugin-build:generate: &gt; node ./scripts/generate-plugin-theme.mjs &amp;&amp; node ./scripts/generate-runtime-export-manifest.mjs
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: wrote packages/plugin-build/src/generated/plugin-theme.generated.ts
+@bb/plugin-build:generate: wrote packages/plugin-build/src/generated/host-tailwind.css
+@bb/plugin-build:generate: wrote packages/plugin-build/src/generated/host-tailwind-version.ts
+@bb/plugin-build:generate: wrote /tmp/checkout (react@19.3.1)
+@bb/process-utils:generate:profile-worker: cache hit, replaying logs 5e4d18a9e4ee4c66
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker /tmp/issue-7346/base/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+@bb/server:typecheck: cache miss, executing 365ed7c675143d80
+@bb/server:typecheck: 
+@bb/server:typecheck: &gt; @bb/server@0.0.1 typecheck /tmp/issue-7346/base/apps/server
+@bb/server:typecheck: &gt; tsrs --noEmit
+@bb/server:typecheck: 
+
+ Tasks:    6 successful, 6 total
+Cached:    5 cached, 6 total
+  Time:    1.663s 
+
+</pre></details><details><summary>fix-lint.log</summary><pre>
+   • turbo 2.11.10
+   • Packages in scope: @bb/server
+   • Running lint:type-aware in 1 package
+   • Remote caching disabled, using shared worktree cache
+
+@bb/templates:generate:plugin-scaffold: cache hit, replaying logs 82746e15e01c03e2
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold /tmp/checkout
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:templates: cache hit, replaying logs 68a495b11eeeb264
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates /tmp/checkout
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/plugin-build:generate: cache hit, replaying logs 1c8ff8d4d894bf1d
+@bb/server:generate:bb-official-marketplace: cache hit, replaying logs 101994fc50c307bc
+@bb/server:generate:bb-official-marketplace: 
+@bb/server:generate:bb-official-marketplace: &gt; @bb/server@0.0.1 generate:bb-official-marketplace /tmp/checkout
+@bb/server:generate:bb-official-marketplace: &gt; node --conditions=source --import tsx scripts/generate-bb-official-marketplace.ts
+@bb/server:generate:bb-official-marketplace: 
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: &gt; @bb/plugin-build@0.0.1 generate /tmp/checkout
+@bb/plugin-build:generate: &gt; node ./scripts/generate-plugin-theme.mjs &amp;&amp; node ./scripts/generate-runtime-export-manifest.mjs
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: wrote packages/plugin-build/src/generated/plugin-theme.generated.ts
+@bb/plugin-build:generate: wrote packages/plugin-build/src/generated/host-tailwind.css
+@bb/plugin-build:generate: wrote packages/plugin-build/src/generated/host-tailwind-version.ts
+@bb/plugin-build:generate: wrote /tmp/checkout (react@19.3.1)
+@bb/process-utils:generate:profile-worker: cache hit, replaying logs 5e4d18a9e4ee4c66
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker /tmp/issue-7346/base/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+@bb/server:typecheck: cache hit, replaying logs 365ed7c675143d80
+@bb/server:typecheck: 
+@bb/server:typecheck: &gt; @bb/server@0.0.1 typecheck /tmp/issue-7346/base/apps/server
+@bb/server:typecheck: &gt; tsrs --noEmit
+@bb/server:typecheck: 
+@bb/server:lint:type-aware: cache miss, executing 2d6d26159f2fb739
+@bb/server:lint:type-aware: 
+@bb/server:lint:type-aware: &gt; @bb/server@0.0.1 lint:type-aware /tmp/issue-7346/base/apps/server
+@bb/server:lint:type-aware: &gt; oxlint -c ../../.oxlintrc.type-aware.json
+@bb/server:lint:type-aware: 
+@bb/server:lint:type-aware: Found 0 warnings and 0 errors.
+@bb/server:lint:type-aware: Finished in 4.4s on 822 files with 5 rules using 20 threads.
+
+ Tasks:    7 successful, 7 total
+Cached:    6 cached, 7 total
+  Time:    5.091s 
+
+</pre></details>
+<p>Other verification commands: <code>pnpm exec oxfmt apps/server/src/services/threads/dispatch-hooks.ts apps/server/test/threads/dispatch-hooks.test.ts</code>; <code>git diff --check</code>; <code>git diff --numstat origin/main</code>; read-only GitHub issue fields, labels, timeline, and PR metadata. Issue content was treated only as untrusted claims; its proposed patch and reported local test were not copied or executed.</p>
+</main></body></html>
