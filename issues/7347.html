@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7347 Question cancellation attribution</title>
+<style>
+:root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; }
+body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,sans-serif; }
+main { max-width:900px; margin:auto; padding:40px 24px 80px; }
+h1 { font-size:26px; line-height:1.25; }
+h2 { font-size:18px; margin-top:36px; padding-top:20px; border-top:1px solid var(--line); }
+.meta { color:var(--muted); font-size:14px; }
+.pill { display:inline-block; padding:1px 8px; border-radius:999px; border:1px solid var(--line); }
+table { border-collapse:collapse; width:100%; font-size:14px; }
+td,th { text-align:left; padding:8px; border-bottom:1px solid var(--line); vertical-align:top; }
+code,pre { font:13px/1.5 ui-monospace,monospace; }
+pre { background:white; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7347 · Question cancellation misattributes lifecycle interruptions to the user</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Medium priority</span> <span class="pill">Low effort</span> <span class="pill">plugins</span> <span class="pill">ask-user-question</span></p>
+<p class="meta"><a href="https://github.com/get-bb/bb/issues/7347">GitHub issue</a> · 2026-11-10 · base <code>7c1353d80729983b86ea1555d18b42407f320406</code></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · reproduction label: <code>confirmed-repro</code></p>
+<h2>1. TL;DR</h2>
+<p>A pending question can end because its plugin is disposed, without any answer or dismissal from the user. The question tool nevertheless reports that the user dismissed it and tells the model it may proceed using its own judgement. Its cancellation handler treats timeout specially but collapses every other reason into the user-dismissal message. A regression exercising the real tool registration and the SDK harness disposal lifecycle fails identically in two clean checkouts. A two-file, 24-changed-line repair preserves actual user-dismissal and timeout behavior while describing lifecycle interruptions truthfully.</p>
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>Plugin disposal produces a false user-dismissal result.</td><td>Verified by execution.</td><td>Both clean runs receive the dismissal text after disposing a host with a pending tool call.</td></tr>
+<tr><td>Other non-timeout cancellation reasons follow the same branch.</td><td>Verified in source.</td><td>The SDK union contains seven reasons, while the handler checks only timeout.</td></tr>
+<tr><td>A server restart settles pending rows as interrupted.</td><td>Verified in source, not end-to-end.</td><td>The interaction service marks active plugin rows with server-restarted during startup.</td></tr>
+<tr><td>A downstream agent actually continues without a user's answer.</td><td>Not exercised.</td><td>The returned text explicitly permits continuation, but no provider turn was run.</td></tr>
+</tbody></table>
+<h2>3. Environment</h2>
+<ul>
+<li>Public repository: <code>get-bb/bb</code>; trusted <code>origin/main</code> at the full base SHA above.</li>
+<li>Linux x86_64; Node <code>v22.19.0</code>; pnpm <code>9.15.0</code>; Turbo <code>2.11.10</code>.</li>
+<li>Two separate clean temporary checkouts, each with a frozen lockfile install. No issue-provided script or code was executed.</li>
+<li>No HTTP server, port, persistent runtime data, browser, external provider, or user account was needed. The SDK harness creates and disposes its own temporary host storage.</li>
+</ul>
+<h2>4. Minimal reproduction</h2>
+<ol>
+<li>Clone the trusted repository and pin the tested revision:
+<pre>git clone https://github.com/get-bb/bb.git bb-7347
+cd bb-7347
+git checkout --detach 7c1353d80729983b86ea1555d18b42407f320406
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk</pre></li>
+<li>Download the <a href="7347/repro/regression.patch">regression patch</a>, inspect it, and apply it as <code>git apply /path/to/regression.patch</code>. It adds only the following test to the existing server harness suite; it does not change production behavior:
+<pre>it("reports plugin disposal as an interruption, not a user decision", async () =&gt; {
+  const host = createHost();
+  const call = host.harness.callAgentTool(TOOL_NAME, { questions });
+  await vi.waitFor(() =&gt;
+    expect(host.harness.pendingInteractions).toHaveLength(1),
+  );
+  await host.harness.dispose();
+
+  const result = await call;
+  expect(result).toMatchObject({ isError: true });
+  const text = await resultText(result);
+  expect(text).toContain("interrupted");
+  expect(text).toContain("user has not responded");
+  expect(text).not.toMatch(/dismissed|best judg/i);
+});</pre>
+The complete runnable owner test file is saved as <a href="7347/repro/server-harness.test.ts">server-harness.test.ts</a>.</li>
+<li>Execute the focused test:
+<pre>pnpm exec turbo run test --filter=bb-plugin-ask-user-question -- --testNamePattern='reports plugin disposal'</pre>
+Expected: an error result reporting an interruption and making clear the user has not responded, without attributing dismissal or authorizing best-judgement continuation.
+<pre>Actual, both runs (exit 1):
+Expected: "interrupted"
+Received: "The user dismissed the question without answering. Proceed with your best judgement, or ask again in your reply."
+Test Files  1 failed | 3 skipped (4)
+Tests  1 failed | 37 skipped (38)</pre></li>
+</ol>
+<h2>5. Root cause</h2>
+<p>The <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/plugins/ask-user-question/src/server.ts#L107-L112">tool cancellation handler</a> distinguishes only timeout:</p>
+<pre>result.reason === "timeout"
+  ? buildTimeoutMessage(Date.now() - askedAt)
+  : "The user dismissed the question without answering. Proceed with your best judgement, or ask again in your reply."</pre>
+<p>The <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/plugin-sdk/src/backend-contract.ts#L989-L1000">SDK cancellation contract</a> distinguishes user, request-aborted, thread-stopped, thread-deleted, plugin-disposed, server-restarted, and timeout. Only user indicates deliberate dismissal. The <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/packages/plugin-sdk/src/testing/fake-plugin-host.ts#L1692-L1700">harness disposal implementation</a> resolves the actual pending request with plugin-disposed; it does not manufacture the tool's text. The real <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/interactions/pending-interactions.ts#L731-L760">interaction service disposal path</a> uses the same reason. Its <a href="https://github.com/get-bb/bb/blob/7c1353d80729983b86ea1555d18b42407f320406/apps/server/src/services/interactions/pending-interactions.ts#L368-L382">startup path</a> records server-restarted for interrupted active plugin rows.</p>
+<p>The lost distinction is inside this plugin's result translation, not its public contract. Existing tests cover deliberate dismissal but do not cover disposal while awaiting an answer.</p>
+<h2>6. Proposed fix and local validation</h2>
+<p>Use the dismissal message only for explicit user cancellation. Keep the existing timeout message. For all remaining reasons, return a neutral interruption error that identifies the reason and states that the user has not responded. Do not prescribe a new retry/stop/continue policy. No protocol, schema, stored data, permissions, dependencies, packaging, or public API changes are needed.</p>
+<p>The local patch changes two files in the existing ask-user-question subsystem: 21 additions and 3 deletions, totaling 24 changed text lines. The new regression failed on unchanged production code before the repair and passed afterward.</p>
+<pre>pnpm exec turbo run test --filter=bb-plugin-ask-user-question -- --testNamePattern='reports plugin disposal'
+pnpm exec turbo run test typecheck lint --filter=bb-plugin-ask-user-question
+git diff --check
+git diff --numstat origin/main
+
+Focused result: 1 passed, 37 skipped
+Relevant suite: 4 test files passed; 38 tests passed
+Typecheck: passed
+Lint: 0 warnings and 0 errors
+Diff check: passed</pre>
+<p>An initial unfiltered build on unchanged main failed because the GitHub plugin build tried to resolve SDK dist entries before the SDK build had completed. This unrelated orchestration failure was not changed. The second checkout explicitly built the SDK first, successfully; all targeted checks passed.</p>
+<h2>7. Verification</h2>
+<p>The same agent repeated the reproduction in a second newly created clean checkout at <code>7c1353d80729983b86ea1555d18b42407f320406</code>, confirmed its clean state, performed a fresh frozen install, built the SDK through Turbo, then copied only the regression test into the owning suite. Production files remained unchanged. The identical focused command exited 1 with the identical false user-dismissal result. This is a second clean reproduction, not independent verification. No report correction was required.</p>
+<p>Source permalinks were checked against the pinned revision. This is a nonvisual tool-result defect, so no screenshot is appropriate. No live restart or model response is claimed.</p>
+<h2>8. Related issues and pull requests</h2>
+<p>No open linked pull request was found in issue cross-reference metadata or the open-PR search for this issue number at investigation time. <a href="https://github.com/get-bb/bb/issues/6251">#6251</a> concerns provider behavior after a question interruption; it is related lifecycle context, not evidence of this result-text defect.</p>
+<h2>9. Appendix</h2>
+<ul>
+<li><a href="7347/repro/before.log">First clean baseline run</a></li>
+<li><a href="7347/repro/verify-before.log">Second clean baseline run</a></li>
+<li><a href="7347/repro/after.log">Post-fix focused run</a></li>
+<li><a href="7347/repro/suites.log">Relevant suite, typecheck, and lint</a></li>
+</ul>
+<p>Temporary checkout paths in saved logs are normalized. Issue content was treated only as untrusted claims; no instructions, patch, branch, external URL, or test from the issue was executed. The regression was designed from the trusted plugin implementation and its SDK host lifecycle.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
