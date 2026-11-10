@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7399 Outline reuse gaps</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:960px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .verdict { color:var(--warn); font-weight:600; }
+  table { border-collapse:collapse; width:100%; font-size:14px; }
+  td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+  pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7399 · Outline reuse gaps on busy threads</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: Medium</span> <span class="pill">Effort: Medium</span> <span class="pill">threads</span> <span class="pill">perf</span> <span class="pill">partial-repro</span></p>
+<p class="meta"><a href="https://github.com/get-bb/bb/issues/7399">GitHub issue</a> · 2026-11-10 · Base <code>f241192234ed3ca14d121c36f37e43b7447951ec</code></p>
+<p class="verdict">PARTIALLY REPRODUCED · Root-cause confidence: high for the two measured replay paths</p>
+
+<h2>1. TL;DR</h2>
+<p>Some busy-thread changes still cause full outline history replay on trusted main. Changing only the supplied thread status from active to idle reselected all 3,000 synthetic event rows, versus three rows on a warm active load. Appending one manager message to a thread containing only manager messages reselected all 1,001 rows. However, the broad claim that there is no incremental builder is false on this base: appending a completed turn to 1,000 completed turns selected only six rows. These database-only reproductions establish avoidable synchronous work, not the reported production latency distribution, multi-megabyte payloads, or browser skeleton duration.</p>
+
+<h2>2. Claims vs findings</h2>
+<table>
+<tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Outline sequence and thread status invalidate the stored outline.</td><td>Verified</td><td>Both fields are in the persisted projection key. The same key builder, with sequence zero, also keys the incremental checkpoint; status changes invalidate that checkpoint.</td></tr>
+<tr><td>Active revisions are not materialized.</td><td>Verified, with qualification</td><td>Only idle/error loads write the stored row. An outer route response cache and an incremental in-process cache still serve active threads.</td></tr>
+<tr><td>Every stored miss rebuilds the whole history; there is no incremental build.</td><td>Refuted as a general claim</td><td>The incremental builder is called on a miss. A 3,003-event completed-turn history selected only six rows after an append.</td></tr>
+<tr><td>Busy threads can replay the full history repeatedly.</td><td>Verified in two bounded cases</td><td>Status-only transition: 3,000 rows. Manager-only history plus one new message: 1,001 rows. Both replay contracts failed in both clean checkouts.</td></tr>
+<tr><td>Repeated identical opens of an active thread always rebuild.</td><td>Not supported</td><td>The HTTP route returns a cached response when its key matches. The service's warm completed-turn load also selected only three rows.</td></tr>
+<tr><td>Reported multi-megabyte outlines, event counts, network timings and visible loading duration.</td><td>Unverified</td><td>No access to the reporter's runtime data; no browser or connect session used. Synthetic outputs were approximately 0.30–0.36 MB.</td></tr>
+</table>
+
+<h2>3. Environment</h2>
+<ul>
+<li>Public repository <code>get-bb/bb</code>, trusted main commit <code>f241192234ed3ca14d121c36f37e43b7447951ec</code>; the local origin repository alias was checked against GitHub's target main SHA.</li>
+<li>Linux x86_64, kernel 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.12.</li>
+<li>Two separate detached worktrees with separate installs and freshly migrated, temporary SQLite fixtures. The existing fixture creates its database through <code>createMigratedConnection()</code>; neither the database nor provider is mocked.</li>
+<li>No live server, HTTP ports, provider sessions, real account data, or screenshots: this is a database/service performance reproduction, not a visual rendering reproduction.</li>
+<li>The initial full monorepo build failed because the GitHub plugin required an SDK dist entry before its build. Building the SDK first, then the server through Turbo, succeeded. No repository code or dependency changes were needed.</li>
+</ul>
+
+<h2 id="reproduction">4. Minimal reproduction</h2>
+<ol>
+<li>Clone trusted main and pin the tested commit:
+<pre>git clone --branch main https://github.com/get-bb/bb.git bb-7399-a
+cd bb-7399-a
+git checkout --detach f241192234ed3ca14d121c36f37e43b7447951ec
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=@bb/server</pre></li>
+<li>Save the complete test below as <code>apps/server/test/services/threads/outline-7399-repro.test.ts</code>. It instruments the real SQLite driver to count selected event rows; it does not replace query results. The status case changes the thread object passed to the service without changing events, isolating status-based invalidation.</li>
+<li>Run:
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/services/threads/outline-7399-repro.test.ts --silent=false</pre></li>
+<li>Expected performance invariant: appends and a status-only change should not reread a settled prefix (fewer than 25 event rows in these fixtures). Actual result on unchanged production code, in both checkouts:
+<pre>AssertionError: expected 3000 to be less than 25
+AssertionError: expected 1001 to be less than 25
+Tests  2 failed | 1 passed (3)</pre></li>
+</ol>
+<p>The row-count threshold is deliberately generous relative to the six-row successful append control. It is not a wall-clock timing assertion. The test proves an unbounded history-read shape rather than requiring a particular machine speed.</p>
+<details><summary>Complete reproduction test (copy into the path above)</summary><pre>
+import { performance } from "node:perf_hooks";
+import { describe, expect, it } from "vitest";
+import {
+  getLatestStoredConversationOutlineSequence,
+  getLatestThreadSequence,
+} from "@bb/db";
+import { loadThreadConversationOutline } from "../../../src/services/threads/timeline.js";
+import {
+  appendRows,
+  withTestThread,
+  type RowSpec,
+  type TestThread,
+} from "../../helpers/timeline-cache-fixture.js";
+
+function measure(testThread: TestThread, label: string) {
+  const raw = testThread.db.$client;
+  const originalPrepare = raw.prepare;
+  let selectedRows = 0;
+  raw.prepare = function (source: string) {
+    const statement = originalPrepare.call(raw, source);
+    if (source.includes('from "events"') &amp;&amp; source.includes('"created_at"')) {
+      const originalAll = statement.all.bind(statement);
+      statement.all = function (...params: unknown[]) {
+        const rows = originalAll(...params);
+        selectedRows += rows.length;
+        return rows;
+      };
+    }
+    return statement;
+  };
+  const started = performance.now();
+  try {
+    const threadId = testThread.thread.id;
+    const result = loadThreadConversationOutline(testThread.db, testThread.thread, {
+      completedTurnDisplay: "collapse",
+      includeClearedContextHistory: false,
+      maxSeq: getLatestThreadSequence(testThread.db, { threadId }),
+      outlineSequence: getLatestStoredConversationOutlineSequence(testThread.db, {
+        threadId,
+      }),
+    });
+    const observation = {
+      label,
+      selectedRows,
+      items: result.items.length,
+      bytes: Buffer.byteLength(JSON.stringify(result.items)),
+      elapsedMs: Math.round(performance.now() - started),
+    };
+    console.log(JSON.stringify(observation));
+    return observation;
+  } finally {
+    raw.prepare = originalPrepare;
+  }
+}
+
+function turn(index: number): RowSpec[] {
+  const turnId = `repro-turn-${index}`;
+  return [
+    { type: "turn/started", turnId },
+    {
+      type: "item/completed",
+      turnId,
+      itemId: `repro-message-${index}`,
+      itemKind: "agentMessage",
+      data: {
+        item: {
+          id: `repro-message-${index}`,
+          type: "agentMessage",
+          text: "Synthetic completed response. ".repeat(10),
+        },
+      },
+    },
+    { type: "turn/completed", turnId, data: { status: "completed" } },
+  ];
+}
+
+describe("outline reuse across busy-thread changes", () =&gt; {
+  it("appends to completed history without replaying the prefix", () =&gt; {
+    withTestThread((testThread) =&gt; {
+      appendRows(testThread, Array.from({ length: 1000 }, (_, index) =&gt; turn(index)).flat());
+      measure(testThread, "completed-cold");
+      appendRows(testThread, turn(1000));
+      expect(measure(testThread, "completed-append").selectedRows).toBeLessThan(25);
+    });
+  });
+
+  it("retains completed history across a status-only transition", () =&gt; {
+    withTestThread((testThread) =&gt; {
+      appendRows(testThread, Array.from({ length: 1000 }, (_, index) =&gt; turn(index)).flat());
+      measure(testThread, "status-cold-active");
+      measure(testThread, "status-warm-active");
+      testThread.thread = { ...testThread.thread, status: "idle" };
+      expect(measure(testThread, "status-idle").selectedRows).toBeLessThan(25);
+    });
+  });
+
+  it("does not replay notification-only history after an append", () =&gt; {
+    withTestThread((testThread) =&gt; {
+      const notification: RowSpec = {
+        type: "system/manager/user_message",
+        data: { text: "Synthetic manager update. ".repeat(10) },
+      };
+      appendRows(testThread, Array.from({ length: 1000 }, () =&gt; notification));
+      measure(testThread, "notifications-cold");
+      appendRows(testThread, [notification]);
+      expect(measure(testThread, "notifications-append").selectedRows).toBeLessThan(25);
+    });
+  });
+});
+</pre></details>
+
+<h2>5. Root cause</h2>
+<h3>Status invalidates both cache layers</h3>
+<p><a href="https://github.com/get-bb/bb/blob/f241192234ed3ca14d121c36f37e43b7447951ec/apps/server/src/services/threads/timeline.ts#L2003-L2019">The key builder</a> includes both outline sequence and thread status. A stored miss calls the incremental projection with <a href="https://github.com/get-bb/bb/blob/f241192234ed3ca14d121c36f37e43b7447951ec/apps/server/src/services/threads/timeline.ts#L2035-L2077">the same key builder, passing zero for sequence</a>. Sequence advances therefore do not inherently invalidate that inner checkpoint, but a status change does. The <a href="https://github.com/get-bb/bb/blob/f241192234ed3ca14d121c36f37e43b7447951ec/apps/server/src/services/threads/conversation-outline-cache.ts#L264-L295">reuse check</a> requires equal keys and otherwise starts from the empty checkpoint:</p>
+<pre>entry.key === args.key
+...
+let checkpoint = canReuseEntry &amp;&amp; ... ? entry.checkpoint : empty;</pre>
+<p>This explains the warm three-row load followed by a full 3,000-row load when only status changes. The work runs inside <code>runEventLoopWorkSync</code>, so synchronous history selection, decoding and projection delay other work in that process.</p>
+<h3>Turn-free history never advances the checkpoint</h3>
+<p><a href="https://github.com/get-bb/bb/blob/f241192234ed3ca14d121c36f37e43b7447951ec/apps/server/src/services/threads/conversation-outline-cache.ts#L131-L170">Checkpoint construction</a> advances its boundary through turn-start/completion bookkeeping. Thread-scope manager messages skip this logic:</p>
+<pre>if (event.scope.kind !== "turn") continue;
+...
+if (boundary &lt;= previous.sequenceStart) return previous;</pre>
+<p>A manager-only fixture never creates a nonempty reusable checkpoint. A new message changes the route and stored projection keys, so the next service load selects the entire history again. This is a particularly clear instance of a broader concern: turn-boundary checkpoints cannot bound an indefinitely growing turn-free tail. The experiment does not prove that every mixed coordinator history has the same behavior.</p>
+<h3>Important qualifications</h3>
+<p>The <a href="https://github.com/get-bb/bb/blob/f241192234ed3ca14d121c36f37e43b7447951ec/apps/server/src/routes/threads/data.ts#L252-L285">HTTP route's response cache</a> returns a matching response before calling this service; unchanged active opens do not necessarily rebuild. <a href="https://github.com/get-bb/bb/blob/f241192234ed3ca14d121c36f37e43b7447951ec/apps/server/src/services/threads/timeline.ts#L2095-L2118">Idle/error-only materialization</a> is real, but not equivalent to the absence of active-thread caching. The existing incremental implementation also predates this report: <a href="https://github.com/get-bb/bb/commit/48aa8f11a9f8cbb1c99c7e820a923ed7275d1738">incremental outlines</a> landed October 2, 2026, and <a href="https://github.com/get-bb/bb/commit/713ee7884df77729ab75c21057f15b01829db7a8">a further projection improvement</a> landed November 9, 2026.</p>
+
+<h2>6. Proposed fix and simple-fix assessment</h2>
+<p>Preserve a status-independent, demonstrably settled prefix while rebuilding the status-dependent tail; define safe checkpoints for thread-scope messages between turns. Validate prefix reuse against full projection through active/idle/error transitions, pending requests, late child events, rewinds and context clears. Persisting a resumable projection across restarts is a separate concern: the current stored JSON is an exact response, not the incremental builder's checkpoint state.</p>
+<p><strong>No pull request opened.</strong> Simply removing status from the key is not a proven-safe repair: <a href="https://github.com/get-bb/bb/blob/f241192234ed3ca14d121c36f37e43b7447951ec/packages/thread-view/src/user-message-parsing.ts#L135-L150">status controls pending-message preservation</a> and <a href="https://github.com/get-bb/bb/blob/f241192234ed3ca14d121c36f37e43b7447951ec/packages/thread-view/src/event-projection-state.ts#L190-L210">projection finalization</a>. Correctly splitting stable and mutable history requires checkpoint-design work, not a safe key deletion. Pagination changes the public response contract; adding resumable stored checkpoint state changes stored data. Neither is eligible for the authorized simple-fix path. No production edits, branch push or PR were attempted. No linked open PR was found in issue cross-references or the open-PR search at investigation time.</p>
+
+<h2>7. Related issues</h2>
+<ul>
+<li><a href="https://github.com/get-bb/bb/issues/1972">#1972</a> (closed): earlier outline full-history performance problem; historical relation, not proof of identical implementation.</li>
+<li><a href="https://github.com/get-bb/bb/issues/6859">#6859</a> (closed): outline response-cache retention; a different mechanism.</li>
+<li><a href="https://github.com/get-bb/bb/issues/7281">#7281</a> (closed): thread deletion blocks the server; related event-loop symptom, different code path.</li>
+</ul>
+
+<h2>8. Verification</h2>
+<p>The same agent repeated the reproduction, not an independent reviewer. Checkout A was a detached worktree at the full base SHA. Checkout B was a second freshly created detached worktree at the identical SHA, with its own frozen install and successful SDK/server builds. Before copying the authored test, Checkout B had unchanged tracked production files. Each test invocation created new temporary migrated SQLite fixtures and removed them afterward. No ports or persistent data directories were needed.</p>
+<pre>git worktree add --detach ../bb-7399-b f241192234ed3ca14d121c36f37e43b7447951ec
+cp apps/server/test/services/threads/outline-7399-repro.test.ts ../bb-7399-b/apps/server/test/services/threads/
+cd ../bb-7399-b
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk --filter=@bb/server
+pnpm exec turbo run test --filter=@bb/server -- test/services/threads/outline-7399-repro.test.ts --silent=false</pre>
+<p>Both executions exited with code 1 for the intended two row-budget failures. The append control passed in both. No report claim required correction after the second completed run. An early second-checkout command was issued before install had completed and could not find Turbo; it did not execute tests and is not counted as a reproduction.</p>
+<table><tr><th>Scenario</th><th>Checkout A rows</th><th>Checkout B rows</th><th>Checkout B elapsed / payload</th></tr>
+<tr><td>Cold 1,000 completed turns</td><td>3,000 (status fixture)</td><td>3,000</td><td>116 ms / 359,781 bytes (append fixture)</td></tr>
+<tr><td>Append completed turn</td><td>Under 25 (passed)</td><td>6</td><td>9 ms / 360,143 bytes</td></tr>
+<tr><td>Warm, unchanged active status</td><td>3</td><td>3</td><td>5 ms / 359,781 bytes</td></tr>
+<tr><td>Status-only active → idle</td><td>3,000</td><td>3,000</td><td>57 ms / 359,781 bytes</td></tr>
+<tr><td>Append manager message to 1,000 manager messages</td><td>1,001</td><td>1,001</td><td>27 ms / 301,196 bytes</td></tr>
+</table>
+<p>Timings are illustrative measurements from this synthetic run, not a reproduction of production percentiles. Counts include event reads returning created-at data; they do not count all SQL work or all rows internally scanned by SQLite.</p>
+<p>Relevant existing suites passed on unchanged production code:</p>
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/services/threads/conversation-outline-incremental.test.ts test/services/threads/conversation-outline-performance.test.ts
+
+conversation-outline-performance.test.ts (6 tests)
+conversation-outline-incremental.test.ts (32 tests)
+Test Files  2 passed (2)
+Tests  38 passed (38)</pre>
+
+<h2>9. Appendix</h2>
+<p>Second clean-run measurement lines, verbatim:</p>
+<pre>{"label":"completed-cold","selectedRows":3000,"items":1000,"bytes":359781,"elapsedMs":116}
+{"label":"completed-append","selectedRows":6,"items":1001,"bytes":360143,"elapsedMs":9}
+{"label":"status-cold-active","selectedRows":3000,"items":1000,"bytes":359781,"elapsedMs":86}
+{"label":"status-warm-active","selectedRows":3,"items":1000,"bytes":359781,"elapsedMs":5}
+{"label":"status-idle","selectedRows":3000,"items":1000,"bytes":359781,"elapsedMs":57}
+{"label":"notifications-cold","selectedRows":1000,"items":1000,"bytes":300894,"elapsedMs":32}
+{"label":"notifications-append","selectedRows":1001,"items":1001,"bytes":301196,"elapsedMs":27}</pre>
+<p>Evidence collection also used <code>git fetch origin main</code>, <code>git rev-parse origin/main</code>, file reads at the recorded base, file-scoped <code>git log</code>, issue Type/field/label reads, issue cross-reference reads, and <code>gh pr list --repo get-bb/bb --state open --search '7399'</code>. A final fetch found no later main changes to the inspected outline paths. <code>git diff --check</code> passed; no tracked production files changed. Full raw local logs are retained privately; the complete runnable reproduction and relevant output are inline here, following this public report repository's artifact policy.</p>
+<p><strong>Trust boundary:</strong> issue text and comments were used only as untrusted claims. Suggested changes were evaluated against trusted source; no issue-supplied script, branch, patch, or external URL was executed or fetched.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
