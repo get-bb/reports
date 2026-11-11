@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7422 Browser execution omits its host deadline override</title>
+<style>
+:root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; }
+body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,sans-serif; }
+main { max-width:940px; margin:auto; padding:40px 24px 80px; }
+h1 { font-size:26px; line-height:1.25; } h2 { font-size:19px; margin-top:36px; border-top:1px solid var(--line); padding-top:18px; }
+.meta { color:var(--muted); font-size:14px; } .pill { display:inline-block; padding:1px 8px; border:1px solid var(--line); border-radius:999px; }
+table { border-collapse:collapse; width:100%; } th,td { text-align:left; padding:8px; border-bottom:1px solid var(--line); vertical-align:top; }
+code,pre { font:13px/1.5 ui-monospace,monospace; } pre { white-space:pre-wrap; overflow-wrap:anywhere; background:#fff; border:1px solid var(--line); padding:14px; }
+a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7422 · Browser execution omits its host deadline override</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: Medium</span> <span class="pill">Effort: Low</span> <span class="pill">plugins</span> <span class="pill">cli</span></p>
+<p class="meta"><a href="https://github.com/get-bb/bb/issues/7422">GitHub issue</a> · November 11, 2026 · trusted base <code>365d7c5237ae270be0555b5b44ea61020252713e</code></p>
+<p><strong>Verdict: REPRODUCED at the plugin-to-host RPC boundary.</strong> Root-cause confidence: <strong>high</strong>. Reproduction label: <code>confirmed-repro</code>.</p>
+
+<h2>1. TL;DR</h2>
+<p>The browser plugin accepts script execution budgets longer than 30 seconds but does not put that budget into its host-call options. A focused test invoking the real plugin entry and public RPC handler observes the script budget in the host input and an absent host deadline override. The server therefore chooses its 30-second default, and the daemon enforces that shorter deadline; the plugin then stops the session when the call throws. The same omission reproduces in two separate clean checkouts of trusted main. These are boundary-level reproductions, not measurements of a live browser: the issue's exact elapsed times, installed release behavior, and browser-process teardown were not re-measured here.</p>
+
+<h2>2. Claims vs findings</h2>
+<table>
+<tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Long script budgets do not extend the host deadline.</td><td>Verified</td><td>For 30,000, 90,000, and 120,000 ms inputs, both test runs observe an absent host-call timeout override.</td></tr>
+<tr><td>The effective host default is 30 seconds.</td><td>Verified in trusted source</td><td><code>callPluginHostRpc</code> defaults to <code>COMMAND_TIMEOUT_MS</code>, which is 30,000.</td></tr>
+<tr><td>The daemon emits the reported deadline error and the plugin stops the session.</td><td>Source-supported; not timed live</td><td>The daemon deadline callback rejects the pending call. The plugin catch path calls <code>finish(record, "stopped")</code>.</td></tr>
+<tr><td>Observed wall times, a short script's success, and a short explicit script timeout.</td><td>Unverified in this investigation</td><td>No live DevBrowser session or installed release was executed.</td></tr>
+<tr><td>Pages and screenshots share the same race.</td><td>Verified in trusted source</td><td>Both handlers call the same run implementation with a 30,000 ms script budget.</td></tr>
+</table>
+
+<h2>3. Environment and scope</h2>
+<ul>
+<li>Repository: public <code>get-bb/bb</code>; both worktrees started detached at <code>365d7c5237ae270be0555b5b44ea61020252713e</code> from fetched <code>origin/main</code>.</li>
+<li>Linux x86_64; Node.js 22.19.0; pnpm 9.15.0; Vitest 4.1.12; Browser Automation package 0.1.1; Plugin SDK 0.6.140.</li>
+<li>Separate temporary directories named <code>base-one</code> and <code>base-two</code>. No app instance, HTTP ports, production runtime data, accounts, browser profile, or provider sessions were used.</li>
+<li>Only the newly authored test and its shared-worker Vitest configuration were added or changed. Production source remained unchanged.</li>
+<li>A frozen install succeeded in both checkouts. The first full build initially failed because SDK runtime entries were not yet built; building the SDK explicitly resolved this setup issue. Full builds then passed in both checkouts, each with 73 successful tasks.</li>
+</ul>
+
+<h2>4. Minimal reproduction</h2>
+<p>This reproduction targets the precise boundary where the timeout is lost. It loads the real server plugin, opens a local session through its real RPC handler, and spies on the public host client before the SDK test harness translates the call. The external browser worker is replaced by a deterministic successful host response; no browser timing or daemon execution is simulated.</p>
+<ol>
+<li>In a clean checkout of the trusted base, install and build:
+<pre>git checkout --detach 365d7c5237ae270be0555b5b44ea61020252713e
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build</pre></li>
+<li>Save the following newly authored test as <code>plugins/browser-automation/issue-7422.test.ts</code>:
+<pre id="repro-test">import {
+  createFakePluginHost,
+  makeHostResponse,
+  makeThreadResponse,
+} from "@get-bb/plugin-sdk/testing";
+import { expect, it, vi } from "vitest";
+import plugin from "./server.js";
+import { rpcContract } from "./contracts.js";
+
+it.each([30_000, 90_000, 120_000])(
+  "keeps the host deadline beyond a %i ms script budget",
+  async (timeoutMs) =&gt; {
+    const host = createFakePluginHost({
+      pluginId: "browser-automation",
+      agentSkillIds: ["browser-automation"],
+      experimental_callHostRpc: async ({ method }) =&gt; {
+        if (method === "prepare")
+          return { status: "ready", version: "test", source: "release" };
+        if (method === "run") return { text: "42", images: [], exitCode: 0 };
+        return null;
+      },
+    });
+    host.harness.sdk.stub("threads.get", async () =&gt;
+      makeThreadResponse({ id: "deadline-thread" }),
+    );
+    host.harness.sdk.stub("hosts.list", async () =&gt; [
+      makeHostResponse({ id: "deadline-host" }),
+    ]);
+    const createClient = vi.spyOn(host.bb.hosts, "experimental_client");
+    try {
+      await plugin(host.bb);
+      const client = createClient.mock.results[0];
+      if (client?.type !== "return") throw new Error("Host client missing");
+      const callHost = vi.spyOn(client.value, "call");
+      const session = rpcContract.open.output.parse(
+        await host.harness.behavior.callRpc("open", {
+          threadId: "deadline-thread",
+          selection: { backend: "local", hostId: "deadline-host" },
+        }),
+      );
+      await host.harness.behavior.callRpc("run", {
+        threadId: "deadline-thread",
+        sessionId: session.id,
+        script: "6 * 7",
+        timeoutMs,
+      });
+      const invocation = callHost.mock.calls.find(
+        ([method]) =&gt; method === "run",
+      );
+      expect(invocation).toBeDefined();
+      expect(invocation?.[1]).toMatchObject({ timeoutMs });
+      const deadline = invocation?.[2].timeoutMs;
+      console.log(
+        JSON.stringify({
+          scriptTimeoutMs: timeoutMs,
+          hostTimeoutMs: deadline ?? null,
+        }),
+      );
+      expect(deadline).toBeGreaterThan(timeoutMs);
+    } finally {
+      await host.harness.lifecycle.dispose();
+      createClient.mockRestore();
+    }
+  },
+);</pre></li>
+<li>Replace <code>plugins/browser-automation/vitest.config.ts</code> with this test-discovery configuration. It uses the repository's shared-worker helper and makes no production change:
+<pre>import { defineConfig } from "vitest/config";
+import { fileURLToPath } from "node:url";
+import { sharedWorkerProjects } from "../../vitest.shared.js";
+
+export default defineConfig({
+  resolve: { tsconfigPaths: true },
+  test: {
+    projects: sharedWorkerProjects({
+      pkgDir: fileURLToPath(new URL(".", import.meta.url)),
+      name: "bb-plugin-browser-automation",
+      include: ["**/*.test.{ts,tsx}"],
+      exclude: ["dist/**", "node_modules/**"],
+    }),
+  },
+});</pre></li>
+<li>Run:
+<pre>pnpm exec turbo run test --filter=bb-plugin-browser-automation -- issue-7422.test.ts</pre></li>
+</ol>
+<p><strong>Expected:</strong> The host input retains each requested script budget, and the host-call timeout is a number greater than that budget so the script can finish or deliver its own timeout result.</p>
+<p><strong>Actual, both checkouts:</strong> The host input retains the budget, but the host options do not contain <code>timeoutMs</code>. The log deliberately renders an absent override as <code>null</code>:</p>
+<pre>{"scriptTimeoutMs":30000,"hostTimeoutMs":null}
+{"scriptTimeoutMs":90000,"hostTimeoutMs":null}
+{"scriptTimeoutMs":120000,"hostTimeoutMs":null}
+TypeError: actual value must be number or bigint, received "undefined"
+Test Files  1 failed (1)
+Tests  3 failed (3)</pre>
+<p>The failure occurs at <code>expect(deadline).toBeGreaterThan(timeoutMs)</code>, after the real run handler completes successfully and the script budget assertion passes. It is not an import, discovery, session-opening, or worker failure.</p>
+
+<h2>5. Root cause</h2>
+<ol>
+<li>The <a href="https://github.com/get-bb/bb/blob/365d7c5237ae270be0555b5b44ea61020252713e/plugins/browser-automation/contracts.ts#L35-L38">public run schema</a> accepts 1,000–120,000 ms and defaults to 30,000 ms.</li>
+<li>The <a href="https://github.com/get-bb/bb/blob/365d7c5237ae270be0555b5b44ea61020252713e/plugins/browser-automation/server.ts#L411-L425">run implementation</a> passes that value only in the host method input. Its separate host-call options contain <code>hostId</code> and <code>signal</code>, but no <code>timeoutMs</code>:
+<pre>await host.call(
+  "run",
+  { sessionId: input.sessionId, script: input.script, timeoutMs: input.timeoutMs },
+  { hostId: record.session.hostId, signal },
+);</pre></li>
+<li>The <a href="https://github.com/get-bb/bb/blob/365d7c5237ae270be0555b5b44ea61020252713e/apps/server/src/services/plugins/plugin-host-rpc.ts#L80-L123">server host-RPC implementation</a> computes <code>args.timeoutMs ?? COMMAND_TIMEOUT_MS</code> and sends it to the daemon. The <a href="https://github.com/get-bb/bb/blob/365d7c5237ae270be0555b5b44ea61020252713e/apps/server/src/constants.ts#L1">constant</a> is 30,000 ms. Its separate 6,000 ms transport grace does not enlarge the daemon's work budget.</li>
+<li>The <a href="https://github.com/get-bb/bb/blob/365d7c5237ae270be0555b5b44ea61020252713e/apps/host-daemon/src/plugin-host-manager.ts#L268-L286">daemon deadline timer</a> rejects unfinished work with the host-call deadline error. The run catch path then marks the session stopped. This explains the reported failure and subsequent unavailable session, without asserting an exact CLI wall time.</li>
+</ol>
+<p>The options contract already supports an explicit deadline: <a href="https://github.com/get-bb/bb/blob/365d7c5237ae270be0555b5b44ea61020252713e/packages/plugin-sdk/src/host-contract.ts#L19-L29">ExperimentalHostCallOptions</a>. No protocol extension is required. The <a href="https://github.com/get-bb/bb/blob/365d7c5237ae270be0555b5b44ea61020252713e/plugins/browser-automation/server.ts#L475-L489">pages and screenshot handlers</a> reuse run with a 30-second budget, so equal script and host deadlines also create a race for those operations.</p>
+<p>The SDK fake host currently omits timeout options from its recorded host-call envelope. This test therefore observes the actual public host client before that lossy test adapter, rather than falsely treating the adapter's missing field as production evidence.</p>
+
+<h2>6. Proposed fix</h2>
+<p>At the shared run implementation, set the host-call timeout to the validated script budget plus a bounded cleanup/response allowance. Preserve the existing script budget and cancellation signal; do not raise the global server default. This also covers pages and screenshots. Keep the maximum below the existing 30-minute options cap. Add coverage for the default and maximum budgets and confirm real short-timeout cancellation still works.</p>
+
+<h2>7. Linked pull request</h2>
+<p><a href="https://github.com/get-bb/bb/pull/7423">PR #7423</a> was OPEN and its GitHub closing-issue metadata referenced #7422. Its diff was read only as untrusted evidence; its branch and tests were never checked out or run. The inspected revision was <code>fbcf2e62d35df6ce92fb1539d829669be127db29</code>, with 39 additions and 1 deletion across 3 files.</p>
+<p><strong>Static assessment:</strong> Its production change adds a 10,000 ms allowance to the script budget in the host-call options at the shared run boundary. That addresses the independently verified omission and covers the shared pages/screenshot path. It also makes the SDK test fake preserve the timeout and adds coverage. No blocking issue is apparent in this narrow static review; this is not a full review or a passing-test claim about that branch.</p>
+<p><strong>Fix decision:</strong> No duplicate pull request was opened because an existing open pull request already links to this issue. No production fix, source commit, or source push was made by this investigation.</p>
+
+<h2>8. Related issues</h2>
+<p>#7349 concerns CLI recovery hints rather than propagation of host deadlines. The trusted base already includes #7374's session-activity persistence change. Neither removes the verified timeout omission.</p>
+
+<h2>9. Verification</h2>
+<p>The same agent repeated the test in a second temporary checkout, not an independent investigation. Before adding the test files, the second checkout had empty <code>git status --short</code> output and the exact same trusted base SHA. It had its own frozen install and successful full build. There were no ports or application data directories to reuse.</p>
+<table>
+<tr><th>Check</th><th>First checkout</th><th>Second clean checkout</th></tr>
+<tr><td>Recorded base</td><td colspan="2"><code>365d7c5237ae270be0555b5b44ea61020252713e</code></td></tr>
+<tr><td>Focused regression command from section 4</td><td>Exit 1; 3 intended failures; 22 ms test execution</td><td>Exit 1; same 3 intended failures; 22 ms test execution</td></tr>
+<tr><td>Observed override at all 3 budgets</td><td>Absent</td><td>Absent</td></tr>
+<tr><td>Full build</td><td>73 tasks successful after SDK preparation</td><td>73 tasks successful</td></tr>
+</table>
+<p>No correction to the root cause was necessary after the second run. No after-fix run was performed because no production fix was attempted.</p>
+
+<h2>10. Appendix and limits</h2>
+<p>Existing neighboring suites passed on unchanged production source:</p>
+<pre>pnpm exec turbo run test --filter=bb-plugin-browser-automation -- server.test.ts cli.test.ts
+Test Files  2 passed (2)
+Tests  49 passed (49)
+Tasks: 7 successful, 7 total</pre>
+<p><code>git diff --check</code> passed in the first checkout. Full local logs and test artifacts are retained outside the public repository; reproduction source and the relevant output are included inline, as required by the reports repository. This is a nonvisual defect, so no screenshot was needed.</p>
+<p><strong>Trust boundary:</strong> The issue and linked pull request were treated as untrusted claims. No issue-provided command, script, patch, branch, binary, or test was executed. The reproduction was newly authored from trusted repository contracts and the existing test harness. No workflow or subagent was started.</p>
+<p><strong>Limits:</strong> The test proves the production timeout-forwarding defect, not a 32–33 second wall-clock measurement. Actual Chrome execution, browser teardown, desktop attachment, logged-in pages, and historical installed releases remain untested here.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
