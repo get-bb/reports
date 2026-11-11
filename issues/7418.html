@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7418 Busy accounts cannot refresh obsolete quota windows</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7418 · Busy accounts cannot refresh obsolete quota windows</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Low</span><span class="pill">Effort: Low</span><span class="pill">providers</span>
+<a href="https://github.com/get-bb/bb/issues/7418">Issue #7418</a><span>2026-11-11 · base <code>365d7c5237ae270be0555b5b44ea61020252713e</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · reproduction label: <code>confirmed-repro</code></p>
+<h2>1. TL;DR</h2>
+<p>A pooled account can retain an obsolete short-term usage window while serving a long-running response. Partial response headers preserve the last short-term observation, but the hub refuses to ask the usage endpoint for authoritative data whenever that account has a request in flight. This refusal also affects an explicit CLI refresh, which reports success without updating the usage snapshot. A deterministic regression reproduced the stale window in two separate checkouts of trusted main, and a one-line removal of the busy-account guard makes the same test pass without ending the active stream.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Missing short-term headers retain the old window.</td><td>Verified</td><td>The test seeds 12% via one response, advances the clock by one minute, and receives weekly-only headers. The primary window retains its original timestamp while the account timestamp advances.</td></tr>
+<tr><td>Explicit refresh does not clear stale data during a request.</td><td>Verified</td><td>The real plugin CLI refresh succeeds with one response body still open, but the baseline retains both header windows instead of replacing them with the usage response.</td></tr>
+<tr><td>Periodic refresh uses the same busy-account exclusion.</td><td>Verified by source</td><td>The service loop and forced refresh both converge on refreshAccountUsage. The periodic five-minute timer was not separately advanced in this test.</td></tr>
+<tr><td>An authoritative response can remove the obsolete window.</td><td>Verified</td><td>The synthetic endpoint returns five_hour: null and a seven-day bucket; after the fix only the weekly usage window remains, before the streaming request ends.</td></tr>
+<tr><td>The display can present an older window with a newer account timestamp.</td><td>Verified by source and state</td><td>The regression checks distinct timestamps. The publisher includes stored windows and the account-level timestamp, not window-level ages. No browser rendering was claimed or captured.</td></tr>
+<tr><td>The reporter’s provider actually removed an account limit.</td><td>Unverified externally</td><td>No live credentials, production database, runtime logs, or provider traffic were accessed. The exact provider-side transition is represented by controlled transport responses.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Trusted repository: public <code>get-bb/bb</code>, fetched <code>origin/main</code> at <code>365d7c5237ae270be0555b5b44ea61020252713e</code>.</li>
+<li>Linux 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.12.</li>
+<li>First checkout: <code>bb/</code>; second detached checkout: <code>verify/</code>. Each received its own frozen install and build. Both started from the same commit with unmodified production code.</li>
+<li>Real Account Pooler plugin entry, CLI dispatch, hub, quota merge, usage parser, and status interface; only the provider HTTP transport is synthetic. The repository’s existing plugin host test harness supplies isolated storage.</li>
+<li>No development app, browser, production service, or real provider was used. No network ports were opened; each fixture created and removed a fresh temporary data directory.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Create and build a clean trusted checkout:<pre>WORK=$(mktemp -d)
+git clone --depth 1 --branch main https://github.com/get-bb/bb.git &quot;$WORK/bb&quot;
+cd &quot;$WORK/bb&quot;
+git fetch origin main
+git checkout 365d7c5237ae270be0555b5b44ea61020252713e
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build
+</pre></li>
+<li>Save the complete patch below as <code>/tmp/issue-7418-regression.patch</code>, then apply it to add only the focused regression:<pre>git apply /tmp/issue-7418-regression.patch
+pnpm exec turbo run test --filter=bb-plugin-account-pool -- src/server.test.ts -t &#x27;refreshes usage and drops obsolete windows while an account is streaming&#x27;</pre></li>
+<li>The regression seeds a short-term header observation, leaves the next weekly-only response body open, and invokes the real plugin CLI command <code>account refresh</code>. The fake usage endpoint is prepared to remove the primary window.</li>
+<li>Expected: the refresh leaves the response in flight, makes one usage read, removes the primary window, and updates weekly utilization to 45%. Actual on base: the command succeeds, but primary 12% and weekly 44% remain header-sourced.</li></ol>
+<h3>Observed failure, first checkout</h3><pre>bb-plugin-account-pool:test:  FAIL  |bb-plugin-account-pool| src/server.test.ts &gt; sequential pool recovery &gt; refreshes usage and drops obsolete windows while an account is streaming
+bb-plugin-account-pool:test: AssertionError: expected [ { slot: &#x27;primary&#x27;, …(6) }, …(1) ] to deeply equal [ ObjectContaining{…} ]
+bb-plugin-account-pool:test: 
+bb-plugin-account-pool:test: - Expected
+bb-plugin-account-pool:test: + Received
+bb-plugin-account-pool:test: 
+bb-plugin-account-pool:test:   [
+bb-plugin-account-pool:test:     {
+bb-plugin-account-pool:test: +     &quot;observedAt&quot;: 1794381562494,
+bb-plugin-account-pool:test: +     &quot;resetAt&quot;: 4102444800000,
+bb-plugin-account-pool:test: +     &quot;slot&quot;: &quot;primary&quot;,
+bb-plugin-account-pool:test: +     &quot;source&quot;: &quot;header&quot;,
+bb-plugin-account-pool:test: +     &quot;status&quot;: null,
+bb-plugin-account-pool:test: +     &quot;utilization&quot;: 0.12,
+bb-plugin-account-pool:test: +     &quot;windowMinutes&quot;: 300,
+bb-plugin-account-pool:test: +   },
+bb-plugin-account-pool:test: +   {
+bb-plugin-account-pool:test: +     &quot;observedAt&quot;: 1794381622494,
+bb-plugin-account-pool:test: +     &quot;resetAt&quot;: 4102444800000,
+bb-plugin-account-pool:test:       &quot;slot&quot;: &quot;secondary&quot;,
+bb-plugin-account-pool:test: -     &quot;source&quot;: &quot;usage&quot;,
+bb-plugin-account-pool:test: -     &quot;utilization&quot;: 0.45,
+bb-plugin-account-pool:test: +     &quot;source&quot;: &quot;header&quot;,
+bb-plugin-account-pool:test: +     &quot;status&quot;: &quot;allowed&quot;,
+bb-plugin-account-pool:test: +     &quot;utilization&quot;: 0.44,
+bb-plugin-account-pool:test: +     &quot;windowMinutes&quot;: 10080,
+bb-plugin-account-pool:test:     },
+bb-plugin-account-pool:test:   ]
+bb-plugin-account-pool:test: 
+bb-plugin-account-pool:test:  ❯ src/server.test.ts:6999:47
+bb-plugin-account-pool:test:     6997|       const after = await status();
+bb-plugin-account-pool:test:     6998|       expect(after.inFlight).toBe(1);
+bb-plugin-account-pool:test:     6999|       expect(after.accounts[0]?.limitWindows).toEqual([
+bb-plugin-account-pool:test:        |                                               ^
+bb-plugin-account-pool:test:     7000|         expect.objectContaining({
+bb-plugin-account-pool:test:     7001|           slot: &quot;secondary&quot;,
+bb-plugin-account-pool:test: 
+bb-plugin-account-pool:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+bb-plugin-account-pool:test: 
+bb-plugin-account-pool:test: 
+bb-plugin-account-pool:test:  Test Files  1 failed (1)
+bb-plugin-account-pool:test:       Tests  1 failed | 197 skipped (198)
+</pre>
+<details><summary>Complete reproduction patch (apply to the recorded base)</summary><pre>diff --git a/plugins/account-pool/src/server.test.ts b/plugins/account-pool/src/server.test.ts
+index fc52b05..049893f 100644
+--- a/plugins/account-pool/src/server.test.ts
++++ b/plugins/account-pool/src/server.test.ts
+@@ -6918,6 +6918,99 @@ describe(&quot;sequential pool recovery&quot;, () =&gt; {
+     },
+   );
+ 
++  it(&quot;refreshes usage and drops obsolete windows while an account is streaming&quot;, async () =&gt; {
++    let now = Date.now();
++    let messageCount = 0;
++    let usageReads = 0;
++    const stream = new TransformStream&lt;Uint8Array, Uint8Array&gt;();
++    const writer = stream.writable.getWriter();
++    const fixture = await createFixture({
++      upstreamUrl: &quot;https://upstream.example&quot;,
++      source: &quot;oauth&quot;,
++      options: {
++        now: () =&gt; now,
++        usageUrl: &quot;https://upstream.example/usage&quot;,
++        fetch: async (input) =&gt; {
++          if (new URL(String(input)).pathname === &quot;/usage&quot;) {
++            usageReads++;
++            return Response.json({
++              five_hour: null,
++              seven_day: { utilization: 45, resets_at: &quot;4102444800&quot; },
++            });
++          }
++          messageCount++;
++          const headers = {
++            &quot;anthropic-ratelimit-unified-7d-utilization&quot;: &quot;0.44&quot;,
++            &quot;anthropic-ratelimit-unified-7d-reset&quot;: &quot;4102444800&quot;,
++            ...(messageCount === 1
++              ? {
++                  &quot;anthropic-ratelimit-unified-5h-utilization&quot;: &quot;0.12&quot;,
++                  &quot;anthropic-ratelimit-unified-5h-reset&quot;: &quot;4102444800&quot;,
++                }
++              : { &quot;content-type&quot;: &quot;text/event-stream&quot; }),
++          };
++          return messageCount === 1
++            ? Response.json({ ok: true }, { headers })
++            : new Response(stream.readable, { headers });
++        },
++      },
++    });
++    const send = () =&gt;
++      fixture.host.harness.behavior.fetchHttp(&quot;POST&quot;, &quot;/v1/messages&quot;, {
++        headers: authHeaders(fixture.key),
++        body,
++      });
++    const first = await send();
++    expect(first.status).toBe(200);
++    await first.text();
++    const firstObservedAt = now;
++    now += 60_000;
++    const response = await send();
++    const responseBody = response.text();
++    const status = async () =&gt;
++      statusSchema.parse(
++        await fixture.host.harness.behavior.callRpc(&quot;status.get&quot;, null),
++      );
++    try {
++      expect(response.status).toBe(200);
++      const before = await status();
++      expect(before.inFlight).toBe(1);
++      expect(before.accounts[0]?.observedAt).toBe(now);
++      expect(before.accounts[0]?.limitWindows).toEqual(
++        expect.arrayContaining([
++          expect.objectContaining({
++            slot: &quot;primary&quot;,
++            utilization: 0.12,
++            observedAt: firstObservedAt,
++            source: &quot;header&quot;,
++          }),
++        ]),
++      );
++      const readsBeforeRefresh = usageReads;
++      const refresh = await fixture.host.harness.behavior.runCli([
++        &quot;account&quot;,
++        &quot;refresh&quot;,
++        fixture.account.id,
++        &quot;--json&quot;,
++      ]);
++      expect(refresh.exitCode).toBe(0);
++      const after = await status();
++      expect(after.inFlight).toBe(1);
++      expect(after.accounts[0]?.limitWindows).toEqual([
++        expect.objectContaining({
++          slot: &quot;secondary&quot;,
++          utilization: 0.45,
++          source: &quot;usage&quot;,
++        }),
++      ]);
++      expect(usageReads).toBe(readsBeforeRefresh + 1);
++    } finally {
++      await writer.close();
++      await responseBody;
++    }
++    expect((await status()).inFlight).toBe(0);
++  });
++
+   it(&quot;returns Codex paid pins to recovered subscriptions and persists spending restrictions&quot;, async () =&gt; {
+     let now = Date.now();
+     let signIns = 0;
+</pre></details>
+<details><summary>Added regression test</summary><pre>  it(&quot;refreshes usage and drops obsolete windows while an account is streaming&quot;, async () =&gt; {
+    let now = Date.now();
+    let messageCount = 0;
+    let usageReads = 0;
+    const stream = new TransformStream&lt;Uint8Array, Uint8Array&gt;();
+    const writer = stream.writable.getWriter();
+    const fixture = await createFixture({
+      upstreamUrl: &quot;https://upstream.example&quot;,
+      source: &quot;oauth&quot;,
+      options: {
+        now: () =&gt; now,
+        usageUrl: &quot;https://upstream.example/usage&quot;,
+        fetch: async (input) =&gt; {
+          if (new URL(String(input)).pathname === &quot;/usage&quot;) {
+            usageReads++;
+            return Response.json({
+              five_hour: null,
+              seven_day: { utilization: 45, resets_at: &quot;4102444800&quot; },
+            });
+          }
+          messageCount++;
+          const headers = {
+            &quot;anthropic-ratelimit-unified-7d-utilization&quot;: &quot;0.44&quot;,
+            &quot;anthropic-ratelimit-unified-7d-reset&quot;: &quot;4102444800&quot;,
+            ...(messageCount === 1
+              ? {
+                  &quot;anthropic-ratelimit-unified-5h-utilization&quot;: &quot;0.12&quot;,
+                  &quot;anthropic-ratelimit-unified-5h-reset&quot;: &quot;4102444800&quot;,
+                }
+              : { &quot;content-type&quot;: &quot;text/event-stream&quot; }),
+          };
+          return messageCount === 1
+            ? Response.json({ ok: true }, { headers })
+            : new Response(stream.readable, { headers });
+        },
+      },
+    });
+    const send = () =&gt;
+      fixture.host.harness.behavior.fetchHttp(&quot;POST&quot;, &quot;/v1/messages&quot;, {
+        headers: authHeaders(fixture.key),
+        body,
+      });
+    const first = await send();
+    expect(first.status).toBe(200);
+    await first.text();
+    const firstObservedAt = now;
+    now += 60_000;
+    const response = await send();
+    const responseBody = response.text();
+    const status = async () =&gt;
+      statusSchema.parse(
+        await fixture.host.harness.behavior.callRpc(&quot;status.get&quot;, null),
+      );
+    try {
+      expect(response.status).toBe(200);
+      const before = await status();
+      expect(before.inFlight).toBe(1);
+      expect(before.accounts[0]?.observedAt).toBe(now);
+      expect(before.accounts[0]?.limitWindows).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            slot: &quot;primary&quot;,
+            utilization: 0.12,
+            observedAt: firstObservedAt,
+            source: &quot;header&quot;,
+          }),
+        ]),
+      );
+      const readsBeforeRefresh = usageReads;
+      const refresh = await fixture.host.harness.behavior.runCli([
+        &quot;account&quot;,
+        &quot;refresh&quot;,
+        fixture.account.id,
+        &quot;--json&quot;,
+      ]);
+      expect(refresh.exitCode).toBe(0);
+      const after = await status();
+      expect(after.inFlight).toBe(1);
+      expect(after.accounts[0]?.limitWindows).toEqual([
+        expect.objectContaining({
+          slot: &quot;secondary&quot;,
+          utilization: 0.45,
+          source: &quot;usage&quot;,
+        }),
+      ]);
+      expect(usageReads).toBe(readsBeforeRefresh + 1);
+    } finally {
+      await writer.close();
+      await responseBody;
+    }
+    expect((await status()).inFlight).toBe(0);
+  });
+</pre></details>
+<p>The existing test file’s helpers exercise the real plugin boundary. No new production seam or dependency is required. Reproduction source and output are embedded here rather than published as separate artifacts, following the reports repository’s privacy and file-hygiene rules.</p>
+<h2>5. Root cause</h2>
+<p>Responses may legitimately omit a window. The header merger therefore keeps the previous value instead of treating absence as evidence that a limit was removed.</p>
+<p><a href="https://github.com/get-bb/bb/blob/365d7c5237ae270be0555b5b44ea61020252713e/plugins/account-pool/src/quota.ts#L82-L106">plugins/account-pool/src/quota.ts:82</a></p><pre>  headers: Headers,
+  slot: LimitWindowSlot,
+  previous: AccountQuota,
+  now: number,
+): LimitWindow | null {
+  const { minutes, header } = CLAUDE_WINDOWS[slot];
+  const utilization = parseNumber(
+    headers.get(`${PREFIX}${header}-utilization`),
+  );
+  const resetAt = parseReset(headers.get(`${PREFIX}${header}-reset`));
+  const status = headers.get(`${PREFIX}${header}-status`);
+  const prior =
+    previous.limitWindows.find((window) =&gt; window.slot === slot) ?? null;
+  if (utilization === null &amp;&amp; resetAt === null &amp;&amp; status === null)
+    return prior;
+  return {
+    slot,
+    windowMinutes: minutes,
+    utilization: utilization ?? prior?.utilization ?? null,
+    resetAt: resetAt ?? prior?.resetAt ?? null,
+    status: status ?? prior?.status ?? null,
+    observedAt: now,
+    source: &quot;header&quot;,
+  };
+}</pre>
+<p>Each upstream response is merged immediately. A weekly update advances the account observation even while an older primary observation survives.</p>
+<p><a href="https://github.com/get-bb/bb/blob/365d7c5237ae270be0555b5b44ea61020252713e/plugins/account-pool/src/hub.ts#L620-L628">plugins/account-pool/src/hub.ts:620</a></p><pre>          const { response } = upstream;
+          const observed = adapter.quotaFromHeaders(
+            selected.account.id,
+            response.headers,
+            this.options.quotas.get(selected.account.id),
+            family,
+            this.options.now(),
+          );
+          this.options.quotas.put(observed);</pre>
+<p><a href="https://github.com/get-bb/bb/blob/365d7c5237ae270be0555b5b44ea61020252713e/plugins/account-pool/src/quota.ts#L147-L160">plugins/account-pool/src/quota.ts:147</a></p><pre>  const observed =
+    limitWindows.some((window) =&gt; !previous.limitWindows.includes(window)) ||
+    representativeClaim !== null ||
+    extraUsage !== previous.extraUsage ||
+    scoped !== null;
+  return {
+    accountId,
+    usageRestriction: previous.usageRestriction,
+    extraUsage,
+    representativeClaim: representativeClaim ?? previous.representativeClaim,
+    familyWeekly,
+    limitWindows,
+    observedAt: observed ? now : previous.observedAt,
+    heldUntil: previous.heldUntil,</pre>
+<p>The actual defect is refresh starvation: the busy-account guard returns before refresh deduplication, throttling, and the adapter request. Forced refresh bypasses the interval but not this guard. A continuously active account can therefore never obtain the usage snapshot needed to clear the obsolete value.</p>
+<p><a href="https://github.com/get-bb/bb/blob/365d7c5237ae270be0555b5b44ea61020252713e/plugins/account-pool/src/hub.ts#L308-L325">plugins/account-pool/src/hub.ts:308</a></p><pre>  async refreshUsage(accountId?: string, force = false): Promise&lt;void&gt; {
+    const accounts = (await this.options.accounts.list()).filter(
+      (account) =&gt;
+        account.enabled &amp;&amp;
+        account.kind === &quot;oauth&quot; &amp;&amp;
+        (accountId === undefined || account.id === accountId),
+    );
+    await Promise.all(
+      accounts.map((account) =&gt;
+        this.refreshAccountUsage(
+          account,
+          force ? 0 : DEFAULT_USAGE_REFRESH_INTERVAL_MS,
+          force,
+        ),
+      ),
+    );
+  }
+</pre>
+<p><a href="https://github.com/get-bb/bb/blob/365d7c5237ae270be0555b5b44ea61020252713e/plugins/account-pool/src/hub.ts#L353-L365">plugins/account-pool/src/hub.ts:353</a></p><pre>  private async refreshAccountUsage(
+    account: Account,
+    minIntervalMs: number,
+    recoverError = false,
+  ): Promise&lt;void&gt; {
+    const adapter = this.adapter(account.provider);
+    if ((this.inFlightByAccount.get(account.id) ?? 0) &gt; 0) return;
+    const running = this.usageRefreshes.get(account.id);
+    if (running !== undefined) return running;
+    const now = this.options.now();
+    const last = this.lastUsageRefreshAt.get(account.id);
+    if (last !== undefined &amp;&amp; now - last &lt; minIntervalMs) return;
+    this.lastUsageRefreshAt.set(account.id, now);</pre>
+<p>Once allowed to run, the existing authoritative parser rebuilds the two main windows when their keys are supplied, discarding null buckets. No header inference change is needed.</p>
+<p><a href="https://github.com/get-bb/bb/blob/365d7c5237ae270be0555b5b44ea61020252713e/plugins/account-pool/src/usage.ts#L184-L191">plugins/account-pool/src/usage.ts:184</a></p><pre>  const limitWindows =
+    data.five_hour === undefined &amp;&amp; data.seven_day === undefined
+      ? previous.limitWindows
+      : [
+          usageWindow(&quot;primary&quot;, data.five_hour, now),
+          usageWindow(&quot;secondary&quot;, data.seven_day, now),
+        ].filter((window): window is LimitWindow =&gt; window !== null);
+  return {</pre>
+<p>The usage publication path exposes stored windows and uses the account-wide timestamp, explaining why the stale primary can appear newly observed. That separate age-presentation limitation is not changed by the proposed fix.</p>
+<p><a href="https://github.com/get-bb/bb/blob/365d7c5237ae270be0555b5b44ea61020252713e/plugins/account-pool/src/usage-source.ts#L117-L126">plugins/account-pool/src/usage-source.ts:117</a></p><pre>          };
+          for (const window of account.limitWindows) {
+            add(
+              window.slot,
+              usageWindowLabel(window.windowMinutes, window.slot),
+              window.utilization,
+              window.resetAt,
+              null,
+            );
+          }</pre>
+<p><a href="https://github.com/get-bb/bb/blob/365d7c5237ae270be0555b5b44ea61020252713e/plugins/account-pool/src/usage-source.ts#L150-L157">plugins/account-pool/src/usage-source.ts:150</a></p><pre>          return {
+            id: account.id,
+            accountKey: accountKey(account),
+            providerId: account.provider === &quot;claude&quot; ? &quot;claude-code&quot; : &quot;codex&quot;,
+            label: account.label,
+            scope: { kind: &quot;shared&quot; },
+            observedAt: account.observedAt,
+            usage:</pre>
+<h2>6. Proposed fix and safety</h2>
+<p>Remove only the in-flight early return in <code>AccountPoolHub.refreshAccountUsage</code>. Keep the existing refresh single-flight map, refresh intervals, credential refresh serialization, response-header merge semantics, and authoritative usage parser. This allows both forced and due periodic refreshes during streaming without canceling active responses or guessing what an absent header means.</p>
+<p>The verified change is two files, 93 additions and one deletion: <strong>94 changed text lines</strong>. It changes one existing subsystem, adds no dependency or stored-data change, and changes no public protocol, authentication contract, permission boundary, packaging, or release behavior.</p>
+<h3>Post-fix focused regression</h3><pre>bb-plugin-account-pool:test:  Test Files  1 passed (1)
+bb-plugin-account-pool:test:       Tests  1 passed | 197 skipped (198)
+ Tasks:    7 successful, 7 total
+Cached:    5 cached, 7 total
+  Time:    2.467s </pre>
+<h3>Relevant full checks</h3><pre>pnpm exec turbo run test lint typecheck --filter=bb-plugin-account-pool
+bb-plugin-account-pool:lint: Found 3 warnings and 0 errors.
+bb-plugin-account-pool:test:  Test Files  14 passed (14)
+bb-plugin-account-pool:test:       Tests  395 passed (395)
+ Tasks:    10 successful, 10 total
+Cached:    6 cached, 10 total
+  Time:    15.569s 
+git diff --check
+Result: exit 0</pre>
+<p>All 395 plugin tests passed across 14 files. Lint reports three pre-existing warnings and no errors; typecheck passes. The active stream remains usable and is drained normally after refresh. Concurrent header updates can still change subsequent observations; removal of a provider limit cannot be inferred solely from header absence.</p>
+<h2>7. Verification: second clean checkout</h2>
+<p>The same agent created a second detached checkout from the recorded trusted commit, confirmed an initially clean working tree, performed a separate frozen install and full build, then applied only the regression patch. Each fixture used a new temporary data directory. No production code fix was present in this checkout. This is a repeated clean reproduction, not an independent-agent check.</p>
+<pre>git worktree add --detach ../verify 365d7c5237ae270be0555b5b44ea61020252713e
+cd ../verify
+git status --porcelain
+Expected and actual before setup: no output
+git rev-parse HEAD
+365d7c5237ae270be0555b5b44ea61020252713e
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build
+git apply /tmp/issue-7418-regression.patch
+pnpm exec turbo run test --filter=bb-plugin-account-pool -- src/server.test.ts -t &#x27;refreshes usage and drops obsolete windows while an account is streaming&#x27;</pre>
+<pre>bb-plugin-account-pool:test:  FAIL  |bb-plugin-account-pool| src/server.test.ts &gt; sequential pool recovery &gt; refreshes usage and drops obsolete windows while an account is streaming
+bb-plugin-account-pool:test: AssertionError: expected [ { slot: &#x27;primary&#x27;, …(6) }, …(1) ] to deeply equal [ ObjectContaining{…} ]
+bb-plugin-account-pool:test: 
+bb-plugin-account-pool:test: - Expected
+bb-plugin-account-pool:test: + Received
+bb-plugin-account-pool:test: 
+bb-plugin-account-pool:test:   [
+bb-plugin-account-pool:test:     {
+bb-plugin-account-pool:test: +     &quot;observedAt&quot;: 1794381654239,
+bb-plugin-account-pool:test: +     &quot;resetAt&quot;: 4102444800000,
+bb-plugin-account-pool:test: +     &quot;slot&quot;: &quot;primary&quot;,
+bb-plugin-account-pool:test: +     &quot;source&quot;: &quot;header&quot;,
+bb-plugin-account-pool:test: +     &quot;status&quot;: null,
+bb-plugin-account-pool:test: +     &quot;utilization&quot;: 0.12,
+bb-plugin-account-pool:test: +     &quot;windowMinutes&quot;: 300,
+bb-plugin-account-pool:test: +   },
+bb-plugin-account-pool:test: +   {
+bb-plugin-account-pool:test: +     &quot;observedAt&quot;: 1794381714239,
+bb-plugin-account-pool:test: +     &quot;resetAt&quot;: 4102444800000,
+bb-plugin-account-pool:test:       &quot;slot&quot;: &quot;secondary&quot;,
+bb-plugin-account-pool:test: -     &quot;source&quot;: &quot;usage&quot;,
+bb-plugin-account-pool:test: -     &quot;utilization&quot;: 0.45,
+bb-plugin-account-pool:test: +     &quot;source&quot;: &quot;header&quot;,
+bb-plugin-account-pool:test: +     &quot;status&quot;: &quot;allowed&quot;,
+bb-plugin-account-pool:test: +     &quot;utilization&quot;: 0.44,
+bb-plugin-account-pool:test: +     &quot;windowMinutes&quot;: 10080,
+bb-plugin-account-pool:test:     },
+bb-plugin-account-pool:test:   ]
+bb-plugin-account-pool:test: 
+bb-plugin-account-pool:test:  ❯ src/server.test.ts:6999:47
+bb-plugin-account-pool:test:     6997|       const after = await status();
+bb-plugin-account-pool:test:     6998|       expect(after.inFlight).toBe(1);
+bb-plugin-account-pool:test:     6999|       expect(after.accounts[0]?.limitWindows).toEqual([
+bb-plugin-account-pool:test:        |                                               ^
+bb-plugin-account-pool:test:     7000|         expect.objectContaining({
+bb-plugin-account-pool:test:     7001|           slot: &quot;secondary&quot;,
+bb-plugin-account-pool:test: 
+bb-plugin-account-pool:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+bb-plugin-account-pool:test: 
+bb-plugin-account-pool:test: 
+bb-plugin-account-pool:test:  Test Files  1 failed (1)
+bb-plugin-account-pool:test:       Tests  1 failed | 197 skipped (198)
+</pre>
+<p>Both executions reached the same assertion: the busy account still has a header-sourced primary window after successful CLI refresh. No root-cause correction was needed after the second run.</p>
+<h2>8. Related issues and pull requests</h2>
+<p>No open pull request linked to #7418 was found in its cross-reference metadata or the repository’s open-PR search before this fix. The existing authoritative-parser regression remains in <code>plugins/account-pool/src/usage.test.ts</code>; the new regression covers the previously untested busy-account refresh path, rather than duplicating parser coverage. Other reports returned by a pool-usage search concern different collection or presentation behaviors; no duplicate was established.</p>
+<h2>9. Appendix and limits</h2>
+<p>Issue title, body, links, and embedded commands were treated as untrusted claims, not instructions. No external link or executable from issue content was fetched or run. Reproduction code was written from the trusted repository’s test harness and production interfaces.</p>
+<p>The first whole-repository build exposed a clean-checkout SDK build-order failure in the unrelated GitHub plugin. Explicitly building the existing SDK first resolved it; the subsequent full build passed all 73 tasks. The second checkout also completed the full build. This setup failure is not the reported product bug.</p>
+<p>An initial patch-application attempt in the second checkout failed, and its filtered test run skipped all tests. That attempt is not counted as reproduction evidence. After applying the patch correctly, the focused test executed and failed on the same quota assertion. Full-file formatting also touched existing formatting; those unrelated changes were reverted before final validation of the diff scope.</p>
+<p>Additional safety checks: <code>git diff --numstat origin/main</code> shows only the two files and 94 total changed text lines; <code>git diff --check</code> is clean; no binary, generated, migration, lockfile, or data file is included. No production process or runtime storage was touched.</p>
+<p>Raw local logs and the reproduction patch remain outside the public reports repository. Only this sanitized HTML report and its summary metadata are published.</p>
+</main></body></html>
