@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7466 Rejected local host credentials prevent launcher recovery</title>
+<style>
+:root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; }
+body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+h3 { font-size:15px; margin:22px 0 6px; }
+.meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+.pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+.pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7466 · Rejected local host credentials prevent launcher recovery</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High</span><span class="pill">Effort: Medium</span><span class="pill">host</span><span class="pill">perf</span><a href="https://github.com/get-bb/bb/issues/7466">Issue #7466</a><span>2026-11-12 · base <code>030b1b729f28acedc6f86cd65a71cb3678da8124</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · reproduction label: <code>confirmed-repro</code></p>
+<h2>1. TL;DR</h2>
+<p>A local full-stack launcher exits with status 1 whenever its saved host credential is rejected, even though it owns a healthy local server with an existing enrollment mechanism. File existence suppresses the launcher's enrollment-key request, and the daemon always selects the saved credential without a rejection fallback. Two consecutive launches with the same invalid credential both fail at session opening; deleting only the auth file restores readiness. This was reproduced with real packaged server and daemon processes in two clean checkouts, without mocked authentication or a mocked database. An external supervisor that restarts these exits repeats the same startup work; macOS launchd behavior, the reported historical restart count, and CPU magnitude were not measured here.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>Rejected saved credentials prevent local startup.</td><td>Verified</td><td>Both checkouts: initial control ready; two stale-key launches exit 1, never ready, with session-open 401.</td></tr>
+<tr><td>Restarting does not repair persisted state.</td><td>Verified</td><td>Two consecutive actual launcher invocations against the same isolated data directory fail identically in each run.</td></tr>
+<tr><td>Removing the auth file unblocks startup.</td><td>Verified</td><td>Final control reaches readiness with the same database and synthetic host identity, after removing only the rejected auth file.</td></tr>
+<tr><td>The launcher withholds recovery material and the daemon has no fallback.</td><td>Verified</td><td>Trusted source branches below explain the real-process result.</td></tr>
+<tr><td>A service manager repeats startup indefinitely and incurs substantial CPU cost.</td><td>Mechanism supported; magnitude unverified</td><td>Persistent exit 1 supports restart-loop behavior under restart-on-exit policy. No service manager was installed and no unbounded loop was run.</td></tr>
+<tr><td>A long-lived credential became invalid unexpectedly.</td><td>Unverified</td><td>The test substitutes an intentionally invalid synthetic value; it does not determine how the reporter's original credential was invalidated.</td></tr>
+<tr><td>The failure is a lock or protocol mismatch.</td><td>Ruled out for this reproduction</td><td>Healthy enrollment controls bracket the failure; the actual daemon log records session-open 401, not protocol mismatch or lock acquisition failure.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Public repository <code>get-bb/bb</code>; trusted <code>origin/main</code> at <code>030b1b729f28acedc6f86cd65a71cb3678da8124</code>. A final fetch found no later main commit affecting the relevant paths.</li>
+<li>Linux 4.19.0-gvisor, x64; Node v22.19.0; pnpm 9.15.0; package version bb-app 0.49.0 built from source.</li>
+<li>First clean checkout: loopback ports 47466/47467. Second clean checkout: 47468/47469. Each run creates a new temporary data directory and isolated HOME and removes them afterward.</li>
+<li>No production instance, real credentials, imported store, provider sessions, browser, or service manager was used. Child environment is explicitly constructed rather than forwarding BB connection variables.</li>
+<li>Ports were checked by binding and closing a Node TCP listener before use; <code>ss</code> is unavailable on this host. A final bind check verifies cleanup.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<p>This test is authored from the trusted launcher, identity, auth-state, and smoke-boot implementation. It was not copied from the issue or the linked PR. Save the complete script in section 10 as <code>launcher-auth-repro.mjs</code> outside the checkout.</p>
+<ol><li>Clone only the trusted repository and select the recorded main commit:
+<pre>git clone https://github.com/get-bb/bb.git /tmp/bb-7466-base
+cd /tmp/bb-7466-base
+git checkout --detach 030b1b729f28acedc6f86cd65a71cb3678da8124
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build:types build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=bb-app</pre></li>
+<li>Choose unused loopback ports in 40000–60000, then execute the script:
+<pre>node /tmp/launcher-auth-repro.mjs "$PWD" 47466 47467</pre></li>
+<li>The script boots a fresh instance, waits for readiness, and stops it; writes only a known synthetic invalid credential with the same fixed test identity; retries twice; removes that credential file; and verifies a final healthy enrollment control. It never reads or prints an auth file.</li></ol>
+<p><strong>Expected behavior:</strong> a launcher-owned local deployment recovers an explicitly rejected persisted credential and reaches readiness, using an authorized bounded enrollment path. Both stale-key attempts should report <code>ready:true</code>; the regression assertion would pass.</p>
+<p><strong>Actual behavior:</strong> each stale-key attempt reports <code>ready:false</code> and <code>exitCode:1</code>, the real daemon records a session-open 401, and the test exits 1 at its intended recovery assertion. No invocation hits the test timeout. This is a nonvisual lifecycle bug, so screenshots are not applicable.</p>
+<h3>First run — complete retained observation</h3><pre>Node v22.19.0; linux/x64; ports 47466/47467
+{&quot;name&quot;:&quot;fresh-enrollment-control&quot;,&quot;ready&quot;:true,&quot;exitCode&quot;:0,&quot;exitSignal&quot;:null,&quot;timedOut&quot;:false}
+  ○  Starting server
+  ✓  Server listening on http://127.0.0.1:47466
+  ○  Starting host daemon
+  ✓  Host daemon running
+  ●  bb is ready
+  ●  Shutting down
+{&quot;name&quot;:&quot;persisted-key-attempt-1&quot;,&quot;ready&quot;:false,&quot;exitCode&quot;:1,&quot;exitSignal&quot;:null,&quot;timedOut&quot;:false}
+  ○  Starting server
+  ✓  Server listening on http://127.0.0.1:47466
+  ○  Starting host daemon
+  ✗  Host daemon failed to start
+  ●  Shutting down
+{&quot;name&quot;:&quot;persisted-key-attempt-2&quot;,&quot;ready&quot;:false,&quot;exitCode&quot;:1,&quot;exitSignal&quot;:null,&quot;timedOut&quot;:false}
+  ○  Starting server
+  ✓  Server listening on http://127.0.0.1:47466
+  ○  Starting host daemon
+  ✗  Host daemon failed to start
+  ●  Shutting down
+host-daemon-stdio.log: Failed to open session: 401 Unauthorized
+{&quot;name&quot;:&quot;auth-file-removed-control&quot;,&quot;ready&quot;:true,&quot;exitCode&quot;:0,&quot;exitSignal&quot;:null,&quot;timedOut&quot;:false}
+  ○  Starting server
+  ✓  Server listening on http://127.0.0.1:47466
+  ○  Starting host daemon
+  ✓  Host daemon running
+  ●  bb is ready
+  ●  Shutting down
+Observed session-open 401: true
+Stale starts ready: false, false
+REGRESSION: local launcher must recover rejected persisted credentials instead of exiting
+Temporary runtime data and isolated home removed; child process groups stopped.
+</pre>
+<h2>5. Root cause</h2>
+<ol><li><a href="https://github.com/get-bb/bb/blob/030b1b729f28acedc6f86cd65a71cb3678da8124/packages/bb-app/src/launcher.ts#L2319-L2342">Launcher enrollment preparation</a> returns the inherited environment as soon as <code>auth.json</code> exists:
+<pre>if (await pathExists(join(args.dataDir, HOST_AUTH_FILE_NAME))) {
+  return args.env;
+}</pre>
+The full-stack caller at <a href="https://github.com/get-bb/bb/blob/030b1b729f28acedc6f86cd65a71cb3678da8124/packages/bb-app/src/launcher.ts#L4310-L4326">launcher.ts:4310</a> uses this preparation before spawning the daemon. Existence is treated as sufficient evidence that no enrollment material is needed; credential acceptance is not checked.</li>
+<li><a href="https://github.com/get-bb/bb/blob/030b1b729f28acedc6f86cd65a71cb3678da8124/apps/host-daemon/src/start-host-daemon.ts#L94-L118">Daemon credential selection</a> chooses <code>persistedAuth?.hostKey ?? (await enrollDaemonHost(...)).hostKey</code>. A saved key wins even when enrollment material is separately supplied. State is rewritten only when persisted auth was absent.</li>
+<li><a href="https://github.com/get-bb/bb/blob/030b1b729f28acedc6f86cd65a71cb3678da8124/apps/host-daemon/src/server-client.ts#L168-L174">HTTP retry policy</a> treats non-5xx errors such as 401 as nonretryable. <a href="https://github.com/get-bb/bb/blob/030b1b729f28acedc6f86cd65a71cb3678da8124/apps/host-daemon/src/server-client.ts#L387-L397">Session-open HTTP handling</a> turns a non-201 response into <code>ServerResponseError</code>. <a href="https://github.com/get-bb/bb/blob/030b1b729f28acedc6f86cd65a71cb3678da8124/apps/host-daemon/src/server-connection.ts#L410-L418">Connection error classification</a> stores a nonretryable, non-protocol error as fatal. <a href="https://github.com/get-bb/bb/blob/030b1b729f28acedc6f86cd65a71cb3678da8124/apps/host-daemon/src/start-host-daemon.ts#L200-L207">Daemon startup</a> has no credential-recovery branch.</li>
+<li><a href="https://github.com/get-bb/bb/blob/030b1b729f28acedc6f86cd65a71cb3678da8124/packages/bb-app/src/launcher.ts#L3719-L3730">Full-stack supervision</a> catches daemon startup failure, sets <code>process.exitCode = 1</code>, and shuts down the full stack:
+<pre>} catch {
+  endStep(red("✗"), "Host daemon failed to start");
+  ...
+  process.exitCode = 1;
+  await args.shutdown("SIGTERM");
+  return "stopped";
+}</pre>
+Because the invalid auth file survives, the next supervisor-triggered launch takes precisely the same branches.</li>
+<li><a href="https://github.com/get-bb/bb/blob/030b1b729f28acedc6f86cd65a71cb3678da8124/apps/server/src/internal/hosts.ts#L53-L78">Existing loopback enrollment-key route</a> already supports requesting enrollment material for a specified identity, but checks the loopback/security boundary. Recovery must preserve that boundary; it must not turn arbitrary remote rejections into automatic enrollment.</li></ol>
+<p>The deeper mismatch is between persistent local state and server acceptance: a present file is not proof that its credential remains valid. The persistent exit is reproduced; a particular service manager's retry cadence and plugin-by-plugin CPU cost are outside this test.</p>
+<h2>6. Proposed fix — first principles</h2>
+<p>For a full-stack launcher that owns its local server, make a narrowly scoped recovery credential available for the existing host identity. On an explicit persisted-credential rejection at session startup, cleanly dispose the failed daemon instance, enroll once through the existing authorized path, replace the saved credential, and retry once. Preserve remote-machine behavior and all loopback and machine-management checks. Do not retry unrelated network, lock, protocol, or permission errors as if they were stale credentials. Verify that a second rejection stops rather than recursively re-enrolling.</p>
+<p>No production code was changed. A linked open PR already addresses this issue, and changes to authentication/re-enrollment are outside the autopilot's simple-fix allowance even without that duplicate-PR guard.</p>
+<h2>7. Linked PR — static review only</h2>
+<p><a href="https://github.com/get-bb/bb/pull/7467">PR #7467</a> is OPEN and its GitHub closing-issue metadata explicitly links #7466. Only its metadata and diff were read as untrusted evidence; its branch and tests were never checked out or executed.</p>
+<p>The diff targets both verified missing steps: supplying enrollment material despite saved auth and adding a bounded retry after a classified saved-key rejection. <strong>Static verdict: direction matches the root cause; runtime correctness is not verified.</strong> Review should specifically exercise failed-instance cleanup/lock release, same-host identity preservation, explicit authorization failures versus credential rejection, a failed second enrollment, and a complete real-process stale-key startup. The baseline runs in this report do not validate that PR, and no approval or CI claim is made.</p>
+<h2>8. Related issues</h2>
+<p>The report references a previous first-start timeout investigation. Its public metadata describes a WSL2 startup-abort symptom; this reproduction instead observes an actual authenticated session-opening 401 after a healthy server start. That distinction does not prove there are no other duplicates.</p>
+<h2>9. Verification — second clean checkout, same agent</h2>
+<p>The same agent repeated the entire four-launch test in a second clean checkout at the exact recorded commit, with its own dependency installation/build, new ports 47468/47469, a newly created data directory, and a newly created isolated HOME. Source working trees remained clean. This is a repeated clean reproduction, not independent-agent verification.</p>
+<pre>git clone https://github.com/get-bb/bb.git /tmp/bb-7466-verify
+cd /tmp/bb-7466-verify
+git checkout --detach 030b1b729f28acedc6f86cd65a71cb3678da8124
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build:types build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=bb-app
+node /tmp/launcher-auth-repro.mjs "$PWD" 47468 47469</pre>
+<p>Both controls reached readiness; both stale launches exited 1; the real daemon logged session-open 401. The intended regression assertion failed again, confirming the first result. No root-cause correction was needed. Checkout paths above are reproducible aliases; random local path suffixes are omitted for privacy.</p>
+<pre>Node v22.19.0; linux/x64; ports 47468/47469
+{&quot;name&quot;:&quot;fresh-enrollment-control&quot;,&quot;ready&quot;:true,&quot;exitCode&quot;:0,&quot;exitSignal&quot;:null,&quot;timedOut&quot;:false}
+  ○  Starting server
+  ✓  Server listening on http://127.0.0.1:47468
+  ○  Starting host daemon
+  ✓  Host daemon running
+  ●  bb is ready
+  ●  Shutting down
+{&quot;name&quot;:&quot;persisted-key-attempt-1&quot;,&quot;ready&quot;:false,&quot;exitCode&quot;:1,&quot;exitSignal&quot;:null,&quot;timedOut&quot;:false}
+  ○  Starting server
+  ✓  Server listening on http://127.0.0.1:47468
+  ○  Starting host daemon
+  ✗  Host daemon failed to start
+  ●  Shutting down
+{&quot;name&quot;:&quot;persisted-key-attempt-2&quot;,&quot;ready&quot;:false,&quot;exitCode&quot;:1,&quot;exitSignal&quot;:null,&quot;timedOut&quot;:false}
+  ○  Starting server
+  ✓  Server listening on http://127.0.0.1:47468
+  ○  Starting host daemon
+  ✗  Host daemon failed to start
+  ●  Shutting down
+host-daemon-stdio.log: Failed to open session: 401 Unauthorized
+host-daemon-stdio.log: Failed to open session: 401 Unauthorized
+{&quot;name&quot;:&quot;auth-file-removed-control&quot;,&quot;ready&quot;:true,&quot;exitCode&quot;:0,&quot;exitSignal&quot;:null,&quot;timedOut&quot;:false}
+  ○  Starting server
+  ✓  Server listening on http://127.0.0.1:47468
+  ○  Starting host daemon
+  ✓  Host daemon running
+  ●  bb is ready
+  ●  Shutting down
+Observed session-open 401: true
+Stale starts ready: false, false
+REGRESSION: local launcher must recover rejected persisted credentials instead of exiting
+Temporary runtime data and isolated home removed; child process groups stopped.
+</pre>
+<h2>10. Appendix — complete reproduction test</h2>
+<p>All necessary test code and exact retained expected/actual observations are inline. Repository policy excludes raw logs and test artifacts from the public reports checkout; originals remain in the local investigation evidence directory rather than being committed. Logs displayed above are deliberately limited to readiness, failure, shutdown, and the session-open status; no credentials or runtime data are included.</p>
+<pre>import assert from &quot;node:assert/strict&quot;;
+import { spawn } from &quot;node:child_process&quot;;
+import { once } from &quot;node:events&quot;;
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from &quot;node:fs/promises&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join, resolve } from &quot;node:path&quot;;
+import { setTimeout as delay } from &quot;node:timers/promises&quot;;
+
+const [checkout, serverPort, daemonPort] = process.argv.slice(2);
+assert(checkout &amp;&amp; serverPort &amp;&amp; daemonPort, &quot;Provide checkout, server port, daemon port&quot;);
+for (const port of [serverPort, daemonPort]) {
+  assert(Number(port) &gt;= 40000 &amp;&amp; Number(port) &lt;= 60000, &quot;Use isolated high ports&quot;);
+}
+const root = await mkdtemp(join(tmpdir(), &quot;bb-7466-runtime-&quot;));
+const dataDir = join(root, &quot;data&quot;);
+const homeDir = join(root, &quot;home&quot;);
+await mkdir(dataDir);
+await mkdir(homeDir);
+const hostId = &quot;00000000-0000-4000-8000-000000007466&quot;;
+await writeFile(join(dataDir, &quot;host-id&quot;), `${hostId}\n`);
+const launcher = resolve(checkout, &quot;packages/bb-app/dist/bb-app.js&quot;);
+const env = {
+  PATH: process.env.PATH,
+  HOME: homeDir,
+  TMPDIR: root,
+  LANG: &quot;C.UTF-8&quot;,
+  NODE_ENV: &quot;production&quot;,
+  BB_TELEMETRY: &quot;false&quot;,
+};
+const results = [];
+
+async function launch(name) {
+  const child = spawn(process.execPath, [
+    launcher,
+    &quot;--data-dir&quot;, dataDir,
+    &quot;--server-bind-host&quot;, &quot;127.0.0.1&quot;,
+    &quot;--server-port&quot;, serverPort,
+    &quot;--host-daemon-port&quot;, daemonPort,
+    &quot;--no-in-app-updates&quot;,
+    &quot;--bundled&quot;,
+    &quot;start&quot;,
+  ], { cwd: checkout, env, detached: true, stdio: [&quot;ignore&quot;, &quot;pipe&quot;, &quot;pipe&quot;] });
+  const exited = once(child, &quot;exit&quot;);
+  let output = &quot;&quot;;
+  let ready = false;
+  let timedOut = false;
+  let stopped = false;
+  function signalGroup(signal) {
+    try {
+      process.kill(-child.pid, signal);
+    } catch (error) {
+      if (error.code !== &quot;ESRCH&quot;) throw error;
+    }
+  }
+  function collect(chunk) {
+    output += chunk.toString(&quot;utf8&quot;).replace(/\x1b\[[0-9;]*m/g, &quot;&quot;);
+    if (!stopped &amp;&amp; output.includes(&quot;bb is ready&quot;)) {
+      ready = true;
+      stopped = true;
+      signalGroup(&quot;SIGTERM&quot;);
+    }
+  }
+  child.stdout.on(&quot;data&quot;, collect);
+  child.stderr.on(&quot;data&quot;, collect);
+  const timeout = setTimeout(() =&gt; {
+    timedOut = true;
+    signalGroup(&quot;SIGTERM&quot;);
+  }, 120_000);
+  const hardTimeout = setTimeout(() =&gt; signalGroup(&quot;SIGKILL&quot;), 140_000);
+  let exitCode;
+  let exitSignal;
+  try {
+    [exitCode, exitSignal] = await exited;
+  } finally {
+    clearTimeout(timeout);
+    clearTimeout(hardTimeout);
+    signalGroup(&quot;SIGKILL&quot;);
+  }
+  const significant = output.split(&quot;\n&quot;).filter((line) =&gt;
+    /Starting server|Server listening|Starting host daemon|Host daemon failed|Host daemon running|bb is ready|Shutting down/.test(line)
+  );
+  const result = { name, ready, exitCode, exitSignal, timedOut };
+  results.push(result);
+  console.log(JSON.stringify(result));
+  for (const line of significant) console.log(line);
+  assert(!timedOut, `${name}: startup timed out`);
+  await delay(400);
+  return result;
+}
+
+try {
+  console.log(`Node ${process.version}; ${process.platform}/${process.arch}; ports ${serverPort}/${daemonPort}`);
+  const initial = await launch(&quot;fresh-enrollment-control&quot;);
+  assert(initial.ready, &quot;Fresh enrollment must reach readiness before testing rejected credentials&quot;);
+  await writeFile(join(dataDir, &quot;auth.json&quot;), `${JSON.stringify({
+    hostId,
+    hostKey: &quot;synthetic-invalid-host-key&quot;,
+  })}\n`, { mode: 0o600 });
+  const rejectedFirst = await launch(&quot;persisted-key-attempt-1&quot;);
+  const rejectedSecond = await launch(&quot;persisted-key-attempt-2&quot;);
+  const names = await readdir(join(dataDir, &quot;logs&quot;));
+  let unauthorized = false;
+  for (const name of names.filter((name) =&gt; name.endsWith(&quot;.log&quot;))) {
+    const text = await readFile(join(dataDir, &quot;logs&quot;, name), &quot;utf8&quot;);
+    for (const line of text.split(&quot;\n&quot;)) {
+      if (line.includes(&quot;Failed to open session: 401 Unauthorized&quot;)) {
+        unauthorized = true;
+        console.log(`${name}: Failed to open session: 401 Unauthorized`);
+      }
+    }
+  }
+  await rm(join(dataDir, &quot;auth.json&quot;));
+  const recovered = await launch(&quot;auth-file-removed-control&quot;);
+  assert(recovered.ready, &quot;Removing rejected credentials must restore startup&quot;);
+  console.log(`Observed session-open 401: ${unauthorized}`);
+  console.log(`Stale starts ready: ${rejectedFirst.ready}, ${rejectedSecond.ready}`);
+  assert(rejectedFirst.ready &amp;&amp; rejectedSecond.ready,
+    &quot;REGRESSION: local launcher must recover rejected persisted credentials instead of exiting&quot;);
+} catch (error) {
+  console.error(error.message);
+  process.exitCode = 1;
+} finally {
+  await rm(root, { recursive: true, force: true });
+  console.log(&quot;Temporary runtime data and isolated home removed; child process groups stopped.&quot;);
+}
+</pre>
+<h3>Build and cleanup notes</h3>
+<p>The initial broad <code>pnpm exec turbo run build</code> failed because the GitHub plugin attempted to resolve SDK runtime subpaths before the SDK dist was available. Building the SDK runtime and bundled types first, then the focused <code>bb-app</code> build through Turbo, resolved the prerequisite without source changes. Both focused builds completed with 62 successful tasks. The SDK prerequisite completed with 5 successful tasks in each checkout. The lifecycle harness runs real packaged server/daemon processes and the real SQLite database and migrations, not mocked transport or persistence.</p>
+<p>Each control and stale launch is bounded, every child process group is stopped, and the temporary runtime directory and isolated HOME are removed by the harness. No dev-app instance was started, so no unrelated dev-stop command was run. Relevant source links were checked against the recorded commit; both trusted working trees passed <code>git diff --check</code> and stayed unmodified.</p>
+<p>Security note: the issue and linked PR were treated solely as untrusted claims and static evidence. No issue-provided script, test, patch, branch, or external URL was executed or fetched. All executed product code came from trusted main; the diagnostic harness was authored locally.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
