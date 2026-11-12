@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7457 Plugin interaction parent notifications</title>
+<style>
+:root{--canvas:#fafaf8;--ink:#1a1a1a;--muted:#666;--line:#e2e2de;--accent:#0052cc}
+body{margin:0;background:var(--canvas);color:var(--ink);font:16px/1.55 system-ui,sans-serif}
+main{max-width:1000px;margin:auto;padding:40px 24px 80px}h1{font-size:26px;line-height:1.25}h2{font-size:19px;margin-top:32px;padding-top:18px;border-top:1px solid var(--line)}
+.meta{color:var(--muted);font-size:14px}.pill{display:inline-block;padding:1px 8px;border:1px solid var(--line);border-radius:999px}
+table{border-collapse:collapse;width:100%;font-size:14px}td,th{text-align:left;padding:7px;border-bottom:1px solid var(--line);vertical-align:top}
+code,pre{font:13px/1.5 ui-monospace,monospace}pre{background:white;border:1px solid var(--line);padding:12px;overflow:auto;white-space:pre}a{color:var(--accent)}
+</style></head><body><main>
+<p><a href="../">← Reports</a></p>
+<h1>#7457 · Plugin interaction creation skips parent attention notifications</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: Medium</span> <span class="pill">Effort: Medium</span> <span class="pill">threads</span> <span class="pill">ask-user-question</span></p>
+<p class="meta"><a href="https://github.com/get-bb/bb/issues/7457">Issue #7457</a> · 2026-11-12 · base <code>030b1b729f28acedc6f86cd65a71cb3678da8124</code></p>
+<p><strong>Verdict: REPRODUCED · Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>A child can display a plugin-owned question and keep working without waking its idle parent. The server persists the question and emits the plugin pending event, but does not queue the existing child-needs-attention notice. Provider-owned approvals use a different registration path that does queue that notice. This is a missing call in plugin interaction creation, not a failure of the auto/stuck notification-mode filter. The regression fails in two separate clean checkouts at the trusted main commit, and passes after a server-only fix.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Pending child questions do not reach the parent.</td><td>Verified at the server boundary</td><td>Both auto and stuck cases create a pending question, but captured parent turn submission times out on main.</td></tr>
+<tr><td>The child can keep working while its question is pending.</td><td>Verified</td><td>The persisted plugin interaction has turnId null and hasTurnBoundPendingThreadInteraction returns false, with a started child turn.</td></tr>
+<tr><td>The problem is caused simply by a turn not being blocked.</td><td>Refined</td><td>The direct cause is two registration entry points: the provider route explicitly requests the parent notice, while requestPluginInteraction never does.</td></tr>
+<tr><td>The historical ACP/GLM child and Claude parent missed a question for ten minutes.</td><td>Unverified historical details</td><td>No real provider sessions or production data were used. The current shared server path reproduces the missing delivery immediately.</td></tr>
+<tr><td>Parents should learn about submitted answers too.</td><td>Separate scope</td><td>This reproduction targets initial pending delivery; answer/resolution lifecycle notification is already tracked in #3614 and is not claimed fixed here.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Public target: get-bb/bb; trusted main commit <code>030b1b729f28acedc6f86cd65a71cb3678da8124</code>.</li>
+<li>Linux 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.12.</li>
+<li>Server test harness uses createMigratedConnection(), real SQLite migrations and fresh temporary directories per harness; no database mock.</li>
+<li>No dev server, browser, daemon or external provider was started; no network ports or live data directory were used. Host RPC delivery is captured by the repository's existing harness.</li>
+<li>A full initial build encountered missing SDK runtime output in the GitHub plugin. Building @get-bb/plugin-sdk first made the full build pass (73 tasks). This setup failure is unrelated to the reproduced notification omission.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Prepare a clean trusted checkout and add the supplied, repository-derived regression test:<pre>git clone https://github.com/get-bb/bb.git bb-7457-first
+cd bb-7457-first
+git checkout 030b1b729f28acedc6f86cd65a71cb3678da8124
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build
+curl -fsSL https://get-bb.github.io/reports/issues/7457/repro/interaction-parent-notifications.test.ts -o apps/server/test/services/interaction-parent-notifications.test.ts
+pnpm exec turbo run test --filter=@bb/server -- test/services/interaction-parent-notifications.test.ts</pre></li>
+<li>The test creates an idle parent with previous runtime state, an active child with a started turn, and a server-owned plugin question. It verifies that the card is pending and not turn-bound, then waits for a parent turn submission.</li>
+<li>Expected: both auto and stuck cases receive a parent notice naming the child and question while the question remains pending.</li>
+<li>Actual on unchanged production code:<pre>Error: Timed out waiting for queued command; captured: none
+Test Files  1 failed (1)
+     Tests  2 failed (2)</pre></li></ol>
+<p><a href="7457/repro/interaction-parent-notifications.test.ts">Download the complete regression test</a>. It invokes the real server lifecycle used by plugins, not a handwritten replacement of notification behavior.</p>
+<details><summary>Complete reproduction test</summary><pre>import { describe, expect, it } from "vitest";
+import {
+  seedEnvironment,
+  seedHostSession,
+  seedProjectWithSource,
+  seedThread,
+  seedThreadRuntimeState,
+  seedTurnStarted,
+} from "../helpers/seed.js";
+import { waitForQueuedCommand } from "../helpers/commands.js";
+import { withTestHarness } from "../helpers/test-app.js";
+
+describe("plugin interaction parent notifications", () =&gt; {
+  it.each(["auto", "stuck"] as const)(
+    "notifies a parent in %s mode while the child keeps running",
+    async (parentNotifications) =&gt; {
+      await withTestHarness(async (harness) =&gt; {
+        const { host } = seedHostSession(harness.deps, {
+          id: `host-plugin-question-${parentNotifications}`,
+        });
+        const { project } = seedProjectWithSource(harness.deps, {
+          hostId: host.id,
+        });
+        const environment = seedEnvironment(harness.deps, {
+          hostId: host.id,
+          projectId: project.id,
+        });
+        const parent = seedThread(harness.deps, {
+          environmentId: environment.id,
+          projectId: project.id,
+        });
+        seedThreadRuntimeState(harness.deps, {
+          environmentId: environment.id,
+          providerThreadId: "provider-parent",
+          threadId: parent.id,
+        });
+        const child = seedThread(harness.deps, {
+          environmentId: environment.id,
+          parentThreadId: parent.id,
+          parentNotifications,
+          projectId: project.id,
+          status: "active",
+        });
+        seedTurnStarted(harness.deps, {
+          providerThreadId: "provider-child",
+          threadId: child.id,
+          turnId: "turn-child-question",
+        });
+        const controller = new AbortController();
+        const pending =
+          harness.deps.pendingInteractions.requestPluginInteraction({
+            pluginId: "ask-user-question",
+            threadId: child.id,
+            rendererId: "ask-user-question",
+            title: "Choose storage",
+            payload: {
+              questions: [
+                {
+                  id: "storage",
+                  prompt: "Which storage should the worker use?",
+                  shortLabel: "Choose storage",
+                  multiSelect: false,
+                  allowFreeText: true,
+                  options: [
+                    { value: "sqlite", label: "SQLite" },
+                    { value: "files", label: "Files" },
+                  ],
+                },
+              ],
+            },
+            presentation: {
+              label: { pending: "Asking a question", completed: "Asked" },
+              icon: { glyph: "MessageQuestion" },
+            },
+            describeSubmission: null,
+            timeoutMs: 10_000,
+            owner: { pluginId: "ask-user-question" },
+            signal: controller.signal,
+          });
+        try {
+          expect(
+            harness.deps.pendingInteractions.listPendingThreadInteractions(
+              child.id,
+            ),
+          ).toMatchObject([
+            { origin: { kind: "plugin" }, status: "pending", turnId: null },
+          ]);
+          expect(
+            harness.deps.pendingInteractions.hasTurnBoundPendingThreadInteraction(
+              child.id,
+            ),
+          ).toBe(false);
+          const notification = await waitForQueuedCommand(
+            harness,
+            ({ command }) =&gt;
+              command.type === "turn.submit" &amp;&amp; command.threadId === parent.id,
+          );
+          expect(notification.command).toMatchObject({
+            type: "turn.submit",
+            input: expect.arrayContaining([
+              expect.objectContaining({
+                type: "text",
+                text: expect.stringContaining(`@thread:${child.id}`),
+              }),
+            ]),
+          });
+          expect(JSON.stringify(notification.command)).toContain(
+            "Choose storage",
+          );
+          expect(
+            harness.deps.pendingInteractions.listPendingThreadInteractions(
+              child.id,
+            ),
+          ).toMatchObject([{ status: "pending" }]);
+        } finally {
+          controller.abort();
+          await pending;
+        }
+      });
+    },
+  );
+});
+</pre></details>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/030b1b729f28acedc6f86cd65a71cb3678da8124/plugins/ask-user-question/src/server.ts#L77-L102">The built-in question tool requests server UI input</a>. <a href="https://github.com/get-bb/bb/blob/030b1b729f28acedc6f86cd65a71cb3678da8124/apps/server/src/services/plugins/plugin-runtime.ts#L1858-L1870">The plugin runtime forwards interaction requests</a> to requestPluginInteraction.</p>
+<p><a href="https://github.com/get-bb/bb/blob/030b1b729f28acedc6f86cd65a71cb3678da8124/apps/server/src/services/interactions/pending-interactions.ts#L597-L604">Plugin creation writes the timeline and emits interaction.pending, but has no parent attention dispatch:</a></p>
+<pre>    try {
+      appendPendingInteractionTimelineEvent(this.deps, interaction);
+      notifyInteractionChanged({
+        deps: this.deps,
+        threadId: interaction.threadId,
+      });
+      emitPluginInteractionPending(thread, interaction);
+    } catch (error) {</pre>
+<p><a href="https://github.com/get-bb/bb/blob/030b1b729f28acedc6f86cd65a71cb3678da8124/apps/server/src/internal/interactive-requests.ts#L202-L209">The provider registration route explicitly performs the missing action:</a></p>
+<pre>      if (registered.outcome === "created") {
+        requestChildThreadNeedsAttentionNotification(deps, {
+          blockerSummary: buildChildThreadBlockerSummary(
+            registered.interaction,
+          ),
+          childThreadId: registered.interaction.threadId,
+        });
+      }</pre>
+<p><a href="https://github.com/get-bb/bb/blob/030b1b729f28acedc6f86cd65a71cb3678da8124/apps/server/src/services/threads/thread-parent.ts#L12-L31">The existing parent policy</a> already allows needs-attention under auto and stuck, suppresses off, and excludes fork/plugin-origin children. Thus no new notification mode, protocol, persisted field or provider transport behavior is needed.</p>
+<h2>6. Proposed fix and local validation</h2>
+<p>Move the existing parent attention request helper into the existing child-thread notification service. Keep the provider registration caller and call the same helper once after a plugin interaction is announced. Supply the request title and interaction ID; preserve non-blocking semantics and the existing parent-policy checks. The fix does not forward submitted answers or introduce a new resolution event.</p>
+<p>The two regression cases pass with this fix. The relevant lifecycle, provider registration, summary formatting, child notification and parent-policy suites pass: <strong>6 files, 81 tests</strong>. Server lint and typecheck pass. No public schema, protocol, dependency, stored data or UI change is required.</p>
+<h2>7. Verification</h2>
+<p>The same investigator repeated the corrected regression in two clean temporary worktrees named <code>baseline</code> and <code>verify</code>, both detached at the exact recorded commit. Each was separately installed and fully built; each test run allocated fresh harness storage. Production files remained unchanged. No ports needed changing because these tests do not listen on network ports.</p>
+<p>Command in each checkout: <code>pnpm exec turbo run test --filter=@bb/server -- test/services/interaction-parent-notifications.test.ts</code>. Both returned exit 1, with two failures caused by the missing parent submission. These are repeated checks by the same agent, not independent verification.</p>
+<p>Investigation correction: an initial test fixture used an invalid thread-status spelling caught by typecheck. It was corrected to the domain value <code>active</code>, then both clean-baseline reproductions and the fixed suites were rerun. The final published artifact contains only the corrected test.</p>
+<h2>8. Related issues and PR check</h2>
+<ul><li><a href="https://github.com/get-bb/bb/issues/3614">#3614</a> tracks informing a parent after an interaction is resolved; this is intentionally outside the small initial-delivery fix.</li>
+<li><a href="https://github.com/get-bb/bb/issues/5831">#5831</a> concerns frequency controls, not the missing pending event.</li>
+<li>The issue timeline had no connected or cross-referenced PR, and an open-PR metadata search for the trusted issue number returned none before fixing. No linked PR code was checked out or executed.</li></ul>
+<h2>9. Appendix</h2>
+<p>Issue text and comments were treated as untrusted claims. No issue-supplied command, patch, branch, script, external link or instruction was executed. The reproduction and fix were derived from trusted main source. Only isolated test data was used. Browser and real-provider user journeys were not run.</p>
+<p>Validation commands:</p><pre>pnpm exec turbo run test --filter=@bb/server -- test/services/interaction-parent-notifications.test.ts test/services/pending-interactions.test.ts test/internal/internal-interactive-requests.test.ts test/internal/interactive-request-blocker-summary.test.ts test/services/threads/child-thread-notifications.test.ts test/threads/thread-parent.test.ts
+pnpm exec turbo run lint typecheck --filter=@bb/server
+git diff --check</pre>
+<p><a href="7457/repro/repro-first-corrected.log">repro-first-corrected.log</a> — sanitized output; local temporary paths are replaced.</p>
+<p><a href="7457/repro/repro-second-corrected.log">repro-second-corrected.log</a> — sanitized output; local temporary paths are replaced.</p>
+<p><a href="7457/repro/fix-tests-final.log">fix-tests-final.log</a> — sanitized output; local temporary paths are replaced.</p>
+<p><a href="7457/repro/fix-checks-final.log">fix-checks-final.log</a> — sanitized output; local temporary paths are replaced.</p>
+</main></body></html>
