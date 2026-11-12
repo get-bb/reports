@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7473 Retry history rescans</title>
+<style>
+:root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; }
+body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,sans-serif; }
+main { max-width:960px; margin:auto; padding:40px 24px 80px; }
+h1 { font-size:26px; line-height:1.25; } h2 { font-size:18px; margin-top:36px; border-top:1px solid var(--line); padding-top:20px; }
+.meta { color:var(--muted); font-size:14px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:1px 8px; }
+a { color:var(--accent); } table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:8px; border-bottom:1px solid var(--line); vertical-align:top; }
+pre { background:white; border:1px solid var(--line); padding:12px; overflow:auto; } code,pre { font:13px/1.5 ui-monospace,monospace; }
+</style></head><body><main>
+<p><a href="../">← reports</a></p>
+<h1>#7473 · Retry supersession repeatedly scans request history</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">High priority</span> <span class="pill">Low effort</span> <span class="pill">threads</span> <span class="pill">perf</span></p>
+<p class="meta"><a href="https://github.com/get-bb/bb/issues/7473">GitHub issue</a> · November 12, 2026 · base <code>7794941da1b6e2baf017e5f7ab65b5f223fcaf54</code></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> for the synthetic database/API stall on current trusted main. The historical production duration is not verified.</p>
+<h2>1. TL;DR</h2>
+<p>When a new prompt overtakes an outstanding retry, the server asks whether the provider already accepted that retry's input. On a long thread, the database repeatedly searches request history for each accepted input. A newly authored reproduction with 2,000 requests and 1,999 accepted inputs blocks inside the synchronous queue API for 7,624.882 ms; the same agent reproduces it in a second clean checkout. The retry still reaches the correct superseded state, so this is a latency defect rather than evidence of lost input. Removing the correlation reduces the same operation to 9.536 ms in the first patched run.</p>
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>A long production thread stalled for roughly 207 seconds.</td><td>Unverified</td><td>No production instance, user database, or historical logs were accessed. No HTTP/UI duration is claimed.</td></tr>
+<tr><td>An unaccepted queued retry can make the new-request path expensive.</td><td>Verified on trusted main</td><td>Three unpatched executions took 7,624.882, 7,768.574, and 7,609.121 ms. Correct queue-state assertions pass before the latency assertion fails.</td></tr>
+<tr><td>The acceptance lookup repeats request-history work.</td><td>Verified</td><td>The inner request lookup references the outer accepted event's JSON ID. A production-only change to an uncorrelated membership query reduces the measured API operation to 9.536 and 9.448 ms.</td></tr>
+<tr><td>Eligibility and queue semantics must remain unchanged.</td><td>Verified within tested cases</td><td>Root/direct-retry acceptance drops the retry; deeper descendants, unrelated IDs, other-thread acceptance, null IDs, and missing IDs retain a superseded row. Every case includes a duplicate direct-retry request ID.</td></tr>
+</tbody></table>
+<h2>3. Environment</h2>
+<ul><li>Public repository get-bb/bb; trusted origin/main commit <code>7794941da1b6e2baf017e5f7ab65b5f223fcaf54</code>, fetched before investigation and before creating the fix branch.</li>
+<li>Linux 4.19.0-gvisor x86_64; Node v22.19.0; pnpm 9.15.0; better-sqlite3 12.11.1; SQLite 3.53.2; Vitest 4.1.12.</li>
+<li>Two separately installed temporary git worktrees, called checkout A and checkout B. Both start with unchanged trusted-main production code. Only the investigator-authored test is added for baseline runs.</li>
+<li>No app server, provider session, ports, persistent runtime data directory, network reproduction, or credentials. Each test uses a fresh migrated SQLite database in memory via createMigratedConnection().</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Create a disposable trusted checkout and install the locked dependencies:
+<pre>git clone --branch main https://github.com/get-bb/bb.git bb-7473
+cd bb-7473
+git checkout 7794941da1b6e2baf017e5f7ab65b5f223fcaf54
+pnpm install --frozen-lockfile --prefer-offline</pre></li>
+<li>Copy the <a href="#regression-test">complete newly authored regression test below</a> into <code>packages/db/test/data/queued-retry-history.test.ts</code>. This test is derived from trusted repository APIs, not from code supplied in the issue.</li>
+<li>Run through the normal orchestrator:
+<pre>pnpm exec turbo run test --filter=@bb/db -- test/data/queued-retry-history.test.ts --silent=false</pre></li>
+<li>Observe the expected baseline failure. The final test file's checkout-B run prints:
+<pre>{"requestCount":2000,"superseded":1,"elapsedMs":7609.120911999999}
+AssertionError: expected 7609.120911999999 to be less than 500
+Tests  1 failed | 7 passed (8)</pre>
+The 500 ms bound is a generous regression tripwire, not a product latency guarantee. Correctness assertions establish that one retry is superseded and retained before checking elapsed time. Very heavily contended hosts may need separate interpretation.</li>
+<li>For the verified local repair, apply the <a href="#verified-fix">production-only diff below</a> and rerun the same test. The first patched run printed:
+<pre>{"requestCount":2000,"superseded":1,"elapsedMs":9.535642000000053}
+Tests  1 passed (1)</pre>
+That first version contained the latency test only; seven semantic cases were then added, preserved in the downloadable final file. The final focused database run passed all eight new cases plus 118 existing cases.</li></ol>
+<details id="regression-test"><summary>Complete reproduction and regression test</summary><pre>
+import { performance } from "node:perf_hooks";
+import { encodeClientTurnRequestIdNumber } from "@bb/domain";
+import { expect, it } from "vitest";
+import { upsertHost } from "../../src/data/hosts.js";
+import { createProject } from "../../src/data/projects.js";
+import {
+  createQueuedThreadMessage,
+  getQueuedThreadMessage,
+  supersedeQueuedRetriesInTransaction,
+} from "../../src/data/queued-thread-messages.js";
+import { createThread } from "../../src/data/threads.js";
+import { noopNotifier } from "../../src/notifier.js";
+import { createMigratedConnection } from "../../src/testing.js";
+
+it("supersedes an unaccepted retry without repeatedly walking long request history", () =&gt; {
+  const db = createMigratedConnection();
+  try {
+    const host = upsertHost(db, noopNotifier, { name: "retry-history" });
+    const { project } = createProject(db, noopNotifier, {
+      name: "retry-history",
+      source: {
+        type: "local_path",
+        hostId: host.id,
+        path: "/tmp/retry-history",
+      },
+    });
+    const thread = createThread(db, noopNotifier, {
+      projectId: project.id,
+      providerId: "codex",
+    });
+    const requestCount = 2_000;
+    const requestId = (value: number) =&gt;
+      encodeClientTurnRequestIdNumber({ value });
+    const insert = db.$client.prepare(`INSERT INTO events
+      (id, thread_id, scope_kind, turn_id, sequence, type, data, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 0)`);
+    db.$client.transaction(() =&gt; {
+      for (let index = 1; index &lt;= requestCount; index++) {
+        insert.run(
+          `request-${index}`,
+          thread.id,
+          "thread",
+          null,
+          index * 2,
+          "client/turn/requested",
+          JSON.stringify({
+            requestId: requestId(index),
+            input: [
+              { type: "text", text: "history ".repeat(256), mentions: [] },
+            ],
+          }),
+        );
+        if (index &lt; requestCount) {
+          insert.run(
+            `accepted-${index}`,
+            thread.id,
+            "turn",
+            `turn-${index}`,
+            index * 2 + 1,
+            "turn/input/accepted",
+            JSON.stringify({ clientRequestId: requestId(index) }),
+          );
+        }
+      }
+    })();
+    const retry = createQueuedThreadMessage(db, noopNotifier, {
+      threadId: thread.id,
+      content: [],
+      model: "gpt-5",
+      reasoningLevel: "medium",
+      permissionMode: "full",
+      serviceTier: "default",
+      waitingOn: null,
+      sendAt: null,
+      payload: {
+        kind: "retry",
+        retryOfTurnRequestId: requestId(requestCount),
+        attempt: 1,
+        reason: "retry-history",
+      },
+      systemNotice: null,
+    });
+    const started = performance.now();
+    const superseded = db.transaction(
+      (tx) =&gt;
+        supersedeQueuedRetriesInTransaction(tx, {
+          threadId: thread.id,
+          retryOfTurnRequestId: null,
+        }),
+      { behavior: "immediate" },
+    );
+    const elapsed = performance.now() - started;
+    expect(superseded).toBe(1);
+    expect(getQueuedThreadMessage(db, retry.id)?.waitingOn).toBe(
+      JSON.stringify({ kind: "superseded" }),
+    );
+    console.info(
+      JSON.stringify({ requestCount, superseded, elapsedMs: elapsed }),
+    );
+    expect(elapsed).toBeLessThan(500);
+  } finally {
+    db.$client.close();
+  }
+});
+
+it.each([
+  { acceptance: "root", clientId: 1, foreignThread: false, dropped: true },
+  {
+    acceptance: "direct retry",
+    clientId: 2,
+    foreignThread: false,
+    dropped: true,
+  },
+  {
+    acceptance: "deeper retry",
+    clientId: 3,
+    foreignThread: false,
+    dropped: false,
+  },
+  {
+    acceptance: "unrelated",
+    clientId: 4,
+    foreignThread: false,
+    dropped: false,
+  },
+  {
+    acceptance: "other thread",
+    clientId: 1,
+    foreignThread: true,
+    dropped: false,
+  },
+  {
+    acceptance: "null ID",
+    clientId: null,
+    foreignThread: false,
+    dropped: false,
+  },
+  {
+    acceptance: "missing ID",
+    clientId: undefined,
+    foreignThread: false,
+    dropped: false,
+  },
+])(
+  "preserves retry disposition for $acceptance acceptance",
+  ({ clientId, foreignThread, dropped }) =&gt; {
+    const db = createMigratedConnection();
+    try {
+      const host = upsertHost(db, noopNotifier, { name: "retry-acceptance" });
+      const { project } = createProject(db, noopNotifier, {
+        name: "retry-acceptance",
+        source: {
+          type: "local_path",
+          hostId: host.id,
+          path: "/tmp/retry-acceptance",
+        },
+      });
+      const thread = createThread(db, noopNotifier, {
+        projectId: project.id,
+        providerId: "codex",
+      });
+      const other = createThread(db, noopNotifier, {
+        projectId: project.id,
+        providerId: "codex",
+      });
+      const requestId = (value: number) =&gt;
+        encodeClientTurnRequestIdNumber({ value });
+      const insert = db.$client.prepare(`INSERT INTO events
+      (id, thread_id, scope_kind, turn_id, sequence, type, data, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 0)`);
+      for (const [index, parent] of [null, 1, 2, null, 1].entries()) {
+        const requestNumber = index === 4 ? 2 : index + 1;
+        insert.run(
+          `request-${index}`,
+          thread.id,
+          "thread",
+          null,
+          index + 1,
+          "client/turn/requested",
+          JSON.stringify({
+            requestId: requestId(requestNumber),
+            ...(parent === null ? {} : { retryOfRequestId: requestId(parent) }),
+          }),
+        );
+      }
+      insert.run(
+        "accepted",
+        foreignThread ? other.id : thread.id,
+        "turn",
+        "accepted-turn",
+        6,
+        "turn/input/accepted",
+        JSON.stringify({
+          clientRequestId: clientId == null ? clientId : requestId(clientId),
+        }),
+      );
+      const retry = createQueuedThreadMessage(db, noopNotifier, {
+        threadId: thread.id,
+        content: [],
+        model: "gpt-5",
+        reasoningLevel: "medium",
+        permissionMode: "full",
+        serviceTier: "default",
+        waitingOn: null,
+        sendAt: null,
+        payload: {
+          kind: "retry",
+          retryOfTurnRequestId: requestId(1),
+          attempt: 1,
+          reason: "retry-acceptance",
+        },
+        systemNotice: null,
+      });
+      expect(
+        db.transaction((tx) =&gt;
+          supersedeQueuedRetriesInTransaction(tx, {
+            threadId: thread.id,
+            retryOfTurnRequestId: null,
+          }),
+        ),
+      ).toBe(1);
+      const stored = getQueuedThreadMessage(db, retry.id);
+      if (dropped) {
+        expect(stored).toBeNull();
+      } else {
+        expect(stored?.waitingOn).toBe(JSON.stringify({ kind: "superseded" }));
+      }
+    } finally {
+      db.$client.close();
+    }
+  },
+);
+</pre></details>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/7794941da1b6e2baf017e5f7ab65b5f223fcaf54/packages/db/src/data/queued-thread-messages.ts#L1210-L1244">hasAcceptedQueuedRetryInput</a> starts with accepted events and asks an EXISTS subquery to locate a request whose ID equals the current accepted event's clientRequestId. The request eligibility condition also selects the retry root or requests whose retryOfRequestId equals that root. With no accepted match, all candidate accepted inputs must be considered, and each candidate repeats a JSON-filtered request lookup. The thread/type index limits each lookup to the thread and event type but does not index the compared JSON request IDs.</p>
+<pre>json_extract(chainRequest.data, '$.requestId') =
+  json_extract(accepted.data, '$.clientRequestId')</pre>
+<p><a href="https://github.com/get-bb/bb/blob/7794941da1b6e2baf017e5f7ab65b5f223fcaf54/packages/db/src/data/queued-thread-messages.ts#L1247-L1294">supersedeQueuedRetriesInTransaction</a> invokes the lookup for eligible overtaken retries. Claimed and already-superseded rows are excluded before this call. The <a href="https://github.com/get-bb/bb/blob/7794941da1b6e2baf017e5f7ab65b5f223fcaf54/apps/server/src/services/threads/thread-events.ts#L549-L560">new-request event append</a> invokes supersession; the <a href="https://github.com/get-bb/bb/blob/7794941da1b6e2baf017e5f7ab65b5f223fcaf54/apps/server/src/services/threads/thread-send.ts#L436-L484">send path</a> wraps it in an immediate write transaction. The database adapter invokes <a href="https://github.com/get-bb/bb/blob/7794941da1b6e2baf017e5f7ab65b5f223fcaf54/packages/db/src/connection.ts#L262-L286">the underlying synchronous statement.get</a>. Consequently JavaScript cannot service other work until this database call returns. No actual HTTP request was timed here.</p>
+<h2>6. Proposed fix and verified repair</h2>
+<p>Compute the eligible root/direct-retry request IDs in an uncorrelated subquery, then test the accepted input ID for membership. Keep the accepted-event thread/type filters, LIMIT 1, eligibility checks, and queue transitions unchanged. Positive WHERE membership preserves the existing treatment of absent/null IDs and duplicates for the text request IDs used by the domain; this is not recursive retry ancestry.</p>
+<p>The repair changes only the queued-message database subsystem: two files, 237 additions and 3 deletions, <strong>240 total text lines</strong>. There are no dependencies, generated files, schema changes, migrations, stored-data changes, public contracts, or provider changes. No test-only production seam is added.</p>
+<details id="verified-fix"><summary>Verified production-only diff</summary><pre>
+diff --git a/packages/db/src/data/queued-thread-messages.ts b/packages/db/src/data/queued-thread-messages.ts
+index b0d2484fc9..37f2165d21 100644
+--- a/packages/db/src/data/queued-thread-messages.ts
++++ b/packages/db/src/data/queued-thread-messages.ts
+@@ -1221,15 +1221,17 @@ function hasAcceptedQueuedRetryInput(
+         and(
+           eq(accepted.threadId, retry.threadId),
+           eq(accepted.type, "turn/input/accepted"),
+-          exists(
++          inArray(
++            sql`json_extract(${accepted.data}, '$.clientRequestId')`,
+             db
+-              .select({ sequence: chainRequest.sequence })
++              .select({
++                requestId: sql`json_extract(${chainRequest.data}, '$.requestId')`,
++              })
+               .from(chainRequest)
+               .where(
+                 and(
+                   eq(chainRequest.threadId, retry.threadId),
+                   eq(chainRequest.type, "client/turn/requested"),
+-                  sql`json_extract(${chainRequest.data}, '$.requestId') = json_extract(${accepted.data}, '$.clientRequestId')`,
+                   or(
+                     sql`json_extract(${chainRequest.data}, '$.requestId') = ${retry.retryOfTurnRequestId}`,
+                     sql`json_extract(${chainRequest.data}, '$.retryOfRequestId') = ${retry.retryOfTurnRequestId}`,
+</pre></details>
+<h2>7. Verification</h2>
+<p>The same agent repeated the reproduction in a second clean checkout B at the exact recorded base. It received a separate frozen dependency install and fresh in-memory databases. This is repeat verification, not an independent review.</p>
+<table><tr><th>Run</th><th>Result</th><th>Artifact</th></tr>
+<tr><td>Checkout A, unchanged main, initial latency regression</td><td>Expected failure: 7,624.882 ms; queue result correct</td><td>Baseline output below</td></tr>
+<tr><td>Checkout B, unchanged main, repeated latency regression</td><td>Expected failure: 7,768.574 ms</td><td>Second-checkout output below</td></tr>
+<tr><td>Checkout B, unchanged main, final eight-case artifact</td><td>Expected latency failure: 7,609.121 ms; seven semantic cases pass</td><td>Verbatim output in reproduction steps</td></tr>
+<tr><td>Checkout A, repaired production code</td><td>9.536 ms, latency regression passes</td><td>Verbatim output in reproduction steps</td></tr>
+<tr><td>Database regression, queue, wait, and query-plan suites</td><td>126 tests pass; measured supersession 9.448 ms</td><td>Suite summaries below</td></tr>
+<tr><td>Server turn-failed-retry suite</td><td>22 existing tests pass</td><td>Suite summaries below</td></tr>
+<tr><td>Database typecheck and type-aware lint</td><td>Pass; zero lint warnings/errors</td><td>Suite summaries below</td></tr></table>
+<p>No report correction was needed after checkout B. The historical 207-second incident and full HTTP/UI responsiveness remain explicitly unverified. The all-workspace build initially hit an unrelated build-order error: the GitHub plugin attempted to consume SDK runtime entries before they existed. Building the SDK runtime/types succeeded; the relevant database and server checks above then passed. An all-workspace build is not claimed to pass.</p>
+<h2>8. Related issues and PR status</h2>
+<p><a href="https://github.com/get-bb/bb/issues/6835">#6835</a> concerns broader synchronous SQLite stalls; this report verifies one narrower queued-retry path. GitHub issue timeline metadata and an open-PR search found no open pull request linked to #7473 when the fix was prepared. No linked branch or issue-supplied code was executed.</p>
+<h2>9. Appendix</h2>
+<p>Issue data, including its suggested commands and patch, was treated only as untrusted claims. The reproduction and repair were authored from trusted-main source. Raw logs remain in local investigation storage; the complete test, repair, and relevant verbatim output are inline in this self-contained report, following this public report repository's artifact policy. The test is nonvisual; no screenshot is warranted.</p>
+<pre>Checkout A, baseline:
+{"requestCount":2000,"superseded":1,"elapsedMs":7624.882357}
+AssertionError: expected 7624.882357 to be less than 500
+
+Checkout B, initial repeat:
+{"requestCount":2000,"superseded":1,"elapsedMs":7768.5740160000005}
+
+Database suites after repair:
+{"requestCount":2000,"superseded":1,"elapsedMs":9.448302000000012}
+Test Files  4 passed (4)
+Tests  126 passed (126)
+
+Server suite after repair:
+Test Files  1 passed (1)
+Tests  22 passed (22)
+
+Final formatted regression test after repair:
+{"requestCount":2000,"superseded":1,"elapsedMs":9.261032999999998}
+Tests  8 passed (8)
+
+Type-aware lint:
+Found 0 warnings and 0 errors.</pre>
+<pre>pnpm exec turbo run build
+pnpm exec turbo run build build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run test --filter=@bb/db -- test/data/queued-retry-history.test.ts test/data/queued-thread-messages.test.ts test/data/queued-message-waits.test.ts test/query-plans.test.ts --silent=false
+pnpm exec turbo run test --filter=@bb/server -- test/threads/turn-failed-retry.test.ts
+pnpm exec turbo run typecheck lint:type-aware --filter=@bb/db
+git diff --check
+git diff --numstat origin/main</pre>
+</main></body></html>
