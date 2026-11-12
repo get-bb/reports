@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>#7461 · Checkpoint contention invalidates a pinned-WAL test observation</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7461 · Checkpoint contention invalidates a pinned-WAL test observation</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Low</span><span class="pill">Effort: Low</span><span class="pill">host</span>
+<a href="https://github.com/get-bb/bb/issues/7461">GitHub issue</a><span>2026-11-12 · base <code>030b1b729f28acedc6f86cd65a71cb3678da8124</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · Reproduction label: <code>confirmed-repro</code>.</p>
+<h2>1. TL;DR</h2>
+<p>A database test assumes that a PASSIVE checkpoint always returns usable WAL frame counts. Its background checkpoint worker is still active, so the observation can encounter SQLite's exclusive checkpoint lock instead. SQLite then reports a busy checkpoint with frame counts of minus one, and the test mistakes that sentinel for a small WAL. On two clean checkouts of trusted main, taking the real checkpoint lock in a separate process reproduced the exact assertion failure, with production code unchanged. The uninstrumented five-test suite passed in each checkout; this investigation demonstrates the contention mechanism, not the natural Windows failure frequency.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>The pinned-reader test samples a checkpoint while the worker is alive.</td><td class="ok">Verified</td><td>The test starts and attaches the worker, waits 250 ms, then samples a PASSIVE checkpoint without stopping it.</td></tr>
+<tr><td>A competing checkpoint lock yields busy=1 and frame counts of -1.</td><td class="ok">Verified</td><td>Real POSIX record-lock contention on SQLite's checkpoint-lock byte returned exactly {busy:1,log:-1,checkpointed:-1} in both checkouts.</td></tr>
+<tr><td>That return value fails the existing assertion.</td><td class="ok">Verified</td><td>Both runs failed with “expected -1 to be greater than 32768”; the other four tests passed.</td></tr>
+<tr><td>This is a naturally occurring Windows CI race.</td><td class="unv">Not independently exercised</td><td>No Windows runner was available. The experiment controls the lock directly on Linux, rather than measuring the real worker's overlap frequency or fetching the reported CI URL.</td></tr>
+<tr><td>The reported production fallback is protected by pausing the worker first.</td><td class="ok">Verified statically</td><td>The worker sets paused before posting starved; the main handler checkpoints and then posts resume. This is not a proof that all possible external database clients are coordinated.</td></tr>
+</table>
+<h2>3. Environment</h2>
+<ul><li>Repository: public <code>get-bb/bb</code>, trusted <code>origin/main</code> at <code>030b1b729f28acedc6f86cd65a71cb3678da8124</code>; fetched again before writing this report, still the same commit.</li>
+<li>Linux x86_64; Node v22.19.0; pnpm 9.15.0; Python 3.13.9; better-sqlite3 12.11.1; Vitest 4.1.12.</li>
+<li>Two separate clean clones of the target repository, each with a frozen-lockfile installation. The second clone was explicitly detached at the recorded commit.</li>
+<li>No running bb instance, provider, account, network port, or real user database was used. Every test creates and removes its own temporary SQLite directory.</li>
+<li>The normal monorepo build was attempted in both clones. Both stopped on the pre-existing GitHub plugin build prerequisite: the local SDK's <code>dist/process.js</code> and <code>dist/host.js</code> were absent. This did not prevent the focused Turbo database test task from building its upstream dependencies and running.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<p>Prerequisites: Linux/POSIX record locks, Python 3, Node and the repository's pnpm version. This is Linux-only diagnostic instrumentation, not a proposed cross-platform committed regression.</p>
+<ol><li>Clone the trusted target and pin the tested commit. Install normally, attempt the normal build, then run the unmodified owning suite. It passed five of five tests in each checkout.
+<pre>git clone --single-branch --branch main https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout --detach 030b1b729f28acedc6f86cd65a71cb3678da8124
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec turbo run test --filter=@bb/db -- test/wal-checkpointer.test.ts</pre>
+<p>The full-build SDK prerequisite failure described above is separate from this reproduction; continue with the focused test task if it occurs.</p></li>
+<li>Save the following investigator-authored patch as <code>repro.patch</code>, then run <code>git apply repro.patch</code>. It modifies only the existing test observation, not the production worker. A child process takes the actual SQLite checkpoint lock, signals readiness, and releases it before the unchanged assertions run. No database mock or added dependency is involved.
+<pre>diff --git a/packages/db/test/wal-checkpointer.test.ts b/packages/db/test/wal-checkpointer.test.ts
+index 22470c76ef..ba064674da 100644
+--- a/packages/db/test/wal-checkpointer.test.ts
++++ b/packages/db/test/wal-checkpointer.test.ts
+@@ -1,4 +1,6 @@
+ import Database from "better-sqlite3";
++import { spawn } from "node:child_process";
++import { once } from "node:events";
+ import {
+   closeSync,
+   existsSync,
+@@ -135,9 +137,29 @@ describe("startWalCheckpointer", () =&gt; {
+           await new Promise&lt;void&gt;((resolve) =&gt; setImmediate(resolve));
+         }
+         await new Promise&lt;void&gt;((resolve) =&gt; setTimeout(resolve, 250));
+-        const [pinned] = db.$client.pragma(
+-          "wal_checkpoint(PASSIVE)",
+-        ) as CheckpointRow[];
++        const lockHolder = spawn("python3", [
++          "-c",
++          [
++            "import fcntl, sys",
++            "with open(sys.argv[1], 'r+b') as shm:",
++            "    fcntl.lockf(shm, fcntl.LOCK_EX, 1, 121)",
++            "    print('locked', flush=True)",
++            "    sys.stdin.read()",
++          ].join("\n"),
++          `${path}-shm`,
++        ]);
++        const lockReleased = once(lockHolder, "exit");
++        let pinned: CheckpointRow | undefined;
++        try {
++          await once(lockHolder.stdout, "data");
++          [pinned] = db.$client.pragma(
++            "wal_checkpoint(PASSIVE)",
++          ) as CheckpointRow[];
++          console.log("Checkpoint lock held:", JSON.stringify(pinned));
++        } finally {
++          lockHolder.stdin.end();
++          await lockReleased;
++        }
+         expect(pinned?.log).toBeGreaterThan(32_768);
+         expect(pinned?.checkpointed).toBeLessThan(pinned?.log ?? 0);
+ 
+</pre></li>
+<li>Run the same focused suite again:
+<pre>pnpm exec turbo run test --filter=@bb/db -- test/wal-checkpointer.test.ts</pre>
+<p>Expected for a contention-tolerant observation: obtain valid frame counts after the transient checkpoint lock is released, then pass the pinned-reader assertions. Actual output in both clean runs:</p>
+<pre>Checkpoint lock held: {"busy":1,"log":-1,"checkpointed":-1}
+AssertionError: expected -1 to be greater than 32768
+Tests  1 failed | 4 passed (5)</pre></li></ol>
+<p>The helper holds a real lock rather than starting a checkpoint loop from the issue. This deterministically exercises the exact competing-checkpoint exclusion state without running any issue-supplied script or linked PR code. Raw logs and the patch are retained locally; the public report embeds the repeatable evidence instead of publishing raw artifacts, in accordance with the reports repository policy.</p>
+<h2>5. Root cause</h2>
+<p>The <a href="https://github.com/get-bb/bb/blob/030b1b729f28acedc6f86cd65a71cb3678da8124/packages/db/test/wal-checkpointer.test.ts#L114-L148">pinned-reader test</a> runs the following after waiting 250 ms, while its checkpointer is still attached:</p>
+<pre>const [pinned] = db.$client.pragma(
+  "wal_checkpoint(PASSIVE)",
+) as CheckpointRow[];
+expect(pinned?.log).toBeGreaterThan(32_768);
+expect(pinned?.checkpointed).toBeLessThan(pinned?.log ?? 0);</pre>
+<p>The <a href="https://github.com/get-bb/bb/blob/030b1b729f28acedc6f86cd65a71cb3678da8124/packages/db/src/wal-checkpointer.ts#L30-L74">worker checkpoint and rescheduling path</a> issues the same PASSIVE pragma. A fixed sleep does not establish checkpoint ownership or exclude the worker's next attempt. The observation therefore needs to distinguish checkpoint-lock contention from a valid frame count.</p>
+<p>The installed, lockfile-pinned SQLite amalgamation corroborates the mechanism: <code>SQLITE_SHM_NLOCK</code> is 8, <code>UNIX_SHM_BASE</code> is 120, and <code>WAL_CKPT_LOCK</code> is slot 1, giving byte offset 121. <code>sqlite3WalCheckpoint</code> takes that exclusive lock; a competing holder returns <code>SQLITE_BUSY</code> before frame outputs are filled. <code>sqlite3_wal_checkpoint_v2</code> initializes those outputs to -1. The helper uses this actual OS lock; the observed pragma row then confirms the result through better-sqlite3.</p>
+<p>This does not indicate that the write loop generated too few frames: -1 is the unavailable-output sentinel, not a positive WAL size. The <a href="https://github.com/get-bb/bb/blob/030b1b729f28acedc6f86cd65a71cb3678da8124/packages/db/src/wal-checkpointer.ts#L63-L74">worker pause ordering</a> and <a href="https://github.com/get-bb/bb/blob/030b1b729f28acedc6f86cd65a71cb3678da8124/packages/db/src/wal-checkpointer.ts#L293-L316">main-thread fallback and resume ordering</a> also explain why the same uncoordinated observation is specific to the test rather than evidence of a new production policy defect.</p>
+<h2>6. Proposed fix</h2>
+<p>Keep the existing substantive assertions, but obtain the checkpoint observation with a bounded asynchronous retry when <code>busy === 1</code>. Yield between attempts so the worker can release its lock; preserve a deadline so persistent contention still fails. Do not “fix” the assertion by accepting negative frame counts, lower the frame threshold, or change production checkpoint scheduling to accommodate an observation-only race.</p>
+<p>A cross-platform regression should exercise genuine transient checkpoint contention through an appropriate repository-owned harness. The Linux lock-holder here is intentionally only diagnostic and should not be added to the Windows test suite unchanged.</p>
+<h2>7. PR review</h2>
+<h3><a href="https://github.com/get-bb/bb/pull/7462">PR #7462</a> — static review only</h3>
+<p>GitHub cross-reference metadata links this open PR to the issue, and its body includes the closing reference. Its untrusted diff adds a bounded asynchronous retry to the existing test's checkpoint observation, yielding for 5 ms with a 5-second deadline, while preserving the frame assertions. This is aligned with the verified root cause. No PR branch was fetched or executed, so this report does not claim that its exact implementation passes tests or Windows CI.</p>
+<p>Review notes: the displayed patch adds no committed contention regression, leaving deterministic coverage dependent on follow-up work; it also adds a source comment at the changed observation block, contrary to the target repository's no-code-comments rule. Neither changes the demonstrated cause. No duplicate fix branch or pull request was created because this linked open PR already exists.</p>
+<h2>8. Related issues</h2>
+<p>A targeted repository search found no other issue establishing this same checkpoint-observation failure. <a href="https://github.com/get-bb/bb/issues/6010">#6010</a> is a different worker-startup test flake, not a duplicate of this lock-contention mechanism. Broader WAL/crash reports were not treated as evidence for this test-only defect.</p>
+<h2>9. Verification</h2>
+<p>The same investigator repeated the work in a second clean clone, pinned to the same trusted base commit, with a separate installation and newly created temporary test databases. This is repeat verification by the same agent, not independent verification.</p>
+<table><tr><th>Checkout</th><th>Unmodified focused suite</th><th>With investigator lock instrumentation</th></tr>
+<tr><td>First trusted clone</td><td>Exit 0; 5 passed</td><td>Exit 1; exact -1 assertion; 1 failed, 4 passed</td></tr>
+<tr><td>Second clean trusted clone</td><td>Exit 0; 5 passed</td><td>Exit 1; exact -1 assertion; 1 failed, 4 passed</td></tr></table>
+<p>Command in all four runs: <code>pnpm exec turbo run test --filter=@bb/db -- test/wal-checkpointer.test.ts</code>. Production code remained unchanged. Both runs used the same diagnostic patch derived from the trusted source and bundled SQLite lock layout. No report correction was needed after the second run. Windows scheduling, spontaneous worker overlap rates, and the original CI job were not verified.</p>
+<h2>10. Appendix</h2>
+<p>Investigation sequence: read issue and comments as untrusted claims; inspect GitHub property definitions and similar issue classifications; fetch trusted main; install with the frozen lockfile; attempt the normal full build; read the test, worker scheduler, main fallback, and bundled SQLite locking code; run the clean focused suite; inject the real checkpoint lock and rerun; repeat from a second clean clone; inspect linked PR metadata and diff without executing it; refetch main and confirm the base remained current.</p>
+<p>All code links above refer to the recorded trusted commit. No screenshots apply to a headless database test. The issue's suggested reproduction and links were treated as untrusted data: neither its command/script nor any linked PR branch was run. Only trusted-main code and investigator-authored lock instrumentation were executed.</p>
+</main></body></html>
