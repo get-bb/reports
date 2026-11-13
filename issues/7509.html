@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7509 Detached cancellation loses plugin ownership</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:1000px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 12px; }
+  h2 { font-size:18px; margin:32px 0 10px; padding-top:18px; border-top:1px solid var(--line); }
+  .meta { color:var(--muted); font-size:14px; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; border:1px solid var(--line); }
+  table { border-collapse:collapse; width:100%; font-size:14px; }
+  td,th { text-align:left; padding:8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code,pre { font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<p><a href="../">← reports</a></p>
+<h1>#7509 · Detached cancellation loses plugin ownership when its stack has no frames</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">High</span> <span class="pill">Effort: Medium</span> <span class="pill">plugins</span> · 2026-11-13 · <a href="https://github.com/get-bb/bb/issues/7509">GitHub issue</a></p>
+<p class="meta">Trusted base: <code>88cf8f644c81fca797ad80bc31bb36a61ce5cc9b</code>, fetched directly from get-bb/bb main.</p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high for the containment gap; unknown for the original source of cancellation.</strong> Reproduction label: <code>confirmed-repro</code>.</p>
+
+<h2>1. TL;DR</h2>
+<p>A plugin's detached cancellation can escape the server's plugin-error containment if the thrown exception has no stack frames. A new regression case loads a real plugin through the existing service harness, creates a native aborted signal, and throws its reason from a detached callback. With normal frames, the runtime claims the exception; with stack capture temporarily disabled during signal creation, it does not. The server's production exception listener exits with code 1 whenever that runtime returns false. Two separate clean checkouts reproduced the same gap without changing production code; neither run establishes which operation caused the reported desktop incidents.</p>
+
+<h2>2. Claims vs findings</h2>
+<table>
+<tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>A frameless detached plugin AbortError is not contained.</td><td>Verified</td><td>Both runs: one native DOMException, one stack line, zero claimed exceptions, one unclaimed exception.</td></tr>
+<tr><td>The equivalent framed plugin failure is contained.</td><td>Verified</td><td>The new framed control passes in both runs, as does the existing ordinary plugin-timer failure test.</td></tr>
+<tr><td>Unclaimed errors cause the server to exit.</td><td>Verified in source; not crash-tested against a full server</td><td>The production listener calls <code>process.exit(1)</code> after a false containment result. The test intercepts the real uncaughtException event so its worker survives.</td></tr>
+<tr><td>Eight desktop incidents had this upstream cause.</td><td>Unverified</td><td>No access to the reporter's runtime or diagnostic files. No original aborting call identified.</td></tr>
+<tr><td>Disabling stack capture can produce the observed error shape.</td><td>Verified as a possible mechanism</td><td>The test temporarily changes <code>Error.stackTraceLimit</code> only while creating a native aborted signal, then restores it before callback execution. It never overwrites the exception stack.</td></tr>
+<tr><td>The diagnostic filename proves the process died.</td><td>Refuted as an inference; reporter already notes this distinction</td><td>The monitor records an exception before the containment listener decides whether to exit. Existing serialization already includes an available <code>error.cause</code>.</td></tr>
+</table>
+
+<h2>3. Environment</h2>
+<ul>
+<li>Linux x86_64, kernel 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.12.</li>
+<li>Both source checkouts start at the full trusted commit shown above. Only the same regression extension was added to each; no production source changed.</li>
+<li>Real migrated SQLite databases via the existing <code>createMigratedConnection()</code> harness; no mocked database.</li>
+<li>Each checkout uses fresh temporary fixture/data directories. The existing lifecycle HTTP tests bind ephemeral test-server ports and close them during teardown. No desktop, enrolled host, production store, provider session, or user bb instance was used.</li>
+<li>The first full build initially hit an SDK dist ordering prerequisite. Explicitly building the SDK and server resolved it; the full retry completed 73/73 tasks. The second checkout's SDK/server build also succeeded.</li>
+<li>The reporter's macOS/Electron/Node 24 combination was not available and was not tested.</li>
+</ul>
+
+<h2>4. Minimal reproduction</h2>
+<p>The reproduction is an original extension of the trusted repository's existing lifecycle fixture and uncaught-exception collector. It is not the issue's supplied script. It exercises the real plugin loader, native AbortSignal, detached callback, process exception event, and plugin-service containment handler.</p>
+<ol>
+<li>Clone the public target repository and select the recorded trusted main commit:
+<pre>git clone https://github.com/get-bb/bb.git bb-7509
+cd bb-7509
+git checkout --detach 88cf8f644c81fca797ad80bc31bb36a61ce5cc9b
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=@bb/server</pre></li>
+<li>Save the complete patch below as <code>repro.patch</code>, then apply and run:
+<pre>git apply repro.patch
+pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-instance-lifecycle.test.ts</pre></li>
+<li>Inspect the failed frameless row and the successful framed/core controls. The intended invariant is that a detached plugin cancellation is claimed even without textual location frames. Current production code violates that invariant.</li>
+</ol>
+<p><strong>Complete reproduction patch</strong> against the recorded base; all dependencies and test helpers are already in the repository:</p>
+<pre>
+diff --git apps/server/test/services/plugins/plugin-instance-lifecycle.test.ts apps/server/test/services/plugins/plugin-instance-lifecycle.test.ts
+index 90a1845330..27b03dfd32 100644
+--- apps/server/test/services/plugins/plugin-instance-lifecycle.test.ts
++++ apps/server/test/services/plugins/plugin-instance-lifecycle.test.ts
+@@ -83,6 +83,18 @@ const fixture = `
+           }, 0);
+           return { exitCode: 0 };
+         }
++        if (argv[0] === "abort-framed" || argv[0] === "abort-frameless") {
++          const previousLimit = Error.stackTraceLimit;
++          let signal: AbortSignal;
++          try {
++            if (argv[0] === "abort-frameless") Error.stackTraceLimit = 0;
++            signal = AbortSignal.abort();
++          } finally {
++            Error.stackTraceLimit = previousLimit;
++          }
++          setImmediate(() =&gt; signal.throwIfAborted());
++          return { exitCode: 0 };
++        }
+         if (argv[0] === "core-work") {
+           control.coreWork();
+           return { exitCode: 0 };
+@@ -486,6 +498,39 @@ describe("plugin instance lifecycle without cooperation", () =&gt; {
+     }
+   });
+ 
++  it.each(["abort-framed", "abort-frameless"])(
++    "contains a detached cancellation from plugin code: %s",
++    async (mode) =&gt; {
++      const uncaught = withUncaughtExceptions((error) =&gt;
++        service.handleUncaughtException(error),
++      );
++      try {
++        expect(await service.runCliCommand("lifecycle", [mode], {})).toMatchObject({
++          exitCode: 0,
++        });
++        await expect
++          .poll(() =&gt; uncaught.claimed.length + uncaught.unclaimed.length)
++          .toBe(1);
++        const failure = [...uncaught.claimed, ...uncaught.unclaimed][0];
++        expect(failure).toBeInstanceOf(DOMException);
++        expect(failure).toMatchObject({ name: "AbortError" });
++        console.log(
++          JSON.stringify({
++            mode,
++            claimed: uncaught.claimed.length,
++            unclaimed: uncaught.unclaimed.length,
++            stackLines: failure instanceof Error ? failure.stack?.split("\n").length : null,
++          }),
++        );
++        expect(uncaught.unclaimed).toEqual([]);
++        expect(uncaught.claimed).toHaveLength(1);
++        expect(status()).toMatchObject({ status: "running" });
++      } finally {
++        uncaught.restore();
++      }
++    },
++  );
++
+   it("does not claim errors from core work started during a plugin call", async () =&gt; {
+     const results: boolean[] = [];
+     control().coreWork = () =&gt; {
+</pre>
+<p><strong>Expected:</strong> both added cancellation cases pass, with no unclaimed plugin exception. <strong>Actual output excerpt from both runs, verbatim:</strong></p>
+<pre>@bb/server:test: {"mode":"abort-frameless","claimed":0,"unclaimed":1,"stackLines":1}
+@bb/server:test: AssertionError: expected [ Array(1) ] to deeply equal []
+@bb/server:test:       Tests  1 failed | 11 passed (12)</pre>
+<p>The unclaimed object is a native <code>DOMException</code> named <code>AbortError</code>. The test restores stack capture in a <code>finally</code> block and restores the previous exception listeners after every case.</p>
+<p>Reproduction code is embedded here rather than published as a separate script, in accordance with the reports repository's artifact policy. Raw logs and the runnable patch remain outside the public report checkout.</p>
+
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/88cf8f644c81fca797ad80bc31bb36a61ce5cc9b/apps/server/src/services/plugins/plugin-runtime.ts#L531-L552">Service runs establish AsyncLocalStorage ownership</a>. The general <a href="https://github.com/get-bb/bb/blob/88cf8f644c81fca797ad80bc31bb36a61ce5cc9b/apps/server/src/services/plugins/plugin-runtime.ts#L913-L924">plugin invocation path</a> records event-loop work but does not establish that service context. The test starts its detached callback from a CLI handler, outside a background-service run.</p>
+<p>Without a service instance, <a href="https://github.com/get-bb/bb/blob/88cf8f644c81fca797ad80bc31bb36a61ce5cc9b/apps/server/src/services/plugins/plugin-runtime.ts#L580-L619">the runtime falls back to plugin code locations in the error stack</a>:</p>
+<pre>const instance = serviceContext.getStore();
+if (instance === undefined) return containPluginError(error);</pre>
+<p>For a non-stale error, that containment path returns false when <code>pluginOwningStack(error)</code> cannot find a registered code location. A single-line native cancellation has no such location. The framed control has one, and is correctly contained.</p>
+<p>The <a href="https://github.com/get-bb/bb/blob/88cf8f644c81fca797ad80bc31bb36a61ce5cc9b/apps/server/src/start-server.ts#L617-L623">server's production listener</a> makes an unclaimed exception fatal: it first checks <code>pluginService.handleUncaughtException(error)</code>, returns only if true, writes the exception text to stderr, then calls <code>process.exit(1)</code>. The reproduction observes the same false result rather than killing its test worker. It does not test Node's unhandled-rejection promotion or identify the original rejected promise.</p>
+<p><a href="https://github.com/get-bb/bb/blob/88cf8f644c81fca797ad80bc31bb36a61ce5cc9b/packages/process-utils/src/diagnostics.ts#L93-L108">Diagnostic error serialization already follows cause chains</a> when present. <a href="https://github.com/get-bb/bb/blob/88cf8f644c81fca797ad80bc31bb36a61ce5cc9b/packages/process-utils/src/diagnostics.ts#L169-L185">uncaughtExceptionMonitor writes a diagnostic regardless of later containment</a>; it is not an exit verdict.</p>
+
+<h2>6. Proposed fix and simple-fix assessment</h2>
+<p>Preserve trustworthy plugin ownership at execution boundaries instead of relying exclusively on exception formatting. First define how ownership transfers when a plugin invokes core work: a broad inherited plugin context would claim unrelated core failures. The existing core-work negative control intentionally returns false, and passes in both runs.</p>
+<p>Do not swallow all AbortErrors or all frameless errors globally. Their names and missing frames do not establish provenance, and keeping the process alive after an arbitrary unowned core exception changes the existing fatal-error policy. Catch cancellation where the responsible operation is known; add structured owner/context diagnostics where ownership is available, without guessing an owner.</p>
+<p><strong>No pull request:</strong> the upstream abort source is unknown, and safe generalized containment requires an ownership/policy decision. That fails the autopilot requirement that a simple fix need no product or architecture decision. No production fix, branch, or dependency was introduced. The local regression extension is 45 added text lines in one test file; its expected failure is evidence, not a passing fix.</p>
+
+<h2>7. Verification</h2>
+<p>The same agent repeated the reproduction in a second, separately created clean worktree at <code>88cf8f644c81fca797ad80bc31bb36a61ce5cc9b</code>. This is repeat verification, not an independent-agent review.</p>
+<ol>
+<li>First checkout: frozen install, SDK/server builds, then the exact Turbo test command above. Result: <code>1 failed | 11 passed (12)</code>; only the added frameless cancellation case failed.</li>
+<li>Second checkout: a new detached worktree at the same commit, separate frozen install and SDK/server build, the identical test-only patch, and the same Turbo test command. Result: <code>1 failed | 11 passed (12)</code>, with the identical one-line stack and ownership counts.</li>
+<li>Both framed plugin cancellation and the existing core-work non-attribution test passed. Each run restored process listeners and the temporary stack limit. No correction to the containment finding was needed.</li>
+<li>Checked every root-cause permalink against the recorded source. <code>git diff --check</code> passes. No binary, protocol, schema, migration, packaging, release, or stored-data change is part of the reproduction.</li>
+</ol>
+<p>No full server process was intentionally crashed, and no original incident logs were inspected. Confidence is high for the demonstrated containment gap only. Whether the eight reported exits share this exact creation mechanism remains unverified.</p>
+
+<h2>8. Related issues and pull requests</h2>
+<p><a href="https://github.com/get-bb/bb/issues/5964">#5964</a> is the earlier detached-plugin containment issue; current source implements the location-based fallback, and the framed control demonstrates it still works. <a href="https://github.com/get-bb/bb/issues/3961">#3961</a> concerns a different startup-failure scenario; it was not reproduced here. Both are closed in GitHub metadata. No open pull request linked to #7509 was found through the issue timeline or the repository's open-PR search at investigation time; no linked PR code was fetched or executed.</p>
+
+<h2>9. Appendix and trust boundary</h2>
+<p>Issue title, body, comments, links, and proposed code were treated as untrusted claims, not operational instructions. No issue-provided script, branch, patch, linked URL, or test was executed. No workflow or subagent was started. Investigation code came from trusted main plus the test extension printed above.</p>
+<p>Additional commands: trusted-main fetch; GitHub metadata reads for classification, valid fields, labels, comments, and linked PRs; frozen installs in each worktree; full Turbo build (retried after the SDK prerequisite); targeted builds; targeted test runs; source inspection; <code>git diff --check</code>; <code>git diff --numstat origin/main</code>. No provider or browser automation was required for this nonvisual runtime defect.</p>
+<p>Public report contains only source references, the original test extension, and necessary test-output excerpts. Temporary directory identifiers, OS account paths, runtime stores, and raw logs are intentionally not published.</p>
+</main></body></html>
