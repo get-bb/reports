@@ -1,0 +1,11 @@
+import { readFileSync, writeFileSync, readdirSync } from "node:fs";
+import { gzipSync } from "node:zlib";
+const root = process.argv[2];
+const output = process.argv[3];
+const mainCss = readdirSync(`${root}/apps/app/dist/assets`).find((name) => /^index-.*\.css$/.test(name));
+const css = readFileSync(`${root}/apps/app/dist/assets/${mainCss}`, "utf8") + readFileSync(`${root}/plugins/tasks/dist/app.css`, "utf8");
+const dom = readFileSync(`${root}/baseline-dom.html`, "utf8");
+const html = `<!doctype html><html><head><meta charset="utf-8"><style>${css}</style></head><body style="padding:24px"><h1>Tasks list — component capture</h1><p>Actual plugin DOM and compiled styles, synthetic task data; not a macOS desktop capture.</p><div data-bb-plugin="tasks" style="width:1000px;height:420px">${dom}</div></body></html>`;
+writeFileSync(`${output}.html`, html);
+const script = `const page = await browser.getPage("main"); await page.goto("about:blank"); await page.evaluate(async () => { const bytes = Uint8Array.from(atob("${gzipSync(html).toString("base64")}"), character => character.charCodeAt(0)); const html = await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"))).text(); document.open(); document.write(html); document.close(); }); console.log(await page.evaluate(() => { const row = document.querySelector('[data-task-key]'); const label = [...row.querySelectorAll('span')].find(element => element.textContent === 'VALIDATION-12345'); return {key:label.textContent, width:label.clientWidth, contentWidth:label.scrollWidth, title:label.getAttribute('title'), searchboxes:document.querySelectorAll('input[type="search"]').length}; })); await page.shot({type:"jpeg",maxEdge:1280,quality:85}); undefined;`;
+writeFileSync(`${output}.js`, script);
