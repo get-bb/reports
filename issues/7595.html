@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7595 Completed plugin invocations retain cancellation bookkeeping</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7595 · Completed plugin invocations retain cancellation bookkeeping</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High</span><span class="pill">Effort: Low</span><span class="pill">plugins · perf · confirmed-repro</span>
+<a href="https://github.com/get-bb/bb/issues/7595">Issue</a> · 2026-11-15 · base <code>da3e60b81d560e114a2bec724bb59c997aaaae7f</code></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>A loaded plugin accumulates V8 cancellation bookkeeping when successful RPC invocations have caller signals. In a real plugin service with a migrated SQLite database, 256 completed invocations left 256 additional WeakCells after repeated garbage collection; 256 control invocations without caller signals left none. This reproduced twice, from separate clean checkouts of the same trusted main commit. The long-lived stopping signal is composed into a fresh <code>AbortSignal.any</code> on every signalled call, and completion never disposes that composition. This verifies the per-call retention mechanism, not the reporter's production heap size, hourly byte-growth estimate, or an actual server crash.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Completed signalled RPC calls accumulate bookkeeping while the plugin remains loaded.</td><td class="ok">Verified</td><td>+256 WeakCells for 256 completed calls in each run; stopping signal remained unaborted.</td></tr>
+<tr><td>No caller signal avoids the per-call composite.</td><td class="ok">Verified</td><td>256 control calls produced a zero-cell delta in both runs.</td></tr>
+<tr><td>A reload is required.</td><td class="no">Not required</td><td>No reload occurred during either measured batch.</td></tr>
+<tr><td>The production memory slope and heap totals apply to stock bb.</td><td class="unv">Unverified</td><td>No production instance, fork, or hours-long deployment was accessed.</td></tr>
+<tr><td>Removing signal links on completion is behavior-neutral.</td><td class="no">Refuted</td><td>A handler-retained signal currently receives the caller's later abort, including its reason, after the successful RPC has returned.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Public target repository: <code>get-bb/bb</code>; trusted origin/main: <code>da3e60b81d560e114a2bec724bb59c997aaaae7f</code>.</li>
+<li>Node <code>v22.19.0</code>, pnpm <code>9.15.0</code>, Vitest <code>4.1.12</code>, Debian GNU/Linux 12, Linux 4.19.0-gvisor, x86_64.</li>
+<li>No provider, live bb instance, public HTTP listener, or real application data. The test creates a local temporary plugin and uses the existing app harness with a migrated SQLite database; both are cleaned in its finally block.</li>
+<li>First checkout: detached trusted main, then a local investigation branch. Second checkout: a fresh detached worktree at the same commit, its own frozen install and server build. Neither checkout used issue scripts, patches, linked branches, or downstream code.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Use a fresh checkout at the pinned commit and build trusted dependencies. The explicit SDK build avoids a pristine-tree ordering failure seen on the first full build.</li>
+<li>Save the complete test below at <code>apps/server/test/services/plugins/plugin-invocation-retention.test.ts</code>. This is newly written from the repository's service interface and existing test harness, not copied from the issue.</li>
+<li>Run the focused Turbo command. Every measured invocation must return <code>{ ok: true, result: null }</code>. Expect bounded bookkeeping after completion; actual signalled growth is one cell per call.</li></ol>
+<pre>git clone https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout --detach da3e60b81d560e114a2bec724bb59c997aaaae7f
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build
+pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-invocation-retention.test.ts</pre>
+<h3>Reproduction test</h3><pre>import { mkdtemp, rm, writeFile } from &quot;node:fs/promises&quot;;
+import { Session } from &quot;node:inspector/promises&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { setImmediate as nextTurn } from &quot;node:timers/promises&quot;;
+import { getHeapSnapshot } from &quot;node:v8&quot;;
+import { expect, it } from &quot;vitest&quot;;
+import { defineRpcContract } from &quot;@get-bb/plugin-sdk&quot;;
+import { z } from &quot;zod&quot;;
+import { createTestAppHarness } from &quot;../../helpers/test-app.js&quot;;
+
+const heapSchema = z.object({
+  snapshot: z.object({ meta: z.object({ node_fields: z.array(z.string()) }) }),
+  strings: z.array(z.string()),
+  nodes: z.array(z.number()),
+});
+
+async function weakCellCount(): Promise&lt;number&gt; {
+  const session = new Session();
+  session.connect();
+  try {
+    for (let round = 0; round &lt; 4; round += 1) {
+      await session.post(&quot;HeapProfiler.collectGarbage&quot;);
+      await nextTurn();
+    }
+  } finally {
+    session.disconnect();
+  }
+  const chunks: Buffer[] = [];
+  for await (const chunk of getHeapSnapshot()) chunks.push(Buffer.from(chunk));
+  const heap = heapSchema.parse(JSON.parse(Buffer.concat(chunks).toString()));
+  const nameOffset = heap.snapshot.meta.node_fields.indexOf(&quot;name&quot;);
+  let count = 0;
+  for (
+    let offset = nameOffset;
+    offset &lt; heap.nodes.length;
+    offset += heap.snapshot.meta.node_fields.length
+  ) {
+    if (heap.strings[heap.nodes[offset]!] === &quot;system / WeakCell&quot;) count += 1;
+  }
+  return count;
+}
+
+it(&quot;releases cancellation bookkeeping after completed plugin RPC calls&quot;, async () =&gt; {
+  const harness = await createTestAppHarness();
+  const pluginDir = await mkdtemp(join(tmpdir(), &quot;bb-rpc-retention-&quot;));
+  try {
+    await writeFile(
+      join(pluginDir, &quot;package.json&quot;),
+      JSON.stringify({
+        name: &quot;bb-plugin-retention-probe&quot;,
+        version: &quot;0.1.0&quot;,
+        bb: {
+          name: &quot;Retention probe&quot;,
+          description: &quot;RPC lifetime regression fixture&quot;,
+          branding: { icon: &quot;Zap&quot; },
+          server: &quot;./server.ts&quot;,
+        },
+      }),
+    );
+    await writeFile(join(pluginDir, &quot;server.ts&quot;), &quot;export default () =&gt; {};&quot;);
+    expect((await harness.pluginService.installPath(pluginDir)).status).toBe(
+      &quot;running&quot;,
+    );
+    const api = harness.pluginService.getApi(&quot;retention-probe&quot;);
+    if (api === undefined) throw new Error(&quot;probe plugin unavailable&quot;);
+    let retainedSignal: AbortSignal | undefined;
+    api.rpc.register(
+      defineRpcContract({ probe: { input: z.null(), output: z.null() } }),
+      {
+        probe(_input, context) {
+          retainedSignal = context.experimental_signal;
+          return null;
+        },
+      },
+    );
+    const lookup = harness.pluginService.getRpcHandler(
+      &quot;retention-probe&quot;,
+      &quot;probe&quot;,
+    );
+    if (lookup.outcome !== &quot;found&quot;)
+      throw new Error(&quot;probe handler unavailable&quot;);
+    async function invoke(signal: AbortSignal | null): Promise&lt;void&gt; {
+      if (lookup.outcome !== &quot;found&quot;)
+        throw new Error(&quot;probe handler unavailable&quot;);
+      expect(
+        await harness.pluginService.invokeRpcHandler(
+          lookup.owner,
+          &quot;probe&quot;,
+          lookup.value,
+          null,
+          { kind: &quot;client&quot; },
+          signal,
+        ),
+      ).toEqual({ ok: true, result: null });
+    }
+    for (let call = 0; call &lt; 16; call += 1) await invoke(null);
+    retainedSignal = undefined;
+    const before = await weakCellCount();
+    for (let call = 0; call &lt; 256; call += 1) await invoke(null);
+    retainedSignal = undefined;
+    const withoutCaller = await weakCellCount();
+    for (let call = 0; call &lt; 256; call += 1) {
+      await invoke(new AbortController().signal);
+    }
+    retainedSignal = undefined;
+    const withCaller = await weakCellCount();
+    const caller = new AbortController();
+    await invoke(caller.signal);
+    const completedSignal = retainedSignal;
+    caller.abort(&quot;after-completion&quot;);
+    console.log(
+      JSON.stringify({
+        before,
+        withoutCaller,
+        withCaller,
+        controlDelta: withoutCaller - before,
+        signalledDelta: withCaller - withoutCaller,
+        stopped: lookup.owner.stopping.signal.aborted,
+        completedSignalAborted: completedSignal?.aborted,
+        completedSignalReason: completedSignal?.reason,
+      }),
+    );
+    expect(withoutCaller - before).toBeLessThan(16);
+    expect(withCaller - withoutCaller).toBeLessThan(16);
+  } finally {
+    await harness.pluginService.stop();
+    await harness.cleanup();
+    await rm(pluginDir, { recursive: true, force: true });
+  }
+}, 120_000);
+</pre>
+<p>The test warms the service, measures 256 no-caller control calls, then 256 calls with fresh caller signals. It drops the handler's observed signal reference before every snapshot. Four inspector-triggered garbage collections and event-loop turns precede each V8 snapshot. The assertion permits small incidental variation (fewer than 16 cells); both observed deltas were exactly 256. Only aggregate counts are published; no heap snapshots or raw application logs are included.</p>
+<h3>First run: actual output</h3><pre>{&quot;before&quot;:58,&quot;withoutCaller&quot;:58,&quot;withCaller&quot;:314,&quot;controlDelta&quot;:0,&quot;signalledDelta&quot;:256,&quot;stopped&quot;:false,&quot;completedSignalAborted&quot;:true,&quot;completedSignalReason&quot;:&quot;after-completion&quot;}
+AssertionError: expected 256 to be less than 16
+Test Files  1 failed (1)
+Tests       1 failed (1)</pre>
+<h3>Expected output</h3><pre>controlDelta: near zero
+signalledDelta: near zero
+stopped: false
+Tests: 1 passed</pre>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/da3e60b81d560e114a2bec724bb59c997aaaae7f/apps/server/src/services/plugins/plugin-service.ts#L2231-L2247">invokeRpcHandler</a> passes the invocation signal to the actual registered plugin handler. <a href="https://github.com/get-bb/bb/blob/da3e60b81d560e114a2bec724bb59c997aaaae7f/apps/server/src/services/plugins/plugin-runtime.ts#L908-L914">invokeWrapped</a> chooses the live instance stopping signal and composes it with each caller signal:</p>
+<pre>const lifetime = instance.stopping.signal.aborted
+  ? released
+  : instance.stopping.signal;
+const signal =
+  callerSignal === undefined
+    ? lifetime
+    : AbortSignal.any([callerSignal, lifetime]);</pre>
+<p><a href="https://github.com/get-bb/bb/blob/da3e60b81d560e114a2bec724bb59c997aaaae7f/apps/server/src/services/plugins/plugin-runtime.ts#L920-L931">Execution settlement</a> removes the invocation from the active set and updates statistics. <a href="https://github.com/get-bb/bb/blob/da3e60b81d560e114a2bec724bb59c997aaaae7f/apps/server/src/services/plugins/plugin-runtime.ts#L960-L970">The finally block</a> removes only the separately installed release listener. Neither operation detaches the composite signal's bookkeeping.</p>
+<p>The local Node runtime's built-in <code>internal/abort_controller</code> source explains the retained V8 cells: its <code>AbortSignal.any</code> registers each source in <code>sourceSignalsCleanupRegistry</code>, with no unregister token or per-call completion operation. The long-lived source remains a live finalization target even after the composite itself becomes unreachable. A shrinking dependent-signal set therefore does not imply that all finalization bookkeeping was reclaimed. This distinction is why measuring ordinary event listeners alone would miss the leak.</p>
+<p>The direct test localizes retention to signalled calls: the same service, schemas, handler, and invocation path show zero control growth. It does not establish that every WeakCell elsewhere in a production heap has this cause.</p>
+<h2>6. Proposed fix and automatic-fix safety</h2>
+<p>A disposable signal fan-in could forward caller and instance cancellation, preserve the first abort reason, handle already-aborted inputs, and release source listeners once execution settles. It must keep cancellation active while the handler is still executing, including during reload drain and caller release.</p>
+<p><strong>No automatic fix PR:</strong> completion-scoped disposal changes observable behavior for handlers retaining the supplied signal. The test demonstrates that an abort after a successful return currently reaches that signal with reason <code>after-completion</code>. The <a href="https://github.com/get-bb/bb/blob/da3e60b81d560e114a2bec724bb59c997aaaae7f/packages/plugin-sdk/src/rpc-contract.ts#L287-L296">public experimental signal contract</a> describes caller and reload cancellation but does not explicitly limit the signal to an active invocation. Choosing whether this late behavior should remain supported is a signal-lifetime contract decision. The autopilot's no-product-or-architecture-decision condition is therefore not satisfied. No production patch, fix commit, or branch was pushed.</p>
+<p>Next step: decide and document that lifetime, then test caller abort, plugin stop, already-aborted input, success/rejection cleanup, first-reason preservation, late abort, repeated-call heap retention, and reload drain before replacing the composition. The existing lifecycle tests cover several active-call cancellation cases but not the measured heap retention.</p>
+<h2>7. Verification</h2>
+<p>The same agent repeated the reproduction in a second clean trusted checkout; this is not independent verification. Before adding only the locally authored test, that checkout was clean at <code>da3e60b81d560e114a2bec724bb59c997aaaae7f</code>. It used its own frozen install, SDK/server builds, migrated test database, and temporary plugin. No live process or ports were required. The same focused Turbo command failed at the same retention assertion:</p>
+<pre>{&quot;before&quot;:58,&quot;withoutCaller&quot;:58,&quot;withCaller&quot;:314,&quot;controlDelta&quot;:0,&quot;signalledDelta&quot;:256,&quot;stopped&quot;:false,&quot;completedSignalAborted&quot;:true,&quot;completedSignalReason&quot;:&quot;after-completion&quot;}
+AssertionError: expected 256 to be less than 16
+Test Files  1 failed (1)
+Tests       1 failed (1)</pre>
+<p>Both runs support the final verdict without changes to production code. No claim was upgraded to a production byte-growth measurement. The snapshot counts are Node/V8-version dependent; the verified environment differs from the issue's reported Node release.</p>
+<h2>8. Related issues and PR status</h2>
+<p><a href="https://github.com/get-bb/bb/issues/6858">#6858</a> concerns replaced plugin instances after reload, not bookkeeping from steady invocations without reload. <a href="https://github.com/get-bb/bb/issues/4162">#4162</a> concerns general server memory diagnostics. <a href="https://github.com/get-bb/bb/issues/7336">#7336</a> concerns in-flight tool behavior during reload. <a href="https://github.com/get-bb/bb/issues/4941">#4941</a> concerns RPC caller timeout and handler cancellation.</p>
+<p>GitHub cross-reference metadata and an open-PR search found no target-repository PR linked to #7595 during this investigation. No downstream linked URL, diff, or branch was fetched or run.</p>
+<h2>9. Appendix and limits</h2>
+<p>The public report includes the complete test and exact diagnostic/error output inline; raw logs remain local in accordance with the reports repository rules. No production data, secrets, or user home paths are published. Issue text and links were treated as untrusted claims, not executable instructions.</p>
+<ul><li>Frozen install: succeeded in both checkouts.</li><li>First full build: initially failed because plugin SDK runtime subpaths were not built. Explicit trusted SDK build followed by the normal full Turbo build passed: 74/74 tasks.</li><li>Second checkout: explicit SDK and server builds passed: server build 7/7 tasks.</li><li>Focused retention regression: failed before any production change in both checkouts, exactly as expected (+256 cells).</li><li>No production fix or after-fix test result is claimed. No UI or hours-long deployment verification was needed for the narrowly reproduced mechanism.</li></ul>
+<p>Additional read-only checks: repository visibility and issue properties through GitHub GraphQL; labels; issue comments and cross-reference timeline; open pull requests; related issue metadata; source line numbers; local Node built-in abort-controller implementation. No workflow or subagent was used.</p>
+</main></body></html>
