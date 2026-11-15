@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Issue 7578 · Cross-project notification batch recovery</title>
+<style>
+:root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --ok:#0e8a16; }
+body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,sans-serif; }
+main { max-width:1040px; margin:auto; padding:32px 24px 72px; }
+h1 { line-height:1.2; } h2 { margin-top:36px; }
+.meta { color:var(--muted); } .pill { display:inline-block; border:1px solid var(--line); border-radius:12px; padding:2px 10px; margin:2px; }
+.verdict { color:var(--ok); font-weight:700; } a { color:var(--accent); }
+table { border-collapse:collapse; width:100%; } td,th { text-align:left; vertical-align:top; border-bottom:1px solid var(--line); padding:8px; }
+pre { overflow:auto; padding:16px; background:white; border:1px solid var(--line); border-radius:6px; font-size:13px; }
+code { font-family:ui-monospace,monospace; }
+</style></head><body><main>
+<p class="meta"><a href="../">Reports</a> · <a href="https://github.com/get-bb/bb/issues/7578">Issue #7578</a> · November 15, 2026</p>
+<h1>#7578 · Cross-project notification batch recovery</h1>
+<p><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Low</span><span class="pill">remote</span><span class="pill">confirmed-repro</span></p>
+<p class="meta">Trusted main: <code>da3e60b81d560e114a2bec724bb59c997aaaae7f</code></p>
+<p class="verdict">REPRODUCED · root-cause confidence: high · deterministic sender-boundary reproduction</p>
+<h2>1. TL;DR</h2>
+<p>The mobile sender puts registered devices into requests by count, not by Expo project. When the transport rejects a mixed-project request, the sender abandons every device in that request and returns only the other delivery channels. A focused regression exercises registration, the actual plugin send RPC, status CLI, and read-dismissal events with a deterministic Expo transport substitute. It fails on trusted main in two clean checkouts. A ten-line sender repair splits only cross-project-rejected batches into smaller requests; all 67 plugin tests, lint, and typecheck then pass. This is not evidence of live Expo acceptance or on-device OS delivery.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Subscriptions from different projects can share a request.</td><td>Verified</td><td>Trusted sender maps all subscriptions, then chunks only by count. The regression registers four interleaved synthetic tokens assigned to two project groups.</td></tr>
+<tr><td>A cross-project rejection prevents mobile acknowledgement.</td><td>Verified at the plugin boundary</td><td>The transport substitute returns a request-level rejection for mixed groups. Actual RPC output omits mobile in both clean baseline runs.</td></tr>
+<tr><td>The diagnostic failure state follows that rejection.</td><td>Supported by trusted source; guard tests also verify terminal rejection diagnostics</td><td>The request-error branch returns zero accepted deliveries and a rejection reason; the caller writes a failed outcome.</td></tr>
+<tr><td>A standalone physical Android notification succeeded.</td><td>Unverified here</td><td>No real device, Expo account, notification manager, or production subscription was accessed.</td></tr>
+<tr><td>The same device projects are rejected by the live Expo service.</td><td>Unverified here</td><td>The reproduction supplies a deterministic request rejection; no live external push is made.</td></tr>
+</table>
+<h2>3. Environment</h2>
+<ul><li>Public repository: get-bb/bb. Trusted base commit: <code>da3e60b81d560e114a2bec724bb59c997aaaae7f</code>.</li>
+<li>Linux x86_64; Node 22.19.0; pnpm 9.15.0; Vitest 4.1.12. Provider-independent; no provider session was started.</li>
+<li>First run: clean target checkout. Second run: a separate fresh detached Git worktree at the same commit, with a frozen installation and only the regression patch applied.</li>
+<li>No app/server listener, network port, production runtime, database, or data directory was needed. The repository's plugin host harness supplies isolated in-memory plugin state.</li>
+<li>Frozen install succeeded. The first full build needed the documented SDK bootstrap (<code>build:types</code>); after that, the normal full Turbo build completed with 74 successful tasks.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<p>The fixture deliberately models the claimed relay boundary: a request with more than one synthetic project is rejected, while homogeneous requests receive ordinary Expo ticket responses. It runs the real plugin and real subscription/sender logic, not a replacement sender. All fixture tokens are synthetic and never sent externally.</p>
+<ol><li>Create a clean checkout and build its trusted dependencies:
+<pre>git clone https://github.com/get-bb/bb.git bb-repro-7578
+cd bb-repro-7578
+git checkout --detach da3e60b81d560e114a2bec724bb59c997aaaae7f
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build</pre></li>
+<li>Save the complete patch below to <code>/tmp/issue-7578-regression.patch</code>, then apply it and run the regression:
+<pre>git apply /tmp/issue-7578-regression.patch
+pnpm exec turbo run test --force --filter=bb-plugin-push-notifications -- server.test.ts -t 'delivers alerts and dismissals across mixed Expo projects'</pre></li>
+<li>Expected: the send RPC includes <code>mobile</code>, every device is accepted exactly once, status counts every accepted ticket, and dismissals reach every project. Actual on unchanged main: the first assertion fails because the send RPC returns only <code>web</code> and <code>desktop</code>.</li></ol>
+<pre>- Expected
++ Received
+
+  {
+    &quot;channels&quot;: [
+      &quot;web&quot;,
+      &quot;desktop&quot;,
+-     &quot;mobile&quot;,
+    ],
+    &quot;ok&quot;: true,
+  }
+
+</pre>
+<details open><summary>Complete regression patch, including bounded-retry safety checks</summary><pre>diff --git a/plugins/push-notifications/server.test.ts b/plugins/push-notifications/server.test.ts
+index 672b8f1a70..528e21228d 100644
+--- a/plugins/push-notifications/server.test.ts
++++ b/plugins/push-notifications/server.test.ts
+@@ -5,6 +5,7 @@ import {
+ } from &quot;@get-bb/plugin-sdk/testing&quot;;
+ import { EnvHttpProxyAgent } from &quot;undici&quot;;
+ import { describe, expect, it, vi } from &quot;vitest&quot;;
++import { z } from &quot;zod&quot;;
+ import {
+   CLIENT_NOTIFICATION_CHANNEL,
+   listPushSubscriptionsOutputSchema,
+@@ -885,6 +886,146 @@ describe(&quot;push sender&quot;, () =&gt; {
+     }
+   });
+ 
++  it(&quot;delivers alerts and dismissals across mixed Expo projects&quot;, async () =&gt; {
++    const tokens = [
++      &quot;ExponentPushToken[development-one]&quot;,
++      &quot;ExponentPushToken[production-one]&quot;,
++      &quot;ExponentPushToken[development-two]&quot;,
++      &quot;ExponentPushToken[production-two]&quot;,
++    ];
++    const projectByToken = new Map(
++      tokens.map((token, index) =&gt; [token, index % 2]),
++    );
++    const acceptedTokens: string[] = [];
++    const expo = createFakeExpo();
++    const host = await setup({
++      expo,
++      dismissReadNotifications: true,
++      fetch: async (url, init) =&gt; {
++        const batchTokens = z
++          .array(z.object({ to: z.string() }))
++          .parse(JSON.parse(init.body))
++          .map((message) =&gt; message.to);
++        if (
++          new Set(batchTokens.map((token) =&gt; projectByToken.get(token))).size &gt;
++          1
++        ) {
++          return {
++            ok: false,
++            status: 400,
++            text: async () =&gt;
++              JSON.stringify({
++                errors: [{ code: &quot;PUSH_TOO_MANY_EXPERIENCE_IDS&quot; }],
++              }),
++          };
++        }
++        acceptedTokens.push(...batchTokens);
++        return expo.fetch(url, init);
++      },
++    });
++    try {
++      for (const token of tokens) await host.addSubscription(token);
++      const thread = host.setThread();
++      await expect(
++        host.harness.behavior.callRpc(&quot;notifications.send&quot;, {
++          title: &quot;Cross-project delivery&quot;,
++          threadId: thread.id,
++        }),
++      ).resolves.toEqual({ ok: true, channels: [&quot;web&quot;, &quot;desktop&quot;, &quot;mobile&quot;] });
++      expect([...acceptedTokens].sort()).toEqual([...tokens].sort());
++      const status = await host.harness.behavior.runCli([&quot;status&quot;, &quot;--json&quot;]);
++      expect(JSON.parse(status.stdout).lastSendOutcome).toMatchObject({
++        status: &quot;sent&quot;,
++        sentCount: tokens.length,
++      });
++
++      acceptedTokens.length = 0;
++      expo.requests.length = 0;
++      await host.harness.behavior.emitThreadEvent(&quot;experimental_thread.read&quot;, {
++        thread: { ...thread, lastReadAt: 200 },
++      });
++      await vi.waitFor(() =&gt;
++        expect([...acceptedTokens].sort()).toEqual([...tokens].sort()),
++      );
++      expect(expo.requests.flat()).toHaveLength(tokens.length);
++      expect(
++        expo.requests
++          .flat()
++          .every((message) =&gt; message.data.kind === &quot;dismiss&quot;),
++      ).toBe(true);
++      expo.ticketErrors.set(
++        &quot;ExponentPushToken[production-one]&quot;,
++        &quot;DeviceNotRegistered&quot;,
++      );
++      expo.ticketErrors.set(
++        &quot;ExponentPushToken[development-two]&quot;,
++        &quot;MessageRateExceeded&quot;,
++      );
++      await expect(
++        host.harness.behavior.callRpc(&quot;notifications.send&quot;, {
++          title: &quot;Partial&quot;,
++        }),
++      ).resolves.toEqual({ ok: true, channels: [&quot;web&quot;, &quot;desktop&quot;, &quot;mobile&quot;] });
++      const failedStatus = await host.harness.behavior.runCli([
++        &quot;status&quot;,
++        &quot;--json&quot;,
++      ]);
++      expect(JSON.parse(failedStatus.stdout).lastSendOutcome).toMatchObject({
++        status: &quot;failed&quot;,
++        reason: &quot;relay rejected one or more tickets&quot;,
++      });
++      const listed = listPushSubscriptionsOutputSchema.parse(
++        await host.harness.behavior.callRpc(&quot;pushSubscriptions.list&quot;, {}),
++      );
++      expect(
++        listed.subscriptions.map((subscription) =&gt; subscription.id),
++      ).toEqual([&quot;subscription-1&quot;, &quot;subscription-3&quot;, &quot;subscription-4&quot;]);
++      expect(JSON.stringify(host.harness.logEntries)).not.toContain(
++        &quot;ExponentPushToken&quot;,
++      );
++    } finally {
++      await host.cleanup();
++    }
++  });
++
++  it.each([
++    { code: &quot;PUSH_TOO_MANY_EXPERIENCE_IDS&quot;, subscriptionCount: 1 },
++    { code: &quot;TOO_MANY_REQUESTS&quot;, subscriptionCount: 2 },
++  ])(
++    &quot;does not split $code for $subscriptionCount subscriptions&quot;,
++    async ({ code, subscriptionCount }) =&gt; {
++      let attempts = 0;
++      const host = await setup({
++        fetch: async () =&gt; {
++          attempts += 1;
++          return {
++            ok: false,
++            status: 400,
++            text: async () =&gt; JSON.stringify({ errors: [{ code }] }),
++          };
++        },
++      });
++      try {
++        for (let index = 0; index &lt; subscriptionCount; index += 1) {
++          await host.addSubscription(`ExponentPushToken[device-${index}]`);
++        }
++        await expect(
++          host.harness.behavior.callRpc(&quot;notifications.send&quot;, {
++            title: &quot;Rejected&quot;,
++          }),
++        ).resolves.toEqual({ ok: true, channels: [&quot;web&quot;, &quot;desktop&quot;] });
++        expect(attempts).toBe(1);
++        const status = await host.harness.behavior.runCli([&quot;status&quot;, &quot;--json&quot;]);
++        expect(JSON.parse(status.stdout).lastSendOutcome).toMatchObject({
++          status: &quot;failed&quot;,
++          reason: &quot;relay rejected the request&quot;,
++        });
++      } finally {
++        await host.cleanup();
++      }
++    },
++  );
++
+   it(&quot;warns once per hour for network failures and logs only row ids&quot;, async () =&gt; {
+     let now = 10_000;
+     const host = await setup({
+</pre></details>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/da3e60b81d560e114a2bec724bb59c997aaaae7f/plugins/push-notifications/sender.ts#L464-L488">Subscription batching and outcome aggregation</a> create one delivery per subscription and split solely at the 100-message request limit:</p>
+<pre>    const deliveries: Delivery[] = rows.map((subscription) =&gt; ({
+      subscription,
+      message: {
+        to: subscription.expoPushToken,
+        title,
+        body,
+        data: { ...data, subscriptionId: subscription.id },
+        sound: &quot;default&quot;,
+        channelId: &quot;threads&quot;,
+        priority: &quot;high&quot;,
+      },
+    }));
+    let sentCount = 0;
+    let failure: string | null = null;
+    for (const batch of chunks(deliveries, EXPO_PUSH_BATCH_SIZE)) {
+      const result = await sendBatch(batch);
+      sentCount += result.sentCount;
+      failure ??= result.failure;
+    }
+    await setLastOutcome(
+      failure === null
+        ? { status: &quot;sent&quot;, at: now(), sentCount }
+        : { status: &quot;failed&quot;, at: now(), reason: failure },
+    );
+    return sentCount &gt; 0 ? [...channels, &quot;mobile&quot;] : channels;</pre>
+<p><a href="https://github.com/get-bb/bb/blob/da3e60b81d560e114a2bec724bb59c997aaaae7f/plugins/push-notifications/sender.ts#L605-L611">The request-error branch</a> treats every error code as terminal and returns no accepted deliveries:</p>
+<pre>    if (parsed.data.errors &amp;&amp; parsed.data.errors.length &gt; 0) {
+      const codes = parsed.data.errors.map((error) =&gt; error.code ?? &quot;unknown&quot;);
+      bb.log.warn(
+        `Expo push request was rejected with codes ${codes.join(&quot;, &quot;)}`,
+      );
+      return { sentCount: 0, failure: &quot;relay rejected the request&quot; };
+    }</pre>
+<p>Thus a mixed-project rejection affects unrelated valid devices together. Individual tokens carry no locally stored Expo-project partition, and the sender neither learns a partition nor narrows a rejected request. <a href="https://github.com/get-bb/bb/blob/da3e60b81d560e114a2bec724bb59c997aaaae7f/plugins/push-notifications/sender.ts#L491-L518">Read-dismissal pushes share the same batch sender</a>, so fixing only notification creation would miss that path.</p>
+<h2>6. Proposed fix and verification</h2>
+<p>For <code>PUSH_TOO_MANY_EXPERIENCE_IDS</code> only, split a rejected batch in half and retry its two halves. Stop splitting at one subscription. Preserve each delivery object so ordinary ticket indexing, unregistered-device removal, accepted-ticket counts, and failure aggregation still work. Other request failures and network failures retain their existing behavior. Successful homogeneous batches are not resent.</p>
+<p>This avoids new project metadata, persisted state, schema changes, public protocols, dependencies, or external response-details parsing. The tradeoff is extra relay requests whenever a batch mixes projects: a completely interleaved batch can use up to <code>2n − 1</code> requests including failed parents; recursion depth is logarithmic, and each original batch has at most 100 deliveries. An optimization that caches project partitions is intentionally outside this contained fix.</p>
+<p>Local repair: 10 production additions and 141 test additions across two files, 151 total changed text lines. The regression checks successful alert delivery and diagnostic counts, dismissal delivery, ticket failure propagation, removal of the correct unregistered row after splitting, and token-free logs. Two guard cases prove no repeated request for an already-singleton cross-project rejection or an unrelated request error.</p>
+<pre>pnpm exec turbo run test lint typecheck --filter=bb-plugin-push-notifications
+Test Files  3 passed (3)
+Tests  67 passed (67)
+Tasks: 10 successful, 10 total
+git diff --check
+(no output; exit 0)</pre>
+<h2>7. Linked PR review</h2>
+<p><a href="https://github.com/get-bb/bb/pull/7579">PR #7579</a> was closed without merging when inspected. Only its GitHub metadata and textual diff were read as untrusted data; its branch and tests were never checked out or executed. Its diff parses relay-supplied project groups, validates the token partition, and caches project assignments for later batching. That statically targets the same request-batching cause, but only when the rejection supplies the expected partition details. No runtime verdict is claimed for that closed patch. No open linked PR existed when the simple-fix check ran.</p>
+<h2>8. Related issues</h2>
+<p>A small repository issue search showed other notification-platform reports and notification routing requests, but no second confirmed duplicate was established. This report addresses only #7578.</p>
+<h2>9. Verification: second clean reproduction</h2>
+<p>The same investigator created a second clean detached worktree at <code>da3e60b81d560e114a2bec724bb59c997aaaae7f</code>, ran a frozen installation, and applied only the regression-test patch. The production sender remained unchanged. The exact focused command from section 4 was repeated with <code>--force</code> so it executed rather than replaying cached test output. It failed with the same missing <code>mobile</code> channel, supporting the root cause and final verdict. This is repeat verification by the same investigator, not independent review.</p>
+<p>The final test patch was rerun there after a test-only compatibility adjustment from <code>toSorted()</code> to copying plus <code>sort()</code> for this package's configured TypeScript library. The failure remained the intended RPC-channel assertion. No report conclusion changed.</p>
+<h2>10. Appendix and limits</h2>
+<p>The regression was added and observed failing before the production repair. The second checkout independently of the working files (but not independently of the investigator) repeated that failure. After the repair, the complete owning plugin suite passed, alongside lint and typecheck. No broad unrelated test sweep, hardware test, or visual test is claimed. The selected notification feature recipes for closed-app OS delivery and physical-device permissions remain unrun because test mobile hardware and credentials were not supplied.</p>
+<p>Evidence operations: repository and issue-property reads; trusted-main fetch and commit verification; frozen install; SDK bootstrap and full Turbo build; two focused baseline runs; owning-plugin tests, lint, typecheck, formatting, and diff checks; static metadata/diff inspection of the closed linked PR. Issue content was treated only as hypotheses; no issue-provided script or external link was executed or fetched.</p>
+<p>Raw machine-path-containing logs and local reproduction artifacts remain outside the published Git history. The report embeds the complete test patch and the relevant exact expected-versus-actual output, so no private artifact is needed to repeat it.</p>
+</main></body></html>
