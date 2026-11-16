@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7627 · Idle-session release waits for the sweep</title>
+<style>
+body{margin:0;background:#fafaf8;color:#1a1a1a;font:16px/1.55 system-ui,sans-serif}main{max-width:900px;margin:auto;padding:40px 24px 80px}h1{font-size:26px;line-height:1.25}h2{font-size:18px;margin-top:36px;padding-top:20px;border-top:1px solid #e2e2de}.meta{color:#666;font-size:14px}.pill{display:inline-block;border:1px solid #e2e2de;border-radius:999px;padding:1px 8px;font-size:12px}table{border-collapse:collapse;width:100%;font-size:14px}td,th{text-align:left;vertical-align:top;padding:8px;border-bottom:1px solid #e2e2de}pre{background:white;border:1px solid #e2e2de;border-radius:6px;padding:12px;overflow:auto}pre,code{font:13px/1.5 ui-monospace,monospace}a{color:#0052cc}
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7627 · Idle-session release waits for the sweep</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: Medium</span> <span class="pill">Effort: Low</span> <span class="pill">host</span> · 2026-11-16 · <a href="https://github.com/get-bb/bb/issues/7627">GitHub issue</a></p>
+<p class="meta">Trusted base: <code>da3e60b81d560e114a2bec724bb59c997aaaae7f</code></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>The host daemon checks idle provider sessions on a five-minute interval, rather than when an idle deadline arrives. Changing the timeout only changes the eligibility threshold supplied to that interval; zero does not request an immediate check. Two clean checkouts of trusted main produced the same deterministic scheduler trace: an eligibility deadline one millisecond after a sweep was not checked for another 299,999 milliseconds. This establishes the scheduling defect without using a real account or provider process; actual memory retention and the reporter's historical measurements were not measured. Existing configuration documentation already discloses the extra polling delay, despite also describing zero as ASAP.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Zero does not arrange immediate release.</td><td>Verified at the scheduler boundary.</td><td>No check at simulated time 1 ms; first check at 300,000 ms.</td></tr>
+<tr><td>A configured positive timeout can acquire almost five minutes of extra delay.</td><td>Verified.</td><td>With five minutes configured and eligibility beginning at 1 ms, the deadline is 300,001 ms; checks occur at 300,000 and 600,000 ms.</td></tr>
+<tr><td>The mechanism is provider-independent.</td><td>Verified structurally.</td><td>The daemon invokes the runtime manager without a provider-specific branch.</td></tr>
+<tr><td>The setting is described as ASAP.</td><td>Verified with a qualification.</td><td>Configuration documentation also explicitly says machines check every five minutes and release can lag.</td></tr>
+<tr><td>Historical host measurements and dominant RAM impact.</td><td>Unverified.</td><td>No production logs, account state, or real provider processes were used.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Public repository get-bb/bb, freshly fetched main at the full commit above; production source unchanged.</li><li>Linux x86_64, Node v22.19.0, pnpm 9.15.0, repository Vitest 4.1.12.</li><li>Two distinct temporary detached worktrees: base and verify. The second was clean before adding only the diagnostic test.</li><li>No development instance, ports, user data directory, provider version, or credentials required. The real scheduler runs with fake timers and a recording runtime-manager boundary.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Create a clean checkout at the recorded commit and install its locked dependencies:
+<pre>git clone https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout --detach da3e60b81d560e114a2bec724bb59c997aaaae7f
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=@bb/host-daemon</pre></li>
+<li>Save the complete test below as <code>apps/host-daemon/src/idle-session-7627.test.ts</code>.</li>
+<li>Run <code>pnpm exec turbo run test --force --filter=@bb/host-daemon -- src/idle-session-7627.test.ts</code>.</li></ol>
+<p>Expected: an idle eligibility check at 1 ms for zero, and at 300,001 ms for five minutes. Actual: neither deadline triggers a check. The recording boundary reports every call, but deliberately does not implement release or simulate provider state. Its assertion about the next periodic check succeeds, confirming the failure is missing deadline scheduling, not a broken timer fixture.</p>
+<pre>{"timeoutMinutes":0,"deadlineMs":1,"sweepTimesAtDeadline":[],"sweepTimesMs":[300000],"nextSweepMs":300000,"latenessMs":299999}
+{"timeoutMinutes":5,"deadlineMs":300001,"sweepTimesAtDeadline":[300000],"sweepTimesMs":[300000,600000],"nextSweepMs":600000,"latenessMs":299999}
+AssertionError: expected [] to include 1
+AssertionError: expected [ 300000 ] to include 300001
+Test Files  1 failed (1)
+Tests  2 failed (2)</pre>
+<details><summary>Complete diagnostic test</summary><pre>
+import { afterEach, expect, it, vi } from "vitest";
+import { startIdleProviderSessionReaper } from "./app.js";
+
+afterEach(() =&gt; {
+  vi.useRealTimers();
+});
+
+it.each([0, 5])(
+  "checks eligible sessions at the configured %i-minute deadline",
+  async (timeoutMinutes) =&gt; {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const sweepTimesMs: number[] = [];
+    const reaper = startIdleProviderSessionReaper({
+      logger: {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      },
+      nowMs: Date.now,
+      runtimeManager: {
+        async reapIdleProviderSessions({ nowMs }) {
+          sweepTimesMs.push(nowMs);
+          return { reapedSessions: [] };
+        },
+      },
+      setIntervalFn(callback, intervalMs) {
+        const timer = setInterval(callback, intervalMs);
+        return {
+          clear: () =&gt; clearInterval(timer),
+          unref: () =&gt; timer.unref(),
+        };
+      },
+    });
+
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      reaper.setTimeoutMinutes(timeoutMinutes);
+      const deadlineMs = 1 + timeoutMinutes * 60_000;
+      await vi.advanceTimersByTimeAsync(timeoutMinutes * 60_000);
+      const sweepTimesAtDeadline = [...sweepTimesMs];
+      const nextSweepMs = timeoutMinutes === 0 ? 300_000 : 600_000;
+      await vi.advanceTimersByTimeAsync(nextSweepMs - Date.now());
+      console.log(
+        JSON.stringify({
+          timeoutMinutes,
+          deadlineMs,
+          sweepTimesAtDeadline,
+          sweepTimesMs,
+          nextSweepMs,
+          latenessMs: nextSweepMs - deadlineMs,
+        }),
+      );
+      expect(sweepTimesMs).toContain(nextSweepMs);
+      expect(sweepTimesAtDeadline).toContain(deadlineMs);
+    } finally {
+      reaper.stop();
+    }
+  },
+);
+</pre></details>
+<p>This is a baseline scheduler diagnostic, not a complete post-fix lifecycle regression: a deadline-based implementation must additionally be given a real turn-ending event. No linked-PR code was executed or copied into this test.</p>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/da3e60b81d560e114a2bec724bb59c997aaaae7f/apps/host-daemon/src/app.ts#L91">The interval constant is five minutes</a>. <a href="https://github.com/get-bb/bb/blob/da3e60b81d560e114a2bec724bb59c997aaaae7f/apps/host-daemon/src/app.ts#L198-L251">The reaper has only one periodic trigger</a>:</p>
+<pre>const timer = args.setIntervalFn(() =&gt; {
+  if (running || timeoutMinutes === null) {
+    return;
+  }
+  running = true;
+  void args.runtimeManager
+    .reapIdleProviderSessions({
+      idleForMs: timeoutMinutes * 60_000,
+      nowMs: args.nowMs(),
+    })
+    ...
+}, IDLE_PROVIDER_SESSION_REAP_INTERVAL_MS);
+...
+setTimeoutMinutes(value) {
+  timeoutMinutes = value;
+}</pre>
+<p><a href="https://github.com/get-bb/bb/blob/da3e60b81d560e114a2bec724bb59c997aaaae7f/packages/agent-runtime/src/runtime.ts#L864-L935">The runtime records idle time when a turn completes or a non-retrying provider error arrives</a>, and rejects candidates whose elapsed idle time is below the configured threshold. That bookkeeping does not itself schedule release. <a href="https://github.com/get-bb/bb/blob/da3e60b81d560e114a2bec724bb59c997aaaae7f/apps/host-daemon/src/app.ts#L604-L624">The daemon's runtime-event callback only forwards the event</a>; it does not wake the reaper.</p>
+<p>For a session idle from time 1 ms with a five-minute threshold, the 300,000 ms sweep sees only 299,999 ms of idleness and must reject it. The following sweep is at 600,000 ms. Zero still waits for the first sweep. This adds a polling-phase delay approaching five minutes under healthy scheduling; it is not a hard upper bound if the event loop or a sweep stalls.</p>
+<p><a href="https://github.com/get-bb/bb/blob/da3e60b81d560e114a2bec724bb59c997aaaae7f/apps/host-daemon/src/runtime-manager.ts#L552-L575">The manager serializes release with thread control</a>; the runtime retains active/pending, restorable-session, and background-work guards. Those safeguards explain why scheduling should be repaired without bypassing eligibility. <a href="https://github.com/get-bb/bb/blob/da3e60b81d560e114a2bec724bb59c997aaaae7f/docs/configuration.md#L272">The current documentation acknowledges polling delay</a>.</p>
+<h2>6. Proposed fix</h2>
+<p>Arrange a host-local check when the actual runtime reports a turn has ended and an idle deadline is reached; zero should schedule a prompt check. Reuse the existing guarded manager pass, preserve per-thread serialization, re-arm on setting changes, avoid overlapping passes, and cancel local timers on shutdown. Retain a fallback sweep for sessions that become eligible without a normal completion event or remain busy at the first deadline. A landing regression should drive the daemon's real turn-ending event path and verify zero, positive deadlines, active-work protection, timeout updates, and shutdown.</p>
+<h2>7. Linked PR review</h2>
+<p><a href="https://github.com/get-bb/bb/pull/7628">PR #7628</a> was open before this investigation and already links this issue. Its metadata and diff were read strictly as untrusted data; its branch was never checked out or run.</p>
+<p><strong>Static assessment:</strong> the diff targets the verified scheduling cause by observing turn-ending events, arming a deadline timer, preserving the periodic fallback, and calling the existing release pass. It also adds tests and adjusts user-facing descriptions. No additional blocker was established by this limited static inspection. This is not a passing-test claim or merge approval; tests in this report run only against trusted main. No duplicate fix PR was created.</p>
+<h2>8. Verification</h2>
+<p>The same agent repeated the reproduction in a second clean temporary checkout at the exact same trusted commit, installed frozen dependencies, built SDK types and the host daemon, added only the same diagnostic file, and ran the command above with <code>--force</code> to prevent a cached test result. Both cases failed at the intended deadline assertion, with byte-identical JSON timing traces and 299,999 ms lateness. No report correction was needed after the repeat. This is a second clean reproduction, not independent verification by another agent.</p>
+<p>Separately, trusted-main existing suites passed:</p>
+<pre>pnpm exec turbo run test --filter=@bb/host-daemon -- src/app.test.ts src/runtime-manager.test.ts
+Test Files  2 passed (2)
+Tests  75 passed (75)
+
+pnpm exec turbo run test --filter=@bb/agent-runtime -- src/runtime.process-lifecycle.test.ts
+Test Files  1 passed (1)
+Tests  36 passed (36)</pre>
+<h2>9. Related issues</h2>
+<p>No additional issue was validated for equivalence. The existing open PR is the reason this automation does not attempt another fix.</p>
+<h2>10. Appendix and limits</h2>
+<p>The initial full-monorepo build failed when plugin bundles could not resolve the SDK runtime. Building SDK types alone did not remove that prerequisite failure; an explicit SDK runtime build and focused host builds succeeded. A final full-monorepo build then passed all 74 tasks. This build prerequisite is distinct from the two intentional scheduler assertion failures.</p>
+<pre>pnpm exec turbo run build
+pnpm exec turbo run build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=@bb/host-daemon</pre>
+<p>Supporting investigation used read-only GitHub metadata, trusted source inspection, clean-checkout status checks, and the focused test/build commands recorded here. Raw logs and the test remain outside the reports repository; the complete shareable evidence is inline, as required by the reports repository's publication policy. No screenshots apply to this nonvisual scheduling defect. Issue text, links, and the PR diff were treated as untrusted evidence only; no issue-supplied command, patch, branch, or external URL was executed or fetched.</p>
+<p class="meta">Agent-generated reproduction and root-cause report.</p>
+</main></body></html>
