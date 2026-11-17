@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Report #7708 · Recurring automation retry consent has a pre-association race</title>
+<style>body{margin:0;background:#fafaf8;color:#1a1a1a;font:16px/1.55 system-ui,sans-serif}main{max-width:1000px;margin:auto;padding:32px 24px 70px}h1{line-height:1.2}h2{margin-top:32px;border-top:1px solid #ddd;padding-top:18px}a{color:#0052cc}pre{background:white;border:1px solid #ddd;border-radius:6px;padding:14px;overflow:auto;font-size:13px}code{font-size:13px}table{border-collapse:collapse;width:100%}td,th{text-align:left;vertical-align:top;border-bottom:1px solid #ddd;padding:8px}.verdict{color:#9a6000}.meta{color:#555}</style>
+</head><body><main>
+<p><a href="../">Reports</a> · <a href="https://github.com/get-bb/bb/issues/7708">Issue #7708</a></p>
+<h1>Recurring automation retry consent has a pre-association race</h1>
+<p class="meta">Bug · Priority: Medium · Effort: Medium · plugins, automations, provider-retry<br>November 17, 2026 · trusted main: <code>1320c88e8abdd3f145bc9a5c305eace269fb2f28</code></p>
+<p class="verdict"><strong>Verdict: PARTIALLY REPRODUCED</strong> · Root-cause confidence: <strong>medium</strong> for the reported incident; high for the demonstrated race.</p>
+<h2>1. TL;DR</h2>
+<p>A scheduled automation normally declines provider retries, but it cannot recognize its new thread until the thread-spawn SDK call returns. When a failure and retry-consent request arrive before that response, the real automations plugin answers <code>allow</code>, and the real provider-retry plugin submits a retry. The same request is declined immediately after the spawn response. The early failure notification also misses the automation run; restarting its sweep service with the failed thread state reconciles the run and submits a fresh automation spawn. This controlled interleaving reproduces competing retry submissions, not the reporter's full macOS wake sequence or three completed prompts.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>A recurring scheduled turn can receive consent for a provider retry.</td><td>Verified under a forced startup interleaving.</td><td>Consent is allow before the spawn response; one actual call from provider-retry to the SDK retry boundary.</td></tr>
+<tr><td>The automation can also resubmit its work.</td><td>Verified with an explicit sweep-service restart after the early failure.</td><td>Startup reconciliation plus a 30-second virtual-time advance produces a second SDK spawn submission.</td></tr>
+<tr><td>The ordinary recurring-turn consent guard is ineffective.</td><td>Not generally true.</td><td>The same request is declined after thread association; all 200 existing tests pass.</td></tr>
+<tr><td>macOS wake and Claude Code HTTP 503 produce three threads running the full prompt.</td><td>Unverified.</td><td>No macOS, live Claude process, wake transition, real queue dispatch, or full prompt execution was used.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Two separately installed clean checkouts of public get-bb/bb at the full commit above; source package version 0.49.0, not the reported 0.48 release.</li>
+<li>Linux 4.19.0-gvisor x86_64; Node v22.19.0; pnpm 9.15.0.</li>
+<li>Production automations and provider-retry entry points run inside the repository's FakePluginHost. Automation storage is real isolated SQLite with the plugin's migrations, not a database mock.</li>
+<li>The SDK spawn, thread-state, event-list, RPC transport, and retry-delivery boundaries are controlled fixtures. RPC delegates to the real automations handler. The injected failure has HTTP 503, category internal, and accepted input; the automation uses the repository's Codex fixture. No provider credentials or live providers are needed.</li>
+<li>No development server, ports, user runtime database, or production instance was used. Each host creates fresh temporary plugin storage.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<p>In a fresh checkout of the recorded commit, save the complete patch below as <code>repro.patch</code> outside the repository, install and build, then apply it. The patch changes only the existing automations test owner and imports the existing provider-retry entry point. Production source is unchanged.</p>
+<pre>git clone https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout --detach 1320c88e8abdd3f145bc9a5c305eace269fb2f28
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build:types build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build
+git apply ../repro.patch
+pnpm exec turbo run test --filter=bb-plugin-automations -- src/server-harness.test.ts -t 'spawn response is pending'</pre>
+<p><strong>Expected:</strong> a recurring schedule-owned first turn answers <code>{kind: "decline"}</code> even if failure notification arrives before its spawn response. <strong>Actual:</strong> the assertion fails because consent is <code>{kind: "allow"}</code>. The test deliberately retains this failing assertion as the regression contract.</p>
+<pre>bb-plugin-automations:test: {&quot;beforeSpawn&quot;:{&quot;kind&quot;:&quot;allow&quot;},&quot;afterSpawn&quot;:{&quot;kind&quot;:&quot;decline&quot;,&quot;reason&quot;:&quot;automation \&quot;Startup race\&quot; runs again on its schedule&quot;},&quot;runStatus&quot;:&quot;running&quot;,&quot;providerRetries&quot;:1,&quot;spawned&quot;:2}
+bb-plugin-automations:test:  FAIL  src/server-harness.test.ts &gt; automations server plugin harness &gt; declines a recurring first-turn retry while the spawn response is pending
+bb-plugin-automations:test: AssertionError: expected { kind: 'allow' } to match object { kind: 'decline' }
+bb-plugin-automations:test:  Test Files  1 failed (1)
+bb-plugin-automations:test:       Tests  1 failed | 39 skipped (40)
+ Tasks:    6 successful, 7 total
+Cached:    5 cached, 7 total</pre>
+<p><code>providerRetries: 1</code> counts actual SDK retry submissions by the real provider-retry plugin. <code>spawned: 2</code> counts initial plus recovery SDK spawn submissions, not live provider processes. <code>runStatus: "running"</code> is read after the first failure and before recovery, demonstrating the missed settlement.</p>
+<details><summary>Complete reproduction patch, including the new regression test</summary><pre>diff --git a/plugins/automations/src/server-harness.test.ts b/plugins/automations/src/server-harness.test.ts
+index ad57a57581..e6df26454e 100644
+--- a/plugins/automations/src/server-harness.test.ts
++++ b/plugins/automations/src/server-harness.test.ts
+@@ -4,11 +4,13 @@ import { afterEach, describe, expect, it, vi } from &quot;vitest&quot;;
+ import {
+   createFakePluginHost,
+   makeThreadResponse,
++  makeTurnFailedEvent,
+   PluginContextStaleError,
+   type FakePluginHost,
+ } from &quot;@get-bb/plugin-sdk/testing&quot;;
+ import { createScriptRunScope } from &quot;./script-runner.js&quot;;
+ import plugin from &quot;./server.js&quot;;
++import providerRetryPlugin from &quot;../../provider-retry/server.js&quot;;
+ import { createAutomationService } from &quot;./service.js&quot;;
+ import {
+   automationListResponseSchema,
+@@ -1973,6 +1975,134 @@ describe(&quot;automations server plugin harness&quot;, () =&gt; {
+     await harness.dispose();
+   });
+ 
++  it(&quot;declines a recurring first-turn retry while the spawn response is pending&quot;, async () =&gt; {
++    vi.useFakeTimers();
++    vi.setSystemTime(new Date(&quot;2026-01-01T00:00:00.000Z&quot;));
++    const host = await bootAutomationsPlugin();
++    const { harness } = host;
++    const answers: unknown[] = [];
++    let spawned = 0;
++    const retryHost = createFakePluginHost({
++      pluginId: &quot;provider-retry&quot;,
++      sdk: {
++        plugins: {
++          experimental_discoverRpc: async () =&gt; [
++            {
++              pluginId: &quot;automations&quot;,
++              displayName: &quot;Automations&quot;,
++              method: &quot;provider-retry.v1.consent&quot;,
++            },
++          ],
++          callRpc: async ({ input }) =&gt; {
++            const answer = await harness.callRpc(
++              &quot;provider-retry.v1.consent&quot;,
++              input,
++            );
++            answers.push(answer);
++            return answer;
++          },
++        },
++        threads: {
++          retry: async ({ turnRequestId, sendAt }) =&gt; ({
++            ok: true,
++            delivery: &quot;queued&quot;,
++            turnRequestId,
++            attempt: 2,
++            queuedMessageId: &quot;queued_race&quot;,
++            waitingOn: { kind: &quot;time&quot; },
++            sendAt,
++          }),
++        },
++      },
++    });
++    await providerRetryPlugin(retryHost.bb);
++    harness.sdk.stub(&quot;threads.events.list&quot;, async () =&gt; [
++      {
++        type: &quot;client/turn/requested&quot;,
++        data: {
++          requestId: FAILED_REQUEST_ID,
++          target: { kind: &quot;thread-start&quot; },
++        },
++      },
++    ]);
++    harness.sdk.stub(&quot;threads.spawn&quot;, async () =&gt; {
++      spawned += 1;
++      const thread = makeThreadResponse({
++        id: `thr_spawned_${spawned}`,
++        projectId: PROJECT_ID,
++      });
++      if (spawned &gt; 1) return thread;
++      await harness.emitThreadEvent(&quot;thread.failed&quot;, {
++        thread: { ...thread, status: &quot;error&quot; },
++        error: &quot;Provider unavailable&quot;,
++      });
++      const result = await retryHost.harness.emitThreadEvent(
++        &quot;turn.failed&quot;,
++        makeTurnFailedEvent({
++          threadId: thread.id,
++          requestId: FAILED_REQUEST_ID,
++          originPluginId: &quot;automations&quot;,
++          errorInfo: {
++            category: &quot;internal&quot;,
++            httpStatusCode: 503,
++            providerCode: null,
++          },
++        }),
++      );
++      expect(result.errors).toEqual([]);
++      return thread;
++    });
++    const automation = await createAgentAutomation(harness, {
++      name: &quot;Startup race&quot;,
++      trigger: { triggerType: &quot;schedule&quot;, cron: &quot;* * * * *&quot;, timezone: &quot;UTC&quot; },
++    });
++    vi.setSystemTime(new Date(&quot;2026-01-01T00:01:05.000Z&quot;));
++    const service = harness.runService(&quot;automation-sweep&quot;);
++    await vi.waitFor(() =&gt; expect(answers).toHaveLength(1));
++    service.controller.abort();
++    await service.done;
++    const afterSpawn = await harness.callRpc(&quot;provider-retry.v1.consent&quot;, {
++      threadId: &quot;thr_spawned_1&quot;,
++      requestId: FAILED_REQUEST_ID,
++      reason: &quot;Provider unavailable&quot;,
++      sendAt: Date.now() + 60_000,
++    });
++    const { runs } = automationRunListResponseSchema.parse(
++      await harness.callRpc(&quot;automations_runs&quot;, {
++        projectId: PROJECT_ID,
++        automationId: automation.id,
++      }),
++    );
++    const providerRetries =
++      retryHost.harness.sdk.callsTo(&quot;threads.retry&quot;).length;
++    harness.sdk.stub(
++      &quot;threads.get&quot;,
++      async ({ threadId }: { threadId: string }) =&gt; ({
++        ...makeThreadResponse({ id: threadId, projectId: PROJECT_ID }),
++        status: &quot;error&quot;,
++      }),
++    );
++    const restarted = harness.runService(&quot;automation-sweep&quot;);
++    await vi.advanceTimersByTimeAsync(30_000);
++    await vi.waitFor(() =&gt; expect(spawned).toBe(2));
++    restarted.controller.abort();
++    await restarted.done;
++    console.log(
++      JSON.stringify({
++        beforeSpawn: answers[0],
++        afterSpawn,
++        runStatus: runs[0]?.status,
++        providerRetries,
++        spawned,
++      }),
++    );
++    await retryHost.harness.dispose();
++    await harness.dispose();
++    expect(providerRetries).toBe(1);
++    expect(afterSpawn).toMatchObject({ kind: &quot;decline&quot; });
++    expect(answers[0]).toMatchObject({ kind: &quot;decline&quot; });
++  });
++
+   it(&quot;disables automations targeting a deleted thread&quot;, async () =&gt; {
+     const { harness } = await bootAutomationsPlugin();
+     const automation = await createAgentAutomation(harness, {
+</pre></details>
+<p>The whole runnable patch is embedded here so this report is self-contained. Raw logs and the patch are retained locally, not committed as separate files, following the reports repository's publication policy.</p>
+<h2>5. Root cause</h2>
+<ol><li><a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/plugins/automations/src/run.ts#L130-L149">executeAgentRun awaits spawn before persisting the thread ID</a>. Thus the run exists but cannot yet be queried by that thread.</li>
+<li><a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/plugins/automations/src/retry-consent.ts#L43-L69">answerRetryConsent looks up the run by thread ID and allows a missing run</a>. The fixture uses a matching request ID and thread-start target, so the missing association, not a parse error, causes consent.</li>
+<li><a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/plugins/provider-retry/server.ts#L23-L53">askSender calls the sender's consent RPC</a> and <a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/plugins/provider-retry/server.ts#L127-L159">the handler only suppresses retry on an explicit decline</a>. A valid allow answer falls through to the existing SDK retry submission path.</li>
+<li><a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/plugins/automations/src/run.ts#L338-L364">failure settlement also depends on the thread/run association</a>. The first failure event finds no run, leaving it running after spawn eventually returns.</li>
+<li><a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/plugins/automations/src/run.ts#L371-L400">startup reconciliation settles running rows</a> using <a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/plugins/automations/src/run.ts#L407-L461">the thread's failed state</a>. <a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/plugins/automations/src/data.ts#L770-L803">recurring failures schedule bounded quick retries</a>, allowing a fresh spawn even though provider-retry has already submitted its retry.</li></ol>
+<p>Core <a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/apps/server/src/services/threads/dispatch-attempt.ts#L988-L999">schedules thread provisioning before returning the admitted thread</a>; <a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/apps/server/src/services/threads/thread-provisioning.ts#L606-L621">provisioning advances asynchronously</a>. This supports the plausibility of an earlier lifecycle notification, but the reproduction intentionally forces that ordering at the SDK boundary. It does not prove that the real HTTP transport and lifecycle event dispatcher produce it during a macOS wake.</p>
+<h2>6. Proposed fix and safety decision</h2>
+<p>Associate automation ownership with the first request before provider execution can emit lifecycle events, and ensure a settlement cannot be lost during thread creation. Keep the request-ID and schedule/manual distinctions; blanket refusal of all automation retries could break one-shot and manual turns.</p>
+<p><strong>No fix PR:</strong> only a controlled boundary interleaving is confirmed, not the full reported transport sequence. A safe repair needs verified early run/thread ownership across spawn and lifecycle delivery; no under-500-line, single-subsystem repair with a passing regression has been established. The next experiment is a core integration test delaying the real spawn HTTP response while provisioning emits a structured 503, with durable queue state inspected before and after plugin restart.</p>
+<h2>7. Verification</h2>
+<p>The same agent repeated the reproduction in a second clean temporary checkout at the exact recorded commit, with a separate frozen dependency installation and freshly created plugin databases. Both checkouts built all 74 build tasks successfully after explicitly building the SDK runtime/types. Neither checkout modifies production code; the second receives only the saved test patch. Turbo test execution was forced in the second checkout to prevent a cached failure from masquerading as a rerun.</p>
+<pre>pnpm exec turbo run test --force --filter=bb-plugin-automations -- src/server-harness.test.ts -t 'spawn response is pending'
+bb-plugin-automations:test: {&quot;beforeSpawn&quot;:{&quot;kind&quot;:&quot;allow&quot;},&quot;afterSpawn&quot;:{&quot;kind&quot;:&quot;decline&quot;,&quot;reason&quot;:&quot;automation \&quot;Startup race\&quot; runs again on its schedule&quot;},&quot;runStatus&quot;:&quot;running&quot;,&quot;providerRetries&quot;:1,&quot;spawned&quot;:2}
+bb-plugin-automations:test:  FAIL  src/server-harness.test.ts &gt; automations server plugin harness &gt; declines a recurring first-turn retry while the spawn response is pending
+bb-plugin-automations:test: AssertionError: expected { kind: 'allow' } to match object { kind: 'decline' }
+bb-plugin-automations:test:  Test Files  1 failed (1)
+bb-plugin-automations:test:       Tests  1 failed | 39 skipped (40)
+ Tasks:    6 successful, 7 total
+Cached:    0 cached, 7 total</pre>
+<p>Second-run result: the same allow-before/decline-after observation, one provider retry submission, two spawn submissions after service recovery, and the same intended assertion failure. No report correction was required. This is a repeated check by the same agent, not independent verification.</p>
+<h2>8. Existing coverage and related work</h2>
+<p>Unmodified main's automations suite passes 167 tests in 12 files; provider-retry passes 33 tests in one file. Those suites cover decline after a run is attached and provider-retry honoring a sender's decline. The new case isolates their missing cross-plugin startup ordering. The test patch also passes the automations package typecheck and <code>git diff --check</code>.</p>
+<p>No open pull request linked to #7708 was present in the issue timeline or the issue-number PR search at investigation time. Trusted history shows the current recurring retry policy and consent guard were changed by <a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/plugins/automations/src/retry-consent.ts#L1-L69">the existing consent implementation</a>; no linked PR branch was checked out or run.</p>
+<h2>9. Appendix and limitations</h2>
+<p>Commands used in addition to the reproduction: baseline <code>pnpm exec turbo run test --filter=bb-plugin-automations --filter=bb-plugin-provider-retry</code>; typecheck <code>pnpm exec turbo run typecheck --filter=bb-plugin-automations</code>; <code>git diff --check</code>; recorded-commit source inspection and GitHub issue/PR metadata reads. The initial broad build failed because SDK runtime output was absent; explicitly building the SDK and rerunning the same broad build resolved this setup failure. The second checkout built the SDK first and completed the broad build successfully.</p>
+<p>The controlled spawn response has already allocated its thread fixture before emitting failure. Recovery is an explicit restart of the registered automation-sweep service, not a real machine wake or process restart. SDK retry delivery returns a queued receipt fixture; the durable queue and provider continuation are not exercised. These limits are why the verdict is partial and root-cause confidence for the reported incident is medium.</p>
+<p>Trust boundary: issue text was treated only as untrusted claims. No issue-supplied scripts, commands, branches, or external URLs were executed or fetched. All executable repository code came from trusted main plus the evidence-derived test patch.</p>
+</main></body></html>
