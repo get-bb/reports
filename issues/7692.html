@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7692 · Repeated pending-buffer byte accounting</title>
+<style>
+:root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; }
+body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,sans-serif; }
+main { max-width:900px; margin:auto; padding:40px 24px 80px; }
+h1 { font-size:26px; line-height:1.25; } h2 { font-size:18px; margin-top:36px; padding-top:20px; border-top:1px solid var(--line); }
+.meta { color:var(--muted); font-size:14px; } .pill { display:inline-block; padding:1px 8px; border-radius:999px; border:1px solid var(--line); }
+table { border-collapse:collapse; width:100%; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); }
+code,pre { font:13px/1.5 ui-monospace,monospace; } pre { background:white; border:1px solid var(--line); padding:12px; overflow:auto; }
+a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<p><a href="../">← reports</a></p>
+<h1>#7692 · Repeated pending-buffer byte accounting</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Medium priority</span> <span class="pill">Low effort</span> <span class="pill">host · perf · confirmed-repro</span></p>
+<p class="meta">November 17, 2026 · <a href="https://github.com/get-bb/bb/issues/7692">Issue #7692</a> · trusted base <code>1320c88e8abdd3f145bc9a5c305eace269fb2f28</code></p>
+<p><strong>Verdict: REPRODUCED · Root-cause confidence: high.</strong></p>
+
+<h2>1. TL;DR</h2>
+<p>A long provider message arriving in many chunks makes the line reader repeatedly measure all bytes accumulated so far. A 24 MiB JSON line delivered in 32 KiB chunks passes more than 9.67 billion characters to byte-length accounting, 384.5 times the payload. Two clean checkouts reproduce the same deterministic work amplification and a failing linear-work assertion. The synchronous feed takes several seconds on this host, although exact timings depend on the environment. No duplicate fix was attempted because open PR #7699 already closes this issue.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>Accumulated text is remeasured after each incomplete chunk.</td><td>Verified</td><td>Trusted source lines 43–46 and byte-length input instrumentation.</td></tr>
+<tr><td>Fixed-size chunk delivery creates quadratic accounting work.</td><td>Verified</td><td>32.5×, 128.5×, and 384.5× work amplification for 2, 8, and 24 MiB lines; identical in both checkouts.</td></tr>
+<tr><td>The affected reader handles provider process stdout.</td><td>Verified</td><td>Trusted runtime call at line 435.</td></tr>
+<tr><td>The default ceiling is 64 MiB.</td><td>Verified</td><td>Reader constant at line 3; all reproduction inputs stay below it.</td></tr>
+<tr><td>The issue's particular machine timings and all-thread user impact.</td><td>Not measured here</td><td>This investigation uses Node 22 and isolated streams, not a live daemon or provider session. The event-handler work is synchronous; user-visible fleet impact is not quantified.</td></tr>
+<tr><td>Rope flattening is the precise engine-level cause.</td><td>Not independently profiled</td><td>The repeated full-prefix byte-length inputs alone establish quadratic accounting work; no V8 profiling claim is required.</td></tr></table>
+
+<h2>3. Environment</h2>
+<ul><li>Public repository <code>get-bb/bb</code>; trusted <code>origin/main</code> fetched directly from that repository.</li>
+<li>Base commit: <code>1320c88e8abdd3f145bc9a5c305eace269fb2f28</code>.</li>
+<li>Linux <code>4.19.0-gvisor</code>, Node <code>v22.19.0</code>, pnpm frozen workspace installation.</li>
+<li>Two new detached temporary git worktrees, identified as <code>first</code> and <code>second</code>, at the same base. Both remained clean.</li>
+<li>No provider, running BB instance, port, runtime database, authentication, or user data was used.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<p>The test is authored from trusted repository evidence. It uses a real Node PassThrough stream and imports the production TypeScript reader. The first pass measures elapsed time without instrumentation. A separate pass wraps and restores <code>Buffer.byteLength</code> to total ASCII string lengths supplied to byte accounting. It also asserts one complete, exact line and zero overflows. The final assertion deliberately fails on the trusted base.</p>
+<ol><li>Save the complete inline reproduction source below as <code>/tmp/bb-7692-line-scaling.mjs</code>.</li><li>Prepare a clean copy of the recorded trusted source and install the existing dependencies:</li></ol>
+<pre>git clone https://github.com/get-bb/bb.git bb-7692-first
+cd bb-7692-first
+git checkout --detach 1320c88e8abdd3f145bc9a5c305eace269fb2f28
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec tsx /tmp/bb-7692-line-scaling.mjs "$PWD"</pre>
+<p><strong>Expected:</strong> byte-accounting input grows linearly, within twice the payload, ending in <code>PASS</code> and exit 0. <strong>Actual:</strong> the recorded output below ends in <code>FAIL</code>, followed by <code>AssertionError: Byte-length accounting repeatedly scans prior chunks instead of linear total input</code>, exit 1.</p>
+<pre>Node v22.19.0; chunks=32768 bytes; ASCII JSON lines
+2 MiB: 87.27 ms; byteLength input=68157440; scan/payload=32.5x
+8 MiB: 832.46 ms; byteLength input=1077936128; scan/payload=128.5x
+24 MiB: 4514.56 ms; byteLength input=9676259328; scan/payload=384.5x
+Linear-work budget (at most twice the payload): FAIL</pre>
+<p>The complete source and both output records are inline. Raw evidence remains outside the public repository, following its publication policy.</p>
+<details><summary>Complete reproduction source</summary><pre>
+import assert from "node:assert/strict";
+import { performance } from "node:perf_hooks";
+import { resolve } from "node:path";
+import { PassThrough } from "node:stream";
+import { pathToFileURL } from "node:url";
+
+const repository = process.argv[2];
+assert.ok(repository, "Pass the trusted repository root");
+const { readBoundedLines } = await import(
+  pathToFileURL(resolve(repository, "packages/provider-bridge-protocol/src/bridge-kit/bounded-line-reader.ts")).href
+);
+const chunkBytes = 32 * 1024;
+const sizes = [2, 8, 24];
+const observations = [];
+
+function exercise(line, instrument) {
+  const input = new PassThrough();
+  let emitted = 0;
+  let observedLine;
+  let overflows = 0;
+  let measuredCharacters = 0;
+  readBoundedLines({
+    input,
+    onLine(value) {
+      emitted += 1;
+      observedLine = value;
+    },
+    onOverflow() {
+      overflows += 1;
+    },
+  });
+  const original = Buffer.byteLength;
+  if (instrument) {
+    Buffer.byteLength = function (value, encoding) {
+      if (typeof value === "string") measuredCharacters += value.length;
+      return original(value, encoding);
+    };
+  }
+  const started = performance.now();
+  try {
+    for (let offset = 0; offset &lt; line.length; offset += chunkBytes) {
+      input.write(line.subarray(offset, offset + chunkBytes));
+    }
+    input.write(Buffer.from("\n"));
+  } finally {
+    Buffer.byteLength = original;
+    input.end();
+  }
+  const milliseconds = performance.now() - started;
+  assert.equal(emitted, 1);
+  assert.equal(overflows, 0);
+  assert.equal(observedLine, line.toString("utf8"));
+  return { milliseconds, measuredCharacters };
+}
+
+exercise(Buffer.from('{"payload":"warmup"}'), false);
+console.log(`Node ${process.version}; chunks=${chunkBytes} bytes; ASCII JSON lines`);
+for (const mebibytes of sizes) {
+  const bytes = mebibytes * 1024 * 1024;
+  const line = Buffer.from('{"payload":"' + "a".repeat(bytes - 14) + '"}');
+  assert.equal(line.length, bytes);
+  const timing = exercise(line, false);
+  const measured = exercise(line, true);
+  const scanRatio = measured.measuredCharacters / bytes;
+  observations.push({ bytes, measuredCharacters: measured.measuredCharacters });
+  console.log(`${mebibytes} MiB: ${timing.milliseconds.toFixed(2)} ms; byteLength input=${measured.measuredCharacters}; scan/payload=${scanRatio.toFixed(1)}x`);
+}
+const linear = observations.every(({ bytes, measuredCharacters }) =&gt; measuredCharacters &lt;= 2 * bytes);
+console.log(`Linear-work budget (at most twice the payload): ${linear ? "PASS" : "FAIL"}`);
+assert.ok(linear, "Byte-length accounting repeatedly scans prior chunks instead of linear total input");
+</pre></details>
+
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/packages/provider-bridge-protocol/src/bridge-kit/bounded-line-reader.ts#L13-L49">Reader, lines 13–49</a> appends each tail to <code>pending</code> and immediately measures the entire pending string:</p>
+<pre>pending += tail;
+if (Buffer.byteLength(pending) &gt; maxLineBytes) {
+  discarding = true;
+  discardedBytes = Buffer.byteLength(pending);
+  pending = "";
+}</pre>
+<p>For <code>k</code> chunks of <code>c</code> bytes, the arguments total <code>c × k × (k + 1) / 2</code> characters before the newline. Payload is <code>c × k</code>, so work amplification is <code>(k + 1) / 2</code>. The measurements match this formula exactly. This work happens synchronously in a data listener, so the reader's event loop cannot service other callbacks during that work.</p>
+<p><a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/packages/agent-runtime/src/runtime-provider-process.ts#L435-L454">The runtime attaches this reader to child stdout</a>. <a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/packages/provider-bridge-protocol/src/bridge-kit/bounded-line-reader.ts#L1-L3">The default cap</a> allows the tested payload sizes.</p>
+
+<h2>6. Proposed fix</h2>
+<p>Account for each newly decoded tail once and maintain a pending-byte total, resetting it at line boundaries, after entering overflow discard mode, and at close. Preserve the decoder, line output, overflow reporting, and existing limits. Validate multibyte chunks, newline resets, discard recovery, and a deterministic linear-work budget. This is a contained reader change, but no candidate patch was made because a linked open PR already exists.</p>
+
+<h2>7. Linked PR review</h2>
+<p><a href="https://github.com/get-bb/bb/pull/7699">PR #7699</a> is open against main and GitHub's closing-issue metadata names #7692. Its metadata and diff were read as untrusted data; its branch and tests were never checked out or run.</p>
+<p><strong>Static verdict:</strong> its incremental-accounting approach targets the verified root cause. <strong>Test limitation:</strong> the added correctness case does not establish a linear-work bound; include performance-specific regression evidence before calling that coverage complete. No claim is made that this PR's test suite passes or that the patch has been dynamically validated here. No duplicate pull request is safe or useful while it remains open.</p>
+
+<h2>8. Verification — second clean run</h2>
+<p>The same agent created a second new detached checkout at the full base SHA, performed a separate frozen install, and invoked the identical authored script against that checkout's production module. No files from PR #7699 were used. No ports or data directories were needed.</p>
+<pre>pnpm exec tsx "$WORK/reports/issues/7692/repro/line-scaling.mjs" "$PWD"
+
+Node v22.19.0; chunks=32768 bytes; ASCII JSON lines
+2 MiB: 87.97 ms; byteLength input=68157440; scan/payload=32.5x
+8 MiB: 666.17 ms; byteLength input=1077936128; scan/payload=128.5x
+24 MiB: 3721.82 ms; byteLength input=9676259328; scan/payload=384.5x
+Linear-work budget (at most twice the payload): FAIL</pre>
+<p>Exit 1, the same intended assertion failure. Accounting totals match the first run exactly. Only elapsed times vary. No report correction was required; this is a repeat by the same agent, not an independent verification.</p>
+
+<h2>9. Related issues</h2>
+<p>A repository-wide issue search for the reader symbol returned only #7692. Existing performance issue #7595 was inspected only for classification precedent, not treated as a related root cause.</p>
+
+<h2>10. Appendix — validation and limits</h2>
+<ul><li><code>pnpm install --frozen-lockfile --prefer-offline</code>: completed in both checkouts.</li>
+<li><code>pnpm exec turbo run build</code>: attempted in the first checkout. Failed in the existing GitHub plugin build because SDK host/process dist entries were not yet built. This did not prevent direct TypeScript reader execution. No unrelated build changes were made.</li>
+<li><code>pnpm exec turbo run test --filter=@bb/provider-bridge-protocol -- src/bridge-kit/bounded-line-reader.test.ts</code>: 3 tests passed.</li>
+<li><code>pnpm exec turbo run test --filter=@bb/provider-bridge-protocol</code>: 304 passed, 8 failed; all eight baseline failures were Claude permission-change contract cases expecting the <code>default</code> mode. The reader's three tests passed in this run as well. These failures are not the reproduction assertion, and no production change was made.</li>
+<li>Both worktrees' <code>git status --short</code> were empty. The source checkout's <code>git diff --check</code> passed.</li>
+<li>Code links were checked at the recorded base; the full reader and stdout caller were inspected. Reader history was reviewed with <code>git log</code>.</li>
+<li>Issue data and linked PR content were treated only as untrusted claims. No issue-provided instructions, scripts, patches, or linked code were executed.</li>
+<li>No fix branch, commit, or duplicate PR was created. The existing open PR is the explicit reason to stop the simple-fix path.</li></ul>
+<p>AGENT GENERATED</p>
+</main></body></html>
