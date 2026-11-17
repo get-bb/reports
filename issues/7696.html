@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7696 Pi snapshot payload duplication</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --ok:#0e8a16; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); } .ok { color:var(--ok); font-weight:600; }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7696 · Pi command snapshots duplicate output in the diagnostic fallback</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Low</span><span class="pill">providers · provider-pi · perf</span><a href="https://github.com/get-bb/bb/issues/7696">GitHub issue</a><span>2026-11-17 · base <code>1320c88e8a</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+
+<h2>1. TL;DR</h2>
+<p>Pi command output is sent twice inside a single bridge update: once as the output snapshot and once inside a diagnostic copy of the original event. A synthetic 65,536-byte snapshot produced a 131,462-byte serialized delta array, with two complete copies of the output. The assembler displayed the output only once, so this is redundant transport and validation work, not duplicate text in the timeline. The same agent repeated the test in a second clean checkout at the same trusted main commit and obtained identical results. An existing open PR, #7703, already targets this root cause, so no duplicate fix PR was created.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>Command updates include the same output in the snapshot and the fallback.</td><td class="ok">Verified</td><td>Two independently installed checkouts; two payload sizes; JSON contains two full copies at both sizes.</td></tr>
+<tr><td>The fallback is validated before it reaches assembly.</td><td class="ok">Verified statically</td><td>The translator validates the raw fallback with providerRawEventSchema; the runtime adapter validates the delta batch, whose fallback uses the same raw-event schema.</td></tr>
+<tr><td>The fallback is unused during a normal open turn.</td><td class="ok">Verified</td><td>The test opens a turn and starts a command before the update. The assembled output is exactly one copy. The assembler's fallback branch runs only without a current turn.</td></tr>
+<tr><td>Tool start/end diagnostics can remain available without update fallbacks.</td><td class="ok">Verified statically</td><td>Start and end construct their own fallbacks on separate paths; the linked PR leaves those paths unchanged.</td></tr>
+<tr><td>Long-running commands suffer a particular CPU or latency penalty.</td><td>Not benchmarked</td><td>Payload amplification is directly measured; elapsed-time and live-provider performance were not measured. Duplication adds a constant factor to cumulative snapshot traffic rather than changing its asymptotic class.</td></tr>
+<tr><td>Pi can never emit an update outside a turn, including extensions or malformed sequences.</td><td>Not established universally</td><td>The reproduction exercises the normal lifecycle only. Omitting the optional fallback intentionally drops out-of-turn updates; start/end diagnostics remain a separate concern.</td></tr></table>
+
+<h2>3. Environment</h2>
+<ul><li>Trusted public repository: <code>get-bb/bb</code>; fetched <code>origin/main</code>: <code>1320c88e8abdd3f145bc9a5c305eace269fb2f28</code>.</li>
+<li>Linux <code>4.19.0-gvisor x86_64</code>; Node <code>v22.19.0</code>; pnpm <code>9.15.0</code>; workspace Pi dependencies pinned at <code>0.84.4</code>.</li>
+<li>Separate source clone and detached verification worktree, each with a frozen dependency installation. No production source was modified.</li>
+<li>No live provider, real user data, server, port, or data directory was needed. All events and identifiers are synthetic.</li>
+<li>The initial full workspace build failed in unrelated plugin builds because SDK dist files were not yet present. The focused Turbo build completed after SDK prerequisites were built, in both checkouts. The isolated reproduction and the existing translator suite then executed successfully as test processes.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the trusted repository and pin the observed main commit. Install its existing dependencies and build the affected dependency graph:
+<pre>git clone --single-branch --branch main https://github.com/get-bb/bb.git bb-7696
+cd bb-7696
+git checkout --detach 1320c88e8abdd3f145bc9a5c305eace269fb2f28
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=bb-plugin-provider-pi...</pre></li>
+<li>Save the complete test below as <code>plugins/provider-pi/src/issue-7696.repro.test.ts</code>. It creates a real translator and assembler, opens a turn, starts a synthetic command, supplies cumulative output, and checks that the serialized delta carries that output once. It does not execute the command string or start a provider.
+<pre>
+import { expect, it } from "vitest";
+import { experimental_createDeltaAssembler as createDeltaAssembler } from "@get-bb/plugin-sdk/provider-bridge/testing";
+import { createPiDeltaTranslator } from "./delta-translation.js";
+
+it.each([4096, 65536])("serializes a %i-byte command snapshot once", (size) =&gt; {
+  const translator = createPiDeltaTranslator({
+    resolveModelContextWindow: () =&gt; null,
+  });
+  const assembler = createDeltaAssembler({
+    providerId: "pi",
+    entropyPrefix: "wire-repro",
+    textDeltaFlushMs: 0,
+  });
+  const threadId = "isolated-wire-repro";
+  const context = { threadId };
+  for (const event of [
+    { type: "agent_start" },
+    {
+      type: "tool_execution_start",
+      toolCallId: "command-wire-repro",
+      toolName: "bash",
+      args: { command: "synthetic-output", cwd: "/repo" },
+    },
+  ]) {
+    assembler.assemble({ threadId, deltas: translator.translate(event, context) });
+  }
+  const output = "wire-byte/".repeat(Math.ceil(size / 10)).slice(0, size);
+  const deltas = translator.translate(
+    {
+      type: "tool_execution_update",
+      toolCallId: "command-wire-repro",
+      toolName: "bash",
+      partialResult: { content: [{ type: "text", text: output }] },
+    },
+    context,
+  );
+  expect(deltas).toHaveLength(1);
+  expect(deltas[0]).toMatchObject({ kind: "command.outputSnapshot", text: output });
+  const events = assembler.assemble({ threadId, deltas });
+  const visibleOutput = events
+    .filter((event) =&gt; event.type === "item/commandExecution/outputDelta")
+    .map((event) =&gt; event.delta)
+    .join("");
+  expect(visibleOutput).toBe(output);
+  const serialized = JSON.stringify(deltas);
+  const outputCopies = serialized.split(output).length - 1;
+  console.log(JSON.stringify({
+    outputBytes: Buffer.byteLength(output),
+    serializedBytes: Buffer.byteLength(serialized),
+    outputCopies,
+    visibleCopies: visibleOutput === output ? 1 : 0,
+  }));
+  expect(outputCopies).toBe(1);
+});
+</pre></li>
+<li>Run through the repository's normal Turbo dependency orchestration:
+<pre>pnpm exec turbo run test --filter=bb-plugin-provider-pi -- src/issue-7696.repro.test.ts</pre></li></ol>
+<h3>Expected vs actual</h3>
+<p>Expected: <code>outputCopies: 1</code> and two passing test cases. Actual in both runs (verbatim test messages, with runner prefixes omitted):</p>
+<pre>{"outputBytes":4096,"serializedBytes":8582,"outputCopies":2,"visibleCopies":1}
+{"outputBytes":65536,"serializedBytes":131462,"outputCopies":2,"visibleCopies":1}
+AssertionError: expected 2 to be 1 // Object.is equality
+Test Files  1 failed (1)
+Tests  2 failed (2)</pre>
+<p>The expected failure is the final single-copy assertion, not setup, imports, or command execution. Both tests first prove that the returned delta contains the intended snapshot and that assembling it yields the correct visible text. The test is inline rather than a downloadable file because the reports repository prohibits committed scripts, tests, logs, and per-issue artifact directories.</p>
+
+<h2>5. Root cause</h2>
+<p>The command-update branch in <a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/plugins/provider-pi/src/delta-translation.ts#L1178-L1218">delta-translation.ts:1178–1218</a> extracts text from <code>partialResult</code> and constructs:</p>
+<pre>text: snapshot,
+noTurnFallback: noTurnFallbackFor(piEvent.data, context),</pre>
+<p><a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/plugins/provider-pi/src/delta-translation.ts#L642-L657">noTurnFallbackFor</a> wraps the entire parsed Pi event as an <code>sdk/message</code>, including its original <code>partialResult.content[].text</code>. Its <a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/plugins/provider-pi/src/delta-translation.ts#L607-L620">toRawEvent helper</a> validates that raw event. Consequently JSON serialization cannot preserve shared string identity: it writes the text once in the snapshot and again in the fallback.</p>
+<p>The Pi bridge <a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/plugins/provider-pi/src/bridge/bridge.ts#L306-L317">sends the returned deltas without stripping the fallback</a>, and <a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/packages/provider-bridge-protocol/src/bridge-kit/bridge-harness.ts#L48-L56">createBridgeIo serializes them using JSON.stringify</a>. The byte counts above measure the delta array, not the small additional notification envelope.</p>
+<p>The runtime's <a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/packages/agent-runtime/src/bridge-protocol-adapter.ts#L492-L504">bridge-protocol adapter</a> validates the batch before assembly. Its <a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/packages/provider-bridge-protocol/src/thread-delta.ts#L199-L202">fallback schema</a> requires another raw-event validation. These call paths are static findings; this report does not time their CPU cost.</p>
+<p>The <a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/packages/provider-bridge-protocol/src/assembler/delta-assembler.ts#L1813-L1834">snapshot assembler</a> consults the fallback only when no turn is open. During the reproduced lifecycle it instead diffs the snapshot against prior command output, explaining why only one copy is visible. A cumulative snapshot of S ASCII bytes yielded <code>2S + 390</code> bytes for the tested synthetic identifiers; overhead depends on the event and identifiers.</p>
+
+<h2>6. Proposed fix</h2>
+<p>Do not attach the raw no-turn fallback to streamed <code>command.outputSnapshot</code> updates. The neighboring <code>item.progress</code> update path carries the same redundant raw-event pattern and can use the same policy. Keep lifecycle start/end fallbacks, normal output snapshots, and assembler behavior unchanged. The <a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/packages/provider-bridge-protocol/src/thread-delta.ts#L316-L321">existing protocol field is already optional</a>, and the <a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/docs/provider-bridge-protocol.md#L474-L477">documented contract</a> permits dropping an out-of-turn delta when no fallback is attached. This proposal does not require a schema change.</p>
+<p>Before landing, require the single-copy regression to pass, verify unchanged assembled in-turn events, and explicitly test the intended out-of-turn drop policy and retained lifecycle diagnostics. No production patch was applied in this investigation.</p>
+
+<h2>7. Linked PR review</h2>
+<h3><a href="https://github.com/get-bb/bb/pull/7703">PR #7703</a> — statically aligned with the verified cause</h3>
+<p>GitHub metadata shows this PR is open against main and lists #7696 in <code>closingIssuesReferences</code>. The inspected head was <code>1117c7477b0540349680afe410090f73f91466b4</code>. Its diff removes the fallback from the command-snapshot and generic-progress update branches, and adds a regression for update payloads plus retained start fallback. It changes two files (49 additions, two deletions). No linked branch was checked out or executed.</p>
+<p><strong>Findings:</strong> no additional defect established from static inspection. The changed production lines match the verified redundancy. The added test does not itself measure serialized byte amplification or the out-of-turn behavior; the proposed verification above would make those policies explicit. The report's own reproduction was authored from trusted main and run only against trusted main. PR test and parity claims were not treated as executed evidence.</p>
+<p><strong>Automation decision:</strong> skip a new fix branch and PR because this open PR already links to the issue. This avoids competing implementations and follows the duplicate-PR safety rule.</p>
+
+<h2>8. Related issues</h2>
+<p>A repository search for cumulative command-output issues did not establish another exact duplicate. Provider-Pi label discovery surfaced other output-storage investigations, but no duplicate verdict is inferred from their titles. The confirmed linked work for this issue is PR #7703.</p>
+
+<h2>9. Verification</h2>
+<p>The same agent created a second clean detached worktree from the recorded trusted commit, checked that there were no tracked changes, installed frozen dependencies there, and built its own affected dependency graph. Only the independently authored reproduction test was copied into that checkout. No production change, PR branch, provider credentials, runtime data, or dependency directory from the first checkout was copied.</p>
+<pre>git worktree add --detach ../bb-7696-verify 1320c88e8abdd3f145bc9a5c305eace269fb2f28
+cd ../bb-7696-verify
+git status --porcelain
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=bb-plugin-provider-pi...
+git diff --exit-code
+pnpm exec turbo run test --filter=bb-plugin-provider-pi -- src/issue-7696.repro.test.ts</pre>
+<p>Result: two failures at <code>expect(outputCopies).toBe(1)</code>, with the identical 8,582-byte and 131,462-byte payloads shown above. This supports the final verdict without correction; it is a repeated clean run by the same agent, not independent verification.</p>
+<p>Control on the first checkout:</p>
+<pre>pnpm exec turbo run test --filter=bb-plugin-provider-pi -- src/delta-translation.test.ts
+Test Files  1 passed (1)
+Tests  77 passed (77)</pre>
+<p>The control suite passes without a production fix; it covers assembled command output but does not enforce single-copy wire payloads. That explains why the existing tests did not catch the redundant fallback.</p>
+
+<h2>10. Appendix and limits</h2>
+<p>The local investigation also ran <code>git fetch origin main</code>, recorded <code>git rev-parse origin/main</code>, read the issue, repository visibility, labels and property definitions through GitHub metadata, and read the open PR metadata/diff without running its code. Classification was filled only where absent: Bug, Medium priority, Low effort, providers, provider-pi, and perf. Existing issue values were not overwritten.</p>
+<p>Build preparation first attempted <code>pnpm exec turbo run build</code>. It stopped in unrelated plugin builds reporting missing SDK dist entries. Affected-graph builds and Turbo's test prerequisites succeeded; no build-system change or new dependency was introduced. Exact positive/negative evidence is inline above; raw build logs remain local rather than public.</p>
+<p>Issue text and linked PR material were treated as untrusted claims. No instructions, scripts, patches, tests, or branches from those sources were executed. The synthetic input reproduces the bridge-level payload defect without proving a particular real-world latency penalty or behavior of every Pi extension.</p>
+<p>AGENT GENERATED</p>
+</main></body></html>
