@@ -1,0 +1,507 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7694 · Repeated timeline normalization and unstable cached row projections</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7694 · Repeated timeline normalization and unstable cached row projections</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Low</span><span class="pill">Effort: Medium</span><span class="pill">threads · perf</span>
+<a href="https://github.com/get-bb/bb/issues/7694">GitHub issue</a><span>2026-11-17 · base <code>1320c88e8abdd3f145bc9a5c305eace269fb2f28</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>Changing only the current assistant response creates new view objects for an earlier completed turn and a closed delegation, even when their input objects are identical and the same cache is reused. Their contents remain correct; this is unnecessary computation rather than lost messages. A separate probe confirms that a normalized turn's child array is iterated twice again on a subsequent merge of the same snapshot. The UI comparator and signature cache make these identities consequential, but this investigation does not measure visible lag, frame time, or CPU usage in the app.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Unchanged completed turn projections are replaced when a sibling changes.</td><td>Verified</td><td>Deep equality passes; object identity fails in both clean runs.</td></tr>
+<tr><td>Unchanged closed delegation projections are replaced.</td><td>Verified</td><td>The second identity case fails in both runs.</td></tr>
+<tr><td>Existing rows undergo recursive merging again.</td><td>Verified</td><td>Two child-array iterator accesses on the second unchanged merge; first-run normalization and returned row identity both pass.</td></tr>
+<tr><td>Removing recursive joining entirely would be safe.</td><td>Refuted as a fix strategy</td><td>The passing safety test shows that self-joining removes duplicate descendants.</td></tr>
+<tr><td>This produces measurable application-level slowdown.</td><td>Unverified</td><td>No app profiler or browser session was used.</td></tr>
+</table>
+<h2>3. Environment</h2>
+<ul><li>Public target repository: get-bb/bb. Trusted origin/main: <code>1320c88e8abdd3f145bc9a5c305eace269fb2f28</code>, checked again before publication preparation.</li>
+<li>Linux 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0. This differs from the reporter's environment and still reproduces.</li>
+<li>Two detached, temporary worktrees at the same trusted commit, named <code>base</code> and <code>verify</code>. Separate frozen installs; no linked PR branch or test was executed.</li>
+<li>No running bb instance, provider, browser, ports, credentials, or runtime data were required. Screenshots are not applicable to this nonvisual identity/allocation defect.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the public target repository into a fresh directory and select the trusted commit:</li></ol>
+<pre>git clone https://github.com/get-bb/bb.git bb-7694
+cd bb-7694
+git checkout --detach 1320c88e8abdd3f145bc9a5c305eace269fb2f28
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/thread-view --filter=@bb/client-core</pre>
+<p>Save this complete, newly authored test as <code>packages/thread-view/test/issue-7694.test.ts</code>. It imports the actual repository implementations and uses synthetic data only. The iterator probe is instrumentation of the real children array, not a mocked merge implementation.</p>
+<pre>import { describe, expect, it } from &quot;vitest&quot;;
+import type {
+  ThreadTimelineResponse,
+  TimelineConversationRow,
+  TimelineDelegationWorkRow,
+  TimelineRowBase,
+  TimelineTurnRow,
+} from &quot;@bb/server-contract&quot;;
+import {
+  buildTimelineViewRows,
+  createTimelineViewRowsCache,
+} from &quot;../src/timeline-view.js&quot;;
+import {
+  mergeLoadedTimelineWithLatest,
+  prependOlderTimelineRows,
+} from &quot;../../client-core/src/timeline/timeline-merge.js&quot;;
+
+function metadata(id: string, sequence: number): TimelineRowBase {
+  return {
+    id,
+    threadId: &quot;repro-thread&quot;,
+    turnId: &quot;repro-turn&quot;,
+    sourceSeqStart: sequence,
+    sourceSeqEnd: sequence,
+    startedAt: sequence,
+    createdAt: sequence,
+  };
+}
+
+function message(text: string): TimelineConversationRow {
+  return {
+    ...metadata(&quot;response&quot;, 3),
+    kind: &quot;conversation&quot;,
+    role: &quot;assistant&quot;,
+    messageSeq: 3,
+    text,
+    attachments: null,
+    turnRequest: null,
+  };
+}
+
+const completedTurn: TimelineTurnRow = {
+  ...metadata(&quot;earlier-turn&quot;, 1),
+  kind: &quot;turn&quot;,
+  turnId: &quot;earlier-turn&quot;,
+  status: &quot;completed&quot;,
+  summaryCount: 1,
+  completedAt: 2,
+  children: [],
+};
+
+const completedDelegation: TimelineDelegationWorkRow = {
+  ...metadata(&quot;earlier-delegation&quot;, 2),
+  kind: &quot;work&quot;,
+  workKind: &quot;delegation&quot;,
+  status: &quot;completed&quot;,
+  callId: &quot;delegation-call&quot;,
+  toolName: &quot;delegate&quot;,
+  childRef: null,
+  background: false,
+  subagentType: &quot;worker&quot;,
+  description: &quot;Finished task&quot;,
+  output: &quot;done&quot;,
+  completedAt: 2,
+  childRows: [],
+};
+
+describe(&quot;unchanged timeline row projections&quot;, () =&gt; {
+  it.each([
+    { name: &quot;completed turn&quot;, row: completedTurn },
+    { name: &quot;closed delegation&quot;, row: completedDelegation },
+  ])(&quot;reuses the $name view when only response text changes&quot;, ({ row }) =&gt; {
+    const cache = createTimelineViewRowsCache();
+    const first = buildTimelineViewRows([row, message(&quot;A&quot;)], { cache });
+    const second = buildTimelineViewRows([row, message(&quot;AB&quot;)], { cache });
+
+    expect(second[1]).toMatchObject({ kind: &quot;conversation&quot;, text: &quot;AB&quot; });
+    expect(second[0]).toEqual(first[0]);
+    expect(second[0]).toBe(first[0]);
+  });
+
+  it(&quot;still removes duplicate descendants when a row is joined with itself&quot;, () =&gt; {
+    const child = message(&quot;nested&quot;);
+    const duplicated = { ...completedTurn, children: [child, child] };
+    const result = prependOlderTimelineRows({
+      olderRows: [duplicated],
+      loadedRows: [duplicated],
+    });
+
+    expect(result).toEqual([{ ...duplicated, children: [child] }]);
+  });
+
+  it(&quot;does not rescan normalized children on a subsequent unchanged snapshot&quot;, () =&gt; {
+    let iterations = 0;
+    const children = new Proxy([message(&quot;nested&quot;)], {
+      get(target, property, receiver) {
+        if (property === Symbol.iterator) iterations += 1;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const row = { ...completedTurn, children };
+    const latestTimeline: ThreadTimelineResponse = {
+      rows: [row],
+      contextBoundarySeq: null,
+      completedTurnDisplay: &quot;collapse&quot;,
+      activePromptMode: null,
+      activeThinking: null,
+      activeWorkflows: [],
+      activeBackgroundCommands: [],
+      pendingTodos: null,
+      extensionStates: {},
+      providerCommands: null,
+      sessionOptions: null,
+      modelFallback: null,
+      maxSeq: 3,
+      tag: &quot;snapshot&quot;,
+      timelinePage: {
+        returnedSegmentCount: 1,
+        olderCursor: null,
+        historySnapshot: &quot;snapshot&quot;,
+        olderRowsSourceSeqEnd: null,
+      },
+    };
+    const current = {
+      rows: [row],
+      surfaceKey: &quot;repro-surface&quot;,
+      historySnapshot: &quot;snapshot&quot;,
+      latestWindowEndSequence: 3,
+      olderCursor: null,
+    };
+    const first = mergeLoadedTimelineWithLatest({
+      current,
+      latestTimeline,
+      surfaceKey: current.surfaceKey,
+    });
+    expect(first.rows[0]).toBe(row);
+    expect(iterations).toBeGreaterThan(0);
+    iterations = 0;
+    const second = mergeLoadedTimelineWithLatest({
+      current: first,
+      latestTimeline,
+      surfaceKey: current.surfaceKey,
+    });
+    expect(second.rows[0]).toBe(row);
+    expect(iterations).toBe(0);
+  });
+});
+</pre>
+<p>Run from the repository root:</p><pre>pnpm exec turbo run test --filter=@bb/thread-view -- --run test/issue-7694.test.ts</pre>
+<p>Expected after a correct optimization: all four tests pass. Actual on trusted main, repeated in the second worktree:</p>
+<pre>Tests  3 failed | 1 passed (4)
+completed turn: Object.is identity assertion fails; deep equality passes
+closed delegation: Object.is identity assertion fails; deep equality passes
+subsequent unchanged snapshot: expected 0 child-array iterations, received 2
+recursive duplicate-child safety: passes</pre>
+<p>The first two cases create fresh outer arrays and a fresh assistant message, while keeping the earlier input row and cache objects unchanged. The third failing assertion follows a successful normalization run and confirms repeated work without claiming timing measurements.</p>
+<h2>5. Root cause</h2>
+<h3>Repeated recursive joining</h3>
+<p><a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/packages/client-core/src/timeline/timeline-merge.ts#L443-L452">packages/client-core/src/timeline/timeline-merge.ts:443</a> looks up every incoming row by ID, then calls the child-joining routine whenever a loaded row exists. There is no special case for an identical, already-normalized input.</p>
+<pre>  const currentRowsById = new Map(current.rows.map((row) =&gt; [row.id, row]));
+  const latestRows = latestTimeline.rows.map((row) =&gt; {
+    const loaded = currentRowsById.get(row.id);
+    return loaded === undefined
+      ? row
+      : prependOlderTimelineRows({
+          olderRows: [loaded],
+          loadedRows: [row],
+        })[0]!;
+  });</pre>
+<p><a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/packages/client-core/src/timeline/timeline-merge.ts#L180-L230">packages/client-core/src/timeline/timeline-merge.ts:180</a> recursively joins turn children and delegation child rows. <a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/packages/client-core/src/timeline/timeline-merge.ts#L232-L259">packages/client-core/src/timeline/timeline-merge.ts:232</a> constructs deduplication arrays, sets, and a map before returning the original loaded object when children are unchanged. Returning the same row object therefore does not imply that recursive work was avoided. The separate safety case proves that the normalization must not simply be removed.</p>
+<h3>Cache granularity and closed-step wrappers</h3>
+<p><a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/packages/thread-view/src/timeline-view.ts#L926-L973">packages/thread-view/src/timeline-view.ts:926</a> uses an outer-array WeakMap and unconditionally spreads turn and delegation rows into new projections when that outer array is new.</p>
+<pre>function toTimelineViewRow(
+  row: TimelineRow,
+  cache: TimelineViewRowsCache,
+): ThreadTimelineViewRow {
+  switch (row.kind) {
+    case &quot;conversation&quot;:
+    case &quot;system&quot;:
+      return row;
+    case &quot;work&quot;:
+      return toTimelineViewWorkRow(row, cache);
+    case &quot;turn&quot;:
+      return {
+        ...row,
+        children: row.children
+          ? buildTimelineViewRows(row.children, {
+              cache,
+              closedScope: true,
+            })
+          : null,
+      };
+    default:</pre>
+<p><a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/packages/thread-view/src/timeline-view.ts#L983-L993">packages/thread-view/src/timeline-view.ts:983</a> misses its cache for a new outer array. <a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/packages/thread-view/src/timeline-view.ts#L874-L885">packages/thread-view/src/timeline-view.ts:874</a> additionally creates a fresh singleton closed-step work wrapper. Caching only the delegation conversion would leave that wrapper allocation unresolved.</p>
+<pre>function closeOpenStepAtBoundary(
+  work: TimelineWorkSummaryChild[],
+): ThreadTimelineViewRow[] {
+  if (work.length === 0) return [];
+  if (!work.some((row) =&gt; row.kind === &quot;work&quot;)) return work;
+  if (work.length === 1) {
+    return work.map((row) =&gt;
+      row.kind === &quot;work&quot; ? { ...row, inClosedStep: true } : row,
+    );
+  }
+  return [buildStepSummaryRow(work)];
+}</pre>
+<h3>Downstream consequence, not a full UI benchmark</h3>
+<p><a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/apps/app/src/components/thread/timeline/ThreadTimelineRows.tsx#L416-L430">apps/app/src/components/thread/timeline/ThreadTimelineRows.tsx:416</a> uses row identity as a short circuit before comparing render signatures. <a href="https://github.com/get-bb/bb/blob/1320c88e8abdd3f145bc9a5c305eace269fb2f28/packages/client-core/src/timeline/timelineRowSignatures.ts#L330-L336">packages/client-core/src/timeline/timelineRowSignatures.ts:330</a> caches signatures by view-object identity. New equivalent view objects miss that cache. This code path explains additional signature work when the comparator reaches this branch; the investigation does not assert that every mounted row necessarily reaches it on every render.</p>
+<h2>6. Proposed fix</h2>
+<p>Remember immutable row objects that have completed recursive normalization, and skip only subsequent self-joins of those same objects. Keep joining changed rows and retaining recursive duplicate removal. Reuse per-input-row view projections, including singleton closed-step work wrappers, while preserving grouping and open/closed-scope behavior. Add a scope-sensitive regression if changing cache keys or scope handling. No production fix was attempted here because an open pull request already links the issue.</p>
+<h2>7. Linked PR review</h2>
+<h3><a href="https://github.com/get-bb/bb/pull/7701">PR #7701</a> · static review only</h3>
+<p>GitHub timeline metadata and a repository-scoped open-PR lookup identify this open PR as linked to #7694. Its diff adds a WeakSet for previously normalized row identities, per-row view caching, and cached closed-step wrappers. These changes target both verified mechanisms rather than merely suppressing a UI rerender. No blocking defect was established in this bounded static inspection; this is not a safety approval. Its branch, production changes, and supplied tests were not checked out or executed. Consequently the PR's test-pass claims and full fix behavior remain unverified here. No duplicate PR was created.</p>
+<h2>8. Related issues</h2>
+<p>A narrow repository issue-title search for timeline identity returned no additional matches. This is not an exhaustive duplicate search. PR #7701 is the actionable existing fix candidate.</p>
+<h2>9. Verification</h2>
+<p>The same agent created a second clean detached worktree at <code>1320c88e8abdd3f145bc9a5c305eace269fb2f28</code>, confirmed its working tree was clean, ran a new frozen install and the targeted build, copied only the newly authored reproduction file, and reran the exact Turbo command above. The failed test task was executed, not replayed from a successful cache result. Both runs show the same three intended assertion failures and passing duplicate-removal control. This is a repeated clean run, not independent-agent verification. No report correction was needed.</p>
+<p>Existing owner tests were then run unchanged in the second checkout:</p>
+<pre>pnpm exec turbo run test --filter=@bb/thread-view -- --run test/timeline-view.test.ts
+Tests  18 passed (18)
+
+pnpm exec turbo run test --filter=@bb/client-core -- --run test/timeline-merge.test.ts
+Tests  36 passed (36)</pre>
+<h2>10. Appendix</h2>
+<p>Raw evidence remains local; sanitized relevant output and the full reproduction source are inline here, following the reports repository's no-artifact policy.</p>
+<h3>First clean-run output</h3><pre>
+   • turbo 2.11.10
+   • Packages in scope: @bb/thread-view
+   • Running test in 1 package
+   • Remote caching disabled, using shared worktree cache
+
+//:ensure-native-modules: cache bypass, force executing 2cbf82a4d1c41cd6
+@bb/process-utils:generate:profile-worker: cache hit, replaying logs 73f9bfdd153745fd
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker SCRATCH/base/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules SCRATCH/base
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+@bb/thread-view:test: cache miss, executing bc0375576c6eb539
+@bb/thread-view:test: 
+@bb/thread-view:test: &gt; @bb/thread-view@0.0.1 test SCRATCH/base/packages/thread-view
+@bb/thread-view:test: &gt; vitest run --config vitest.config.ts &quot;--run&quot; &quot;test/issue-7694.test.ts&quot;
+@bb/thread-view:test: 
+@bb/thread-view:test: (!) Your Vite config uses features that are unsupported by `configLoader: &#x27;native&#x27;`, which is planned to become the default in a future major version of Vite:
+@bb/thread-view:test:   - `__dirname` (vitest.config.ts:10:15). Use `import.meta.dirname` instead
+@bb/thread-view:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/thread-view:test: (!) Your Vite config uses features that are unsupported by `configLoader: &#x27;native&#x27;`, which is planned to become the default in a future major version of Vite:
+@bb/thread-view:test:   - `__dirname` (vitest.config.ts:10:15). Use `import.meta.dirname` instead
+@bb/thread-view:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/thread-view:test: 
+@bb/thread-view:test:  RUN  v4.1.12 SCRATCH/base/packages/thread-view
+@bb/thread-view:test: 
+@bb/thread-view:test:  ❯ |@bb/thread-view| test/issue-7694.test.ts (4 tests | 3 failed) 13ms
+@bb/thread-view:test:      × reuses the &#x27;completed turn&#x27; view when only response text changes 8ms
+@bb/thread-view:test:      × reuses the &#x27;closed delegation&#x27; view when only response text changes 2ms
+@bb/thread-view:test:      ✓ still removes duplicate descendants when a row is joined with itself 1ms
+@bb/thread-view:test:      × does not rescan normalized children on a subsequent unchanged snapshot 2ms
+@bb/thread-view:test: 
+@bb/thread-view:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 3 ⎯⎯⎯⎯⎯⎯⎯
+@bb/thread-view:test: 
+@bb/thread-view:test:  FAIL  |@bb/thread-view| test/issue-7694.test.ts &gt; unchanged timeline row projections &gt; reuses the &#x27;completed turn&#x27; view when only response text changes
+@bb/thread-view:test: AssertionError: expected { id: &#x27;earlier-turn&#x27;, …(11) } to be { id: &#x27;earlier-turn&#x27;, …(11) } // Object.is equality
+@bb/thread-view:test: 
+@bb/thread-view:test: If it should pass with deep equality, replace &quot;toBe&quot; with &quot;toStrictEqual&quot;
+@bb/thread-view:test: 
+@bb/thread-view:test: Expected: { id: &#x27;earlier-turn&#x27;, …(11) }
+@bb/thread-view:test: Received: serializes to the same string
+@bb/thread-view:test: 
+@bb/thread-view:test: 
+@bb/thread-view:test: Compared values have no visual difference.
+@bb/thread-view:test: 
+@bb/thread-view:test:  ❯ test/issue-7694.test.ts:79:23
+@bb/thread-view:test:      77|     expect(second[1]).toMatchObject({ kind: &quot;conversation&quot;, text: &quot;AB&quot;…
+@bb/thread-view:test:      78|     expect(second[0]).toEqual(first[0]);
+@bb/thread-view:test:      79|     expect(second[0]).toBe(first[0]);
+@bb/thread-view:test:        |                       ^
+@bb/thread-view:test:      80|   });
+@bb/thread-view:test:      81|
+@bb/thread-view:test: 
+@bb/thread-view:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/3]⎯
+@bb/thread-view:test: 
+@bb/thread-view:test:  FAIL  |@bb/thread-view| test/issue-7694.test.ts &gt; unchanged timeline row projections &gt; reuses the &#x27;closed delegation&#x27; view when only response text changes
+@bb/thread-view:test: AssertionError: expected { id: &#x27;earlier-delegation&#x27;, …(19) } to be { id: &#x27;earlier-delegation&#x27;, …(19) } // Object.is equality
+@bb/thread-view:test: 
+@bb/thread-view:test: If it should pass with deep equality, replace &quot;toBe&quot; with &quot;toStrictEqual&quot;
+@bb/thread-view:test: 
+@bb/thread-view:test: Expected: { id: &#x27;earlier-delegation&#x27;, …(19) }
+@bb/thread-view:test: Received: serializes to the same string
+@bb/thread-view:test: 
+@bb/thread-view:test: 
+@bb/thread-view:test: Compared values have no visual difference.
+@bb/thread-view:test: 
+@bb/thread-view:test:  ❯ test/issue-7694.test.ts:79:23
+@bb/thread-view:test:      77|     expect(second[1]).toMatchObject({ kind: &quot;conversation&quot;, text: &quot;AB&quot;…
+@bb/thread-view:test:      78|     expect(second[0]).toEqual(first[0]);
+@bb/thread-view:test:      79|     expect(second[0]).toBe(first[0]);
+@bb/thread-view:test:        |                       ^
+@bb/thread-view:test:      80|   });
+@bb/thread-view:test:      81|
+@bb/thread-view:test: 
+@bb/thread-view:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/3]⎯
+@bb/thread-view:test: 
+@bb/thread-view:test:  FAIL  |@bb/thread-view| test/issue-7694.test.ts &gt; unchanged timeline row projections &gt; does not rescan normalized children on a subsequent unchanged snapshot
+@bb/thread-view:test: AssertionError: expected 2 to be +0 // Object.is equality
+@bb/thread-view:test: 
+@bb/thread-view:test: - Expected
+@bb/thread-view:test: + Received
+@bb/thread-view:test: 
+@bb/thread-view:test: - 0
+@bb/thread-view:test: + 2
+@bb/thread-view:test: 
+@bb/thread-view:test:  ❯ test/issue-7694.test.ts:145:24
+@bb/thread-view:test:     143|     });
+@bb/thread-view:test:     144|     expect(second.rows[0]).toBe(row);
+@bb/thread-view:test:     145|     expect(iterations).toBe(0);
+@bb/thread-view:test:        |                        ^
+@bb/thread-view:test:     146|   });
+@bb/thread-view:test:     147| });
+@bb/thread-view:test: 
+@bb/thread-view:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/3]⎯
+@bb/thread-view:test: 
+@bb/thread-view:test: 
+@bb/thread-view:test:  Test Files  1 failed (1)
+@bb/thread-view:test:       Tests  3 failed | 1 passed (4)
+@bb/thread-view:test:    Start at  10:36:26
+@bb/thread-view:test:    Duration  903ms (transform 464ms, setup 0ms, import 672ms, tests 13ms, environment 0ms)
+@bb/thread-view:test: 
+@bb/thread-view:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/thread-view#test:  ERROR  command (SCRATCH/base/packages/thread-view) pnpm run test --run test/issue-7694.test.ts exited (1)
+
+ Tasks:    2 successful, 3 total
+Cached:    1 cached, 3 total
+  Time:    2.45s 
+Failed:    @bb/thread-view#test
+
+ ERROR  run failed: command  exited (1)
+</pre>
+<h3>Second clean-run output</h3><pre>
+   • turbo 2.11.10
+   • Packages in scope: @bb/thread-view
+   • Running test in 1 package
+   • Remote caching disabled, using shared worktree cache
+
+//:ensure-native-modules: cache bypass, force executing 2cbf82a4d1c41cd6
+@bb/process-utils:generate:profile-worker: cache hit, replaying logs 73f9bfdd153745fd
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker SCRATCH/base/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules SCRATCH/verify
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+//:ensure-native-modules: [ensure-native-modules] Detached hardlinked better-sqlite3 binary before verification
+@bb/thread-view:test: cache miss, executing bc0375576c6eb539
+@bb/thread-view:test: 
+@bb/thread-view:test: &gt; @bb/thread-view@0.0.1 test SCRATCH/verify/packages/thread-view
+@bb/thread-view:test: &gt; vitest run --config vitest.config.ts &quot;--run&quot; &quot;test/issue-7694.test.ts&quot;
+@bb/thread-view:test: 
+@bb/thread-view:test: (!) Your Vite config uses features that are unsupported by `configLoader: &#x27;native&#x27;`, which is planned to become the default in a future major version of Vite:
+@bb/thread-view:test:   - `__dirname` (vitest.config.ts:10:15). Use `import.meta.dirname` instead
+@bb/thread-view:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/thread-view:test: (!) Your Vite config uses features that are unsupported by `configLoader: &#x27;native&#x27;`, which is planned to become the default in a future major version of Vite:
+@bb/thread-view:test:   - `__dirname` (vitest.config.ts:10:15). Use `import.meta.dirname` instead
+@bb/thread-view:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/thread-view:test: 
+@bb/thread-view:test:  RUN  v4.1.12 SCRATCH/verify/packages/thread-view
+@bb/thread-view:test: 
+@bb/thread-view:test:  ❯ |@bb/thread-view| test/issue-7694.test.ts (4 tests | 3 failed) 13ms
+@bb/thread-view:test:      × reuses the &#x27;completed turn&#x27; view when only response text changes 8ms
+@bb/thread-view:test:      × reuses the &#x27;closed delegation&#x27; view when only response text changes 2ms
+@bb/thread-view:test:      ✓ still removes duplicate descendants when a row is joined with itself 1ms
+@bb/thread-view:test:      × does not rescan normalized children on a subsequent unchanged snapshot 2ms
+@bb/thread-view:test: 
+@bb/thread-view:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 3 ⎯⎯⎯⎯⎯⎯⎯
+@bb/thread-view:test: 
+@bb/thread-view:test:  FAIL  |@bb/thread-view| test/issue-7694.test.ts &gt; unchanged timeline row projections &gt; reuses the &#x27;completed turn&#x27; view when only response text changes
+@bb/thread-view:test: AssertionError: expected { id: &#x27;earlier-turn&#x27;, …(11) } to be { id: &#x27;earlier-turn&#x27;, …(11) } // Object.is equality
+@bb/thread-view:test: 
+@bb/thread-view:test: If it should pass with deep equality, replace &quot;toBe&quot; with &quot;toStrictEqual&quot;
+@bb/thread-view:test: 
+@bb/thread-view:test: Expected: { id: &#x27;earlier-turn&#x27;, …(11) }
+@bb/thread-view:test: Received: serializes to the same string
+@bb/thread-view:test: 
+@bb/thread-view:test: 
+@bb/thread-view:test: Compared values have no visual difference.
+@bb/thread-view:test: 
+@bb/thread-view:test:  ❯ test/issue-7694.test.ts:79:23
+@bb/thread-view:test:      77|     expect(second[1]).toMatchObject({ kind: &quot;conversation&quot;, text: &quot;AB&quot;…
+@bb/thread-view:test:      78|     expect(second[0]).toEqual(first[0]);
+@bb/thread-view:test:      79|     expect(second[0]).toBe(first[0]);
+@bb/thread-view:test:        |                       ^
+@bb/thread-view:test:      80|   });
+@bb/thread-view:test:      81|
+@bb/thread-view:test: 
+@bb/thread-view:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/3]⎯
+@bb/thread-view:test: 
+@bb/thread-view:test:  FAIL  |@bb/thread-view| test/issue-7694.test.ts &gt; unchanged timeline row projections &gt; reuses the &#x27;closed delegation&#x27; view when only response text changes
+@bb/thread-view:test: AssertionError: expected { id: &#x27;earlier-delegation&#x27;, …(19) } to be { id: &#x27;earlier-delegation&#x27;, …(19) } // Object.is equality
+@bb/thread-view:test: 
+@bb/thread-view:test: If it should pass with deep equality, replace &quot;toBe&quot; with &quot;toStrictEqual&quot;
+@bb/thread-view:test: 
+@bb/thread-view:test: Expected: { id: &#x27;earlier-delegation&#x27;, …(19) }
+@bb/thread-view:test: Received: serializes to the same string
+@bb/thread-view:test: 
+@bb/thread-view:test: 
+@bb/thread-view:test: Compared values have no visual difference.
+@bb/thread-view:test: 
+@bb/thread-view:test:  ❯ test/issue-7694.test.ts:79:23
+@bb/thread-view:test:      77|     expect(second[1]).toMatchObject({ kind: &quot;conversation&quot;, text: &quot;AB&quot;…
+@bb/thread-view:test:      78|     expect(second[0]).toEqual(first[0]);
+@bb/thread-view:test:      79|     expect(second[0]).toBe(first[0]);
+@bb/thread-view:test:        |                       ^
+@bb/thread-view:test:      80|   });
+@bb/thread-view:test:      81|
+@bb/thread-view:test: 
+@bb/thread-view:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/3]⎯
+@bb/thread-view:test: 
+@bb/thread-view:test:  FAIL  |@bb/thread-view| test/issue-7694.test.ts &gt; unchanged timeline row projections &gt; does not rescan normalized children on a subsequent unchanged snapshot
+@bb/thread-view:test: AssertionError: expected 2 to be +0 // Object.is equality
+@bb/thread-view:test: 
+@bb/thread-view:test: - Expected
+@bb/thread-view:test: + Received
+@bb/thread-view:test: 
+@bb/thread-view:test: - 0
+@bb/thread-view:test: + 2
+@bb/thread-view:test: 
+@bb/thread-view:test:  ❯ test/issue-7694.test.ts:145:24
+@bb/thread-view:test:     143|     });
+@bb/thread-view:test:     144|     expect(second.rows[0]).toBe(row);
+@bb/thread-view:test:     145|     expect(iterations).toBe(0);
+@bb/thread-view:test:        |                        ^
+@bb/thread-view:test:     146|   });
+@bb/thread-view:test:     147| });
+@bb/thread-view:test: 
+@bb/thread-view:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/3]⎯
+@bb/thread-view:test: 
+@bb/thread-view:test: 
+@bb/thread-view:test:  Test Files  1 failed (1)
+@bb/thread-view:test:       Tests  3 failed | 1 passed (4)
+@bb/thread-view:test:    Start at  10:36:43
+@bb/thread-view:test:    Duration  884ms (transform 448ms, setup 0ms, import 649ms, tests 13ms, environment 0ms)
+@bb/thread-view:test: 
+@bb/thread-view:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/thread-view#test:  ERROR  command (SCRATCH/verify/packages/thread-view) pnpm run test --run test/issue-7694.test.ts exited (1)
+
+ Tasks:    2 successful, 3 total
+Cached:    1 cached, 3 total
+  Time:    2.41s 
+Failed:    @bb/thread-view#test
+
+ ERROR  run failed: command  exited (1)
+</pre>
+<h3>Build limitation</h3>
+<p>The initial unfiltered <code>pnpm exec turbo run build</code> failed in an unrelated plugin because the installed Plugin SDK lacked built <code>process.js</code> and <code>host.js</code>. No repository change was made to conceal or fix this unrelated build issue. The affected packages' targeted build and their relevant existing tests passed. Frozen installs succeeded; initial missing package-bin warnings are not reproduction failures. The full application build and live-app performance are not verified.</p>
+<p>Trust boundary: issue content and the linked PR diff were treated as untrusted claims. No supplied scripts, patches, branches, or tests were executed. Only trusted main and this investigator's synthetic reproduction were run. No workflow, agent delegation, production server, or real user data was used.</p>
+</main></body></html>
