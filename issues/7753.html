@@ -1,0 +1,500 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Report · #7753 Synchronous SQLite waits and planner statistics</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7753 · Synchronous SQLite waits and planner statistics</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High</span><span class="pill">Effort: Medium</span><span class="pill">host · threads · perf</span><a href="https://github.com/get-bb/bb/issues/7753">GitHub issue</a><span>2026-11-18 UTC</span></p>
+<p>Trusted main: <code>ab7ad23bacb822445a1d7639d10318af86258148</code></p>
+<p><strong>Verdict: PARTIALLY REPRODUCED</strong> · <strong>Root-cause confidence: medium</strong> for the reported incident; high for the isolated mechanisms below.</p>
+
+<h2>1. TL;DR</h2>
+<p>On current main, a real SQLite writer lock makes a synchronous database update block a zero-delay JavaScript timer for approximately five seconds, using bb's default busy timeout. A fresh migrated database also starts without planner statistics. A synthetic, unhinted turn-item query picks an index that visits a whole thread's completed items instead of seeking one turn; supplying statistics changes that diagnostic query's plan. However, the closest current production DISTINCT query already pins the correct turn index, and both bounded and full analysis work on this small synthetic distribution. The original multi-second large-database reads, 62-second stalls and daemon disconnects were <strong>not</strong> reproduced, so these findings do not establish the cause or size of that production incident.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence and limit</th></tr>
+<tr><td>Synchronous SQLite waits can stall the main event loop.</td><td>Verified mechanism</td><td>Two real connections to a new migrated database. One holds BEGIN IMMEDIATE; the other times out after 5022.7/5034.6 ms. A zero-delay timer cannot fire before return. This is an intentionally induced writer conflict, not the reporter's read workload.</td></tr>
+<tr><td>Planner statistics are absent and maintenance does not populate them.</td><td>Verified for fresh current main</td><td>Both newly migrated databases lack sqlite_stat1 and sqlite_stat4. Searches of db setup/migrations/server source find no ANALYZE or PRAGMA optimize. An existing operator-managed database could differ.</td></tr>
+<tr><td>Without statistics, DISTINCT item-kind reads can choose a thread-wide index.</td><td>Verified diagnostic comparison</td><td>The unhinted variant uses events_thread_type_item_kind_sequence_idx over 40,000 completed rows, not the single matching turn. This variant is explicitly not the current production function.</td></tr>
+<tr><td>The reported item/started DISTINCT query remains a slow current-main hotspot.</td><td>Unverified; closest current query is protected</td><td>Current isStoredTurnContextCompactionOnly reads item/completed and pins the turn index. The original item/started statement was not traced to a current production caller.</td></tr>
+<tr><td>Bounded analysis fails while full analysis fixes the plan.</td><td>Not reproduced on synthetic data</td><td>Both bounded and full analysis change the unhinted plan here. This does not refute the reported database-specific result, and no PRAGMA optimize behavior was tested.</td></tr>
+<tr><td>Correlated retry acceptance lookup is still present.</td><td>Changed on current main</td><td>Current helper uses IN with an uncorrelated request set; history identifies the existing retry fix. No old release or linked PR code was executed.</td></tr>
+<tr><td>Large outline builds can run synchronously.</td><td>Verified code path only</td><td>buildThreadConversationOutline calls runEventLoopWorkSync. No large-thread latency or profile was reproduced.</td></tr>
+<tr><td>Reported stall counts, CPU/wall ratios, shared-disk effects, 502s, plugin contribution and heartbeat losses.</td><td>Unverified</td><td>No original database, raw logs, matching disk workload, third-party plugins or live server used.</td></tr>
+</table>
+
+<h2>3. Environment</h2>
+<ul><li>Public get-bb/bb origin/main at <code>ab7ad23bacb822445a1d7639d10318af86258148</code>; fresh clone plus a second new detached worktree.</li>
+<li>Linux 4.19.0-gvisor x86_64; Node 22.19.0; pnpm 9.15.0; repository-locked better-sqlite3 12.11.1; observed SQLite 3.53.2. These differ from the reporter's environment.</li>
+<li>Real database copied from createMigratedConnection(), with production schema, foreign keys and indexes; 40,000 synthetic completed compaction events in one thread, each in a separate turn.</li>
+<li>Each run uses a newly created temporary directory and file, removed in finally. No ports, dev instance, provider, account, private database or user runtime data accessed.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the trusted repository and pin the recorded main commit. Install frozen dependencies and build the SDK before the broad build to avoid the observed clean-build ordering failure.</li></ol>
+<pre>git clone https://github.com/get-bb/bb.git bb-7753
+cd bb-7753
+git checkout --detach ab7ad23bacb822445a1d7639d10318af86258148
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build</pre>
+<ol start="2"><li>Copy the complete <a href="#reproduction-source">reproduction source below</a> into <code>packages/db/slopcop7753.mts</code>, then run the harness. This direct tsx call is an investigative probe; package tests and builds still use Turbo.</li></ol>
+<pre>pnpm exec tsx packages/db/slopcop7753.mts</pre>
+<p><strong>Expected service invariant:</strong> a timer should not be prevented from running by a database lock wait. <strong>Observed current behavior:</strong> the synchronous write occupies the main thread until bb's 5,000 ms busy timeout expires; the timer has not fired at return. The harness asserts this known blocking behavior and exits successfully. It is <em>not</em> a red/green regression test for a proposed fix.</p>
+<p><strong>Expected query behavior:</strong> a turn-constrained lookup should seek that turn rather than inspect all completed events in its thread. <strong>Actual:</strong> the current pinned query does seek the turn, even before analysis; the diagnostic unhinted variant does not until statistics are supplied.</p>
+<table><tr><th>Run</th><th>Unhinted/no stats</th><th>Current pinned shape/no stats</th><th>Unhinted/bounded stats</th><th>Unhinted/full stats</th><th>Induced write lock wait</th></tr><tr><td>First clean clone</td><td>2.0725 ms</td><td>0.0102 ms</td><td>0.0157 ms</td><td>0.0187 ms</td><td>5022.7 ms</td></tr><tr><td>Second clean worktree</td><td>2.1060 ms</td><td>0.1378 ms</td><td>0.0215 ms</td><td>0.0204 ms</td><td>5034.6 ms</td></tr></table>
+<p>Warm means of 20 calls, not production latency or a cold-I/O benchmark. Absolute values are environment-specific. The unhinted comparison removes the production hint in the harness only; no production code was changed.</p>
+<h3>First run, verbatim</h3><pre>{
+  &quot;rowCount&quot;: 40000,
+  &quot;sqliteVersion&quot;: {
+    &quot;version&quot;: &quot;3.53.2&quot;
+  },
+  &quot;busyTimeoutMs&quot;: 5000,
+  &quot;statisticsBefore&quot;: [],
+  &quot;productionQuery&quot;: {
+    &quot;sql&quot;: &quot;select distinct \&quot;item_kind\&quot; from \&quot;events\&quot; INDEXED BY events_thread_turn_type_item_sequence_idx where (\&quot;events\&quot;.\&quot;thread_id\&quot; = ? and \&quot;events\&quot;.\&quot;turn_id\&quot; = ? and \&quot;events\&quot;.\&quot;type\&quot; = ? and \&quot;events\&quot;.\&quot;parent_tool_call_id\&quot; is null)&quot;,
+    &quot;durationMs&quot;: 0,
+    &quot;cpuDurationMs&quot;: 0
+  },
+  &quot;before&quot;: {
+    &quot;unhintedPlan&quot;: [
+      {
+        &quot;id&quot;: 4,
+        &quot;parent&quot;: 0,
+        &quot;notused&quot;: 61,
+        &quot;detail&quot;: &quot;SEARCH events USING INDEX events_thread_type_item_kind_sequence_idx (thread_id=? AND type=?)&quot;
+      }
+    ],
+    &quot;unhintedMs&quot;: 2.0724710999999956,
+    &quot;pinnedPlan&quot;: [
+      {
+        &quot;id&quot;: 4,
+        &quot;parent&quot;: 0,
+        &quot;notused&quot;: 60,
+        &quot;detail&quot;: &quot;SEARCH events USING INDEX events_thread_turn_type_item_sequence_idx (thread_id=? AND turn_id=? AND type=?)&quot;
+      },
+      {
+        &quot;id&quot;: 23,
+        &quot;parent&quot;: 0,
+        &quot;notused&quot;: 0,
+        &quot;detail&quot;: &quot;USE TEMP B-TREE FOR DISTINCT&quot;
+      }
+    ],
+    &quot;pinnedMs&quot;: 0.010159099999998488
+  },
+  &quot;bounded&quot;: {
+    &quot;unhintedPlan&quot;: [
+      {
+        &quot;id&quot;: 4,
+        &quot;parent&quot;: 0,
+        &quot;notused&quot;: 43,
+        &quot;detail&quot;: &quot;SEARCH events USING INDEX events_thread_turn_type_item_sequence_idx (thread_id=? AND turn_id=? AND type=?)&quot;
+      },
+      {
+        &quot;id&quot;: 23,
+        &quot;parent&quot;: 0,
+        &quot;notused&quot;: 0,
+        &quot;detail&quot;: &quot;USE TEMP B-TREE FOR DISTINCT&quot;
+      }
+    ],
+    &quot;unhintedMs&quot;: 0.01566054999999551
+  },
+  &quot;full&quot;: {
+    &quot;unhintedPlan&quot;: [
+      {
+        &quot;id&quot;: 4,
+        &quot;parent&quot;: 0,
+        &quot;notused&quot;: 43,
+        &quot;detail&quot;: &quot;SEARCH events USING INDEX events_thread_turn_type_item_sequence_idx (thread_id=? AND turn_id=? AND type=?)&quot;
+      },
+      {
+        &quot;id&quot;: 23,
+        &quot;parent&quot;: 0,
+        &quot;notused&quot;: 0,
+        &quot;detail&quot;: &quot;USE TEMP B-TREE FOR DISTINCT&quot;
+      }
+    ],
+    &quot;unhintedMs&quot;: 0.018678149999993822
+  },
+  &quot;statisticsAfter&quot;: [
+    {
+      &quot;name&quot;: &quot;sqlite_stat1&quot;
+    },
+    {
+      &quot;name&quot;: &quot;sqlite_stat4&quot;
+    }
+  ],
+  &quot;blockedMs&quot;: 5022.693241,
+  &quot;timerFiredBeforeReturn&quot;: false,
+  &quot;blockedQuery&quot;: {
+    &quot;sql&quot;: &quot;update \&quot;hosts\&quot; set \&quot;name\&quot; = ? where \&quot;hosts\&quot;.\&quot;id\&quot; = ?&quot;,
+    &quot;durationMs&quot;: 5021.9,
+    &quot;cpuDurationMs&quot;: 10
+  },
+  &quot;limitation&quot;: &quot;Unhinted comparison is diagnostic, not the current production query. Synthetic writer lock is not a reproduction of the reported large-database read stalls.&quot;
+}</pre>
+<h3 id="reproduction-source">Reproduction source, complete</h3><pre>import assert from &quot;node:assert/strict&quot;;
+import { mkdtempSync, rmSync, writeFileSync } from &quot;node:fs&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { performance } from &quot;node:perf_hooks&quot;;
+import { and, eq, isNull, sql } from &quot;drizzle-orm&quot;;
+import { createConnection, SQLITE_BUSY_TIMEOUT_MS } from &quot;./src/connection.js&quot;;
+import { createMigratedConnection } from &quot;./src/testing.js&quot;;
+import { upsertHost } from &quot;./src/data/hosts.js&quot;;
+import { createProject } from &quot;./src/data/projects.js&quot;;
+import { createThread } from &quot;./src/data/threads.js&quot;;
+import { isStoredTurnContextCompactionOnly } from &quot;./src/data/events.js&quot;;
+import { events, hosts } from &quot;./src/schema.js&quot;;
+import { noopNotifier } from &quot;./src/notifier.js&quot;;
+
+const directory = mkdtempSync(join(tmpdir(), &quot;bb-7753-&quot;));
+const databasePath = join(directory, &quot;synthetic.sqlite&quot;);
+const template = createMigratedConnection();
+writeFileSync(databasePath, template.$client.serialize());
+template.$client.close();
+const observed: Array&lt;{ sql: string; durationMs: number; cpuDurationMs: number }&gt; = [];
+const db = createConnection(databasePath, {
+  slowQueryThresholdMs: 0,
+  slowQueryLogger: {
+    info(fields) {
+      observed.push({
+        sql: fields.sql,
+        durationMs: fields.durationMs,
+        cpuDurationMs: fields.cpuDurationMs,
+      });
+    },
+  },
+});
+const blocker = createConnection(databasePath);
+
+try {
+  const host = upsertHost(db, noopNotifier, { name: &quot;synthetic-host&quot; });
+  const { project } = createProject(db, noopNotifier, {
+    name: &quot;synthetic-project&quot;,
+    source: { type: &quot;local_path&quot;, hostId: host.id, path: directory },
+  });
+  const thread = createThread(db, noopNotifier, {
+    status: &quot;idle&quot;,
+    projectId: project.id,
+    providerId: &quot;codex&quot;,
+  });
+  const insert = db.$client.prepare(`
+    INSERT INTO events
+      (id, thread_id, scope_kind, turn_id, sequence, type, item_id, item_kind, data, created_at)
+    VALUES (?, ?, &#x27;turn&#x27;, ?, ?, &#x27;item/completed&#x27;, ?, &#x27;contextCompaction&#x27;, &#x27;{}&#x27;, 1)
+  `);
+  const rowCount = 40000;
+  db.$client.transaction(() =&gt; {
+    for (let index = 0; index &lt; rowCount; index += 1) {
+      insert.run(`event-${index}`, thread.id, `turn-${index}`, index + 1, `item-${index}`);
+    }
+  })();
+  const statisticsBefore = db.$client.prepare(
+    &quot;SELECT name FROM sqlite_schema WHERE name IN (&#x27;sqlite_stat1&#x27;, &#x27;sqlite_stat4&#x27;) ORDER BY name&quot;,
+  ).all();
+  assert.deepEqual(statisticsBefore, []);
+  observed.length = 0;
+  assert.equal(isStoredTurnContextCompactionOnly(db, {
+    threadId: thread.id,
+    turnId: &quot;turn-39999&quot;,
+  }), true);
+  const productionQuery = observed.find((entry) =&gt; entry.sql.startsWith(&#x27;select distinct&#x27;));
+  assert.ok(productionQuery);
+  assert.match(productionQuery.sql, /INDEXED BY events_thread_turn_type_item_sequence_idx/);
+  const comparison = db.selectDistinct({ itemKind: events.itemKind }).from(events).where(and(
+    eq(events.threadId, thread.id),
+    eq(events.turnId, &quot;turn-39999&quot;),
+    eq(events.type, &quot;item/completed&quot;),
+    isNull(events.parentToolCallId),
+  )).toSQL();
+  const pinned = db.selectDistinct({ itemKind: sql&lt;string | null&gt;`${events.itemKind}` })
+    .from(sql`${events} INDEXED BY events_thread_turn_type_item_sequence_idx`)
+    .where(and(
+      eq(events.threadId, thread.id),
+      eq(events.turnId, &quot;turn-39999&quot;),
+      eq(events.type, &quot;item/completed&quot;),
+      isNull(events.parentToolCallId),
+    )).toSQL();
+  const plan = (query: typeof comparison) =&gt; db.$client.prepare(
+    `EXPLAIN QUERY PLAN ${query.sql}`,
+  ).all(...query.params);
+  const measure = (query: typeof comparison) =&gt; {
+    const statement = db.$client.prepare(query.sql);
+    const started = performance.now();
+    for (let iteration = 0; iteration &lt; 20; iteration += 1) {
+      assert.deepEqual(statement.all(...query.params), [{ item_kind: &quot;contextCompaction&quot; }]);
+    }
+    return (performance.now() - started) / 20;
+  };
+  const before = { unhintedPlan: plan(comparison), unhintedMs: measure(comparison), pinnedPlan: plan(pinned), pinnedMs: measure(pinned) };
+  db.$client.pragma(&quot;analysis_limit = 1000&quot;);
+  db.$client.exec(&quot;ANALYZE&quot;);
+  const bounded = { unhintedPlan: plan(comparison), unhintedMs: measure(comparison) };
+  db.$client.pragma(&quot;analysis_limit = 0&quot;);
+  db.$client.exec(&quot;ANALYZE&quot;);
+  const full = { unhintedPlan: plan(comparison), unhintedMs: measure(comparison) };
+  const statisticsAfter = db.$client.prepare(
+    &quot;SELECT name FROM sqlite_schema WHERE name IN (&#x27;sqlite_stat1&#x27;, &#x27;sqlite_stat4&#x27;) ORDER BY name&quot;,
+  ).all();
+  blocker.$client.exec(&quot;BEGIN IMMEDIATE&quot;);
+  let timerFired = false;
+  const timer = new Promise&lt;void&gt;((resolve) =&gt; setTimeout(() =&gt; { timerFired = true; resolve(); }, 0));
+  const started = performance.now();
+  assert.throws(() =&gt; db.update(hosts).set({ name: &quot;blocked-update&quot; }).where(eq(hosts.id, host.id)).run(), /database is locked/);
+  const blockedMs = performance.now() - started;
+  const timerFiredBeforeReturn = timerFired;
+  blocker.$client.exec(&quot;ROLLBACK&quot;);
+  await timer;
+  assert.equal(timerFiredBeforeReturn, false);
+  assert.ok(blockedMs &gt;= SQLITE_BUSY_TIMEOUT_MS - 100);
+  const blockedQuery = observed.findLast((entry) =&gt; entry.sql.startsWith(&#x27;update &quot;hosts&quot;&#x27;));
+  console.log(JSON.stringify({
+    rowCount,
+    sqliteVersion: db.$client.prepare(&quot;SELECT sqlite_version() AS version&quot;).get(),
+    busyTimeoutMs: SQLITE_BUSY_TIMEOUT_MS,
+    statisticsBefore,
+    productionQuery,
+    before,
+    bounded,
+    full,
+    statisticsAfter,
+    blockedMs,
+    timerFiredBeforeReturn,
+    blockedQuery,
+    limitation: &quot;Unhinted comparison is diagnostic, not the current production query. Synthetic writer lock is not a reproduction of the reported large-database read stalls.&quot;,
+  }, null, 2));
+} finally {
+  if (blocker.$client.inTransaction) blocker.$client.exec(&quot;ROLLBACK&quot;);
+  blocker.$client.close();
+  db.$client.close();
+  rmSync(directory, { recursive: true, force: true });
+}
+</pre>
+
+<h2>5. Root cause and limits</h2>
+<p><a href="https://github.com/get-bb/bb/blob/ab7ad23bacb822445a1d7639d10318af86258148/packages/db/src/connection.ts#L420">createConnection</a> opens better-sqlite3 synchronously and configures <code>busy_timeout = 5000</code>. <a href="https://github.com/get-bb/bb/blob/ab7ad23bacb822445a1d7639d10318af86258148/packages/db/src/connection.ts#L199">runTimedStatementOperation</a> invokes <code>args.work()</code> directly and records elapsed time after it returns. A native lock wait therefore prevents JavaScript timers from running even when CPU usage is low. In the two induced updates, the logger measured 5021.9/5033.5 ms wall time and 10/10 ms thread CPU time.</p>
+<p><a href="https://github.com/get-bb/bb/blob/ab7ad23bacb822445a1d7639d10318af86258148/packages/db/src/schema.ts#L904">The competing indexes</a> offer either thread/type/item-kind access or thread/turn/type access. With no statistics, the unhinted DISTINCT shape favors the former on this distribution, filtering the turn after selecting thread-wide candidates. Analysis supplies information that changes the choice. This confirms a planner hazard, not a current-main failure of the closest production lookup.</p>
+<p><a href="https://github.com/get-bb/bb/blob/ab7ad23bacb822445a1d7639d10318af86258148/packages/db/src/data/events.ts#L4561">isStoredTurnContextCompactionOnly</a> already includes this protective clause:</p>
+<pre>.from(sql`${events} INDEXED BY events_thread_turn_type_item_sequence_idx`)</pre>
+<p>Git blame attributes that hint to <code>11175a0d52bb533f81ef29b54a4c245f968b33cd</code> (2026-11-09), not a new change made for this report. <a href="https://github.com/get-bb/bb/blob/ab7ad23bacb822445a1d7639d10318af86258148/packages/db/src/data/queued-thread-messages.ts#L1210">The retry helper</a> already uses <code>inArray</code> with a request-set subquery rather than the reported correlated EXISTS; history attributes that change to <code>f024a372f0e1e0670f6fd7452ebcd1341f639c95</code> (2026-11-13).</p>
+<p><a href="https://github.com/get-bb/bb/blob/ab7ad23bacb822445a1d7639d10318af86258148/apps/server/src/services/threads/timeline.ts#L2179">The outline build</a> still runs inside <code>runEventLoopWorkSync</code>. How much the reporter's incident comes from this path, disk contention, other queries or plugins remains unknown. The induced writer-lock experiment does not establish that production readers wait on writer locks; WAL behavior and actual statement/transaction context matter. No claim is made that analysis would reduce the reported stalls.</p>
+
+<h2>6. Proposed fix / next experiment</h2>
+<p>No new production patch is justified by this evidence. Keep the current targeted index protection. Next, run current main against an operator-controlled sanitized database copy, capture exact SQL with real bindings and per-statement diagnostics during an actual long stall, and compare both result correctness and query plans before/after bounded and full analysis. Measure cold I/O and timer/heartbeat impact separately from warm query timings.</p>
+<p>A planner-statistics lifecycle changes stored database state and needs a deliberate bounded-maintenance policy; moving database work off the event loop is an architectural change. Neither qualifies under this run's simple-fix constraints. The remaining original symptom has no focused failing current-main regression here. No branch, source commit, push or fix PR was created.</p>
+
+<h2>7. Verification</h2>
+<p>The same agent repeated the complete harness in a second new clean trusted worktree, <code>verify</code>, pinned to the identical base. Dependencies were installed from the frozen lockfile and the SDK was built there. The only added executable input was the exact locally authored reproduction artifact. Every invocation allocated a fresh temporary database and directory; no server or ports were needed.</p>
+<pre>git worktree add --detach ../verify ab7ad23bacb822445a1d7639d10318af86258148
+cd ../verify
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build build:types --filter=@get-bb/plugin-sdk
+pnpm exec tsx packages/db/slopcop7753.mts
+pnpm exec turbo run build</pre>
+<p>Both harness runs exited 0 with absent initial statistics, the same competing plans, a working production index hint, and a timer blocked for approximately five seconds. This is a repeat by the same agent, not independent verification. The report explicitly records that bounded analysis succeeds here, unlike the reported distribution; it does not generalize that result.</p>
+<p>Relevant unchanged current-main suites also passed: <code>pnpm exec turbo run test --filter=@bb/db -- test/query-plans.test.ts test/connection.test.ts</code> — <strong>2 files / 72 tests passed</strong>. Broad builds passed in both checkouts (74 tasks each), after the first clean build was repaired by building the SDK. No unrelated source fix was made. The build generated unrelated web route output; this is not evidence about the database issue.</p>
+<h3>Second run, verbatim</h3><pre>{
+  &quot;rowCount&quot;: 40000,
+  &quot;sqliteVersion&quot;: {
+    &quot;version&quot;: &quot;3.53.2&quot;
+  },
+  &quot;busyTimeoutMs&quot;: 5000,
+  &quot;statisticsBefore&quot;: [],
+  &quot;productionQuery&quot;: {
+    &quot;sql&quot;: &quot;select distinct \&quot;item_kind\&quot; from \&quot;events\&quot; INDEXED BY events_thread_turn_type_item_sequence_idx where (\&quot;events\&quot;.\&quot;thread_id\&quot; = ? and \&quot;events\&quot;.\&quot;turn_id\&quot; = ? and \&quot;events\&quot;.\&quot;type\&quot; = ? and \&quot;events\&quot;.\&quot;parent_tool_call_id\&quot; is null)&quot;,
+    &quot;durationMs&quot;: 0.1,
+    &quot;cpuDurationMs&quot;: 0
+  },
+  &quot;before&quot;: {
+    &quot;unhintedPlan&quot;: [
+      {
+        &quot;id&quot;: 4,
+        &quot;parent&quot;: 0,
+        &quot;notused&quot;: 61,
+        &quot;detail&quot;: &quot;SEARCH events USING INDEX events_thread_type_item_kind_sequence_idx (thread_id=? AND type=?)&quot;
+      }
+    ],
+    &quot;unhintedMs&quot;: 2.1060471500000064,
+    &quot;pinnedPlan&quot;: [
+      {
+        &quot;id&quot;: 4,
+        &quot;parent&quot;: 0,
+        &quot;notused&quot;: 60,
+        &quot;detail&quot;: &quot;SEARCH events USING INDEX events_thread_turn_type_item_sequence_idx (thread_id=? AND turn_id=? AND type=?)&quot;
+      },
+      {
+        &quot;id&quot;: 23,
+        &quot;parent&quot;: 0,
+        &quot;notused&quot;: 0,
+        &quot;detail&quot;: &quot;USE TEMP B-TREE FOR DISTINCT&quot;
+      }
+    ],
+    &quot;pinnedMs&quot;: 0.13784544999999754
+  },
+  &quot;bounded&quot;: {
+    &quot;unhintedPlan&quot;: [
+      {
+        &quot;id&quot;: 4,
+        &quot;parent&quot;: 0,
+        &quot;notused&quot;: 43,
+        &quot;detail&quot;: &quot;SEARCH events USING INDEX events_thread_turn_type_item_sequence_idx (thread_id=? AND turn_id=? AND type=?)&quot;
+      },
+      {
+        &quot;id&quot;: 23,
+        &quot;parent&quot;: 0,
+        &quot;notused&quot;: 0,
+        &quot;detail&quot;: &quot;USE TEMP B-TREE FOR DISTINCT&quot;
+      }
+    ],
+    &quot;unhintedMs&quot;: 0.021535550000010062
+  },
+  &quot;full&quot;: {
+    &quot;unhintedPlan&quot;: [
+      {
+        &quot;id&quot;: 4,
+        &quot;parent&quot;: 0,
+        &quot;notused&quot;: 43,
+        &quot;detail&quot;: &quot;SEARCH events USING INDEX events_thread_turn_type_item_sequence_idx (thread_id=? AND turn_id=? AND type=?)&quot;
+      },
+      {
+        &quot;id&quot;: 23,
+        &quot;parent&quot;: 0,
+        &quot;notused&quot;: 0,
+        &quot;detail&quot;: &quot;USE TEMP B-TREE FOR DISTINCT&quot;
+      }
+    ],
+    &quot;unhintedMs&quot;: 0.020353750000003855
+  },
+  &quot;statisticsAfter&quot;: [
+    {
+      &quot;name&quot;: &quot;sqlite_stat1&quot;
+    },
+    {
+      &quot;name&quot;: &quot;sqlite_stat4&quot;
+    }
+  ],
+  &quot;blockedMs&quot;: 5034.551554,
+  &quot;timerFiredBeforeReturn&quot;: false,
+  &quot;blockedQuery&quot;: {
+    &quot;sql&quot;: &quot;update \&quot;hosts\&quot; set \&quot;name\&quot; = ? where \&quot;hosts\&quot;.\&quot;id\&quot; = ?&quot;,
+    &quot;durationMs&quot;: 5033.5,
+    &quot;cpuDurationMs&quot;: 10
+  },
+  &quot;limitation&quot;: &quot;Unhinted comparison is diagnostic, not the current production query. Synthetic writer lock is not a reproduction of the reported large-database read stalls.&quot;
+}</pre>
+
+<h2>8. Related issues and pull requests</h2>
+<p>Prior heartbeat and outline reports concern potentially related symptoms; this report does not establish causal links. The prior retry lookup change is already in the trusted main source. Current issue timeline metadata contained no linked PR, and an open-PR search for this issue returned none. No linked pull-request code was checked out or run.</p>
+
+<h2>9. Appendix</h2>
+<h3>Environment and command ledger</h3><pre>Repository: get-bb/bb (public)
+Trusted base: ab7ad23bacb822445a1d7639d10318af86258148
+Date: 2026-11-18 UTC
+First checkout: source (fresh clone, detached origin/main)
+Second checkout: verify (new detached worktree at the same base)
+No production instance, external plugin, credential, provider session or private database used.
+
+git clone https://github.com/get-bb/bb.git source
+git -C source fetch origin main
+git -C source checkout --detach ab7ad23bacb822445a1d7639d10318af86258148
+cd source
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+Initial broad build: failed because plugin SDK runtime entries were not built.
+pnpm exec turbo run build build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build
+Retry: 74 tasks successful.
+pnpm exec tsx packages/db/slopcop7753.mts
+pnpm exec turbo run test --filter=@bb/db -- test/query-plans.test.ts test/connection.test.ts
+Result: 2 files, 72 tests passed.
+
+git worktree add --detach ../verify ab7ad23bacb822445a1d7639d10318af86258148
+cd ../verify
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build build:types --filter=@get-bb/plugin-sdk
+Copy the exact report artifact into packages/db/slopcop7753.mts.
+pnpm exec tsx packages/db/slopcop7753.mts
+pnpm exec turbo run build
+Result: 74 tasks successful.
+
+Each script invocation creates and deletes a distinct temporary directory and database.
+No listening ports or application processes were started.
+The direct tsx invocation is a deliberate investigation harness, not a package build/test bypass.
+Read-only searches: connection setup, migrations and server source for ANALYZE, PRAGMA optimize and sqlite_stat;
+events schema/indexes; current DISTINCT turn-item query; retry-chain query; synchronous conversation-outline path.
+Git history/blame: events.ts (index hint from 11175a0d52bb533f81ef29b54a4c245f968b33cd),
+queued-thread-messages.ts (retry fix f024a372f0e1e0670f6fd7452ebcd1341f639c95).
+GitHub reads: issue properties and all comments (zero), labels, similar issue classifications,
+issue timeline cross references (none) and open PR search for 7753 (none).
+Re-fetched origin/main before publication: no newer relevant commits.
+</pre>
+<h3>Relevant test output</h3><pre>
+   • turbo 2.11.10
+   • Packages in scope: @bb/db
+   • Running test in 1 package
+   • Remote caching disabled
+
+//:ensure-native-modules: cache bypass, force executing 810d85d02f418a34
+@bb/process-utils:generate:profile-worker: cache miss, executing f989275695ee94b2
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules &lt;trusted-checkout&gt;
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker &lt;trusted-checkout&gt;/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+//:ensure-native-modules: [ensure-native-modules] Detached hardlinked better-sqlite3 binary before verification
+@bb/db:test: cache miss, executing 897e6370fb915ca6
+@bb/db:test: 
+@bb/db:test: &gt; @bb/db@0.0.1 test &lt;trusted-checkout&gt;/packages/db
+@bb/db:test: &gt; vitest run --config vitest.config.ts &quot;test/query-plans.test.ts&quot; &quot;test/connection.test.ts&quot;
+@bb/db:test: 
+@bb/db:test: (!) Your Vite config uses features that are unsupported by `configLoader: &#x27;native&#x27;`, which is planned to become the default in a future major version of Vite:
+@bb/db:test:   - `__dirname` (vitest.config.ts:13:15). Use `import.meta.dirname` instead
+@bb/db:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/db:test: (!) Your Vite config uses features that are unsupported by `configLoader: &#x27;native&#x27;`, which is planned to become the default in a future major version of Vite:
+@bb/db:test:   - `__dirname` (vitest.config.ts:13:15). Use `import.meta.dirname` instead
+@bb/db:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/db:test: (!) Your Vite config uses features that are unsupported by `configLoader: &#x27;native&#x27;`, which is planned to become the default in a future major version of Vite:
+@bb/db:test:   - `__dirname` (vitest.config.ts:13:15). Use `import.meta.dirname` instead
+@bb/db:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/db:test: 
+@bb/db:test:  RUN  v4.1.12 &lt;trusted-checkout&gt;/packages/db
+@bb/db:test: 
+@bb/db:test:  ✓ |@bb/db| test/query-plans.test.ts (59 tests) 398ms
+@bb/db:test:  ✓ |@bb/db| test/connection.test.ts (13 tests) 3063ms
+@bb/db:test:      ✓ distinguishes time waiting inside SQLite from CPU work  503ms
+@bb/db:test:      ✓ samples WAL asynchronously and reuses timestamped samples across slow-query bursts  1184ms
+@bb/db:test: 
+@bb/db:test:  Test Files  2 passed (2)
+@bb/db:test:       Tests  72 passed (72)
+@bb/db:test:    Start at  06:13:05
+@bb/db:test:    Duration  11.22s (transform 3.20s, setup 5.12s, import 663ms, tests 3.46s, environment 0ms)
+@bb/db:test: 
+
+ Tasks:    3 successful, 3 total
+Cached:    0 cached, 3 total
+  Time:    14.937s 
+
+ WARNING  no output files found for task @bb/db#test. Please check your `outputs` key in `turbo.json`
+</pre>
+<p>Issue text and comments were treated only as untrusted claims. No supplied scripts, patches, binaries, branches, external links or live-user data were used. Synthetic identifiers and measurements are generated locally; reproduction files contain no credentials, home paths or production IDs.</p>
+<p>Public report generated by SlopCop. &gt; AGENT GENERATED</p>
+</main></body></html>
