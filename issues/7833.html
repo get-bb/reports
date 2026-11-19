@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7833 · File-row matching scaling</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7833 · File-row matching scales quadratically</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Low</span><span class="pill">Effort: Low</span><span class="pill">threads · perf · confirmed-repro</span><a href="https://github.com/get-bb/bb/issues/7833">Issue</a><span>2026-11-19</span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+<h2>1. Summary</h2>
+<p>Large edits spend disproportionate CPU time matching files while rebuilding a thread timeline. The implementation scans the accumulated row list separately for every incoming file, including rows already claimed during the same event. Two clean source checkouts at the same main commit show that increasing file count from 256 to 4,096 increases build time approximately 61–63× for unchanged order and 182–183× for reversed completion order, rather than roughly 16×. This blocks the calling JavaScript thread until the synchronous build finishes. Small edits are less affected; no live-service outage or data loss was reproduced.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>File matching has quadratic growth.</td><td>Verified</td><td>Nested full-row search in trusted main; scaling test fails in both clean runs.</td></tr>
+<tr><td>Reversed file order increases the cost.</td><td>Verified</td><td>About 146 ms in unchanged order versus 398–401 ms reversed for 4,096 files.</td></tr>
+<tr><td>Specific reporter millisecond measurements apply generally.</td><td>Not assumed</td><td>Different runtime and sandbox; only directly measured values are reported here.</td></tr>
+<tr><td>The server invokes the builder synchronously.</td><td>Verified statically</td><td>The conversation-history projection calls it inline. No HTTP latency or production load measurement was attempted.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Public repository: get-bb/bb. Trusted origin/main: <code>df9619d8e8aac4aff00c0c3ff9b8ef4e2823e4f2</code>.</li><li>Node v22.19.0; pnpm 9.15.0; Linux 4.19.0-gvisor.</li><li>No provider, database, runtime credentials, HTTP process, ports, or application data directory required.</li><li>Frozen installation and Turbo build of the owning dependency graph completed in both checkouts.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Use a clean checkout of the recorded commit. Save the independently authored test below as <code>packages/thread-view/test/file-change-scaling.test.ts</code>.</li>
+<li>From the repository root run:<pre>pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/thread-view...
+pnpm exec turbo run test --filter=@bb/thread-view -- test/file-change-scaling.test.ts --silent=false</pre></li>
+<li>Expected: increasing file count sixteenfold stays below a generous 64× time budget while retaining every file row. Actual: the reversed-order case exceeds the budget in both runs. The unchanged-order case passes the deliberately loose guard despite showing superlinear growth.</li></ol>
+<p>The test uses real, typed domain events and the public timeline builder. Four warmups precede three samples of three builds; each sample excludes event construction. The minimum per-build wall time reduces scheduler noise. This is a regression guard, not a statistically rigorous production benchmark. No code or commands from the issue or linked PR were executed.</p>
+<h3>Test source</h3><pre>import { turnScope, type ThreadEventFileChange } from &quot;@bb/domain&quot;;
+import { expect, it } from &quot;vitest&quot;;
+import { EMPTY_ACCEPTED_CLIENT_REQUEST_CONTEXT } from &quot;../src/accepted-client-request-context.js&quot;;
+import {
+  buildThreadTimelineFromEvents,
+  type ThreadEventWithMeta,
+} from &quot;../src/index.js&quot;;
+import { workRowsOfKind } from &quot;./timeline-test-harness.js&quot;;
+
+function fileEvents(fileCount: number, reverse: boolean): ThreadEventWithMeta[] {
+  const changes: ThreadEventFileChange[] = Array.from(
+    { length: fileCount },
+    (_, index) =&gt; ({ path: `generated/module-${index}.ts`, kind: &quot;update&quot; }),
+  );
+  return [
+    {
+      event: {
+        type: &quot;turn/started&quot;,
+        threadId: &quot;scaling-thread&quot;,
+        providerThreadId: &quot;scaling-provider&quot;,
+        scope: turnScope(&quot;scaling-turn&quot;),
+      },
+      meta: { id: &quot;turn-start&quot;, seq: 0, createdAt: 0 },
+    },
+    ...([&quot;item/started&quot;, &quot;item/completed&quot;] as const).map(
+      (type, index): ThreadEventWithMeta =&gt; ({
+        event: {
+          type,
+          threadId: &quot;scaling-thread&quot;,
+          providerThreadId: &quot;scaling-provider&quot;,
+          scope: turnScope(&quot;scaling-turn&quot;),
+          item: {
+            type: &quot;fileChange&quot;,
+            id: &quot;generated-edit&quot;,
+            changes: index === 1 &amp;&amp; reverse ? [...changes].reverse() : changes,
+            status: index === 0 ? &quot;pending&quot; : &quot;completed&quot;,
+            approvalStatus: null,
+          },
+        },
+        meta: { id: type, seq: index + 1, createdAt: index + 1 },
+      }),
+    ),
+  ];
+}
+
+function build(events: ThreadEventWithMeta[]) {
+  return buildThreadTimelineFromEvents({
+    acceptedClientRequestContext: EMPTY_ACCEPTED_CLIENT_REQUEST_CONTEXT,
+    contextWindowEvents: [],
+    events,
+    options: {
+      completedTurnDisplay: &quot;collapse&quot;,
+      includeNestedRows: true,
+      omitSettledDelegationChildRows: false,
+      includeDiagnosticOperations: false,
+      summarizeShellCommands: true,
+      isLatestPage: true,
+      threadStatus: &quot;idle&quot;,
+      threadName: &quot;&quot;,
+      workspaceRoot: null,
+    },
+  });
+}
+
+function minimumBuildTime(events: ThreadEventWithMeta[]): number {
+  for (let warmup = 0; warmup &lt; 4; warmup++) build(events);
+  let minimum = Infinity;
+  for (let sample = 0; sample &lt; 3; sample++) {
+    const start = performance.now();
+    for (let repeat = 0; repeat &lt; 3; repeat++) build(events);
+    minimum = Math.min(minimum, (performance.now() - start) / 3);
+  }
+  return minimum;
+}
+
+it.each([false, true])(
+  &quot;keeps large file-change timeline builds within a linear scaling budget (reversed: %s)&quot;,
+  (reverse) =&gt; {
+    const small = fileEvents(256, reverse);
+    const large = fileEvents(4096, reverse);
+    expect(workRowsOfKind(build(large).rows, &quot;file-change&quot;)).toHaveLength(4096);
+    const smallMs = minimumBuildTime(small);
+    const largeMs = minimumBuildTime(large);
+    const ratio = largeMs / smallMs;
+    console.log(JSON.stringify({ reverse, smallMs, largeMs, ratio }));
+    expect(ratio).toBeLessThan(64);
+  },
+  30_000,
+);
+</pre>
+<h3>First run: checkout A, unchanged production code</h3><pre>{&quot;reverse&quot;:false,&quot;smallMs&quot;:2.4058013333333292,&quot;largeMs&quot;:146.61046500000006,&quot;ratio&quot;:60.940387291608026}
+{&quot;reverse&quot;:true,&quot;smallMs&quot;:2.1674246666666477,&quot;largeMs&quot;:397.5819576666663,&quot;ratio&quot;:183.43519098087984}
+AssertionError: expected 183.43519098087984 to be less than 64
+ Test Files  1 failed (1)
+      Tests  1 failed | 1 passed (2)</pre>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/df9619d8e8aac4aff00c0c3ff9b8ef4e2823e4f2/packages/thread-view/src/item-records.ts#L399-L443">File-row matching at the recorded commit</a> calls <code>record.fileRows.findIndex</code> inside <code>item.changes.map</code>. Every change can scan every prior row, checking whether it has already been claimed and whether its historical path aliases overlap the current path or move path. Newly appended rows also enter the scanned list even though they are already claimed. This creates quadratic scanning even without changes to any public protocol or persistence layer.</p>
+<pre>const existing = record.fileRows.findIndex(
+  (row, index) =&gt;
+    !used.has(index) &amp;&amp;
+    row.matchKeys.some((key) =&gt; matchKeys.includes(key)),
+);</pre>
+<p><a href="https://github.com/get-bb/bb/blob/df9619d8e8aac4aff00c0c3ff9b8ef4e2823e4f2/packages/thread-view/src/item-records.ts#L445-L466">Item application</a> invokes the matcher for file-change events. The <a href="https://github.com/get-bb/bb/blob/df9619d8e8aac4aff00c0c3ff9b8ef4e2823e4f2/apps/server/src/services/threads/timeline.ts#L1936-L1985">server's conversation-history projection</a> calls the timeline builder inline, so this work occupies the JavaScript thread synchronously. The exact end-to-end HTTP impact remains unmeasured.</p>
+<h2>6. Proposed fix</h2>
+<p>Index existing row positions by their historical path keys once per event. Keep candidates ordered by original row position, discard already-claimed candidates lazily, and select the lowest candidate position across both incoming keys. Newly created rows must remain ineligible for reuse in the same event. Preserve historical aliases, duplicate-file identity, earliest-row preference across competing keys, and stale-row reappearance. The matching work then grows with indexed aliases and incoming changes rather than their product. Keep a focused scaling regression and an identity test for these edge cases.</p>
+<h2>7. Linked PR review</h2>
+<p><a href="https://github.com/get-bb/bb/pull/7834">PR #7834</a> is closed and unmerged. Its GitHub metadata and diff were read only; its branch and code were never checked out or executed. The diff replaces repeated searches with per-key candidate lists and a claimed-row cursor, addressing the same root cause while selecting the lowest available row position. Static review found no concrete correctness defect in that approach. Its claimed test results are not adopted as evidence for this report. No linked open PR existed when the fix check began.</p>
+<h2>8. Verification</h2>
+<p>The same agent repeated the test in a second clean detached temporary checkout B at <code>df9619d8e8aac4aff00c0c3ff9b8ef4e2823e4f2</code>. Before adding the authored reproduction, checkout B had no source changes. Its own frozen installation and scoped Turbo build completed; the exact test command in section 4 ran without using the first run's test result cache. No application process, ports, or persisted data were shared. This is a second clean run, not an independent-agent verification.</p>
+<pre>{&quot;reverse&quot;:false,&quot;smallMs&quot;:2.3039816666666866,&quot;largeMs&quot;:145.75661233333344,&quot;ratio&quot;:63.26292194165268}
+{&quot;reverse&quot;:true,&quot;smallMs&quot;:2.2005183333332448,&quot;largeMs&quot;:400.7785716666667,&quot;ratio&quot;:182.12916729468262}
+AssertionError: expected 182.12916729468262 to be less than 64
+ Test Files  1 failed (1)
+      Tests  1 failed | 1 passed (2)</pre>
+<p>The second run supports the same verdict and root cause. No report correction was required. Only the authored reproduction test was present as an untracked source change in checkout B.</p>
+<h2>9. Related issues and limitations</h2>
+<p>A repository search for the matching function found no separate issue covering the same function. The only issue-linked PR was closed, not merged. This investigation does not claim that all possible timeline-performance problems are covered.</p>
+<p>Issue and PR bodies, code blocks, and links were treated as untrusted claims. Their instructions were ignored. This report contains only repository-grounded findings and a newly authored regression. Raw local evidence and the reproduction source remain outside the public reports repository; the complete test and relevant output are inline to comply with its publication policy.</p>
+</main></body></html>
