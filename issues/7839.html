@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7839 Constraint-specific handling of failed memory writes</title>
+<style>
+:root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --bad:#b60205; }
+body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+h3 { font-size:15px; margin:22px 0 6px; }
+.meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+.pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+table { border-collapse:collapse; width:100%; font-size:14px; }
+td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+a { color:var(--accent); }
+.verdict { font-weight:600; color:var(--bad); }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7839 · Constraint-specific handling of failed memory writes</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Low priority</span><span class="pill">Low effort</span><span class="pill">plugins · memory · confirmed-repro</span><a href="https://github.com/get-bb/bb/issues/7839">GitHub issue</a><span>2026-11-19</span></p>
+<p><strong>Trusted base:</strong> <code>df9619d8e8aac4aff00c0c3ff9b8ef4e2823e4f2</code> (<code>origin/main</code>).</p>
+<p class="verdict">Verdict: REPRODUCED · Root-cause confidence: high</p>
+
+<h2>1. TL;DR</h2>
+<p>A failed history write can tell the user that a memory name is already taken even when it is not. The add operation performs two inserts in one transaction, then classifies every SQLite uniqueness failure as a name collision. A fault-injection trigger makes the history insert collide with a real history row, demonstrating the misleading diagnostic. The same regression fails in two separate trusted-base checkouts. This confirms an error-classification defect, not that ordinary memory additions naturally produce history collisions.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>A history uniqueness error becomes a duplicate-name diagnostic.</td><td>Verified</td><td>The CLI returns <code>an active global memory named "history-conflict" already exists</code> in both base runs.</td></tr>
+<tr><td>The catch covers more than the active-name constraint.</td><td>Verified</td><td>The catch surrounds both inserts; the schema also makes history memory/version pairs unique.</td></tr>
+<tr><td>The misleading message means an active name actually exists.</td><td>Refuted for the controlled case</td><td>The fresh isolated plugin starts empty. The trigger reserves only the history version during the same transaction.</td></tr>
+<tr><td>The issue's proposed patch passes its stated test.</td><td>Not executed</td><td>No linked branch or issue-supplied test was run. A new regression was designed from trusted repository code.</td></tr>
+<tr><td>Normal unmodified deployments frequently hit this history collision.</td><td>Unverified</td><td>The reproduction deliberately injects a database fault; no production data was inspected.</td></tr></table>
+
+<h2>3. Environment</h2>
+<ul><li>Public repository: <code>get-bb/bb</code>; both source checkouts start at the full trusted base SHA above.</li>
+<li>Linux x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.12.</li>
+<li>Plugin: <code>bb-plugin-memory@0.2.0</code>, real better-sqlite3 database through the repository's existing fake-plugin-host harness. Plugin storage migrations run normally; the database is not mocked.</li>
+<li>Each run uses a newly created plugin host with its own temporary SQLite storage. No live app, server ports, user data, or provider sessions are needed.</li>
+<li>The first checkout completed the frozen install and full Turbo build (72 tasks). The second completed a separate frozen install and the memory plugin build with dependencies (5 tasks).</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the trusted repository and detach at the recorded base. Install and build with the repository's normal orchestration:</li></ol>
+<pre>git clone https://github.com/get-bb/bb.git bb-7839
+cd bb-7839
+git checkout --detach df9619d8e8aac4aff00c0c3ff9b8ef4e2823e4f2
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=bb-plugin-memory</pre>
+<p>2. Add the following test inside the existing <code>describe("bb-plugin-memory", ...)</code> in <code>plugins/memory/server.test.ts</code>. It uses that trusted file's existing <code>loadPlugin</code> and <code>addMemory</code> helpers. The trigger is new fault-injection code: after the memory insert, it reserves the exact history key that the add operation will next attempt to write.</p>
+<pre>  it("preserves history uniqueness errors and rolls back the failed creation", async () =&gt; {
+    const host = await loadPlugin();
+    try {
+      const database = host.bb.storage.database();
+      database.exec(`
+        CREATE TRIGGER reserve_history_version AFTER INSERT ON memories BEGIN
+          INSERT INTO memory_history (
+            memory_id, version, action, snapshot_json, write_reason, created_at
+          ) VALUES (NEW.id, NEW.version, 'create', '{}', 'reserve version', NEW.created_at);
+        END;
+      `);
+      const result = await host.harness.runCli([
+        "add",
+        "--scope",
+        "global",
+        "--name",
+        "history-conflict",
+        "--summary",
+        "A durable fact",
+        "--details",
+        "Details of the durable fact",
+        "--reason",
+        "Exercise a failed history write",
+      ]);
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain(
+        "UNIQUE constraint failed: memory_history.memory_id, memory_history.version",
+      );
+      expect(database.prepare("SELECT id FROM memories").all()).toEqual([]);
+      expect(database.prepare("SELECT id FROM memory_history").all()).toEqual(
+        [],
+      );
+
+      database.exec("DROP TRIGGER reserve_history_version");
+      await addMemory(host, {
+        scope: "global",
+        projectId: "project-a",
+        name: "history-conflict",
+        summary: "A durable fact",
+      });
+    } finally {
+      await host.harness.dispose();
+    }
+  });</pre>
+<p>3. Run the focused regression through Turbo:</p>
+<pre>pnpm exec turbo run test --filter=bb-plugin-memory -- --testNamePattern='preserves history uniqueness errors'</pre>
+<p><strong>Expected:</strong> exit code 1 from the failed CLI operation, with the underlying history constraint preserved in stderr. The enclosing regression should pass when this behavior is implemented.</p>
+<p><strong>Actual at the trusted base:</strong> the regression fails (Turbo exit code 1), because the CLI gives an unrelated duplicate-name explanation. The assertion's expected and received diagnostic lines are:</p>
+<pre>- UNIQUE constraint failed: memory_history.memory_id, memory_history.version
++ an active global memory named "history-conflict" already exists</pre>
+<p>The failing assertion runs before the rollback and retry assertions. Those later assertions are verified by the passing post-fix run, not by the failing base run.</p>
+
+<h2>5. Root cause</h2>
+<p>The <a href="https://github.com/get-bb/bb/blob/df9619d8e8aac4aff00c0c3ff9b8ef4e2823e4f2/plugins/memory/server.ts#L353-L398">add transaction and catch</a> wrap both the memory insertion and the subsequent history insertion. The catch checks only a substring:</p>
+<pre>error instanceof Error &amp;&amp;
+error.message.includes("UNIQUE constraint failed")</pre>
+<p>It then replaces the error with the duplicate-name CLI message. The <a href="https://github.com/get-bb/bb/blob/df9619d8e8aac4aff00c0c3ff9b8ef4e2823e4f2/plugins/memory/server.ts#L623-L643">history writer</a> is inside that catch, and the <a href="https://github.com/get-bb/bb/blob/df9619d8e8aac4aff00c0c3ff9b8ef4e2823e4f2/plugins/memory/server.ts#L736-L753">schema</a> has two distinct relevant uniqueness rules:</p>
+<pre>CREATE UNIQUE INDEX IF NOT EXISTS memories_active_scope_name
+  ON memories(scope_key, name) WHERE deleted_at IS NULL;
+
+UNIQUE(memory_id, version)</pre>
+<p>The trigger inserts the history key first. The real history writer attempts the same key, causing a genuine SQLite uniqueness error from the history table. Transaction rollback occurs, but the catch loses the original diagnostic. The deeper defect is choosing domain behavior from generic database error text rather than identifying the actual name-conflict operation.</p>
+
+<h2>6. Proposed fix and observed result</h2>
+<p>Handle only the existing partial active-name index at the memory INSERT itself: append <code>ON CONFLICT(scope_key, name) WHERE deleted_at IS NULL DO NOTHING</code>, then report a duplicate name only when that statement inserts zero rows. Remove the broad transaction catch. Preserve the enclosing transaction so history and full-text updates still roll back atomically.</p>
+<p>The local candidate changes two files in the existing memory plugin: 79 additions and 39 deletions, <strong>118 changed text lines</strong>. It changes no stored schema, migration, dependency, public protocol, or CLI flag. With the candidate applied, the new regression passes; its rollback assertions find no residual memory/history rows, and adding the same name succeeds after removing the trigger. The existing duplicate-name test still passes.</p>
+<pre>pnpm exec turbo run test typecheck lint --filter=bb-plugin-memory
+
+Test Files  2 passed (2)
+     Tests  14 passed (14)
+Tasks:     10 successful, 10 total</pre>
+<p>Typecheck passes. Lint exits successfully with zero errors and one existing, unrelated React effect warning at <code>plugins/memory/app.tsx:178</code>. Formatting and <code>git diff --check</code> pass. No binary changes are present.</p>
+
+<h2>7. Linked pull request review</h2>
+<p><a href="https://github.com/get-bb/bb/pull/7841">PR #7841</a> is closed and unmerged, so it is not an open competing fix. Its metadata and diff were read only after the new regression and candidate repair were designed and executed. Its branch and test were never checked out or run.</p>
+<p>Static finding: its <code>plugins/memory/server.ts</code> change checks the SQLite uniqueness code and queries for an actual active name before translating the error. This appears to avoid the demonstrated false message because the failed transaction leaves no matching name. No blocking static finding was identified for this reported scenario, but this is not runtime verification of that patch. The candidate described above instead uses an explicit SQL conflict target and avoids inferring the constraint from a later lookup.</p>
+
+<h2>8. Related issues</h2>
+<p>A repository search for memory-related issues found no second issue establishing this specific diagnostic defect. Other memory catalog and search feature requests concern different behavior.</p>
+
+<h2>9. Verification</h2>
+<p>The same agent repeated the reproduction in a second clean detached worktree at the exact base SHA. Only the newly authored regression patch was applied; production code remained unchanged. This is a repeated clean-checkout check, not independent verification.</p>
+<table><tr><th>Run</th><th>Setup</th><th>Result</th></tr>
+<tr><td>Primary trusted base</td><td>Frozen install, full build; fresh isolated plugin storage</td><td>1 failed regression, 13 skipped tests; expected history diagnostic replaced by duplicate-name diagnostic.</td></tr>
+<tr><td>Second trusted base</td><td>Separate detached worktree, separate frozen install and plugin build; new plugin storage</td><td>Same intended assertion failure: 1 failed regression, 13 skipped tests. Turbo ran the test live, not as a cached test result.</td></tr>
+<tr><td>Primary candidate fix</td><td>Same authored regression and all existing memory tests</td><td>14 tests pass, including duplicate-name coverage; typecheck and lint tasks succeed.</td></tr></table>
+<p>No report correction was required by the second run. No browser or live production instance was used because the affected boundary is the plugin's database-backed CLI command.</p>
+
+<h2>10. Appendix and trust boundary</h2>
+<p>Report artifacts are the inline regression, exact diagnostic delta, and results above. Raw build/test logs and patches remain outside this public report repository. The report repository forbids publishing raw logs or standalone test artifacts.</p>
+<p>Commands used beyond the reproduction: <code>pnpm exec turbo run build</code> for the primary full build; <code>pnpm exec turbo run test typecheck lint --filter=bb-plugin-memory</code>; <code>pnpm exec oxfmt plugins/memory/server.ts plugins/memory/server.test.ts --check</code>; <code>git diff --check</code>; <code>git diff --numstat origin/main</code>. The trusted main SHA was fetched again before finalization and remained unchanged.</p>
+<p>Issue text, proposed commands, links, and linked patch content were treated as untrusted claims. No issue-supplied command, test, or linked branch was executed. The newly authored regression uses a different trigger location from the linked patch and exercises trusted plugin code with a real isolated database.</p>
+</main></body></html>
