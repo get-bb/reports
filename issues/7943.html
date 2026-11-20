@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7943 Sequential daemon-message validation</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --ok:#0e8a16; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:980px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); } .ok { color:var(--ok); font-weight:600; }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7943 · Sequential daemon-message validation</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Low</span><span class="pill">Effort: Low</span><span class="pill">host · perf · confirmed-repro</span><a href="https://github.com/get-bb/bb/issues/7943">GitHub issue</a><span>2026-11-20</span></p>
+<p>Trusted base: <code>89f1e507d62d0fcd94bd319c61ba2e9cd18f607c</code>, fetched from <code>get-bb/bb origin/main</code> and checked again after reproduction.</p>
+<p><strong>Verdict:</strong> <span class="ok">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high.</p>
+
+<h2>1. TL;DR</h2>
+<p>Routine daemon messages spend avoidable CPU time rejecting unrelated message formats before validating their own format. The exported daemon-to-server validator is an ordered union with 18 members; a terminal-output message reaches member 14, while a failed RPC also crosses a nested success/failure union. On this machine a 32-byte terminal payload took 9.57–9.71 µs per parse with the current validator versus 0.83–0.90 µs with an experimental discriminator-based validator. The normal daemon send and server receive paths both call the current validator. This is a schema-level performance reproduction, not a measurement of user-visible lag, fleet CPU consumption, or end-to-end WebSocket throughput.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>The outgoing message validator has 18 ordered alternatives.</td><td>Verified</td><td>The source and runtime <code>options.length</code> both give 18.</td></tr>
+<tr><td>Late alternatives do unnecessary validation work.</td><td>Verified</td><td>A proxy records 14 reads of the terminal message's <code>type</code> with the production union and 2 with the discriminator comparator; failed RPCs record 19 versus 2.</td></tr>
+<tr><td>The daemon and server both validate these messages.</td><td>Verified by source inspection</td><td><code>sendMessage</code> calls <code>parse</code>; <code>onDaemonSocketMessage</code> passes the schema to <code>parseSocketValue</code>, which calls <code>safeParse</code>. No live production instance was accessed.</td></tr>
+<tr><td>Small terminal messages and failed RPCs have a large relative parsing penalty.</td><td>Verified</td><td>Both clean runs show roughly 10× for the small terminal case and more than 20× for the failed-RPC case.</td></tr>
+<tr><td>The issue's exact benchmark numbers apply universally.</td><td>Not asserted</td><td>This environment uses Node 22 rather than Node 24. Timings are local best-of-five means, not portable thresholds.</td></tr>
+<tr><td>Large payloads remain expensive after dispatch is optimized.</td><td>Verified; attribution partly inferred</td><td>64 KiB takes about 222 µs even with discriminator dispatch. The shared base64 validator includes length, regular-expression, and decoded-length checks; this report does not profile their individual costs.</td></tr>
+<tr><td>The candidate optimization still rejects unknown message types.</td><td>Verified, with a diagnostic caveat</td><td>Both reject unknown types, but the top issue path changes from <code>[]</code> to <code>["type"]</code>. The malformed known-type fixture retains its code/path diagnostics. Full diagnostic equivalence must not be assumed.</td></tr>
+</table>
+
+<h2>3. Environment</h2>
+<ul><li>Public repository: <code>get-bb/bb</code>; trusted commit <code>89f1e507d62d0fcd94bd319c61ba2e9cd18f607c</code>.</li><li>Linux 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; Zod 4.6.7.</li><li>Two separately cloned, initially clean source trees at the same fetched commit, each with its own frozen dependency install and scoped Turbo build. Same agent and machine; the second run is a repeat verification, not an independent review.</li><li>No app, daemon, provider, browser, listening port, or runtime database was started. No account or runtime data was read.</li><li>The agent authored the reproduction from the trusted schema definitions; no issue-provided script, patch, or linked branch was executed.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol>
+<li>Use an existing Node/pnpm installation and obtain the trusted base:
+<pre>git clone https://github.com/get-bb/bb.git source
+cd source
+git checkout --detach 89f1e507d62d0fcd94bd319c61ba2e9cd18f607c
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/host-daemon-contract...</pre></li>
+<li>Save the complete agent-authored script below as <code>packages/host-daemon-contract/repro-7943.ts</code>.</li>
+<li>Run the schema-level experiment:
+<pre>pnpm exec tsx packages/host-daemon-contract/repro-7943.ts</pre></li>
+</ol>
+<p><strong>Expected:</strong> validation dispatch should avoid visiting unrelated formats. Valid outputs must remain equivalent, and malformed payloads must remain rejected. <strong>Actual:</strong> the production schema repeatedly reads the discriminator while traversing alternatives and spends substantially more time on late members. The script's assertions check sample correctness; timing and branch-read output demonstrate the performance defect without a machine-dependent failing timing threshold.</p>
+<p>The comparator exists only in this script. It reuses the trusted member schemas, replaces the nested RPC union with <code>ok</code> dispatch, and then dispatches the outer union by <code>type</code>. It is not installed into production, and these five fixtures do not prove equivalence for every possible input.</p>
+<h3>Complete reproduction script</h3>
+<pre>
+import assert from "node:assert/strict";
+import { performance } from "node:perf_hooks";
+import { z } from "zod";
+import {
+  hostDaemonDaemonWsMessageSchema,
+  hostDaemonOnlineRpcResponseMessageSchema,
+  type HostDaemonDaemonWsMessage,
+} from "./src/session.js";
+
+const original = hostDaemonDaemonWsMessageSchema;
+const dispatched = z.discriminatedUnion("type", [
+  ...original.options.slice(0, -1),
+  z.discriminatedUnion("ok", hostDaemonOnlineRpcResponseMessageSchema.options),
+]);
+
+function countTypeReads(schema: z.ZodType, message: HostDaemonDaemonWsMessage) {
+  let reads = 0;
+  const observed = new Proxy(message, {
+    get(target, property, receiver) {
+      if (property === "type") reads += 1;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  schema.parse(observed);
+  return reads;
+}
+
+function measure(schema: z.ZodType, message: HostDaemonDaemonWsMessage, iterations: number) {
+  for (let warmup = 0; warmup &lt; 1500; warmup += 1) schema.parse(message);
+  const samples: number[] = [];
+  for (let repeat = 0; repeat &lt; 5; repeat += 1) {
+    const started = performance.now();
+    for (let iteration = 0; iteration &lt; iterations; iteration += 1) schema.parse(message);
+    samples.push(((performance.now() - started) * 1000) / iterations);
+  }
+  return Number(Math.min(...samples).toFixed(3));
+}
+
+const terminalMessage = (bytes: number): HostDaemonDaemonWsMessage =&gt; ({
+  type: "terminal.output",
+  terminalId: "fixture-terminal",
+  chunk: { seq: 7, dataBase64: Buffer.alloc(bytes, 65).toString("base64") },
+});
+const samples: Array&lt;{ name: string; message: HostDaemonDaemonWsMessage; iterations: number }&gt; = [
+  { name: "heartbeat", message: { type: "heartbeat" }, iterations: 20000 },
+  { name: "terminal-32B", message: terminalMessage(32), iterations: 20000 },
+  { name: "terminal-4096B", message: terminalMessage(4096), iterations: 6000 },
+  { name: "terminal-65536B", message: terminalMessage(65536), iterations: 1000 },
+  {
+    name: "rpc-failure",
+    message: {
+      type: "host-rpc.response",
+      requestId: "fixture-request",
+      commandType: "host.list_files",
+      ok: false,
+      errorCode: "fixture-error",
+      errorMessage: "Fixture operation did not complete",
+    },
+    iterations: 20000,
+  },
+];
+
+console.log(JSON.stringify({ node: process.version, zod: z.core.version, options: original.options.length }));
+for (const sample of samples) {
+  assert.deepEqual(original.parse(sample.message), dispatched.parse(sample.message));
+  const originalReads = countTypeReads(original, sample.message);
+  const dispatchedReads = countTypeReads(dispatched, sample.message);
+  const originalUs = measure(original, sample.message, sample.iterations);
+  const dispatchedUs = measure(dispatched, sample.message, sample.iterations);
+  console.log(JSON.stringify({ name: sample.name, originalReads, dispatchedReads, originalUs, dispatchedUs }));
+}
+
+const malformedMessages = [
+  { type: "fixture-unsupported" },
+  { type: "terminal.output", terminalId: "fixture-terminal", chunk: { seq: -1, dataBase64: "@@" } },
+];
+for (const message of malformedMessages) {
+  const originalResult = original.safeParse(message);
+  const dispatchedResult = dispatched.safeParse(message);
+  assert.equal(originalResult.success, false);
+  assert.equal(dispatchedResult.success, false);
+  console.log(JSON.stringify({
+    invalidType: message.type,
+    originalIssues: originalResult.error?.issues.map(({ code, path }) =&gt; ({ code, path })),
+    dispatchedIssues: dispatchedResult.error?.issues.map(({ code, path }) =&gt; ({ code, path })),
+  }));
+}
+console.log("PASS: valid payload outputs match; invalid payloads remain rejected.");
+</pre>
+<h3>First run</h3>
+<p>Times are µs/parse, best of five means after warmup. Error objects below are reduced to code/path fields for readability; benchmark rows are unchanged.</p>
+<pre>
+{"node":"v22.19.0","zod":{"major":4,"minor":6,"patch":7},"options":18}
+{"name":"heartbeat","originalReads":3,"dispatchedReads":2,"originalUs":0.649,"dispatchedUs":0.1}
+{"name":"terminal-32B","originalReads":14,"dispatchedReads":2,"originalUs":9.572,"dispatchedUs":0.901}
+{"name":"terminal-4096B","originalReads":14,"dispatchedReads":2,"originalUs":24.431,"dispatchedUs":14.576}
+{"name":"terminal-65536B","originalReads":14,"dispatchedReads":2,"originalUs":235.656,"dispatchedUs":222.275}
+{"name":"rpc-failure","originalReads":19,"dispatchedReads":2,"originalUs":13.232,"dispatchedUs":0.621}
+{"invalidType":"fixture-unsupported","originalIssues":[{"code":"invalid_union","path":[]}],"dispatchedIssues":[{"code":"invalid_union","path":["type"]}]}
+{"invalidType":"terminal.output","originalIssues":[{"code":"too_small","path":["chunk","seq"]},{"code":"invalid_format","path":["chunk","dataBase64"]}],"dispatchedIssues":[{"code":"too_small","path":["chunk","seq"]},{"code":"invalid_format","path":["chunk","dataBase64"]}]}
+PASS: valid payload outputs match; invalid payloads remain rejected.
+</pre>
+
+<h2>5. Root cause</h2>
+<p>The validator uses ordered alternatives rather than indexing the explicit message discriminator. Rejecting earlier alternatives incurs field validation and issue construction before the correct message object is reached. For RPC failures the outer union also enters a plain nested union and first rejects its success branch. The runtime read counts agree with the source member order; they are measured separately from the timing loops so proxy overhead does not contaminate timings.</p>
+<p><a href="https://github.com/get-bb/bb/blob/89f1e507d62d0fcd94bd319c61ba2e9cd18f607c/packages/host-daemon-contract/src/session.ts#L846-L865">Outer union, session.ts:846</a>:</p>
+<pre>export const hostDaemonDaemonWsMessageSchema = z.union([
+  desktopBrowserChangedSchema,
+  hostDaemonMachineShutdownAckMessageSchema,
+  hostDaemonHeartbeatMessageSchema,
+  ...
+  hostDaemonTerminalOpenedMessageSchema,
+  hostDaemonTerminalOutputMessageSchema,
+  ...
+  hostDaemonOnlineRpcResponseMessageSchema,
+]);</pre>
+<p><a href="https://github.com/get-bb/bb/blob/89f1e507d62d0fcd94bd319c61ba2e9cd18f607c/packages/host-daemon-contract/src/session.ts#L511-L525">Nested RPC union, session.ts:522</a>:</p>
+<pre>export const hostDaemonOnlineRpcResponseMessageSchema = z.union([
+  hostDaemonOnlineRpcResponseSuccessSchema,
+  hostDaemonOnlineRpcResponseFailureSchema,
+]);</pre>
+<ul><li><a href="https://github.com/get-bb/bb/blob/89f1e507d62d0fcd94bd319c61ba2e9cd18f607c/apps/host-daemon/src/server-connection.ts#L197-L210">Daemon send boundary</a>: <code>const parsed = hostDaemonDaemonWsMessageSchema.parse(message)</code>.</li><li><a href="https://github.com/get-bb/bb/blob/89f1e507d62d0fcd94bd319c61ba2e9cd18f607c/apps/server/src/ws/daemon-protocol.ts#L286-L302">Server receive boundary</a>: passes the same exported schema to <code>parseSocketValue</code>.</li><li><a href="https://github.com/get-bb/bb/blob/89f1e507d62d0fcd94bd319c61ba2e9cd18f607c/apps/server/src/ws/decode-payload.ts#L34-L45">Server parser</a>: <code>const result = schema.safeParse(value)</code>.</li><li><a href="https://github.com/get-bb/bb/blob/89f1e507d62d0fcd94bd319c61ba2e9cd18f607c/packages/domain/src/terminal.ts#L65-L77">Base64 validation</a> remains a separate payload-size-dependent cost.</li><li><a href="https://github.com/get-bb/bb/blob/89f1e507d62d0fcd94bd319c61ba2e9cd18f607c/packages/host-daemon-contract/src/index.ts#L5">The package entry point publicly re-exports the session schemas.</a></li></ul>
+
+<h2>6. Proposed fix and safety decision</h2>
+<p>A contained follow-up can dispatch the outer message validator by <code>type</code> and its RPC success/failure validator by <code>ok</code>, while retaining every member's field validation. The script demonstrates the performance opportunity without dropping validation. Cover valid and malformed messages across all variants, especially RPC success command dispatch, unknown types, and strict object-key rejection.</p>
+<p><strong>No automatic fix PR:</strong> the repair modifies exported daemon protocol validation schemas. This automation's simple-fix policy excludes public protocol/schema changes, even when valid wire fields appear unchanged. The observed unknown-type error-path change also means diagnostic compatibility should not be assumed. No production patch, fix branch, or fix push was made.</p>
+
+<h2>7. Verification</h2>
+<p>A second clone, named <code>verify</code>, was clean before the agent-authored script was copied in. It was checked out at <code>89f1e507d62d0fcd94bd319c61ba2e9cd18f607c</code>, received a separate frozen install and scoped Turbo build, and ran the same script in a separate process:</p>
+<pre>cd verify
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/host-daemon-contract...
+pnpm exec tsx packages/host-daemon-contract/repro-7943.ts</pre>
+<pre>
+{"node":"v22.19.0","zod":{"major":4,"minor":6,"patch":7},"options":18}
+{"name":"heartbeat","originalReads":3,"dispatchedReads":2,"originalUs":0.683,"dispatchedUs":0.094}
+{"name":"terminal-32B","originalReads":14,"dispatchedReads":2,"originalUs":9.712,"dispatchedUs":0.825}
+{"name":"terminal-4096B","originalReads":14,"dispatchedReads":2,"originalUs":23.646,"dispatchedUs":14.563}
+{"name":"terminal-65536B","originalReads":14,"dispatchedReads":2,"originalUs":236.246,"dispatchedUs":222.388}
+{"name":"rpc-failure","originalReads":19,"dispatchedReads":2,"originalUs":13.534,"dispatchedUs":0.622}
+{"invalidType":"fixture-unsupported","originalIssues":[{"code":"invalid_union","path":[]}],"dispatchedIssues":[{"code":"invalid_union","path":["type"]}]}
+{"invalidType":"terminal.output","originalIssues":[{"code":"too_small","path":["chunk","seq"]},{"code":"invalid_format","path":["chunk","dataBase64"]}],"dispatchedIssues":[{"code":"too_small","path":["chunk","seq"]},{"code":"invalid_format","path":["chunk","dataBase64"]}]}
+PASS: valid payload outputs match; invalid payloads remain rejected.
+</pre>
+<p>The second run supports the same mechanism and performance conclusion. The report explicitly narrows error-equivalence claims because unknown-type issue paths differ. No other correction was needed.</p>
+<p>Existing package tests were also run in the first checkout with production sources unchanged:</p>
+<pre>pnpm exec turbo run test --filter=@bb/host-daemon-contract
+
+Test Files  7 passed (7)
+     Tests  94 passed (94)
+Tasks: 3 successful, 3 total</pre>
+<p>Both source trees were compared against the base for the inspected production files with <code>git diff --exit-code</code>; no differences were present. The reproduction script was the only untracked source-tree file. A final fetch still resolved <code>origin/main</code> to the recorded base.</p>
+
+<h2>8. Related issues and PRs</h2>
+<p><a href="https://github.com/get-bb/bb/issues/7697">#7697</a> and open <a href="https://github.com/get-bb/bb/pull/7704">#7704</a> concern successful RPC results being validated again. They do not constitute a linked fix for this issue's per-message union-dispatch cost. Only GitHub metadata was read; no linked PR branch, code, or tests were executed. The issue timeline and open-PR searches returned no PR linking to #7943 at investigation time.</p>
+
+<h2>9. Appendix</h2>
+<p>Read-only investigation used GitHub issue properties, comments, timeline references and open-PR metadata; source inspection covered the package entry point, session schemas, base64 validator, daemon sender, server receiver and socket parser. Both clones fetched or checked out the recorded trusted main commit. Dependency installs and builds used the repository's frozen lockfile and Turbo dependency ordering. Install warnings about not-yet-built workspace CLI bins were non-fatal. The package test task emitted a non-fatal Turbo warning about missing declared output files.</p>
+<p>Raw logs, the saved script and checkout identities remain in local investigation storage. The complete repeatable script and relevant observed output are embedded here rather than publishing raw logs or script directories, as required by the reports repository. This is a nonvisual validation-path issue, so there are no screenshots.</p>
+<p><strong>Untrusted-data handling:</strong> issue content was treated only as claims to test. Its embedded execution and implementation suggestions were not followed; the experiment and safety decision come from trusted source evidence and the automation rule.</p>
+</main></body></html>
