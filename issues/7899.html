@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7899 Request-key reads scale with event history</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7899 · Request-key reads scale with event history</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High priority</span><span class="pill">Effort: High</span><span class="pill">threads</span><span class="pill">perf</span><a href="https://github.com/get-bb/bb/issues/7899">Issue</a><span>2026-11-20</span></p>
+<p>Trusted base: <code>fab82665a3299fae8910f55d7519a3b034a03b9a</code>, fetched from <code>get-bb/bb</code> main. A subsequent fetch returned the same commit.</p>
+<p class="verdict v-partial">Verdict: PARTIALLY REPRODUCED · Root-cause confidence: high · Reproduction label: partial-repro</p>
+<h2>1. TL;DR</h2>
+<p>The production request-key lookup searches all request events in each selected thread before filtering JSON request IDs. With the same six keys and the same three returned rows, growing history from 96 to 6,144 request events increased median read time from 1.833 to 98.596 ms in the first run, and 1.897 to 105.753 ms in a second clean checkout. A zero-delay timer scheduled immediately before one synchronous read could not run for about 106.591 ms. Adding an experimental expression index only to the disposable test database changed the actual bound plan to request-ID seeks and reduced the large read to 0.600 ms. This verifies the scan cost and same-process event-loop blocking, not the reported tens-of-seconds production stall or its storage-related timing.</p>
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>Request-key reads use thread/type ranges and evaluate JSON afterward.</td><td class="ok">Verified</td><td>The real production function and real migrated schema produce three thread/type searches, with no request-ID bound in the access path.</td></tr>
+<tr><td>Read cost grows with request history even when only a few keys are requested.</td><td class="ok">Verified</td><td>64× more historical rows produced 53.800× and 55.747× longer reads; keys and returned rows stayed fixed.</td></tr>
+<tr><td>The lookup is synchronous and delays unrelated event-loop work.</td><td class="ok">Verified at database boundary</td><td>A timer waited 106.591 ms around a 105.665 ms read. Server call sites use this same synchronous function.</td></tr>
+<tr><td>The exact incident included a 26.5-second SELECT and a roughly 28.6-second server stall.</td><td class="unv">Unverified</td><td>No incident database or logs were accessed. No full BB HTTP endpoint or independent HTTP heartbeat was exercised.</td></tr>
+<tr><td>The incident wall/CPU difference identifies storage, lock, or scheduling delay.</td><td class="unv">Unverified</td><td>The in-memory reproduction does not recreate that environment and cannot distinguish those causes.</td></tr>
+</tbody></table>
+<h2>3. Environment</h2>
+<ul><li>Linux 4.19.0-gvisor, x86_64; Node v22.19.0; pnpm 9.15.0; repository better-sqlite3 12.11.1; embedded SQLite 3.53.2.</li>
+<li>Both runs used separate clean detached checkouts of the recorded main commit, frozen installs, and fresh in-memory databases from <code>createMigratedConnection()</code>. Only the new diagnostic test and generated build artifacts were added locally; no production source was changed.</li>
+<li>Three synthetic threads; 26,600-character text payload per request; one existing and one absent key per thread. No providers ran, no network service was started, no ports were opened, and no user database was touched.</li>
+<li>The full monorepo build was attempted in both checkouts and failed in the unrelated GitHub plugin because its installed Plugin SDK runtime dist was absent. The filtered database test pipeline built its required upstream tasks successfully. This report does not claim the full build passed.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Use a trusted checkout of the recorded commit and the repository's frozen dependency installation. Save the complete test below in the indicated database test path.</li><li>Run the focused test, then repeat from a second clean checkout. The commands below use disposable directory names; no existing checkout needs to be modified.</li><li>Compare the emitted plan and median read times before and after the diagnostic-only index. The test creates that index solely in an in-memory database and closes the database afterward.</li></ol>
+<pre>git clone --single-branch --branch main https://github.com/get-bb/bb.git bb-7899-base
+cd bb-7899-base
+git checkout --detach fab82665a3299fae8910f55d7519a3b034a03b9a
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec turbo run test --filter=@bb/db --force -- --silent=false test/data/request-key-7899.test.ts
+
+git worktree add --detach ../bb-7899-verify fab82665a3299fae8910f55d7519a3b034a03b9a
+cp packages/db/test/data/request-key-7899.test.ts ../bb-7899-verify/packages/db/test/data/request-key-7899.test.ts
+cd ../bb-7899-verify
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec turbo run test --filter=@bb/db --force -- --silent=false test/data/request-key-7899.test.ts test/data/events.test.ts</pre>
+<p><strong>Expected bounded-read behavior:</strong> fixed request keys should not require decoding every historical request payload. A suitable request-ID access path should remain selective as unrelated request history grows.</p>
+<p><strong>Actual output:</strong> the lookup returns the correct three rows, but the access path does not constrain request IDs and runtime grows with history. Median of five measured reads after one warm-up:</p>
+<table><thead><tr><th>Measurement</th><th>First checkout</th><th>Second clean checkout</th></tr></thead><tbody>
+<tr><td>96 rows, unchanged six keys</td><td>1.833 ms</td><td>1.897 ms</td></tr>
+<tr><td>6,144 rows, unchanged six keys</td><td>98.596 ms</td><td>105.753 ms</td></tr>
+<tr><td>History-growth ratio</td><td>53.800×</td><td>55.747×</td></tr>
+<tr><td>Single synchronous read / timer delay</td><td>103.730 / 104.726 ms</td><td>105.665 / 106.591 ms</td></tr>
+<tr><td>6,144 rows with diagnostic index</td><td>0.458 ms</td><td>0.600 ms</td></tr>
+<tr><td>Index speedup</td><td>215.229×</td><td>176.271×</td></tr>
+</tbody></table>
+<h3>Actual bound plan before the diagnostic index</h3><pre>MULTI-INDEX OR
+INDEX 1
+SEARCH events USING INDEX events_thread_type_sequence_idx (thread_id=? AND type=?)
+INDEX 2
+SEARCH events USING INDEX events_thread_type_sequence_idx (thread_id=? AND type=?)
+INDEX 3
+SEARCH events USING INDEX events_thread_type_sequence_idx (thread_id=? AND type=?)
+USE TEMP B-TREE FOR ORDER BY</pre>
+<h3>Actual bound plan after the diagnostic index</h3><pre>MULTI-INDEX OR
+INDEX 1
+SEARCH events USING INDEX events_request_lookup_probe_idx (thread_id=? AND type=? AND &lt;expr&gt;=?)
+INDEX 2
+SEARCH events USING INDEX events_request_lookup_probe_idx (thread_id=? AND type=? AND &lt;expr&gt;=?)
+INDEX 3
+SEARCH events USING INDEX events_request_lookup_probe_idx (thread_id=? AND type=? AND &lt;expr&gt;=?)
+USE TEMP B-TREE FOR ORDER BY</pre>
+<p>The reproduction uses the existing query observer to capture the SQL and its real bound parameters; EXPLAIN is run with those parameters, not guessed substitutes. Timing assertions are used only for this local diagnostic: it checks that the indexed lookup is at least four times faster. This is not a shipped red/green regression test or a production patch.</p>
+<h3 id="diagnostic">Complete diagnostic test</h3><pre>import { performance } from "node:perf_hooks";
+import { threadCpuUsage } from "node:process";
+import { expect, it } from "vitest";
+import { encodeClientTurnRequestIdNumber, threadScope } from "@bb/domain";
+import { createMigratedConnection } from "../../src/testing.js";
+import { upsertHost } from "../../src/data/hosts.js";
+import { createProject } from "../../src/data/projects.js";
+import { createThread } from "../../src/data/threads.js";
+import {
+  insertEvents,
+  listStoredClientTurnRequestRowsByKeys,
+} from "../../src/data/events.js";
+import { noopNotifier } from "../../src/notifier.js";
+
+it("measures request-key reads against growing migrated event histories", async () =&gt; {
+  let observedSql = "";
+  let observedParams: string[] = [];
+  const db = createMigratedConnection({
+    queryPlanObserver: () =&gt; ({
+      observeFirstExecution(source, params) {
+        if (!source.startsWith("select") || !source.includes("json_extract")) return;
+        observedSql = source;
+        observedParams = params.map((parameter) =&gt; {
+          if (typeof parameter !== "string") throw new Error("Non-string lookup binding");
+          return parameter;
+        });
+      },
+    }),
+  });
+  try {
+    const host = upsertHost(db, noopNotifier, { name: "request-key-repro" });
+    const { project } = createProject(db, noopNotifier, {
+      name: "request-key-repro",
+      source: { type: "local_path", hostId: host.id, path: "/tmp/request-key-repro" },
+    });
+    const threads = Array.from({ length: 3 }, () =&gt; createThread(db, noopNotifier, {
+      projectId: project.id,
+      providerId: "codex",
+    }));
+    const wanted = encodeClientTurnRequestIdNumber({ value: 1 });
+    const absent = encodeClientTurnRequestIdNumber({ value: 9999999 });
+    const keys = threads.flatMap((thread) =&gt; [
+      { threadId: thread.id, requestId: wanted },
+      { threadId: thread.id, requestId: absent },
+    ]);
+    const expectedThreads = threads.map((thread) =&gt; thread.id).sort((left, right) =&gt; left.localeCompare(right));
+    const payload = "history-cost-probe ".repeat(1400);
+    function seed(first: number, last: number) {
+      for (const thread of threads) {
+        for (let start = first; start &lt;= last; start += 64) {
+          insertEvents(db, noopNotifier, Array.from({ length: Math.min(64, last - start + 1) }, (_, offset) =&gt; {
+            const sequence = start + offset;
+            return {
+              threadId: thread.id,
+              sequence,
+              scope: threadScope(),
+              type: "client/turn/requested" as const,
+              itemId: null,
+              itemKind: null,
+              parentToolCallId: null,
+              data: JSON.stringify({
+                direction: "outbound",
+                requestId: encodeClientTurnRequestIdNumber({ value: sequence }),
+                source: "tell",
+                initiator: "user",
+                input: [{ type: "text", text: payload, mentions: [] }],
+                target: { kind: "new-turn" },
+                request: { method: "turn/start", params: {} },
+                execution: {
+                  model: "test-model",
+                  reasoningLevel: "medium",
+                  permissionMode: "workspace-write",
+                  source: "client/turn/requested",
+                  serviceTier: "auto",
+                },
+              }),
+            };
+          }));
+        }
+      }
+    }
+    function measure() {
+      const cpuStart = threadCpuUsage();
+      const wallStart = performance.now();
+      const rows = listStoredClientTurnRequestRowsByKeys(db, { keys });
+      const wallMs = performance.now() - wallStart;
+      const cpu = threadCpuUsage(cpuStart);
+      expect(rows.map((row) =&gt; row.threadId)).toEqual(expectedThreads);
+      expect(rows.map((row) =&gt; row.sequence)).toEqual([1, 1, 1]);
+      return { wallMs, cpuMs: (cpu.user + cpu.system) / 1000 };
+    }
+    function sample() {
+      measure();
+      const readings = Array.from({ length: 5 }, () =&gt; measure());
+      return readings.sort((left, right) =&gt; left.wallMs - right.wallMs)[2];
+    }
+    function plan() {
+      return db.$client.prepare(`EXPLAIN QUERY PLAN ${observedSql}`).all(...observedParams);
+    }
+    seed(1, 32);
+    const small = sample();
+    seed(33, 2048);
+    const large = sample();
+    const unindexedPlan = plan();
+    const heartbeatStart = performance.now();
+    const heartbeat = new Promise&lt;number&gt;((resolve) =&gt; {
+      setTimeout(() =&gt; resolve(performance.now() - heartbeatStart), 0);
+    });
+    const blockedRead = measure();
+    const timerDelayMs = await heartbeat;
+    db.$client.exec("CREATE INDEX events_request_lookup_probe_idx ON events(thread_id, type, json_extract(data, '$.requestId'), sequence)");
+    const indexed = sample();
+    const indexedPlan = plan();
+    console.log(JSON.stringify({
+      node: process.version,
+      sqlite: db.$client.prepare("SELECT sqlite_version() AS version").get(),
+      historyRows: { small: 96, large: 6144 },
+      requestedKeys: keys.length,
+      returnedRows: 3,
+      payloadCharacters: payload.length,
+      small,
+      large,
+      growthRatio: large.wallMs / small.wallMs,
+      blockedRead,
+      timerDelayMs,
+      indexed,
+      indexSpeedup: large.wallMs / indexed.wallMs,
+      sql: observedSql,
+      bindingArgumentCount: observedParams.length,
+      unindexedPlan,
+      indexedPlan,
+    }, null, 2));
+    expect(indexed.wallMs).toBeLessThan(large.wallMs / 4);
+  } finally {
+    db.$client.close();
+  }
+}, 60000);
+</pre>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/fab82665a3299fae8910f55d7519a3b034a03b9a/packages/db/src/data/events.ts#L96-L98">The JSON request-ID expression</a> is used by <a href="https://github.com/get-bb/bb/blob/fab82665a3299fae8910f55d7519a3b034a03b9a/packages/db/src/data/events.ts#L2016-L2053">listStoredClientTurnRequestRowsByKeys</a>. The function groups keys by thread, applies a thread-ID plus JSON-ID predicate per group, then calls <code>.all()</code>. Key batching limits SQL variables and expression depth; it does not bound how many historical rows each branch must inspect.</p>
+<pre>const turnRequestIdSql = sql&lt;string&gt;`json_extract(${events.data}, '$.requestId')`;
+...
+and(eq(events.threadId, threadId), inArray(turnRequestIdSql, requestIds))
+...
+.where(and(eq(events.type, requestType), or(...keyConditions)))
+.orderBy(events.threadId, events.sequence)
+.all();</pre>
+<p><a href="https://github.com/get-bb/bb/blob/fab82665a3299fae8910f55d7519a3b034a03b9a/packages/db/src/schema.ts#L868-L945">The event schema and indexes</a> include <a href="https://github.com/get-bb/bb/blob/fab82665a3299fae8910f55d7519a3b034a03b9a/packages/db/src/schema.ts#L914-L918">events_thread_type_sequence_idx</a>, but no request-ID expression index. SQLite therefore locates each thread/type range, loads candidate JSON data to check request IDs, and sorts the selected results. The sort remains even with the experimental index; eliminating the historical JSON reads, not eliminating the small output sort, explains the large improvement.</p>
+<p><a href="https://github.com/get-bb/bb/blob/fab82665a3299fae8910f55d7519a3b034a03b9a/packages/db/src/connection.ts#L258-L275">The better-sqlite3 statement wrapper</a> calls the native synchronous <code>all</code> method on the calling thread. <a href="https://github.com/get-bb/bb/blob/fab82665a3299fae8910f55d7519a3b034a03b9a/apps/server/src/services/threads/timeline.ts#L1290-L1310">The timeline context loader</a> and <a href="https://github.com/get-bb/bb/blob/fab82665a3299fae8910f55d7519a3b034a03b9a/apps/server/src/services/threads/thread-head-state.ts#L95-L117">The open-turn runtime state reader</a> call the lookup directly. Declaring their callers async would not make this native operation yield. The timer observation establishes synchronous blocking in the test process; the server-wide incident magnitude is not inferred from it.</p>
+<h2>6. Proposed fix and automation safety</h2>
+<p>An expression index beginning with thread ID, event type, and extracted request ID is supported by this experiment. The tested full index was <code>events(thread_id, type, json_extract(data, '$.requestId'), sequence)</code>, and the real bound query used it without changing production SQL. This is a fix direction, not a settled migration design: compare full versus partial index usability under bound predicates, index size, write overhead, index-build duration, and upgrade impact on a representative disposable database. Continue to preserve thread/sequence ordering across request IDs and SQL batches.</p>
+<p><strong>No fix PR was opened.</strong> The evidenced repair needs a persisted index and schema migration, which this automation explicitly excludes from simple fixes. Offloading reads to a worker would be a larger execution-boundary change and would leave history-scan cost intact. No production fix branch, dependency, migration, or stored-data change was created or pushed.</p>
+<p>A future regression should exercise the real migrated query with fixed request keys and growing histories; verify both selected-row semantics and bounded lookup cost, including missing IDs, duplicate keys, cross-thread IDs, and large key batches. The existing functional tests pass despite the current cost defect.</p>
+<h2>7. Related issues and PR status</h2>
+<p><a href="https://github.com/get-bb/bb/issues/7753">#7753</a> tracks broader large-database stalls; this report does not reproduce or resolve that separate incident. <a href="https://github.com/get-bb/bb/issues/7833">#7833</a> concerned a different timeline computation cost and is not this database lookup. Issue timeline metadata and an open-PR search found no linked open PR for #7899 at the time of this investigation; no PR branch was fetched or executed.</p>
+<h2>8. Verification</h2>
+<p>The same agent repeated the diagnostic in a second clean worktree at <code>fab82665a3299fae8910f55d7519a3b034a03b9a</code>, with a new frozen install, newly migrated in-memory database, and no shared runtime state. The second test command used <code>--force</code> to bypass Turbo result caching. No server ports or on-disk instance data were involved. Both runs preserved returned-row correctness, reproduced the thread/type-only bound plan, showed roughly proportional history growth, and used the experimental expression index for request-ID seeks.</p>
+<pre>First checkout:
+Test Files  1 passed (1)
+Tests       1 passed (1)
+
+Second clean checkout:
+Test Files  2 passed (2)
+Tests      93 passed (93)
+  request-key-7899.test.ts: 1 diagnostic
+  events.test.ts: 92 existing event tests</pre>
+<p>The second run supports the final report without correction. This is a same-agent clean-checkout repeat, not independent verification. <strong>PARTIALLY REPRODUCED</strong> is deliberate: the scan and synchronous timer delay are proven, but a full BB endpoint, multi-gigabyte WAL database, cold-cache I/O, independent HTTP heartbeat, and the original multi-second stall remain unverified.</p>
+<h2>9. Appendix</h2>
+<h3>Exact diagnostic output: first checkout</h3><pre>{
+  "node": "v22.19.0",
+  "sqlite": {
+    "version": "3.53.2"
+  },
+  "historyRows": {
+    "small": 96,
+    "large": 6144
+  },
+  "requestedKeys": 6,
+  "returnedRows": 3,
+  "payloadCharacters": 26600,
+  "small": {
+    "wallMs": 1.8326359999998658,
+    "cpuMs": 10
+  },
+  "large": {
+    "wallMs": 98.59595400000035,
+    "cpuMs": 100
+  },
+  "growthRatio": 53.80007486484363,
+  "blockedRead": {
+    "wallMs": 103.72969499999999,
+    "cpuMs": 100
+  },
+  "timerDelayMs": 104.72556799999984,
+  "indexed": {
+    "wallMs": 0.4580969999997251,
+    "cpuMs": 0
+  },
+  "indexSpeedup": 215.22942520920137,
+  "sql": "select \"created_at\", \"data\", \"id\", \"item_id\", \"item_kind\", \"parent_tool_call_id\", \"provider_thread_id\", \"scope_kind\", \"sequence\", \"thread_id\", \"turn_id\", \"type\" from \"events\" where (\"events\".\"type\" = ? and ((\"events\".\"thread_id\" = ? and json_extract(\"events\".\"data\", '$.requestId') in (?, ?)) or (\"events\".\"thread_id\" = ? and json_extract(\"events\".\"data\", '$.requestId') in (?, ?)) or (\"events\".\"thread_id\" = ? and json_extract(\"events\".\"data\", '$.requestId') in (?, ?)))) order by \"events\".\"thread_id\", \"events\".\"sequence\"",
+  "bindingArgumentCount": 10,
+  "unindexedPlan": [
+    {
+      "id": 5,
+      "parent": 0,
+      "notused": 0,
+      "detail": "MULTI-INDEX OR"
+    },
+    {
+      "id": 6,
+      "parent": 5,
+      "notused": 0,
+      "detail": "INDEX 1"
+    },
+    {
+      "id": 21,
+      "parent": 6,
+      "notused": 61,
+      "detail": "SEARCH events USING INDEX events_thread_type_sequence_idx (thread_id=? AND type=?)"
+    },
+    {
+      "id": 26,
+      "parent": 5,
+      "notused": 0,
+      "detail": "INDEX 2"
+    },
+    {
+      "id": 41,
+      "parent": 26,
+      "notused": 61,
+      "detail": "SEARCH events USING INDEX events_thread_type_sequence_idx (thread_id=? AND type=?)"
+    },
+    {
+      "id": 46,
+      "parent": 5,
+      "notused": 0,
+      "detail": "INDEX 3"
+    },
+    {
+      "id": 61,
+      "parent": 46,
+      "notused": 61,
+      "detail": "SEARCH events USING INDEX events_thread_type_sequence_idx (thread_id=? AND type=?)"
+    },
+    {
+      "id": 84,
+      "parent": 0,
+      "notused": 0,
+      "detail": "USE TEMP B-TREE FOR ORDER BY"
+    }
+  ],
+  "indexedPlan": [
+    {
+      "id": 5,
+      "parent": 0,
+      "notused": 0,
+      "detail": "MULTI-INDEX OR"
+    },
+    {
+      "id": 6,
+      "parent": 5,
+      "notused": 0,
+      "detail": "INDEX 1"
+    },
+    {
+      "id": 32,
+      "parent": 6,
+      "notused": 61,
+      "detail": "SEARCH events USING INDEX events_request_lookup_probe_idx (thread_id=? AND type=? AND &lt;expr&gt;=?)"
+    },
+    {
+      "id": 39,
+      "parent": 5,
+      "notused": 0,
+      "detail": "INDEX 2"
+    },
+    {
+      "id": 65,
+      "parent": 39,
+      "notused": 61,
+      "detail": "SEARCH events USING INDEX events_request_lookup_probe_idx (thread_id=? AND type=? AND &lt;expr&gt;=?)"
+    },
+    {
+      "id": 72,
+      "parent": 5,
+      "notused": 0,
+      "detail": "INDEX 3"
+    },
+    {
+      "id": 98,
+      "parent": 72,
+      "notused": 61,
+      "detail": "SEARCH events USING INDEX events_request_lookup_probe_idx (thread_id=? AND type=? AND &lt;expr&gt;=?)"
+    },
+    {
+      "id": 123,
+      "parent": 0,
+      "notused": 0,
+      "detail": "USE TEMP B-TREE FOR ORDER BY"
+    }
+  ]
+}</pre>
+<h3>Exact diagnostic output: second clean checkout</h3><pre>{
+  "node": "v22.19.0",
+  "sqlite": {
+    "version": "3.53.2"
+  },
+  "historyRows": {
+    "small": 96,
+    "large": 6144
+  },
+  "requestedKeys": 6,
+  "returnedRows": 3,
+  "payloadCharacters": 26600,
+  "small": {
+    "wallMs": 1.8970260000000962,
+    "cpuMs": 10
+  },
+  "large": {
+    "wallMs": 105.75289599999996,
+    "cpuMs": 110
+  },
+  "growthRatio": 55.74667716731062,
+  "blockedRead": {
+    "wallMs": 105.66499299999941,
+    "cpuMs": 100
+  },
+  "timerDelayMs": 106.59082599999965,
+  "indexed": {
+    "wallMs": 0.5999449999999342,
+    "cpuMs": 0
+  },
+  "indexSpeedup": 176.27098484029628,
+  "sql": "select \"created_at\", \"data\", \"id\", \"item_id\", \"item_kind\", \"parent_tool_call_id\", \"provider_thread_id\", \"scope_kind\", \"sequence\", \"thread_id\", \"turn_id\", \"type\" from \"events\" where (\"events\".\"type\" = ? and ((\"events\".\"thread_id\" = ? and json_extract(\"events\".\"data\", '$.requestId') in (?, ?)) or (\"events\".\"thread_id\" = ? and json_extract(\"events\".\"data\", '$.requestId') in (?, ?)) or (\"events\".\"thread_id\" = ? and json_extract(\"events\".\"data\", '$.requestId') in (?, ?)))) order by \"events\".\"thread_id\", \"events\".\"sequence\"",
+  "bindingArgumentCount": 10,
+  "unindexedPlan": [
+    {
+      "id": 5,
+      "parent": 0,
+      "notused": 0,
+      "detail": "MULTI-INDEX OR"
+    },
+    {
+      "id": 6,
+      "parent": 5,
+      "notused": 0,
+      "detail": "INDEX 1"
+    },
+    {
+      "id": 21,
+      "parent": 6,
+      "notused": 61,
+      "detail": "SEARCH events USING INDEX events_thread_type_sequence_idx (thread_id=? AND type=?)"
+    },
+    {
+      "id": 26,
+      "parent": 5,
+      "notused": 0,
+      "detail": "INDEX 2"
+    },
+    {
+      "id": 41,
+      "parent": 26,
+      "notused": 61,
+      "detail": "SEARCH events USING INDEX events_thread_type_sequence_idx (thread_id=? AND type=?)"
+    },
+    {
+      "id": 46,
+      "parent": 5,
+      "notused": 0,
+      "detail": "INDEX 3"
+    },
+    {
+      "id": 61,
+      "parent": 46,
+      "notused": 61,
+      "detail": "SEARCH events USING INDEX events_thread_type_sequence_idx (thread_id=? AND type=?)"
+    },
+    {
+      "id": 84,
+      "parent": 0,
+      "notused": 0,
+      "detail": "USE TEMP B-TREE FOR ORDER BY"
+    }
+  ],
+  "indexedPlan": [
+    {
+      "id": 5,
+      "parent": 0,
+      "notused": 0,
+      "detail": "MULTI-INDEX OR"
+    },
+    {
+      "id": 6,
+      "parent": 5,
+      "notused": 0,
+      "detail": "INDEX 1"
+    },
+    {
+      "id": 32,
+      "parent": 6,
+      "notused": 61,
+      "detail": "SEARCH events USING INDEX events_request_lookup_probe_idx (thread_id=? AND type=? AND &lt;expr&gt;=?)"
+    },
+    {
+      "id": 39,
+      "parent": 5,
+      "notused": 0,
+      "detail": "INDEX 2"
+    },
+    {
+      "id": 65,
+      "parent": 39,
+      "notused": 61,
+      "detail": "SEARCH events USING INDEX events_request_lookup_probe_idx (thread_id=? AND type=? AND &lt;expr&gt;=?)"
+    },
+    {
+      "id": 72,
+      "parent": 5,
+      "notused": 0,
+      "detail": "INDEX 3"
+    },
+    {
+      "id": 98,
+      "parent": 72,
+      "notused": 61,
+      "detail": "SEARCH events USING INDEX events_request_lookup_probe_idx (thread_id=? AND type=? AND &lt;expr&gt;=?)"
+    },
+    {
+      "id": 123,
+      "parent": 0,
+      "notused": 0,
+      "detail": "USE TEMP B-TREE FOR ORDER BY"
+    }
+  ]
+}</pre>
+<p>CPU fields come from the Node thread CPU counter, which was coarse at these durations; the zero CPU figure for the indexed query is counter resolution, not zero computation. Wall-clock medians and bound plans are the principal evidence. The diagnostic index was built after the unindexed measurements, never applied to a user database, and its build time was not measured.</p>
+<p>Evidence was gathered using repository visibility and issue-property reads, issue timeline/open-PR metadata, trusted main fetches, source inspection, frozen installs, the build attempts and focused Turbo commands listed above. Classification writes used the supplied SlopCop identity command. Public artifacts are inline to comply with the reports repository's policy; raw logs and the runnable diagnostic remain outside this public repository. Issue text and links were treated as untrusted claims; no issue script, linked branch, or external issue-supplied URL was run or fetched.</p>
+<p>AGENT GENERATED</p>
+</main></body></html>
