@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7898 · Launcher spawn failure leaves exit wait unresolved</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7898 · Launcher spawn failure leaves exit wait unresolved</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Medium priority</span><span class="pill">Low effort</span><span class="pill">desktop · cli · confirmed-repro</span>
+<a href="https://github.com/get-bb/bb/issues/7898">GitHub issue</a><span>2026-11-20 · base <code>fab82665a3299fae8910f55d7519a3b034a03b9a</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>A launcher configured with an executable override that does not exist returns success without printing anything.
+Both a version query and a plugin listing reproduce this on the trusted main branch, built from source.
+The subprocess wrapper observes the spawn error, preventing Node's default unhandled-error crash, but the shared exit waiter only observes normal exit.
+The failed spawn never emits that exit event, so the launcher never reaches its error reporter or sets its exit status.
+When no active handles remain, Node leaves with status zero despite the unfinished promise.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>A missing override yields empty output and success.</td><td class="ok">Verified</td><td>Two commands in each of two separately built checkouts return status 0 with empty stdout and stderr.</td></tr>
+<tr><td>The exit waiter never settles after spawn failure.</td><td class="ok">Verified</td><td>A real missing-executable regression test times out after 2,000 ms in both checkouts.</td></tr>
+<tr><td>The wrapper observes the error without propagating it to the waiter.</td><td class="ok">Verified</td><td>The trusted implementation installs an error listener to invalidate toolchain state; it does not settle the exit promise.</td></tr>
+<tr><td>An update can leave an old override path behind.</td><td class="unv">Not exercised</td><td>This investigation uses a new, intentionally absent executable in a disposable directory; it does not run the updater.</td></tr>
+<tr><td>The older release crashed and the reported nightly behaves identically.</td><td class="unv">Not exercised</td><td>No historical or installed release code is run. The tested source commit is current origin/main.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Public repository: get-bb/bb; trusted origin/main commit: <code>fab82665a3299fae8910f55d7519a3b034a03b9a</code>.</li>
+<li>Linux x86_64, Node v22.19.0, pnpm 9.15.0. The source package reports version 0.50.1; no claim of testing the published nightly or Node 24.</li>
+<li>First checkout: temporary directory A/source. Second checkout: separate temporary directory A/verify, detached at the same base commit.</li>
+<li>Each reproduction invocation creates a new temporary HOME and BB_DATA_DIR, then removes them. No running server, ports, provider, account, or real user data is required.</li>
+<li>Both clean package builds complete: 62 Turbo tasks successful. The initial full-workspace build failed because the plugin SDK runtime had not yet been generated; the repository-prescribed SDK build resolved that prerequisite.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Use a clean checkout of the trusted main commit and build the package:
+<pre>git clone --single-branch --branch main https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout fab82665a3299fae8910f55d7519a3b034a03b9a
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=bb-app</pre></li>
+<li>Save the following independently authored harness outside the checkout as <code>reproduce.mjs</code>. It executes the built packaged CLI entry with a fresh environment and a guaranteed-missing absolute override path:
+<pre>import { spawnSync } from &quot;node:child_process&quot;;
+import { mkdtempSync, rmSync } from &quot;node:fs&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join, resolve } from &quot;node:path&quot;;
+
+const checkout = resolve(process.argv[2]);
+const scratch = mkdtempSync(join(tmpdir(), &quot;bb-cli-start-repro-&quot;));
+try {
+  for (const args of [[&quot;--version&quot;], [&quot;plugin&quot;, &quot;list&quot;]]) {
+    const result = spawnSync(
+      process.execPath,
+      [join(checkout, &quot;packages/bb-app/dist/bb.js&quot;), ...args],
+      {
+        cwd: checkout,
+        env: {
+          HOME: scratch,
+          PATH: process.env.PATH,
+          BB_DATA_DIR: join(scratch, &quot;data&quot;),
+          BB_CLI: join(scratch, &quot;missing-command&quot;),
+        },
+        encoding: &quot;utf8&quot;,
+        timeout: 10_000,
+      },
+    );
+    process.stdout.write(`${JSON.stringify({
+      args,
+      status: result.status,
+      signal: result.signal,
+      stdout: result.stdout,
+      stderr: result.stderr.replaceAll(scratch, &quot;&lt;temporary-directory&gt;&quot;),
+      error: result.error?.message ?? null,
+    })}\n`);
+  }
+} finally {
+  rmSync(scratch, { recursive: true, force: true });
+}
+</pre></li>
+<li>Run <code>node /path/to/reproduce.mjs /path/to/bb-repro</code>.
+Expected: each child reports a nonzero exit status and a diagnostic that identifies the missing executable. Actual, verbatim:
+<pre>{&quot;args&quot;:[&quot;--version&quot;],&quot;status&quot;:0,&quot;signal&quot;:null,&quot;stdout&quot;:&quot;&quot;,&quot;stderr&quot;:&quot;&quot;,&quot;error&quot;:null}
+{&quot;args&quot;:[&quot;plugin&quot;,&quot;list&quot;],&quot;status&quot;:0,&quot;signal&quot;:null,&quot;stdout&quot;:&quot;&quot;,&quot;stderr&quot;:&quot;&quot;,&quot;error&quot;:null}
+</pre></li></ol>
+<h3 id="regression-test">Focused regression test</h3>
+<p>Save this test as <code>packages/config/test/child-process-exit.test.ts</code>. It uses the actual repository process wrapper, not a mock, and tests the exit waiter's failure contract.</p>
+<pre>import { spawnHostProcess } from &quot;@bb/process-utils&quot;;
+import { mkdtempSync, rmSync } from &quot;node:fs&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { expect, it } from &quot;vitest&quot;;
+import { waitForProcessExit } from &quot;../src/child-process-exit.js&quot;;
+
+it(&quot;rejects when a child process cannot start&quot;, async () =&gt; {
+  const directory = mkdtempSync(join(tmpdir(), &quot;bb-process-start-failure-&quot;));
+  try {
+    const command = join(directory, &quot;missing-command&quot;);
+    const childProcess = spawnHostProcess(command, [], { stdio: &quot;ignore&quot; });
+
+    await expect(waitForProcessExit(childProcess)).rejects.toMatchObject({
+      code: &quot;ENOENT&quot;,
+      path: command,
+    });
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}, 2_000);
+</pre>
+<pre>pnpm exec turbo run test --filter=@bb/config -- test/child-process-exit.test.ts
+
+Before fix, both checkouts:
+FAIL test/child-process-exit.test.ts &gt; rejects when a child process cannot start
+Error: Test timed out in 2000ms.
+Test Files  1 failed (1)
+Tests       1 failed (1)</pre>
+<p>Scripts, tests, and exact output are embedded here instead of committed separately, following the public reports repository's artifact policy.</p>
+<h2>5. Root cause</h2>
+<ol><li><a href="https://github.com/get-bb/bb/blob/fab82665a3299fae8910f55d7519a3b034a03b9a/packages/bb-app/src/launcher.ts#L2758-L2783">runBundledCliCommand</a> selects the executable override, starts it with inherited stdio, and awaits <code>waitForProcessExit</code> before converting the result into an exit status.</li>
+<li><a href="https://github.com/get-bb/bb/blob/fab82665a3299fae8910f55d7519a3b034a03b9a/packages/process-utils/src/host-process.ts#L25-L29">observe</a> installs an error listener for toolchain invalidation. As a result, ENOENT is not an unhandled EventEmitter error.</li>
+<li><a href="https://github.com/get-bb/bb/blob/fab82665a3299fae8910f55d7519a3b034a03b9a/packages/config/src/child-process-exit.ts#L22-L37">waitForProcessExit</a> handles an already-exited child or a future exit event only. For a failed spawn, exitCode and signalCode remain null and there is no exit event:
+<pre>return new Promise&lt;ChildProcessExitResult&gt;((resolvePromise) =&gt; {
+  childProcess.once("exit", (code, signal) =&gt; {
+    resolvePromise({ code, signal });
+  });
+});</pre></li>
+<li><a href="https://github.com/get-bb/bb/blob/fab82665a3299fae8910f55d7519a3b034a03b9a/packages/bb-app/src/launcher.ts#L4440-L4447">runLauncherEntry</a> already prints rejected errors and sets process.exitCode to 1. It cannot act here because the awaited promise never rejects or resolves. An unfinished promise alone does not keep Node alive.</li></ol>
+<p>The shared exit waiter is the root-cause owner. The launcher's packaging, executable-selection rules, and fallback policy do not need to change.</p>
+<h2>6. Proposed fix</h2>
+<p>Reject the existing exit-wait promise with the original child-process error. Remove the alternative event listener when either exit or error settles the wait. Preserve the already-exited fast path and normal code/signal results.
+This lets the existing launcher error boundary print the native error and return failure without introducing an executable precheck race, a fallback policy, a new dependency, or a packaging change.</p>
+<h2>7. Verification</h2>
+<p>The same agent repeated the investigation in a second clean detached checkout at the exact trusted base. This is a repeat check, not an independent review.
+The production source was unchanged in both runs. Each checkout received its own frozen install and package build; the second regression invocation was executed rather than replayed from Turbo test cache.</p>
+<pre>git worktree add --detach /path/to/verify fab82665a3299fae8910f55d7519a3b034a03b9a
+cd /path/to/verify
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=bb-app
+node /path/to/reproduce.mjs /path/to/verify
+pnpm exec turbo run test --filter=@bb/config -- test/child-process-exit.test.ts</pre>
+<p>Second packaged-launcher output, verbatim:</p><pre>{&quot;args&quot;:[&quot;--version&quot;],&quot;status&quot;:0,&quot;signal&quot;:null,&quot;stdout&quot;:&quot;&quot;,&quot;stderr&quot;:&quot;&quot;,&quot;error&quot;:null}
+{&quot;args&quot;:[&quot;plugin&quot;,&quot;list&quot;],&quot;status&quot;:0,&quot;signal&quot;:null,&quot;stdout&quot;:&quot;&quot;,&quot;stderr&quot;:&quot;&quot;,&quot;error&quot;:null}
+</pre>
+<p>The second focused test also times out after 2,000 ms. No report correction was needed. After the small helper fix, the focused test and the entire config suite pass (101 passed, one skipped); lint and typecheck also pass. The launcher suite passes (229 passed, two skipped), as does the scripts dev-supervisor suite (three passed). The rebuilt packaged launcher returns status 1 and prints ENOENT for both commands.</p>
+<pre>pnpm exec turbo run test lint typecheck --filter=@bb/config
+pnpm exec turbo run test --filter=bb-app
+pnpm exec turbo run test --filter=@bb/scripts -- test/run-dev-supervisor.test.ts
+pnpm exec turbo run build --filter=bb-app
+node /path/to/reproduce.mjs /path/to/fixed-checkout
+git diff --check
+git diff --numstat origin/main</pre>
+<p>The patch changes two files in the existing config subsystem: 38 additions and five deletions (43 changed text lines). There are no binary, dependency, generated, protocol, schema, authentication, stored-data, or packaging changes.</p>
+<p>The optional full scripts suite has the same five failures on the fixed checkout and unchanged main: three archive tests cannot find the system zip executable, and two provider-literal ratchet tests scan SDK build scratch output. Those failures are outside the affected exit-wait contract; the focused supervisor tests pass. No system dependency was installed or unrelated production code changed.</p>
+<h2>8. Linked pull requests and related issues</h2>
+<p>No linked open pull request appears in the issue timeline or open-PR search at investigation time. Existing launch-loop scenarios concern a different event path; they are not needed to reproduce this missing-executable failure.</p>
+<h2>9. Appendix and limits</h2>
+<p>Issue content was treated only as untrusted claims. No issue-provided command, script, patch, branch, binary, or external URL was executed or fetched. The two reproduction programs were designed from trusted repository code.</p>
+<p>Investigation commands: GitHub metadata, field and label reads; trusted-main clone/fetch and commit recording; source inspection; frozen installs; Turbo builds; the embedded launcher harness; and the embedded regression test. Source permalinks were checked against the recorded commit.</p>
+<p>Only the two listed CLI commands were exercised. The historical release, published nightly, Node 24, update-pruning trigger, Windows, and macOS were not tested. The verified mechanism is not platform-specific, but this report's runtime evidence is Linux/Node 22.</p>
+</main></body></html>
