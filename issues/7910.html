@@ -28,7 +28,7 @@
 <tr><td>Every selected commit is a full 40-character SHA.</td><td>Refuted</td><td>Explicit commit selectors accept 7–40 hex characters and bypass ls-remote expansion. The regression table covers both lengths.</td></tr>
 <tr><td>A broken unrelated ref reliably prevents local cloning.</td><td>Not reproduced with this Git version</td><td>An initial local-path fixture passed on Git 2.39.5. It was replaced with a real HTTP transport and an unavailable ancestor blob, which reproduced the history dependency.</td></tr></table>
 <h2>3. Environment</h2><ul><li>Public target: get-bb/bb, trusted origin/main fab82665a3299fae8910f55d7519a3b034a03b9a.</li><li>Linux 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; Git 2.39.5.</li><li>No live bb instance, provider session, user database, or runtime data was used.</li><li>Each test creates a migrated temporary SQLite database, a unique temporary plugin cache, and a Git HTTP server bound to 127.0.0.1 on an OS-assigned port. Fixtures close servers and remove their temporary directories.</li><li>Frozen installs succeeded in both checkouts. An initial repository-wide build failed on a concurrently unavailable generated SDK runtime; the scoped server build then succeeded in the second checkout. The final server build and typed lint also passed.</li></ul>
-<h2>4. Minimal reproduction</h2><ol><li>Start at the recorded base and install the repository's locked dependencies.</li><li>Download the <a href="7910/repro/regression.patch">authored regression patch</a> and apply it. It modifies only tests, leaving production unchanged.</li><li>Run:<pre>git checkout fab82665a3299fae8910f55d7519a3b034a03b9a
+<h2>4. Minimal reproduction</h2><ol><li>Start at the recorded base and install the repository's locked dependencies.</li><li>Save the complete authored regression patch printed below as <code>regression.patch</code>. It modifies only tests, leaving production unchanged.</li><li>Run:<pre>git checkout fab82665a3299fae8910f55d7519a3b034a03b9a
 pnpm install --frozen-lockfile --prefer-offline
 git apply regression.patch
 pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-install.test.ts -t 'unavailable ancestor|pinned commit'</pre></li><li>The fixture commits an older file, removes it in a later plugin release, and deletes only that older blob from the origin object store. It then serves the repository using Git's own http-backend and requests the intact current plugin commit. The deleted file is not present in the selected tree.</li></ol>
@@ -38,108 +38,173 @@ fatal: the remote end hung up unexpectedly
  Test Files  1 failed (1)
       Tests  1 failed | 2 passed | 55 skipped (58)</pre>
 <p>The two ordinary pinned-commit control cases pass on the same transport. The depth-one repair makes all three cases pass. This fixture intentionally removes an ancestor blob to make excessive history access deterministic; it is not a claim that a normal large repository is corrupt.</p>
-<h3>Authored regression excerpt</h3><pre>async function serveGitRepository(repoDir: string) {
-  const server = createServer((request, response) =&gt; {
-    const url = new URL(request.url ?? &quot;/&quot;, &quot;http://127.0.0.1&quot;);
-    const child = execFile(
-      &quot;git&quot;,
-      [&quot;http-backend&quot;],
-      {
-        encoding: &quot;buffer&quot;,
-        env: {
-          ...process.env,
-          GIT_PROJECT_ROOT: dirname(repoDir),
-          GIT_HTTP_EXPORT_ALL: &quot;1&quot;,
-          PATH_INFO: url.pathname,
-          QUERY_STRING: url.search.slice(1),
-          REQUEST_METHOD: request.method ?? &quot;GET&quot;,
-          CONTENT_TYPE: request.headers[&quot;content-type&quot;] ?? &quot;&quot;,
-        },
-      },
-      (error, stdout, stderr) =&gt; {
-        if (error) {
-          response.writeHead(500).end(stderr);
-          return;
-        }
-        const headerEnd = stdout.indexOf(&quot;\r\n\r\n&quot;);
-        for (const header of stdout
-          .subarray(0, headerEnd)
-          .toString()
-          .split(&quot;\r\n&quot;)) {
-          const separator = header.indexOf(&quot;:&quot;);
-          const name = header.slice(0, separator);
-          const value = header.slice(separator + 1).trim();
-          if (name.toLowerCase() === &quot;status&quot;)
-            response.statusCode = Number.parseInt(value, 10);
-          else response.setHeader(name, value);
-        }
-        response.end(stdout.subarray(headerEnd + 4));
-      },
-    );
-    request.pipe(child.stdin!);
-  });
-  await new Promise&lt;void&gt;((resolvePromise) =&gt;
-    server.listen(0, &quot;127.0.0.1&quot;, resolvePromise),
-  );
-  const address = server.address();
-  if (address === null || typeof address === &quot;string&quot;)
-    throw new Error(&quot;missing git server port&quot;);
-  return {
-    url: `http://127.0.0.1:${address.port}/${repoDir.slice(dirname(repoDir).length + 1)}`,
-    close: () =&gt;
-      new Promise&lt;void&gt;((resolvePromise) =&gt;
-        server.close(() =&gt; resolvePromise()),
-      ),
-  };
-}
-
-    test(&quot;installs a resolved commit without downloading unavailable ancestor blobs&quot;, async ({
-      fixture,
-    }) =&gt; {
-      const { db, workDir, service } = fixture;
-      const repoDir = join(workDir, &quot;repo-selected-commit&quot;);
-      await writePluginFixture(repoDir, { name: &quot;bb-plugin-selected-commit&quot; });
-      await initGitRepo(repoDir);
-      await writeFile(
-        join(repoDir, &quot;retired.txt&quot;),
-        &quot;content from an older release&quot;,
-      );
-      await commitAll(repoDir, &quot;previous release&quot;);
-      const retiredBlob = await git(repoDir, [&quot;rev-parse&quot;, &quot;HEAD:retired.txt&quot;]);
-      await rm(join(repoDir, &quot;retired.txt&quot;));
-      const commit = await commitAll(repoDir, &quot;selected release&quot;);
-      await rm(
-        join(
-          repoDir,
-          &quot;.git&quot;,
-          &quot;objects&quot;,
-          retiredBlob.slice(0, 2),
-          retiredBlob.slice(2),
-        ),
-      );
-      const remote = await serveGitRepository(repoDir);
-
-      try {
-        const entry = await service.install(`git:${remote.url}@main`, {
-          kind: &quot;root&quot;,
-        });
-
-        expect(entry).toMatchObject({
-          id: &quot;selected-commit&quot;,
-          version: &quot;0.1.0&quot;,
-          status: &quot;running&quot;,
-        });
-        expect(getInstalledPluginRegistration(db, entry.id)).toMatchObject({
-          gitResolvedCommit: commit,
-        });
-        expect(existsSync(join(entry.rootDir, &quot;.git&quot;))).toBe(false);
-      } finally {
-        await remote.close();
-      }
-    });
-
+<h3>Complete authored regression patch</h3><pre>diff --git a/apps/server/test/services/plugins/plugin-install.test.ts b/apps/server/test/services/plugins/plugin-install.test.ts
+index 4bd00e040f..8efe26cd68 100644
+--- a/apps/server/test/services/plugins/plugin-install.test.ts
++++ b/apps/server/test/services/plugins/plugin-install.test.ts
+@@ -163,6 +163,61 @@ async function commitAll(repoDir: string, message: string): Promise&lt;string&gt; {
+   return git(repoDir, [&quot;rev-parse&quot;, &quot;HEAD&quot;]);
+ }
+ 
++async function serveGitRepository(repoDir: string) {
++  const server = createServer((request, response) =&gt; {
++    const url = new URL(request.url ?? &quot;/&quot;, &quot;http://127.0.0.1&quot;);
++    const child = execFile(
++      &quot;git&quot;,
++      [&quot;http-backend&quot;],
++      {
++        encoding: &quot;buffer&quot;,
++        env: {
++          ...process.env,
++          GIT_PROJECT_ROOT: dirname(repoDir),
++          GIT_HTTP_EXPORT_ALL: &quot;1&quot;,
++          PATH_INFO: url.pathname,
++          QUERY_STRING: url.search.slice(1),
++          REQUEST_METHOD: request.method ?? &quot;GET&quot;,
++          CONTENT_TYPE: request.headers[&quot;content-type&quot;] ?? &quot;&quot;,
++        },
++      },
++      (error, stdout, stderr) =&gt; {
++        if (error) {
++          response.writeHead(500).end(stderr);
++          return;
++        }
++        const headerEnd = stdout.indexOf(&quot;\r\n\r\n&quot;);
++        for (const header of stdout
++          .subarray(0, headerEnd)
++          .toString()
++          .split(&quot;\r\n&quot;)) {
++          const separator = header.indexOf(&quot;:&quot;);
++          const name = header.slice(0, separator);
++          const value = header.slice(separator + 1).trim();
++          if (name.toLowerCase() === &quot;status&quot;)
++            response.statusCode = Number.parseInt(value, 10);
++          else response.setHeader(name, value);
++        }
++        response.end(stdout.subarray(headerEnd + 4));
++      },
++    );
++    request.pipe(child.stdin!);
++  });
++  await new Promise&lt;void&gt;((resolvePromise) =&gt;
++    server.listen(0, &quot;127.0.0.1&quot;, resolvePromise),
++  );
++  const address = server.address();
++  if (address === null || typeof address === &quot;string&quot;)
++    throw new Error(&quot;missing git server port&quot;);
++  return {
++    url: `http://127.0.0.1:${address.port}/${repoDir.slice(dirname(repoDir).length + 1)}`,
++    close: () =&gt;
++      new Promise&lt;void&gt;((resolvePromise) =&gt;
++        server.close(() =&gt; resolvePromise()),
++      ),
++  };
++}
++
+ function artifactMeta(args: {
+   artifactFormatVersion?: number;
+   pluginId: string;
+@@ -840,28 +895,82 @@ describe(&quot;plugin install flows&quot;, () =&gt; {
+       expect(getInstalledPluginRegistration(db, &quot;connect&quot;)).toBeUndefined();
+     });
+ 
+-    test(&quot;installs a pinned commit sha via clone + checkout&quot;, async ({
++    test(&quot;installs a resolved commit without downloading unavailable ancestor blobs&quot;, async ({
+       fixture,
+     }) =&gt; {
+-      const { workDir, service } = fixture;
+-
+-      const repoDir = join(workDir, &quot;repo-sha&quot;);
+-      await writePluginFixture(repoDir, { name: &quot;bb-plugin-shaman&quot; });
++      const { db, workDir, service } = fixture;
++      const repoDir = join(workDir, &quot;repo-selected-commit&quot;);
++      await writePluginFixture(repoDir, { name: &quot;bb-plugin-selected-commit&quot; });
+       await initGitRepo(repoDir);
+-      const sha = await commitAll(repoDir, &quot;init&quot;);
+-      await writePluginFixture(repoDir, {
+-        name: &quot;bb-plugin-shaman&quot;,
+-        version: &quot;9.9.9&quot;,
+-      });
+-      await commitAll(repoDir, &quot;later&quot;);
++      await writeFile(
++        join(repoDir, &quot;retired.txt&quot;),
++        &quot;content from an older release&quot;,
++      );
++      await commitAll(repoDir, &quot;previous release&quot;);
++      const retiredBlob = await git(repoDir, [&quot;rev-parse&quot;, &quot;HEAD:retired.txt&quot;]);
++      await rm(join(repoDir, &quot;retired.txt&quot;));
++      const commit = await commitAll(repoDir, &quot;selected release&quot;);
++      await rm(
++        join(
++          repoDir,
++          &quot;.git&quot;,
++          &quot;objects&quot;,
++          retiredBlob.slice(0, 2),
++          retiredBlob.slice(2),
++        ),
++      );
++      const remote = await serveGitRepository(repoDir);
+ 
+-      const entry = await service.install(`git:${repoDir}@${sha}`, {
+-        kind: &quot;root&quot;,
+-      });
+-      expect(entry.status).toBe(&quot;running&quot;);
+-      expect(entry.version).toBe(&quot;0.1.0&quot;);
++      try {
++        const entry = await service.install(`git:${remote.url}@main`, {
++          kind: &quot;root&quot;,
++        });
++
++        expect(entry).toMatchObject({
++          id: &quot;selected-commit&quot;,
++          version: &quot;0.1.0&quot;,
++          status: &quot;running&quot;,
++        });
++        expect(getInstalledPluginRegistration(db, entry.id)).toMatchObject({
++          gitResolvedCommit: commit,
++        });
++        expect(existsSync(join(entry.rootDir, &quot;.git&quot;))).toBe(false);
++      } finally {
++        await remote.close();
++      }
+     });
+ 
++    test.for([40, 7])(
++      &quot;installs a pinned commit with a %i-character sha&quot;,
++      async (shaLength, { fixture }) =&gt; {
++        const { workDir, service } = fixture;
++
++        const repoDir = join(workDir, &quot;repo-sha&quot;);
++        await writePluginFixture(repoDir, { name: &quot;bb-plugin-shaman&quot; });
++        await initGitRepo(repoDir);
++        const sha = await commitAll(repoDir, &quot;init&quot;);
++        await writePluginFixture(repoDir, {
++          name: &quot;bb-plugin-shaman&quot;,
++          version: &quot;9.9.9&quot;,
++        });
++        await commitAll(repoDir, &quot;later&quot;);
++
++        const remote = await serveGitRepository(repoDir);
++        try {
++          const entry = await service.install(
++            `git:${remote.url}@${sha.slice(0, shaLength)}`,
++            {
++              kind: &quot;root&quot;,
++            },
++          );
++          expect(entry.status).toBe(&quot;running&quot;);
++          expect(entry.version).toBe(&quot;0.1.0&quot;);
++        } finally {
++          await remote.close();
++        }
++      },
++    );
++
+     test(&quot;never reuses an exact-resolution artifact owned by another plugin&quot;, async ({
+       fixture,
+     }) =&gt; {
 </pre>
-<p>The <a href="7910/repro/regression-excerpt.ts">excerpt</a> depends on the existing fixture helpers; use the complete patch to run it.</p>
+<p>This patch reuses the existing service/database fixtures and includes the smart-HTTP helper and both pinned-commit controls.</p>
 <h2>5. Root cause</h2><p>The shared git artifact materializer performs an unrestricted clone before detaching the selected commit and removing .git, so historical objects outside the selected snapshot are required.</p><ul>
 <li><a href="https://github.com/get-bb/bb/blob/fab82665a3299fae8910f55d7519a3b034a03b9a/apps/server/src/services/plugins/managed-plugin-artifacts.ts#L148-L176">cloneGitCommit at the trusted base</a> clones all advertised refs and their reachable history, detaches the requested commit, checks its identity, and deletes .git.</li>
 <li><a href="https://github.com/get-bb/bb/blob/fab82665a3299fae8910f55d7519a3b034a03b9a/apps/server/src/services/plugins/managed-plugin-artifacts.ts#L609-L632">Semver installation candidate probe</a>, <a href="https://github.com/get-bb/bb/blob/fab82665a3299fae8910f55d7519a3b034a03b9a/apps/server/src/services/plugins/managed-plugin-artifacts.ts#L779-L808">installation materialization</a>, and <a href="https://github.com/get-bb/bb/blob/fab82665a3299fae8910f55d7519a3b034a03b9a/apps/server/src/services/plugins/managed-plugin-artifacts.ts#L1204-L1225">update staging</a> all call this materializer.</li>
@@ -149,7 +214,14 @@ fatal: the remote end hung up unexpectedly
 <h2>7. Linked PR review</h2><p><a href="https://github.com/get-bb/bb/pull/7911">#7911</a> is closed and unmerged. Only its GitHub metadata and textual diff were read; its branch, test code, and commands were not run. It proposes the same broad shallow-first/fallback direction using a separate helper and FETCH_HEAD checkout, with cancellation propagation. That direction addresses the observed cause. Its local broken-ref expectation is Git-version-sensitive: an independently authored local-path probe did not fail on this machine. Verdict: directionally relevant, unverified as an implementation; no execution claim. No open issue-linked PR was found before fix work.</p>
 <h2>8. Related issues</h2><p><a href="https://github.com/get-bb/bb/issues/5373">#5373</a> is closed and concerns marketplace branch selection, rather than this materializer's history transfer.</p>
 <h2>9. Verification</h2><p>The same agent repeated the reproduction in a second clean temporary checkout named <code>verify</code>, detached at fab82665a3299fae8910f55d7519a3b034a03b9a, with a fresh frozen install and successful scoped server build. Only the authored test patch was applied. Git confirmed production source remained unchanged. The identical command failed with the same clone error: one regression failed, both pinned-commit controls passed. Fixture caches, SQLite databases, and ephemeral loopback ports were newly allocated. This is a second clean run by the same agent, not an independent review.</p><p>After the production repair in the first checkout: three focused cases passed; five relevant existing suites passed, totaling 129 tests. Server typecheck, typed lint, server build, formatting, and git diff --check passed. The initial broken-ref fixture was discarded because it did not reproduce with Git 2.39.5; the final report is based on the HTTP/ancestor-blob fixture only.</p>
-<h2>10. Appendix</h2><ul><li><a href="7910/repro/baseline.log">First unchanged-production failure</a></li><li><a href="7910/repro/verify-baseline.log">Second clean unchanged-production failure</a></li><li><a href="7910/repro/focused-fixed.log">Focused repaired result</a></li><li><a href="7910/repro/relevant-tests.log">129-test result</a></li><li><a href="7910/repro/checks.log">Typecheck result</a></li><li><a href="7910/repro/final-build-lint.log">Server build and typed lint</a></li></ul>
+<h2>10. Appendix</h2><p>Raw evidence remains in the private local investigation directory, in accordance with this public site's artifact policy. The relevant output is reproduced here without checkout paths:</p><pre>First unchanged-production run: 1 failed | 2 passed | 55 skipped (58)
+Second clean unchanged-production run: 1 failed | 2 passed | 55 skipped (58)
+Repaired focused run: 3 passed | 55 skipped (58)
+Relevant suites: Test Files 5 passed (5); Tests 129 passed (129)
+Typecheck: exit 0
+Server build: exit 0
+Typed lint: Found 0 warnings and 0 errors.
+git diff --check: exit 0</pre>
 <pre>pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-install.test.ts test/services/plugins/plugin-update.test.ts test/services/plugins/plugin-install-jobs.test.ts test/services/plugins/plugin-update-jobs.test.ts test/services/plugins/update-resolver.test.ts
 pnpm exec turbo run typecheck --filter=@bb/server
 pnpm exec turbo run lint:type-aware build --filter=@bb/server
