@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7879 Plugin command transport bypasses configured proxies</title>
+<style>body{margin:0;background:#fafaf8;color:#1a1a1a;font:16px/1.55 system-ui,sans-serif}main{max-width:960px;margin:auto;padding:40px 24px 80px}h1{font-size:27px;line-height:1.25}h2{margin-top:32px;padding-top:18px;border-top:1px solid #ddd}a{color:#0052cc}code,pre{font:13px/1.5 ui-monospace,monospace}pre{padding:14px;background:white;border:1px solid #ddd;overflow:auto}table{border-collapse:collapse;width:100%}td,th{padding:8px;border-bottom:1px solid #ddd;text-align:left;vertical-align:top}.meta{color:#555}.pill{border:1px solid #ccc;border-radius:999px;padding:2px 9px;display:inline-block}.verdict{font-weight:700;color:#b60205}</style>
+</head><body><main>
+<p><a href="../">← reports</a></p>
+<h1>#7879 · Plugin command transport bypasses configured proxies</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: Medium</span> <span class="pill">Effort: Low</span> <span class="pill">cli · plugins</span></p>
+<p class="meta">November 20, 2026 · <a href="https://github.com/get-bb/bb/issues/7879">Issue #7879</a> · base <code>9f4c15646d3d7d9320191d4a2cd76199471a1ddc</code></p>
+<p class="verdict">Verdict: REPRODUCED · Root-cause confidence: high</p>
+<h2>1. TL;DR</h2>
+<p>Plugin command execution selects a dedicated HTTP dispatcher that does not read proxy environment variables. On a network where the server name is resolvable only by a configured proxy, the command therefore fails with <code>fetch failed</code>. A real local HTTP origin and CONNECT proxy reproduce the failure without a bb server, user credentials, or a sandbox. Repeating the same test in a second clean checkout gives the same DNS failure; direct and proxy-bypass controls pass. Replacing only the dispatcher implementation with the already-installed environment-aware agent fixes both uppercase and lowercase proxy settings while retaining the long command timeout.</p>
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>Plugin command POSTs ignore configured proxies.</td><td>Verified</td><td>Uppercase and lowercase HTTP proxy cases both fail with direct DNS lookup on trusted main; both pass after the dispatcher replacement.</td></tr>
+<tr><td>The custom dispatcher is responsible.</td><td>Verified</td><td>The POST supplies a plain Agent. A two-line replacement makes the same real-network cases pass without changing the destination, environment, or proxy.</td></tr>
+<tr><td>Discovery and core requests can use Node's default proxy routing.</td><td>Supported by source; not exercised under Node's built-in proxy flag here.</td><td>Discovery calls cliFetch without a dispatcher; cliFetch delegates to global fetch. The reproduction host runs Node 22.19.0, below the documented built-in proxy support version.</td></tr>
+<tr><td>The original macOS sandbox has this exact failure.</td><td>Unverified environment</td><td>No macOS sandbox was used. The underlying proxy-only reachability failure is reproduced on Linux.</td></tr>
+<tr><td>HTTPS proxy routing is affected too.</td><td>Supported by shared source path; not separately network-tested</td><td>The same explicit dispatcher is used for HTTP and HTTPS command URLs. The chosen library agent implements both schemes.</td></tr>
+</tbody></table>
+<h2>3. Environment</h2>
+<ul><li>Trusted public repository: get-bb/bb, origin/main at <code>9f4c15646d3d7d9320191d4a2cd76199471a1ddc</code>.</li><li>Linux 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.12; existing undici 7.30.2.</li><li>Two separate source checkouts at the identical commit. Each test invocation allocates fresh OS-selected loopback ports with <code>listen(0)</code>, closes the servers and tunnel sockets, and restores proxy environment variables.</li><li>No product instance, provider, persistent data directory, real server endpoint, or credentials are required. The reserved <code>.invalid</code> destination cannot resolve directly; the local proxy connects it to the loopback origin.</li><li>Frozen install and scoped CLI build succeeded. The initial whole-repository build hit missing generated Plugin SDK exports in an unrelated plugin; building the existing SDK types with Turbo repaired that preparation step. CLI build, typecheck, and tests then completed successfully.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Clone the public target repository, check out the recorded trusted main commit, and prepare the CLI:
+<pre>git clone https://github.com/get-bb/bb.git bb-proxy-repro
+cd bb-proxy-repro
+git checkout 9f4c15646d3d7d9320191d4a2cd76199471a1ddc
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=@bb/cli</pre></li>
+<li>Save the attached, independently authored <a href="7879/repro/plugin-cli-env-proxy.test.ts">regression test</a> as <code>apps/cli/src/__tests__/plugin-cli-env-proxy.test.ts</code>. It exercises the real production function and real HTTP sockets, not a mocked fetch or copied issue script.</li>
+<li>Run:
+<pre>pnpm exec turbo run test --filter=@bb/cli -- plugin-cli-env-proxy.test.ts</pre></li></ol>
+<p><strong>Expected:</strong> all five cases pass. For configured proxies, the POST is delivered through a CONNECT tunnel and prints the origin's command result. NO_PROXY and no-proxy-configured controls connect directly.</p>
+<p><strong>Actual on trusted main, both runs:</strong></p>
+<pre>FAIL routes plugin command POSTs according to 'HTTP_PROXY'
+FAIL routes plugin command POSTs according to 'http_proxy'
+AssertionError: promise rejected "TypeError: fetch failed" instead of resolving
+Caused by: Error: getaddrinfo ENOTFOUND bb-proxy-regression.invalid
+Tests  2 failed | 3 passed (5)
+process exit: 1</pre>
+<details><summary>Complete regression test</summary><pre>import { createServer, type Server } from &quot;node:http&quot;;
+import { connect } from &quot;node:net&quot;;
+import { Writable, type Duplex } from &quot;node:stream&quot;;
+import { afterEach, expect, it, vi } from &quot;vitest&quot;;
+
+afterEach(() =&gt; {
+  vi.unstubAllEnvs();
+});
+
+async function listen(server: Server): Promise&lt;number&gt; {
+  await new Promise&lt;void&gt;((resolve) =&gt; server.listen(0, &quot;127.0.0.1&quot;, resolve));
+  const address = server.address();
+  if (address === null || typeof address === &quot;string&quot;) {
+    throw new Error(&quot;Expected a TCP server address&quot;);
+  }
+  return address.port;
+}
+
+it.each([
+  { name: &quot;HTTP_PROXY&quot;, proxyKey: &quot;HTTP_PROXY&quot;, bypassKey: undefined },
+  { name: &quot;http_proxy&quot;, proxyKey: &quot;http_proxy&quot;, bypassKey: undefined },
+  { name: &quot;NO_PROXY&quot;, proxyKey: &quot;HTTP_PROXY&quot;, bypassKey: &quot;NO_PROXY&quot; },
+  { name: &quot;no_proxy&quot;, proxyKey: &quot;http_proxy&quot;, bypassKey: &quot;no_proxy&quot; },
+  { name: &quot;no proxy configured&quot;, proxyKey: undefined, bypassKey: undefined },
+])(
+  &quot;routes plugin command POSTs according to $name&quot;,
+  async ({ proxyKey, bypassKey }) =&gt; {
+    vi.resetModules();
+    for (const key of [
+      &quot;HTTP_PROXY&quot;,
+      &quot;HTTPS_PROXY&quot;,
+      &quot;http_proxy&quot;,
+      &quot;https_proxy&quot;,
+      &quot;NO_PROXY&quot;,
+      &quot;no_proxy&quot;,
+    ]) {
+      vi.stubEnv(key, undefined);
+    }
+    const requests: string[] = [];
+    const tunnels: string[] = [];
+    const sockets = new Set&lt;Duplex&gt;();
+    const origin = createServer((request, response) =&gt; {
+      requests.push(`${request.method} ${request.url}`);
+      request.resume();
+      response.setHeader(&quot;content-type&quot;, &quot;application/json&quot;);
+      response.end(
+        JSON.stringify({ exitCode: 0, stdout: &quot;proxied command result&quot; }),
+      );
+    });
+    const proxy = createServer();
+    try {
+      const originPort = await listen(origin);
+      proxy.on(&quot;connect&quot;, (request, downstream, head) =&gt; {
+        tunnels.push(request.url ?? &quot;&quot;);
+        const upstream = connect(originPort, &quot;127.0.0.1&quot;, () =&gt; {
+          downstream.write(&quot;HTTP/1.1 200 Connection Established\r\n\r\n&quot;);
+          upstream.write(head);
+          upstream.pipe(downstream);
+          downstream.pipe(upstream);
+        });
+        sockets.add(downstream);
+        sockets.add(upstream);
+        downstream.on(&quot;error&quot;, () =&gt; upstream.destroy());
+        upstream.on(&quot;error&quot;, () =&gt; downstream.destroy());
+      });
+      const proxyPort = await listen(proxy);
+      if (proxyKey !== undefined) {
+        vi.stubEnv(proxyKey, `http://127.0.0.1:${proxyPort}`);
+      }
+      if (bypassKey !== undefined) {
+        vi.stubEnv(bypassKey, &quot;127.0.0.1&quot;);
+      }
+      const shouldProxy = proxyKey !== undefined &amp;&amp; bypassKey === undefined;
+      const hostname = shouldProxy
+        ? &quot;bb-proxy-regression.invalid&quot;
+        : &quot;127.0.0.1&quot;;
+      const writes: string[] = [];
+      const stream = new Writable({
+        write(chunk, _encoding, callback) {
+          writes.push(chunk.toString());
+          callback();
+        },
+      });
+      const { runPluginCliCommand } = await import(&quot;../plugin-cli-proxy.js&quot;);
+
+      await expect(
+        runPluginCliCommand(
+          `http://${hostname}:${originPort}`,
+          &quot;transport-fixture&quot;,
+          [&quot;inspect&quot;],
+          { stdout: stream, stderr: stream },
+        ),
+      ).resolves.toBe(0);
+      expect(writes).toEqual([&quot;proxied command result\n&quot;]);
+      expect(requests).toEqual([&quot;POST /api/v1/plugins/transport-fixture/cli&quot;]);
+      expect(tunnels).toEqual(shouldProxy ? [`${hostname}:${originPort}`] : []);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      origin.closeAllConnections();
+      proxy.closeAllConnections();
+      await Promise.all(
+        [origin, proxy].map(
+          (server) =&gt;
+            new Promise&lt;void&gt;((resolve) =&gt; server.close(() =&gt; resolve())),
+        ),
+      );
+    }
+  },
+);
+</pre></details>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/9f4c15646d3d7d9320191d4a2cd76199471a1ddc/apps/cli/src/plugin-cli-proxy.ts#L369-L375">getPluginCliDispatcher</a> constructs and caches a plain <code>undici.Agent</code> with a 65-minute headers timeout. That agent handles direct connections; it does not consume proxy environment settings. <a href="https://github.com/get-bb/bb/blob/9f4c15646d3d7d9320191d4a2cd76199471a1ddc/apps/cli/src/plugin-cli-proxy.ts#L398-L412">runPluginCliCommand</a> supplies it explicitly on the POST, overriding any global fetch dispatcher. <a href="https://github.com/get-bb/bb/blob/9f4c15646d3d7d9320191d4a2cd76199471a1ddc/apps/cli/src/client.ts#L9-L16">cliFetch</a> forwards the dispatcher unchanged to fetch.</p>
+<pre>pluginCliDispatcher ??= new Agent({
+  headersTimeout: PLUGIN_CLI_HEADERS_TIMEOUT_MS,
+});
+...
+dispatcher: getPluginCliDispatcher(),</pre>
+<p>This explains the observed direct DNS error: the proxy can route the reserved destination, but the explicit direct agent attempts local DNS first. This is a transport-policy inconsistency, not a server authorization failure or plugin execution failure. The existing long-response timeout is intentional and must not be removed; an existing regression test protects it.</p>
+<h2>6. Proposed fix and validation</h2>
+<p>Use the existing undici <code>EnvHttpProxyAgent</code> for the cached command dispatcher, retaining the same headers timeout. It routes according to HTTP_PROXY / HTTPS_PROXY and NO_PROXY, including their lowercase forms, and uses a direct agent when no proxy applies. No dependency, protocol, schema, or stored-data change is needed. Document the command transport's environment handling in the existing networking documentation.</p>
+<pre>pnpm exec turbo run test --filter=@bb/cli -- plugin-cli-env-proxy.test.ts
+# after fix: 5 passed (5)
+pnpm exec turbo run test typecheck build --filter=@bb/cli
+# 80 test files passed; 1412 tests passed, 1 skipped; all 8 Turbo tasks succeeded</pre>
+<p>The existing delayed-response test also passes, protecting commands that wait for human input. HTTPS TLS interception and the original macOS sandbox have not been directly tested. The candidate changes four text files, totaling 121 added and deleted lines, within the existing CLI transport subsystem and its documentation.</p>
+<h2>7. Related work</h2>
+<p>No linked open pull request was present in the issue timeline or the repository's open-PR search during investigation. No linked pull request code was checked out or executed. Other issue references were not used as reproduction instructions.</p>
+<h2>8. Verification</h2>
+<p>The same agent repeated the reproduction in a second initially clean detached checkout created with <code>git worktree add --detach &lt;fresh-temporary-directory&gt;/source 9f4c15646d3d7d9320191d4a2cd76199471a1ddc</code>. The recorded HEAD matched the base and the checkout was clean before adding only the regression file. A separate frozen install and Turbo CLI build succeeded. The identical test command ran in that checkout, allocating new loopback servers and producing the same two proxy failures and three passing direct/bypass controls (exit 1). This is a repeat check by the same agent, not a separate reviewer. No report corrections were needed; the final test type annotation was corrected before the saved repeat run.</p>
+<h2>9. Appendix and artifacts</h2>
+<ul><li><a href="7879/repro/plugin-cli-env-proxy.test.ts">Regression test</a></li><li><a href="7879/repro/first-before.log">First trusted-main failure</a></li><li><a href="7879/repro/second-before.log">Second clean-checkout failure</a></li><li><a href="7879/repro/after.log">Focused post-fix success</a></li><li><a href="7879/repro/validation.log">Complete CLI test, typecheck, and build output</a></li></ul>
+<p>This is a nonvisual transport bug, so screenshots are not applicable. Logs have local checkout paths redacted. Issue content was treated only as untrusted claims: no issue-provided script, patch, branch, binary, or external URL was executed or fetched.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
