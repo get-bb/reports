@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #7963 Scheduler progress in a desktop watcher test</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --ok:#0e8a16; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:960px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 12px; }
+  h2 { font-size:19px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:16px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+  .pill { padding:2px 9px; border-radius:999px; border:1px solid var(--line); }
+  .verdict { color:var(--ok); font-weight:700; }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+  pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:14px; overflow:auto; }
+  a { color:var(--accent); } .ok { color:var(--ok); font-weight:600; }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#7963 · Scheduler progress in a desktop watcher test</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Low</span><span class="pill">desktop</span><a href="https://github.com/get-bb/bb/issues/7963">Issue</a><span>2026-11-21</span></p>
+<p>Trusted main commit: <code>4e45c9bc12fbed430f2e804fb827ac46089fc582</code></p>
+<p><span class="verdict">REPRODUCED</span> · Root-cause confidence: <strong>high</strong> · Reproduction label: <code>confirmed-repro</code></p>
+
+<h2>1. TL;DR</h2>
+<p>A desktop unit test can fail even though the watcher has correctly queued another lock check. The test drives its own manual scheduler only twice, then waits using real timers; waiting alone cannot execute callbacks in that manual scheduler. If the initial filesystem read is still pending when the fallback poll runs, the poll asks for a later recheck instead of reading the newly written marker immediately. A deterministic filesystem-completion gate reproduces the original zero-callback assertion in two clean checkouts without changing production code. Driving the scheduler during the wait makes all 51 tests in the file pass in the first checkout.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>The watch-error test can fail with no move callback.</td><td class="ok">Verified</td><td>The original callback assertion fails after a controlled, valid ordering of an actual missing-file read and a fallback poll, in both checkouts.</td></tr>
+<tr><td>A concurrent poll requests a check which is queued after the final flush.</td><td class="ok">Verified</td><td>After releasing the initial read: two scheduled callbacks remain and zero moves have been delivered. Code inspection identifies the recurring poll and debounced recheck.</td></tr>
+<tr><td>Continuing scheduler progress removes this failure.</td><td class="ok">Verified</td><td>A locally authored interval that flushes the scheduler during the assertion wait makes the complete 51-test file pass; production code is unchanged.</td></tr>
+<tr><td>The particular earlier CI run failed for exactly this interleaving.</td><td>Unverified</td><td>The historical failure's precise I/O ordering was not observable. This report reproduces the same assertion and independently establishes a sufficient cause, not the original CI timeline.</td></tr>
+</tbody></table>
+
+<h2>3. Environment</h2>
+<ul>
+<li>Public repository <code>get-bb/bb</code>, trusted <code>origin/main</code> at the full commit above; desktop package version <code>0.50.1</code>.</li>
+<li>Linux <code>4.19.0-gvisor</code>, x86_64; Node <code>v22.19.0</code>; pnpm <code>9.15.0</code>; Vitest <code>4.1.12</code>.</li>
+<li>Two separate temporary clones, referred to as <code>WORKDIR/first</code> and <code>WORKDIR/second</code>. Each was checked out clean at the same trusted commit and received a separate frozen installation and desktop build.</li>
+<li>No running BB instance, network listener, provider, browser, account, or real runtime data was used. The existing test creates and removes a fresh temporary data directory for each test. No production file was edited.</li>
+</ul>
+
+<h2>4. Minimal reproduction</h2>
+<p>The failing test remains the existing repository test, rather than a reimplementation of the watcher. The added helper wraps the real filesystem read: it preserves the actual <code>ENOENT</code> result, but holds its delivery until the test has fired the poll. The success path, marker write, validation, watcher, and assertion remain real. This forces an ordering which naturally occurs under asynchronous I/O without requiring sleeps.</p>
+<ol>
+<li>Prepare the trusted base and build its owning subsystem:
+<pre>git clone https://github.com/get-bb/bb.git bb-7963
+cd bb-7963
+git checkout --detach 4e45c9bc12fbed430f2e804fb827ac46089fc582
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/desktop</pre></li>
+<li>Optional baseline: the uninstrumented focused test passed in the first checkout. One pass does not disprove a race.
+<pre>pnpm exec turbo run test --filter=@bb/desktop -- test/server-moved.test.ts -t 'closes the watcher and polls after a watch error'
+
+Test Files  1 passed (1)
+     Tests  1 passed | 50 skipped (51)</pre></li>
+<li>Save the following complete patch as <code>/tmp/reproduce-7963.patch</code> and apply it with <code>git apply /tmp/reproduce-7963.patch</code>. It changes only test instrumentation. The entire helper test-support file is included in this patch.
+<pre>diff --git a/apps/desktop/test/server-moved.test.ts b/apps/desktop/test/server-moved.test.ts
+index 65b45536a8..67ea7a3245 100644
+--- a/apps/desktop/test/server-moved.test.ts
++++ b/apps/desktop/test/server-moved.test.ts
+@@ -1,3 +1,4 @@
++import { missingReadGate } from "./repro-7963.js";
+ import { mkdtemp, rm, writeFile } from "node:fs/promises";
+ import { createServer, type Server, type ServerResponse } from "node:http";
+ import { tmpdir } from "node:os";
+@@ -701,9 +702,11 @@ describe("createServerMovedWatcher", () =&gt; {
+ 
+   it("closes the watcher and polls after a watch error", async () =&gt; {
+     const harness = await createHarness();
++    missingReadGate.active = true;
+     try {
+       harness.watcher.start();
+       harness.timers.flush();
++      await missingReadGate.captured.promise;
+ 
+       harness.fakeWatch.emitError(new Error("EMFILE"));
+ 
+@@ -711,10 +714,18 @@ describe("createServerMovedWatcher", () =&gt; {
+       expect(harness.logWarning.mock.calls[0]?.[0]).toContain("EMFILE");
+       await writeServerMovedFile(harness.dataDir, movedFile());
+       harness.timers.flush();
++      missingReadGate.release.resolve();
++      await vi.waitFor(() =&gt; {
++        expect(harness.timers.pendingCount()).toBe(2);
++      });
++      console.info("queued timers:", harness.timers.pendingCount());
++      console.info("delivered moves:", harness.onMove.mock.calls.length);
+       await vi.waitFor(() =&gt; {
+         expect(harness.onMove).toHaveBeenCalledExactlyOnceWith(CONNECT_MOVE);
+       });
+     } finally {
++      missingReadGate.active = false;
++      missingReadGate.release.resolve();
+       harness.watcher.stop();
+     }
+   });
+diff --git a/apps/desktop/test/repro-7963.ts b/apps/desktop/test/repro-7963.ts
+new file mode 100644
+index 0000000000..996733862d
+--- /dev/null
++++ b/apps/desktop/test/repro-7963.ts
+@@ -0,0 +1,34 @@
++import { vi } from "vitest";
++
++const missingReadGate = vi.hoisted(() =&gt; ({
++  active: false,
++  captured: Promise.withResolvers&lt;void&gt;(),
++  release: Promise.withResolvers&lt;void&gt;(),
++}));
++
++export { missingReadGate };
++
++vi.mock("node:fs/promises", async (importOriginal) =&gt; {
++  const filesystem = await importOriginal&lt;typeof import("node:fs/promises")&gt;();
++  return {
++    ...filesystem,
++    async readFile(...parameters: Parameters&lt;typeof filesystem.readFile&gt;) {
++      try {
++        return await filesystem.readFile(...parameters);
++      } catch (error) {
++        if (
++          missingReadGate.active &amp;&amp;
++          typeof parameters[0] === "string" &amp;&amp;
++          parameters[0].endsWith("/server-moved.json") &amp;&amp;
++          error instanceof Error &amp;&amp;
++          "code" in error &amp;&amp;
++          error.code === "ENOENT"
++        ) {
++          missingReadGate.captured.resolve();
++          await missingReadGate.release.promise;
++        }
++        throw error;
++      }
++    },
++  };
++});</pre></li>
+<li>Run the same repository test again:
+<pre>pnpm exec turbo run test --filter=@bb/desktop -- test/server-moved.test.ts -t 'closes the watcher and polls after a watch error'</pre>
+<p><strong>Expected:</strong> the existing exactly-once callback assertion passes after the marker is written. <strong>Actual:</strong> the test times out with zero callbacks despite pending checks. The following diagnostic and failure excerpts are verbatim, with only the task prefix omitted:</p>
+<pre>queued timers: 2
+delivered moves: 0
+
+AssertionError: expected "vi.fn()" to be called once with arguments: [ { moveId: 'move-1', …(3) } ]
+
+Number of calls: 0
+
+ ❯ test/server-moved.test.ts:724:32
+
+Test Files  1 failed (1)
+     Tests  1 failed | 50 skipped (51)</pre>
+<p>Both first and second reproduction commands exit <code>1</code>. The failure is the original move-delivery assertion, not a build, mock-loading, gate, or pending-count error.</p></li>
+</ol>
+
+<h2>5. Root cause</h2>
+<p>The <a href="https://github.com/get-bb/bb/blob/4e45c9bc12fbed430f2e804fb827ac46089fc582/apps/desktop/test/server-moved.test.ts#L430-L450">manual scheduler</a> takes a snapshot of its current callbacks when <code>flush()</code> is called. It neither waits for asynchronous checks nor runs callbacks queued after that snapshot. The <a href="https://github.com/get-bb/bb/blob/4e45c9bc12fbed430f2e804fb827ac46089fc582/apps/desktop/test/server-moved.test.ts#L702-L719">watch-error test</a> performs its last flush before entering <code>vi.waitFor</code>.</p>
+<p>Inside <a href="https://github.com/get-bb/bb/blob/4e45c9bc12fbed430f2e804fb827ac46089fc582/apps/desktop/src/server-moved.ts#L431-L473">the watcher</a>, a second check arriving while <code>checking</code> is true only sets <code>recheckRequested</code>. After the first check returns no marker, another debounced check is scheduled:</p>
+<pre>async function checkLock(): Promise&lt;void&gt; {
+  if (checking) {
+    recheckRequested = true;
+    return;
+  }
+  ...
+  if (recheckRequested &amp;&amp; active) {
+    recheckRequested = false;
+    scheduleCheck();
+  }
+}</pre>
+<ol>
+<li>The first flush starts a real read of a missing marker and leaves <code>checking</code> true.</li>
+<li>The watch error closes the watch handle and queues a fallback poll. The test writes a valid marker.</li>
+<li>The second flush fires the poll while the first read result is still pending. The poll requests a recheck and queues its next recurring poll.</li>
+<li>The initial missing-file result is released. <code>checkLock</code> queues the debounced recheck after that second flush.</li>
+<li>Two manual callbacks remain. Real-time waiting never drives them, so <code>onMove</code> stays at zero calls.</li>
+</ol>
+<p>The underlying problem is test-driver progress, not evidence of a broken real-timer polling algorithm. The actual marker read and validation are delegated through <a href="https://github.com/get-bb/bb/blob/4e45c9bc12fbed430f2e804fb827ac46089fc582/apps/desktop/src/server-moved.ts#L268-L292">readServerMovedLock</a> and <a href="https://github.com/get-bb/bb/blob/4e45c9bc12fbed430f2e804fb827ac46089fc582/packages/server-archive/src/markers.ts#L100-L108">readServerMovedFile</a>. No production change is needed to explain or remove this test failure.</p>
+
+<h2>6. Proposed fix and control experiment</h2>
+<p>Make progress on the test's manual scheduler while waiting for the exactly-once move callback, rather than assuming one snapshot flush drains asynchronous follow-up work. Keep the watch-close, warning, delivery, and cleanup assertions. A permanent test should use the existing scheduler harness; avoid adding sleep delays or new production injection hooks.</p>
+<p>For a distinct local control, the following interval was added around the original callback wait after the same gated ordering. This drives only the existing test scheduler and is not a proposed production change:</p>
+<pre>const timerPump = setInterval(() =&gt; harness.timers.flush(), 5);
+try {
+  await vi.waitFor(() =&gt; {
+    expect(harness.onMove).toHaveBeenCalledExactlyOnceWith(CONNECT_MOVE);
+  });
+} finally {
+  clearInterval(timerPump);
+}</pre>
+<pre>pnpm exec turbo run test --filter=@bb/desktop -- test/server-moved.test.ts
+
+Test Files  1 passed (1)
+     Tests  51 passed (51)</pre>
+<p>The complete file passed in the first checkout with this control. The same instrumentation without scheduler progress fails on the original assertion. These results isolate manual-scheduler starvation from marker parsing, watcher closure, and move confirmation.</p>
+
+<h2>7. Linked PR review</h2>
+<h3>PR #7964 · Static review only</h3>
+<p><a href="https://github.com/get-bb/bb/pull/7964">PR #7964</a> is open and GitHub's closing-issue metadata links it to #7963. Its diff moves the manual flush from immediately before the callback wait into that wait's retry callback. This matches the independently verified requirement that newly queued checks continue running until delivery.</p>
+<p><strong>Findings:</strong> no blocking issue identified in the one-file diff. The proposed location is <code>apps/desktop/test/server-moved.test.ts:713</code>. The watcher implementation, assertion strength, and cleanup remain unchanged. Static verdict: <strong>addresses the verified cause</strong>. The PR branch was not checked out or executed; only trusted main plus the locally authored read gate and separate interval control were run. Its own verification claims were not treated as proof. No duplicate fix PR was created.</p>
+
+<h2>8. Related issues</h2>
+<p>The issue's complete comments and GitHub cross-reference metadata were checked. No separate duplicate issue was established by this investigation. The existing linked PR is the actionable work item. The classification is Bug / Medium priority / Low effort / desktop: this is a contained intermittent CI defect, not an observed desktop crash or outage.</p>
+
+<h2>9. Verification</h2>
+<p>The same agent repeated the reproduction, not an independent reviewer. A second clean checkout at <code>4e45c9bc12fbed430f2e804fb827ac46089fc582</code> was inspected with <code>git status --porcelain</code> before applying the exact patch above. It received its own frozen install, desktop build, and fresh temporary test directories. No application server or reusable port was needed.</p>
+<pre>git clone https://github.com/get-bb/bb.git bb-7963-second
+cd bb-7963-second
+git checkout --detach 4e45c9bc12fbed430f2e804fb827ac46089fc582
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/desktop
+git apply /tmp/reproduce-7963.patch
+pnpm exec turbo run test --filter=@bb/desktop -- test/server-moved.test.ts -t 'closes the watcher and polls after a watch error'</pre>
+<p>Second-run result: the same pending-count diagnostics and exactly-once move assertion failure, with zero calls. This supports <strong>REPRODUCED / high confidence</strong>. No root-cause correction was required. The second clone shared Git object storage only; it had a separate working directory, installation, generated outputs, and test data. A fresh fetch confirmed no newer main change in the investigated files at the time of checking.</p>
+
+<h2>10. Appendix and limits</h2>
+<table><thead><tr><th>Check</th><th>Result</th></tr></thead><tbody>
+<tr><td>Frozen install, first and second checkout</td><td>Both exit 0.</td></tr>
+<tr><td>Desktop Turbo build, first checkout</td><td>Exit 0; 65 tasks successful. Nonfatal existing CommonJS/import.meta build warnings.</td></tr>
+<tr><td>Unmodified focused baseline, first checkout</td><td>Exit 0; 1 passed, 50 skipped.</td></tr>
+<tr><td>Gated reproduction, first and second checkout</td><td>Both exit 1 on the move assertion, with 2 queued callbacks and 0 delivered moves.</td></tr>
+<tr><td>Scheduler-driving control, first checkout</td><td>Exit 0; all 51 tests in the file pass.</td></tr>
+<tr><td>Production files changed</td><td>None. Instrumentation remains local; no source branch is pushed.</td></tr>
+</tbody></table>
+<p>Read-only evidence gathering included <code>git log</code> for the two desktop files, <code>git show</code> at the base commit, <code>git fetch origin main</code>, issue field/comment/cross-reference reads, and <code>gh pr diff 7964 --repo get-bb/bb</code>. Checks used Turbo; full output stayed outside this public repository. The complete reproducible patch and meaningful verbatim output are inline above, following the reports repository's publication policy. Early instrumentation-loading errors were corrected before either reported reproduction; they are not counted as evidence.</p>
+<p>Issue and PR prose was treated only as untrusted claims. No instructions or branch code from that material were executed. This report does not estimate natural flake frequency, establish the precise historical CI interleaving, or claim verification of the linked PR branch. No screenshot is appropriate for this nonvisual test defect.</p>
+</main></body></html>
