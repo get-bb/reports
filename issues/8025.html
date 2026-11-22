@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #8025 Failed plugin candidates skip lifecycle cleanup</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#8025 · Failed plugin candidates skip lifecycle cleanup</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Medium priority</span><span class="pill">Low effort</span><span class="pill">plugins</span>
+<a href="https://github.com/get-bb/bb/issues/8025">Issue</a> · 2026-11-22</p>
+<p>Trusted base: <code>796cdcc0f4bf8a55e23664035c54e8db6fe9d272</code></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · Reproduction label: <code>confirmed-repro</code></p>
+<h2>1. TL;DR</h2>
+<p>A plugin can start a repeating task during initialization and register a cleanup hook for it. When initialization fails, the runtime marks that candidate's API handle stale without running the hook. The task survives both candidate rejection and service shutdown, repeatedly hitting the stale-handle guard. A new service-level regression reproduces this for an initial host-build failure, an initial factory exception, and a failed reload factory. The same agent repeated all three failures in a second clean checkout; sharing the existing dispose-hook runner fixes all three while retaining the previous live instance.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Initial host-build rejection can follow a factory that registered cleanup.</td><td class="ok">Verified</td><td>A syntactically invalid synthetic host entry leaves generation 1's hooks uncalled and its timer alive.</td></tr>
+<tr><td>A factory exception during reload leaks the new candidate but preserves the prior instance.</td><td class="ok">Verified</td><td>Generation 2's hooks are absent; generation 1 still answers its CLI command.</td></tr>
+<tr><td>Stopping the service does not stop the discarded task.</td><td class="ok">Verified</td><td>In both clean runs, the timer count stays nonzero and ticks increase after stop; captured errors are PluginContextStaleError.</td></tr>
+<tr><td>Shared SDK subscriptions and watched-target listeners can leak too.</td><td class="unv">Static support only</td><td>The subscription wrapper spreads the shared SDK and watched-target cleanup is registered in the same hook list. No subscription or watched-target probe was executed.</td></tr>
+<tr><td>Contained uncaught errors can still produce diagnostic report files.</td><td class="unv">Static support only</td><td>The diagnostic monitor writes a report for every uncaughtExceptionMonitor event, before the server's containment handler. The synthetic timer catches errors locally to avoid flooding test diagnostics.</td></tr>
+<tr><td>The incident produced tens of thousands of files or caused a desktop freeze.</td><td class="unv">Not verified</td><td>No real user data, desktop process, historical installation, disk-impact benchmark, or freeze was inspected. Those claims are outside this verdict.</td></tr>
+</table>
+<h2>3. Environment</h2>
+<ul><li>Public repository <code>get-bb/bb</code>, freshly fetched <code>origin/main</code> at the trusted base above.</li>
+<li>Linux x86_64, kernel 4.19.0-gvisor; Node.js v22.19.0; pnpm 9.15.0; Vitest 4.1.12.</li>
+<li>Two distinct temporary source checkouts with frozen dependency installs. The second checkout retained unchanged production files.</li>
+<li>Real migrated SQLite test databases via <code>createMigratedConnection()</code>; per-test temporary plugin/data directories. No provider, credentials, user store, desktop, persistent dev server, or listening ports are needed for this regression.</li>
+<li>Preparation: <code>pnpm install --frozen-lockfile --prefer-offline</code> and <code>pnpm exec turbo run build --filter=@bb/server</code>. Turbo supplies test generators.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Create a trusted checkout:
+<pre>WORK=$(mktemp -d)
+git clone https://github.com/get-bb/bb.git "$WORK/primary"
+cd "$WORK/primary"
+git checkout --detach 796cdcc0f4bf8a55e23664035c54e8db6fe9d272
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/server</pre></li>
+<li>Save the complete test below as <code>apps/server/test/services/plugins/plugin-candidate-cleanup.test.ts</code>. This test was authored from repository lifecycle and service contracts, not copied or executed from the issue.</li>
+<li>Run:
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-candidate-cleanup.test.ts</pre></li></ol>
+<p>Expected: all three cases pass; cleanup is awaited in reverse order, a throwing hook does not prevent timer cleanup, cleanup can still use the live API, and the failed reload leaves the previous instance operational.</p>
+<p>Actual on unchanged production code: all three cases fail. Selected first-run output, with only the Turbo task prefix removed:</p>
+<pre>AssertionError: expected [] to deeply equal [ '1:async', '1:throw', '1:timer' ]
+AssertionError: expected true to be false // Object.is equality
+AssertionError: expected [ 1, 1, 1, 1, 1, 1 ] to have a length of 1 but got 6
+AssertionError: expected [ 'PluginContextStaleError', …(5) ] to deeply equal []
+AssertionError: expected [] to deeply equal [ '2:async', '2:throw', '2:timer' ]
+
+Test Files  1 failed (1)
+     Tests  3 failed (3)</pre>
+<p>Tick counts are timing-dependent; the invariant is that they increase after stop. The fixture catches timer errors into an array and always clears leftover timers in test teardown. Soft assertions expose hook omission, the surviving timer, and stale-handle calls in the same run. The host syntax error printed during the probe is intentional, not a test-environment failure.</p>
+<details><summary>Complete repeatable regression test</summary><pre>import { mkdir, mkdtemp, rm, writeFile } from &quot;node:fs/promises&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import pino from &quot;pino&quot;;
+import { afterEach, beforeEach, describe, expect, it } from &quot;vitest&quot;;
+import { createMigratedConnection } from &quot;@bb/db/testing&quot;;
+import { createAiServiceRegistry } from &quot;../../../src/services/ai/ai-service-registry.js&quot;;
+import {
+  createPluginService,
+  type PluginService,
+} from &quot;../../../src/services/plugins/plugin-service.js&quot;;
+import { createNoopTelemetryService } from &quot;../../../src/services/system/telemetry.js&quot;;
+
+interface CandidateProbe {
+  generation: number;
+  fail: boolean;
+  cleanup: string[];
+  ticks: number[];
+  errors: string[];
+  timers: Map&lt;number, ReturnType&lt;typeof setInterval&gt;&gt;;
+}
+
+declare global {
+  var __candidateProbe: CandidateProbe | undefined;
+}
+
+const serverEntry = `
+  import type { BbPluginApi } from &quot;@get-bb/plugin-sdk&quot;;
+  export default function plugin(bb: BbPluginApi) {
+    const probe = globalThis.__candidateProbe;
+    const generation = ++probe.generation;
+    const timer = setInterval(() =&gt; {
+      probe.ticks.push(generation);
+      try {
+        bb.realtime.publish(&quot;probe&quot;, { generation });
+      } catch (error) {
+        probe.errors.push(error.name);
+      }
+    }, 10);
+    probe.timers.set(generation, timer);
+    bb.onDispose(() =&gt; {
+      clearInterval(timer);
+      probe.timers.delete(generation);
+      probe.cleanup.push(generation + &quot;:timer&quot;);
+    });
+    bb.onDispose(() =&gt; {
+      probe.cleanup.push(generation + &quot;:throw&quot;);
+      throw new Error(&quot;cleanup probe failure&quot;);
+    });
+    bb.onDispose(async () =&gt; {
+      await Promise.resolve();
+      bb.realtime.publish(&quot;cleanup&quot;, { generation });
+      probe.cleanup.push(generation + &quot;:async&quot;);
+    });
+    bb.cli.register({
+      name: &quot;candidate-probe&quot;,
+      summary: &quot;Return the active generation&quot;,
+      run: () =&gt; ({ exitCode: 0, stdout: String(generation) }),
+    });
+    if (probe.fail) throw new Error(&quot;candidate setup failed&quot;);
+  }
+`;
+
+describe(&quot;failed plugin candidate cleanup&quot;, () =&gt; {
+  let workDir: string;
+  let service: PluginService;
+  let probe: CandidateProbe;
+
+  beforeEach(async () =&gt; {
+    workDir = await mkdtemp(join(tmpdir(), &quot;bb-candidate-cleanup-&quot;));
+    probe = {
+      generation: 0,
+      fail: false,
+      cleanup: [],
+      ticks: [],
+      errors: [],
+      timers: new Map(),
+    };
+    globalThis.__candidateProbe = probe;
+    service = createPluginService({
+      aiServices: createAiServiceRegistry(),
+      telemetry: createNoopTelemetryService(),
+      db: createMigratedConnection(),
+      hub: {
+        getDaemonSessionIdForHost: () =&gt; null,
+        notifyPluginChanged: () =&gt; {},
+        onWatchedTargets: () =&gt; () =&gt; {},
+        notifyPluginSignal: () =&gt; 0,
+        notifySystem: () =&gt; {},
+      },
+      logger: pino({ level: &quot;silent&quot; }),
+      dataDir: join(workDir, &quot;data&quot;),
+      appVersion: &quot;0.9.0&quot;,
+      loadTimeoutMs: 5_000,
+      serviceStopTimeoutMs: 100,
+    });
+  });
+
+  afterEach(async () =&gt; {
+    try {
+      await service.stop();
+    } finally {
+      for (const timer of probe.timers.values()) clearInterval(timer);
+      globalThis.__candidateProbe = undefined;
+      await rm(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { failure: &quot;host build&quot;, reload: false },
+    { failure: &quot;factory&quot;, reload: false },
+    { failure: &quot;factory&quot;, reload: true },
+  ])(
+    &quot;cleans up after $failure failure (reload: $reload)&quot;,
+    async ({ failure, reload }) =&gt; {
+      const root = join(workDir, &quot;candidate-probe&quot;);
+      await mkdir(root);
+      await writeFile(
+        join(root, &quot;package.json&quot;),
+        JSON.stringify({
+          name: &quot;bb-plugin-candidate-probe&quot;,
+          version: &quot;0.1.0&quot;,
+          bb: {
+            name: &quot;Candidate cleanup probe&quot;,
+            description: &quot;Exercises failed instance teardown&quot;,
+            branding: { icon: &quot;Zap&quot; },
+            server: &quot;./server.ts&quot;,
+            ...(failure === &quot;host build&quot; ? { host: &quot;./host.ts&quot; } : {}),
+          },
+        }),
+      );
+      await writeFile(join(root, &quot;server.ts&quot;), serverEntry);
+      if (failure === &quot;host build&quot;) {
+        await writeFile(join(root, &quot;host.ts&quot;), &quot;export const broken = ;&quot;);
+      }
+
+      if (reload) {
+        expect(await service.installPath(root)).toMatchObject({
+          status: &quot;running&quot;,
+        });
+        await expect.poll(() =&gt; probe.ticks.includes(1)).toBe(true);
+      }
+      probe.fail = failure === &quot;factory&quot;;
+      if (reload) {
+        expect(await service.reload(&quot;candidate-probe&quot;)).toMatchObject({
+          ok: false,
+          error: expect.stringContaining(&quot;candidate setup failed&quot;),
+        });
+      } else {
+        expect(await service.installPath(root)).toMatchObject({
+          status: &quot;error&quot;,
+        });
+      }
+
+      const discarded = reload ? 2 : 1;
+      expect(probe.generation).toBe(discarded);
+      expect
+        .soft(probe.cleanup)
+        .toEqual([
+          `${discarded}:async`,
+          `${discarded}:throw`,
+          `${discarded}:timer`,
+        ]);
+      expect.soft(probe.timers.has(discarded)).toBe(false);
+      if (reload) {
+        expect(
+          await service.runCliCommand(&quot;candidate-probe&quot;, [], {}),
+        ).toMatchObject({
+          exitCode: 0,
+          stdout: &quot;1&quot;,
+        });
+        expect(probe.timers.has(1)).toBe(true);
+      }
+      await service.stop();
+      const ticksAtStop = probe.ticks.length;
+      await new Promise((resolve) =&gt; setTimeout(resolve, 50));
+      expect.soft(probe.ticks).toHaveLength(ticksAtStop);
+      expect.soft(probe.errors).toEqual([]);
+      expect.soft(probe.timers.size).toBe(0);
+    },
+  );
+});
+</pre></details>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/796cdcc0f4bf8a55e23664035c54e8db6fe9d272/apps/server/src/services/plugins/plugin-runtime.ts#L1714-L1734">discardCandidate</a> aborts runtime-owned signals, interrupts interactions, closes database handles, and invalidates the candidate. It never visits the dispose-hook list:</p>
+<pre>candidate.released.abort();
+candidate.handle.invalidate();
+await Promise.all(detached);</pre>
+<p>By contrast, <a href="https://github.com/get-bb/bb/blob/796cdcc0f4bf8a55e23664035c54e8db6fe9d272/apps/server/src/services/plugins/plugin-runtime.ts#L2271-L2280">normal instance disposal</a> awaits each hook in reverse registration order and logs individual failures before invalidation. <a href="https://github.com/get-bb/bb/blob/796cdcc0f4bf8a55e23664035c54e8db6fe9d272/apps/server/src/services/plugins/plugin-api.ts#L1444-L1447">onDispose</a> only registers callbacks; <a href="https://github.com/get-bb/bb/blob/796cdcc0f4bf8a55e23664035c54e8db6fe9d272/apps/server/src/services/plugins/plugin-api.ts#L1527-L1530">invalidate</a> only marks the handle stale and revokes its RPC caller. Aborting runtime signals does not automatically clear plugin-created JavaScript timers.</p>
+<p>The <a href="https://github.com/get-bb/bb/blob/796cdcc0f4bf8a55e23664035c54e8db6fe9d272/apps/server/src/services/plugins/plugin-runtime.ts#L2136-L2156">factory-error path</a>, <a href="https://github.com/get-bb/bb/blob/796cdcc0f4bf8a55e23664035c54e8db6fe9d272/apps/server/src/services/plugins/plugin-runtime.ts#L2157-L2175">post-factory host-artifact rejection</a>, and <a href="https://github.com/get-bb/bb/blob/796cdcc0f4bf8a55e23664035c54e8db6fe9d272/apps/server/src/services/plugins/plugin-runtime.ts#L2186-L2195">hung-previous-service path</a> all call this incomplete teardown. The first two were exercised; the hung-service path was not. Host-build errors with a previous instance return <a href="https://github.com/get-bb/bb/blob/796cdcc0f4bf8a55e23664035c54e8db6fe9d272/apps/server/src/services/plugins/plugin-runtime.ts#L1864-L1874">before the new factory</a>, so that separate path is not claimed as a reproduced leak.</p>
+<p>Related amplification, not needed for the regression: <a href="https://github.com/get-bb/bb/blob/796cdcc0f4bf8a55e23664035c54e8db6fe9d272/packages/process-utils/src/diagnostics.ts#L169-L185">the diagnostic monitor</a> writes on each uncaught exception event; <a href="https://github.com/get-bb/bb/blob/796cdcc0f4bf8a55e23664035c54e8db6fe9d272/apps/server/src/start-server.ts#L606-L611">the server containment handler</a> claims plugin errors afterward. This supports the potential report flood but does not measure its historical rate. The <a href="https://github.com/get-bb/bb/blob/796cdcc0f4bf8a55e23664035c54e8db6fe9d272/apps/server/src/services/plugins/plugin-api.ts#L365-L372">shared SDK wrapper</a> and <a href="https://github.com/get-bb/bb/blob/796cdcc0f4bf8a55e23664035c54e8db6fe9d272/apps/server/src/services/plugins/plugin-api.ts#L887-L897">watched-target hook registration</a> explain the additional cleanup risk without proving those scenarios dynamically.</p>
+<h2>6. Proposed fix</h2>
+<p>Extract the existing reverse-order, per-hook-isolated disposal loop into one runtime-local helper. Await it in both normal disposal and candidate discard, before closing candidate database handles and before invalidation. Do not replace candidate discard with full active-instance disposal: plugin-wide cancellation or host teardown could disrupt the previous live copy. No public API, wire contract, dependency, stored data, or process diagnostics policy needs to change.</p>
+<p>The local patch follows exactly that shape. The regression also verifies asynchronous completion, exception isolation, valid API access inside cleanup, and preservation of the previous generation. A hook that never resolves remains an existing lifecycle limitation; this change does not introduce a new timeout policy. Report-rate limiting is a separate concern and is deliberately excluded.</p>
+<h2>7. Verification</h2>
+<p>The same agent created a second clean temporary checkout at the exact recorded SHA, installed its own frozen dependency tree, and copied only the newly authored regression test. No production fix or other source changes were present. The same Turbo command above again exited 1 with <strong>3 failed tests</strong>, showing missing hook events, surviving timers, and captured stale-handle errors. The two runs used newly created plugin and database directories. This is a repeated clean-checkout check, not independent verification by another agent.</p>
+<p>No correction to the lifecycle root cause was needed after the second run. The report intentionally limits dynamic conclusions to failed candidates and timers; subscriptions, diagnostic flood size, historical desktop behavior, and the hung-service fallback remain unmeasured.</p>
+<p>After the runtime-only repair, the regression and existing instance-lifecycle suite passed together: <strong>2 files, 16 tests passed</strong>. Eight additional relevant suites passed with <strong>159 tests</strong>, for <strong>175 passing tests across 10 files</strong>. Server lint and typecheck passed through Turbo. The fix changes two files, with 197 additions and 10 deletions: <strong>207 total changed text lines</strong>. There are no binary, dependency, generated, data, public API, or protocol changes.</p>
+<h2>8. Related issues and pull requests</h2>
+<p>GitHub cross-reference metadata and an open-PR search found no open pull request linked to #8025 at the time of investigation. Existing issue <a href="https://github.com/get-bb/bb/issues/7336">#7336</a> concerns in-flight work on normal reload, a different lifecycle situation. This report concerns teardown of a candidate that never becomes the active instance.</p>
+<h2>9. Appendix</h2>
+<p>Additional validation and raw evidence remain local; no logs, standalone test artifacts, user paths, or runtime data are published. The complete test and representative expected-versus-actual output are inline so this HTML is sufficient to repeat the experiment.</p>
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-candidate-cleanup.test.ts test/services/plugins/plugin-instance-lifecycle.test.ts
+# 16 passed
+pnpm exec turbo run lint typecheck --filter=@bb/server
+# 6 Turbo tasks successful
+pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-background.test.ts test/services/plugins/plugin-host-build-policy.test.ts test/services/plugins/plugin-failure-log.test.ts test/services/plugins/plugin-service.test.ts test/services/plugins/plugin-install.test.ts test/services/plugins/plugin-version-reload.test.ts test/services/plugins/plugin-reload-collection.test.ts test/services/plugins/plugin-provider-registration.test.ts
+# 8 files, 159 tests passed
+git diff --check
+git diff --numstat origin/main
+# 15 additions + 10 deletions in plugin-runtime.ts; 182 additions in the regression test
+</pre>
+<p><strong>Trust boundary:</strong> Issue content was treated as untrusted claims. Its commands and supplied test were not executed, its linked external content was not fetched, and no linked pull-request code was checked out. Only trusted origin/main and the agent-authored regression and repair were run.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
