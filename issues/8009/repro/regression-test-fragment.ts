@@ -1,0 +1,79 @@
+it("repro 8009: recovers reasoning after an empty discovery ages across refresh and store reload", async () => {
+    await withTestHarness(async (harness) => {
+      const host = setupCatalogHost(harness, { id: "host-repro-8009" });
+      const unknown = modelList("a", "b").map((model) => ({
+        ...model,
+        reasoningDiscovery: "unknown" as const,
+        supportedReasoningEfforts: [],
+      }));
+      host.setAnswer((command) =>
+        catalogAnswer(
+          command.selectedModel
+            ? unknown.map((model) => ({
+                ...model,
+                reasoningDiscovery: "known" as const,
+              }))
+            : unknown,
+        ),
+      );
+      await host.read("codex");
+      const initial = await host.read("codex", undefined, "a");
+      expect(initial.models[0]).toMatchObject({
+        reasoningDiscovery: "known",
+        supportedReasoningEfforts: [],
+      });
+      const rowKey = {
+        hostId: host.hostId,
+        providerId: "codex",
+        scopeKey: "",
+      };
+      const before = getStoredProviderModelCatalog(harness.db, rowKey);
+      expect(before).not.toBeNull();
+      host.setAnswer((command) =>
+        catalogAnswer(
+          command.selectedModel
+            ? modelList(command.selectedModel).map((model) => ({
+                ...model,
+                supportedReasoningEfforts: [
+                  { reasoningEffort: "high", description: "High" },
+                ],
+                defaultReasoningEffort: "high",
+              }))
+            : unknown,
+        ),
+      );
+      host.clock.now += 2 * 24 * 60 * MINUTE;
+      await host.read("codex");
+      await vi.waitFor(() => {
+        const refreshed = getStoredProviderModelCatalog(harness.db, rowKey);
+        expect(refreshed?.fetchedAt).toBe(host.clock.now);
+      });
+      const after = getStoredProviderModelCatalog(harness.db, rowKey);
+      expect(after?.fingerprint).toBe(before?.fingerprint);
+      installCatalogStore(harness, { clock: host.clock });
+      const cached = await host.read("codex", undefined, "a");
+      const fresh = await host.read("codex", undefined, "b");
+      expect(fresh.models[1]?.supportedReasoningEfforts).toEqual([
+        { reasoningEffort: "high", description: "High" },
+      ]);
+      const selectedRequests = host
+        .listRequests()
+        .filter((command) => command.selectedModel !== undefined)
+        .map((command) => command.selectedModel);
+      console.log(
+        "REPRO_8009",
+        JSON.stringify({
+          elapsedDays: 2,
+          fingerprintUnchanged: after?.fingerprint === before?.fingerprint,
+          fetchedAtAdvanced: after?.fetchedAt !== before?.fetchedAt,
+          storeReloaded: true,
+          selectedRequests,
+          cachedModel: cached.models[0],
+          freshModel: fresh.models[1],
+        }),
+      );
+      expect(cached.models[0]?.supportedReasoningEfforts).toEqual([
+        { reasoningEffort: "high", description: "High" },
+      ]);
+    });
+  });
