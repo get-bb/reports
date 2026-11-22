@@ -1,0 +1,51 @@
+  it.each([false, true])(
+    "restores keyboard focus on pointer press after an unfocused reveal (rejected navigation focus: %s)",
+    async (rejectNavigationFocus) => {
+      vi.useFakeTimers();
+      const focusHostWebContents = vi.fn(() => {
+        requireFakeView(0).webContents.nativelyFocused = false;
+      });
+      const manager = createDesktopBrowserViewManager({
+        partition: "persist:test",
+        focusHostWebContents,
+      });
+      const hostWindow = new FakeHostWindow({
+        contentBounds: { width: 700, height: 450 },
+        webContentsId: 92,
+      });
+      try {
+        manager.attach({
+          hostWindow,
+          request: {
+            threadId: "thread-1",
+            tabId: "browser:a",
+            url: "https://example.com",
+            bounds: { x: 0, y: 0, width: 700, height: 450 },
+            visible: false,
+          },
+        });
+        const view = requireFakeView(0);
+        manager.setVisibleWithoutFocus({
+          hostWindow,
+          request: { tabId: "browser:a", visible: true },
+        });
+        expect(view.visible).toBe(true);
+        expect(view.webContents.focusCalls).toBe(0);
+        if (rejectNavigationFocus) {
+          view.webContents.emitDidStartLoading();
+          view.webContents.nativelyFocused = true;
+          view.webContents.emitFocus();
+          await vi.advanceTimersByTimeAsync(0);
+          expect(focusHostWebContents).toHaveBeenCalledExactlyOnceWith(92);
+        }
+        expect(view.webContents.isFocused()).toBe(false);
+        view.webContents.emitInputEvent("mouseDown");
+        await vi.advanceTimersByTimeAsync(0);
+        expect(view.webContents.focusCalls).toBe(1);
+      } finally {
+        manager.destroyAll();
+        vi.useRealTimers();
+      }
+    },
+  );
+
