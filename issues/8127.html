@@ -1,0 +1,781 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Issue 8127: repeated Git marketplace downloads</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#8127 · Unchanged marketplace refresh downloads Git repositories again</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Medium</span><span class="pill">plugins, perf</span><a href="https://github.com/get-bb/bb/issues/8127">GitHub issue</a><span>November 24, 2026</span></p>
+<p>Trusted origin/main: <code>83368cff5166aa01ff4706056995a7626e859555</code></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · Reproduction label: <code>confirmed-repro</code></p>
+<h2>1. TL;DR</h2>
+<p>A Git-backed marketplace refresh downloads and checks out a fresh repository even when the registered branch still identifies the same commit. A real-service regression using a real SQLite database and a local Git fixture recorded one clone on registration and another on an unchanged refresh. A separate file-transport probe confirmed that materialization checks out a file unrelated to the catalog and removes Git metadata afterward. The same agent repeated both checks in a second clean checkout of the exact trusted base commit. The reported large-repository timings were not benchmarked here.</p>
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>An unchanged refresh downloads the repository again.</td><td>Verified</td><td>Both service runs: unchangedCommit=true, addClones=1, refreshClones=1. Regression fails only at the no-download assertion.</td></tr>
+<tr><td>Materialization checks out unrelated files and discards .git.</td><td>Verified</td><td>Both direct probes read unrelated/not-a-catalog.txt from the checkout; gitDirectoryPresent=false.</td></tr>
+<tr><td>The clone has no depth or blob filter and requests repository history.</td><td>Verified command and source behavior</td><td>Real file:// transport invokes clone --quiet --no-checkout and ordinary pack-objects; trusted source passes no depth/filter options. The fixture contains a deleted 1 MiB historical blob. Pack byte volume was not measured.</td></tr>
+<tr><td>A particular large remote repository takes over a minute.</td><td>Unverified</td><td>No access to that repository was attempted; no private data or reported timing was reused as measured evidence.</td></tr>
+<tr><td>A linked PR already addresses this issue.</td><td>Verified metadata; static code inspection only</td><td>Open, ready PR #8128 lists #8127 in closingIssuesReferences. No PR code was checked out or executed.</td></tr>
+</tbody></table>
+<h2>3. Environment</h2>
+<ul><li>Trusted public repository: get-bb/bb; base 83368cff5166aa01ff4706056995a7626e859555, fetched from the target repository's origin/main.</li><li>Linux x86_64, kernel 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; Git 2.39.5.</li><li>Two separate temporary clones, called checkout-one and checkout-two below. No provider, live BB instance, ports, or user runtime data were needed.</li><li>Each service run uses createMigratedConnection() and fresh mkdtemp data and repository directories; both are removed by existing test teardown. The materialization probes independently create and remove their own temporary repositories.</li><li>Frozen dependency installation and the full Turbo build completed in both checkouts (74 successful tasks each). The first build in checkout-one encountered a missing SDK dist race; building SDK types and retrying the unchanged build succeeded. Checkout-two built the SDK before the full build.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<p>Use a clean clone of get-bb/bb at the recorded commit. The inline regression patch below extends existing trusted fixture helpers; it does not modify production code.</p>
+<ol><li>Prepare trusted source:<pre>git clone https://github.com/get-bb/bb.git bb-8127
+cd bb-8127
+git checkout --detach 83368cff5166aa01ff4706056995a7626e859555
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build</pre></li>
+<li>Save the complete inline patch below as /tmp/regression.patch, inspect it, and apply it in that checkout. Run:<pre>git apply /tmp/regression.patch
+pnpm exec turbo run test --filter=@bb/server -- test/services/plugin-catalog/third-party-marketplaces.test.ts -t 'avoids a repository download when the registered commit is unchanged'</pre></li>
+<li>The test registers a real Git marketplace, checks refresh success and equality of the stored and refreshed commits, then asserts that refresh did not perform a clone or fetch. Expected: refresh success with an unchanged commit and zero repository-download operations. Actual in both runs:<pre>"unchangedCommit": true,
+"addClones": 1,
+"refreshClones": 1
+
+Tests  1 failed | 40 skipped (41)
+Failure: expect(refreshTrace).not.toMatch(/built-in: git (?:clone|fetch) /u)</pre></li>
+<li>For an additional full-checkout observation, save the complete probe source below as /tmp/checkout-probe.mts and run it from the trusted repository root:<pre>node --conditions=source --import tsx /tmp/checkout-probe.mts</pre><pre>{
+  &quot;catalogName&quot;: &quot;probe-marketplace&quot;,
+  &quot;unrelatedFileContent&quot;: &quot;unneeded&quot;,
+  &quot;gitDirectoryPresent&quot;: false,
+  &quot;historySeedBytes&quot;: 1048576,
+  &quot;cloneCommand&quot;: &quot;21:20:05.093219 git.c:460               trace: built-in: git clone --quiet --no-checkout file://&lt;scratch&gt;/repository &lt;scratch&gt;/staging/&lt;temporary-checkout&gt;&quot;,
+  &quot;transportPackCommand&quot;: &quot;21:20:05.106514 git.c:460               trace: built-in: git pack-objects --revs --thin --stdout --delta-base-offset&quot;
+}
+</pre>The probe uses a synthetic file:// remote, not the local-clone hardlink optimization. It creates a historical payload, removes it in the catalog commit, and adds a current unrelated file. No actual pack-size claim is made.</li></ol>
+<details><summary>Regression test body (added to the existing fixture suite)</summary><pre>    it(&quot;avoids a repository download when the registered commit is unchanged&quot;, async () =&gt; {
+      const traceFile = join(dataDir, &quot;git-download.trace&quot;);
+      const previousTrace = process.env.GIT_TRACE;
+      process.env.GIT_TRACE = traceFile;
+      restoreEnv.push(() =&gt; {
+        if (previousTrace === undefined) delete process.env.GIT_TRACE;
+        else process.env.GIT_TRACE = previousTrace;
+      });
+      const catalog = service({ fetch: marketplaceFetch({}) });
+      const added = await catalog.addMarketplace({
+        source: `git:${repo}@main`,
+        subdirectory: null,
+      });
+      const addedTrace = await readFile(traceFile, &quot;utf8&quot;);
+      await writeFile(traceFile, &quot;&quot;);
+      const [refreshed] = await catalog.refreshMarketplaces({
+        name: &quot;acme-plugins&quot;,
+      });
+      expect(refreshed).toMatchObject({
+        ok: true,
+        marketplace: { resolvedCommit: added.resolvedCommit, entryCount: 1 },
+      });
+      const refreshTrace = (await readFile(traceFile, &quot;utf8&quot;))
+        .replaceAll(repo, &quot;&lt;fixture-repository&gt;&quot;)
+        .replaceAll(dataDir, &quot;&lt;isolated-data&gt;&quot;);
+      console.log(
+        JSON.stringify(
+          {
+            unchangedCommit:
+              refreshed?.marketplace.resolvedCommit === added.resolvedCommit,
+            addClones: (addedTrace.match(/built-in: git clone /gu) ?? [])
+              .length,
+            refreshClones: (refreshTrace.match(/built-in: git clone /gu) ?? [])
+              .length,
+            refreshTrace,
+          },
+          null,
+          2,
+        ),
+      );
+      expect(refreshTrace).not.toMatch(/built-in: git (?:clone|fetch) /u);
+    });
+</pre></details>
+<details><summary>Complete checkout probe source</summary><pre>import { execFile } from &quot;node:child_process&quot;;
+import { randomBytes } from &quot;node:crypto&quot;;
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from &quot;node:fs/promises&quot;;
+import { tmpdir } from &quot;node:os&quot;;
+import { join } from &quot;node:path&quot;;
+import { pathToFileURL } from &quot;node:url&quot;;
+import { promisify } from &quot;node:util&quot;;
+
+const run = promisify(execFile);
+const scratch = await mkdtemp(join(tmpdir(), &quot;bb-8127-checkout-&quot;));
+const repository = join(scratch, &quot;repository&quot;);
+const tracePath = join(scratch, &quot;git.trace&quot;);
+const previousTrace = process.env.GIT_TRACE;
+try {
+  await mkdir(repository);
+  await run(&quot;git&quot;, [&quot;init&quot;, &quot;-q&quot;, &quot;-b&quot;, &quot;main&quot;, repository]);
+  await run(&quot;git&quot;, [&quot;-C&quot;, repository, &quot;config&quot;, &quot;user.name&quot;, &quot;Catalog Probe&quot;]);
+  await run(&quot;git&quot;, [&quot;-C&quot;, repository, &quot;config&quot;, &quot;user.email&quot;, &quot;probe@localhost&quot;]);
+  await writeFile(join(repository, &quot;old-payload.bin&quot;), randomBytes(1024 * 1024));
+  await run(&quot;git&quot;, [&quot;-C&quot;, repository, &quot;add&quot;, &quot;.&quot;]);
+  await run(&quot;git&quot;, [&quot;-C&quot;, repository, &quot;commit&quot;, &quot;-qm&quot;, &quot;seed history&quot;]);
+  await rm(join(repository, &quot;old-payload.bin&quot;));
+  await mkdir(join(repository, &quot;unrelated&quot;));
+  await writeFile(join(repository, &quot;unrelated&quot;, &quot;not-a-catalog.txt&quot;), &quot;unneeded\n&quot;);
+  await writeFile(join(repository, &quot;marketplace.json&quot;), JSON.stringify({
+    schemaVersion: 1,
+    name: &quot;probe-marketplace&quot;,
+    displayName: &quot;Probe Marketplace&quot;,
+    plugins: [],
+  }));
+  await run(&quot;git&quot;, [&quot;-C&quot;, repository, &quot;add&quot;, &quot;-A&quot;]);
+  await run(&quot;git&quot;, [&quot;-C&quot;, repository, &quot;commit&quot;, &quot;-qm&quot;, &quot;catalog snapshot&quot;]);
+  const sourceModule = pathToFileURL(join(process.cwd(),
+    &quot;apps/server/src/services/plugin-catalog/marketplace-source.ts&quot;));
+  const { materializeMarketplace } = await import(sourceModule.href);
+  process.env.GIT_TRACE = tracePath;
+  const result = await materializeMarketplace({
+    source: { kind: &quot;git&quot;, url: pathToFileURL(repository).href, ref: &quot;main&quot;, subdirectory: null },
+    cached: null,
+    stagingDir: join(scratch, &quot;staging&quot;),
+    fetch: async () =&gt; { throw new Error(&quot;unexpected HTTP access&quot;); },
+  });
+  try {
+    if (result.iconBase.kind !== &quot;dir&quot;) throw new Error(&quot;expected a checkout&quot;);
+    const unrelated = await readFile(join(result.iconBase.root, &quot;unrelated&quot;, &quot;not-a-catalog.txt&quot;), &quot;utf8&quot;);
+    const gitDirectoryPresent = await stat(join(result.iconBase.root, &quot;.git&quot;)).then(() =&gt; true, () =&gt; false);
+    const trace = (await readFile(tracePath, &quot;utf8&quot;)).replaceAll(scratch, &quot;&lt;scratch&gt;&quot;);
+    console.log(JSON.stringify({
+      catalogName: result.catalog.name,
+      unrelatedFileContent: unrelated.trim(),
+      gitDirectoryPresent,
+      historySeedBytes: 1024 * 1024,
+      cloneCommand: trace.split(&quot;\n&quot;).find((line) =&gt; line.includes(&quot;built-in: git clone &quot;)),
+      transportPackCommand: trace.split(&quot;\n&quot;).find((line) =&gt; line.includes(&quot;built-in: git pack-objects &quot;)),
+    }, null, 2));
+  } finally {
+    await result.dispose();
+  }
+} finally {
+  if (previousTrace === undefined) delete process.env.GIT_TRACE;
+  else process.env.GIT_TRACE = previousTrace;
+  await rm(scratch, { recursive: true, force: true });
+}
+</pre></details>
+<h2>5. Root cause</h2>
+<p>The refresh service persists the resolved commit, but omits it from the cached materialization input. <a href="https://github.com/get-bb/bb/blob/83368cff5166aa01ff4706056995a7626e859555/apps/server/src/services/plugin-catalog/plugin-catalog-service.ts#L637-L660">performRefresh cache input</a> supplies only the manifest and HTTP validators. <a href="https://github.com/get-bb/bb/blob/83368cff5166aa01ff4706056995a7626e859555/apps/server/src/services/plugin-catalog/marketplace-source.ts#L165-L194">materializeMarketplace</a> passes that cache to HTTPS handling but never passes it to Git handling.</p>
+<p><a href="https://github.com/get-bb/bb/blob/83368cff5166aa01ff4706056995a7626e859555/apps/server/src/services/plugin-catalog/marketplace-source.ts#L377-L431">materializeGit</a> unconditionally creates a fresh checkout, runs an unfiltered, non-shallow clone, resolves a commit from that already-downloaded repository, checks out the full tree, and deletes .git. There is no remote-ref comparison before the clone. Resolving the commit after the download cannot save transfer time. The real service then stores the same commit again at <a href="https://github.com/get-bb/bb/blob/83368cff5166aa01ff4706056995a7626e859555/apps/server/src/services/plugin-catalog/plugin-catalog-service.ts#L691-L711">the refresh transaction and disposal</a>.</p>
+<pre>clone --quiet --no-checkout &lt;source&gt; &lt;fresh-checkout&gt;
+rev-parse --verify --end-of-options &lt;ref&gt;^{commit}
+checkout --quiet --detach &lt;commit&gt;
+rm(checkout/.git)</pre>
+<p>The direct probe establishes whole-tree checkout independently of command interpretation. The source establishes that no depth or object filter limits the clone. The test protects the observable download cost at the Git subprocess boundary rather than merely checking source strings.</p>
+<h2>6. Proposed fix (first principles)</h2>
+<p>Pass the persisted Git commit into materialization, resolve the requested remote ref before transfer, and reuse the validated stored catalog when the commit matches. Preserve existing cached icon bytes on that path. For changed commits, bound history and objects and materialize only the catalog and required local assets where supported. Preserve branch/tag/commit resolution and current path validation; remote capability failures and malformed cache contents need explicit fallback tests. These are proposals, not a fix verified by this report.</p>
+<h2>7. PR review</h2>
+<h3>PR #8128 — static inspection only</h3>
+<p><a href="https://github.com/get-bb/bb/pull/8128">Existing ready PR #8128</a> is open against main and explicitly closes #8127. Its untrusted diff passes the stored commit to materialization, adds a remote-ref/cache-hit branch, uses a shallow blob-filtered fetch with sparse checkout, and adjusts icon reuse. This structurally targets the independently verified root cause rather than only a timing symptom. The added tests cover cache reuse and bounded checkout scenarios, but none of that PR's code or tests was executed. No additional defect is asserted from this limited read, and this is not a merge recommendation. Verdict: <strong>targets the root cause; runtime correctness not verified</strong>. A duplicate fix PR was therefore not safe to open.</p>
+<h2>8. Related issues</h2>
+<p>Issue #8115 was checked as a triage precedent (Bug, Medium priority, Medium effort, plugins/perf). This report is scoped to catalog materialization and unchanged catalog refresh. It makes no claim that a plugin-install fix resolves this separate service path.</p>
+<h2>9. Verification</h2>
+<p>The same agent repeated the reproduction, not an independent reviewer. Checkout-two was a separate clean temporary clone at 83368cff5166aa01ff4706056995a7626e859555; the identical regression patch was applied, with no production edits. Both focused runs were cache misses and executed fresh tests. Fresh temporary fixture repositories and service data directories were created on each run, and no application ports were used.</p>
+<table><thead><tr><th>Check</th><th>Checkout one</th><th>Checkout two</th></tr></thead><tbody>
+<tr><td>Full Turbo build</td><td>74 successful tasks after SDK build recovery</td><td>74 successful tasks</td></tr>
+<tr><td>Focused regression command from §4</td><td>Expected failure: 1 failed, 40 skipped; one clone on unchanged refresh</td><td>Same expected failure: 1 failed, 40 skipped; one clone on unchanged refresh</td></tr>
+<tr><td>Direct checkout probe command from §4</td><td>Exit 0; unrelated file present; .git absent</td><td>Exit 0; same observations</td></tr>
+<tr><td>Existing suite, excluding the added regression</td><td>40 passed, 1 skipped (the new regression)</td><td>Not repeated; no production fix was made</td></tr>
+<tr><td>git diff --check</td><td>Passed</td><td>Passed</td></tr></tbody></table>
+<p>There was no contradiction between runs and no verdict correction. The optional standalone probe initially used a .ts extension outside an ESM package and hit a harness transform error; renaming the artifact to .mts resolved that tooling problem before both successful runs. Source links were checked against git show at the recorded commit. Only the service test file was manually changed in the checkouts; the build also regenerated an unrelated web route file, which is not included in the regression patch.</p>
+<h2>10. Appendix</h2><details><summary>Complete regression patch</summary><pre>diff --git a/apps/server/test/services/plugin-catalog/third-party-marketplaces.test.ts b/apps/server/test/services/plugin-catalog/third-party-marketplaces.test.ts
+index 500cb5673d..c476f87c39 100644
+--- a/apps/server/test/services/plugin-catalog/third-party-marketplaces.test.ts
++++ b/apps/server/test/services/plugin-catalog/third-party-marketplaces.test.ts
+@@ -2,6 +2,7 @@ import { execFile } from &quot;node:child_process&quot;;
+ import {
+   mkdir,
+   mkdtemp,
++  readFile,
+   readdir,
+   rm,
+   stat,
+@@ -259,6 +260,49 @@ describe(&quot;third-party marketplaces&quot;, () =&gt; {
+       }
+     });
+ 
++    it(&quot;avoids a repository download when the registered commit is unchanged&quot;, async () =&gt; {
++      const traceFile = join(dataDir, &quot;git-download.trace&quot;);
++      const previousTrace = process.env.GIT_TRACE;
++      process.env.GIT_TRACE = traceFile;
++      restoreEnv.push(() =&gt; {
++        if (previousTrace === undefined) delete process.env.GIT_TRACE;
++        else process.env.GIT_TRACE = previousTrace;
++      });
++      const catalog = service({ fetch: marketplaceFetch({}) });
++      const added = await catalog.addMarketplace({
++        source: `git:${repo}@main`,
++        subdirectory: null,
++      });
++      const addedTrace = await readFile(traceFile, &quot;utf8&quot;);
++      await writeFile(traceFile, &quot;&quot;);
++      const [refreshed] = await catalog.refreshMarketplaces({
++        name: &quot;acme-plugins&quot;,
++      });
++      expect(refreshed).toMatchObject({
++        ok: true,
++        marketplace: { resolvedCommit: added.resolvedCommit, entryCount: 1 },
++      });
++      const refreshTrace = (await readFile(traceFile, &quot;utf8&quot;))
++        .replaceAll(repo, &quot;&lt;fixture-repository&gt;&quot;)
++        .replaceAll(dataDir, &quot;&lt;isolated-data&gt;&quot;);
++      console.log(
++        JSON.stringify(
++          {
++            unchangedCommit:
++              refreshed?.marketplace.resolvedCommit === added.resolvedCommit,
++            addClones: (addedTrace.match(/built-in: git clone /gu) ?? [])
++              .length,
++            refreshClones: (refreshTrace.match(/built-in: git clone /gu) ?? [])
++              .length,
++            refreshTrace,
++          },
++          null,
++          2,
++        ),
++      );
++      expect(refreshTrace).not.toMatch(/built-in: git (?:clone|fetch) /u);
++    });
++
+     it(&quot;adds, refreshes, and removes a git marketplace read from a real checkout&quot;, async () =&gt; {
+       const catalog = service({ fetch: marketplaceFetch({}) });
+ 
+</pre></details>
+<p>Repository publication policy permits only self-contained HTML and screenshots, not raw artifact directories. Complete source, patch, and evidence are therefore inline here; raw local artifacts are retained outside the public reports repository.</p><details><summary>Checkout-one regression log</summary><pre>
+   • turbo 2.11.10
+   • Packages in scope: @bb/server
+   • Running test in 1 package
+   • Remote caching disabled
+
+@bb/templates:generate:templates: cache miss, executing 6f4a5f58fe77bede
+//:ensure-native-modules: cache bypass, force executing b2e101dfaadc5528
+@bb/process-utils:generate:profile-worker: cache miss, executing 06123226c46ede73
+@bb/templates:generate:plugin-scaffold: cache miss, executing 475f8738c9750333
+@bb/plugin-build:generate: cache miss, executing 8b3d9537f3929276
+bb-plugin-bb-guide:generate:api-index: cache miss, executing a61fef2d49b375b3
+@bb/server:generate:bb-official-marketplace: cache miss, executing 232efa8d87e3868b
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates &lt;checkout-one&gt;/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker &lt;checkout-one&gt;/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+bb-plugin-bb-guide:generate:api-index: 
+bb-plugin-bb-guide:generate:api-index: &gt; bb-plugin-bb-guide@0.1.0 generate:api-index &lt;checkout-one&gt;/plugins/bb-guide
+bb-plugin-bb-guide:generate:api-index: &gt; node ../../packages/plugin-sdk/scripts/generate-api-index.mjs skills/bb-plugin-authoring/references
+bb-plugin-bb-guide:generate:api-index: 
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules &lt;checkout-one&gt;
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: &gt; @bb/plugin-build@0.0.1 generate &lt;checkout-one&gt;/packages/plugin-build
+@bb/plugin-build:generate: &gt; node ./scripts/generate-plugin-theme.mjs &amp;&amp; node ./scripts/generate-runtime-export-manifest.mjs
+@bb/plugin-build:generate: 
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold &lt;checkout-one&gt;/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/server:generate:bb-official-marketplace: 
+@bb/server:generate:bb-official-marketplace: &gt; @bb/server@0.0.1 generate:bb-official-marketplace &lt;checkout-one&gt;/apps/server
+@bb/server:generate:bb-official-marketplace: &gt; node --conditions=source --import tsx scripts/generate-bb-official-marketplace.ts
+@bb/server:generate:bb-official-marketplace: 
+//:ensure-native-modules: [ensure-native-modules] Detached hardlinked better-sqlite3 binary before verification
+@get-bb/plugin-sdk:build: cache miss, executing eecd0f59405e76f7
+@get-bb/plugin-sdk:build:types: cache miss, executing 4c0d38e7554de681
+@get-bb/plugin-sdk:build:types: 
+@get-bb/plugin-sdk:build:types: &gt; @get-bb/plugin-sdk@0.6.196 build:types &lt;checkout-one&gt;/packages/plugin-sdk
+@get-bb/plugin-sdk:build:types: &gt; node --max-semi-space-size=128 --max-old-space-size=4096 scripts/build-bundled-dts.mjs
+@get-bb/plugin-sdk:build:types: 
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build: &gt; @get-bb/plugin-sdk@0.6.196 build &lt;checkout-one&gt;/packages/plugin-sdk
+@get-bb/plugin-sdk:build: &gt; node scripts/build-runtime.mjs
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build: Built 25 @get-bb/plugin-sdk runtime entries.
+@bb/plugin-build:generate: plugin-theme.generated.ts up to date
+@bb/plugin-build:generate: host-tailwind.css up to date
+@bb/plugin-build:generate: host-tailwind-version.ts up to date
+@bb/plugin-build:generate: wrote &lt;checkout-one&gt;/packages/plugin-build/src/generated/runtime-export-manifest.generated.ts (react@19.3.1)
+@bb/agent-runtime:generate:test-bridges: cache miss, executing 21fd1e60884b9827
+@bb/agent-runtime:generate:test-bridges: 
+@bb/agent-runtime:generate:test-bridges: &gt; @bb/agent-runtime@0.0.1 generate:test-bridges &lt;checkout-one&gt;/packages/agent-runtime
+@bb/agent-runtime:generate:test-bridges: &gt; node ./scripts/build-test-bridges.mjs
+@bb/agent-runtime:generate:test-bridges: 
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp-next.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-environment-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-machine-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-customization-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-handle.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-view.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-thread-status.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-thread-event-gate.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-file-navigation-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-host-policy.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-plugin-app-collector.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-rpc-tags.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-rpc-query-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-process.d.ts
+@bb/server:test: cache miss, executing b55df217c4bbf8b4
+@bb/server:test: 
+@bb/server:test: &gt; @bb/server@0.0.1 test &lt;checkout-one&gt;/apps/server
+@bb/server:test: &gt; vitest run --config vitest.config.ts &quot;test/services/plugin-catalog/third-party-marketplaces.test.ts&quot; &quot;-t&quot; &quot;avoids a repository download when the registered commit is unchanged&quot;
+@bb/server:test: 
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:22:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:22:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:22:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: 
+@bb/server:test:  RUN  v4.1.12 &lt;checkout-one&gt;/apps/server
+@bb/server:test: 
+@bb/server:test: stdout | test/services/plugin-catalog/third-party-marketplaces.test.ts &gt; third-party marketplaces &gt; git marketplace lifecycle &gt; avoids a repository download when the registered commit is unchanged
+@bb/server:test: {
+@bb/server:test:   &quot;unchangedCommit&quot;: true,
+@bb/server:test:   &quot;addClones&quot;: 1,
+@bb/server:test:   &quot;refreshClones&quot;: 1,
+@bb/server:test:   &quot;refreshTrace&quot;: &quot;21:18:48.213504 git.c:460               trace: built-in: git clone --quiet --no-checkout &lt;fixture-repository&gt; &lt;isolated-data&gt;/marketplaces/staging/&lt;temporary-checkout&gt;\n21:18:48.221635 run-command.c:655       trace: run_command: unset GIT_CONFIG_PARAMETERS GIT_DIR; GIT_PROTOCOL=version=2 'git-upload-pack '\\''&lt;fixture-repository&gt;/.git'\\'''\n21:18:48.225541 git.c:460               trace: built-in: git upload-pack &lt;fixture-repository&gt;/.git\n21:18:48.244484 git.c:460               trace: built-in: git rev-parse --verify --end-of-options 'main^{commit}'\n21:18:48.256012 git.c:460               trace: built-in: git checkout --quiet --detach 9e995ef3170e4458f4e255752d5daccd81809114\n&quot;
+@bb/server:test: }
+@bb/server:test: 
+@bb/server:test:  ❯ |@bb/server:isolated| test/services/plugin-catalog/third-party-marketplaces.test.ts (41 tests | 1 failed | 40 skipped) 382ms
+@bb/server:test:        ↓ reads the selected catalog commit for ref catalog-next
+@bb/server:test:        ↓ reads the selected catalog commit for ref origin/catalog-next
+@bb/server:test:        ↓ reads the selected catalog commit for ref catalog-release
+@bb/server:test:        ↓ reads the selected catalog commit for ref commit
+@bb/server:test:        × avoids a repository download when the registered commit is unchanged 376ms
+@bb/server:test:        ↓ adds, refreshes, and removes a git marketplace read from a real checkout
+@bb/server:test:        ↓ reads the catalog and its icons from the subdirectory on add and on refresh
+@bb/server:test:        ↓ keeps reading the repository root when no subdirectory is given
+@bb/server:test:        ↓ refuses the subdirectory ../outside
+@bb/server:test:        ↓ refuses the subdirectory /etc
+@bb/server:test:        ↓ refuses the subdirectory tools/../..
+@bb/server:test:        ↓ refuses the subdirectory .git
+@bb/server:test:        ↓ refuses the subdirectory tools\bb
+@bb/server:test:        ↓ refuses the subdirectory tools/missing
+@bb/server:test:        ↓ refuses the subdirectory tools/bb/marketplace.json
+@bb/server:test:        ↓ refuses a subdirectory that is a symlink out of the checkout
+@bb/server:test:        ↓ refuses a subdirectory for the source https://acme.test/marketplace.json
+@bb/server:test:        ↓ refuses a subdirectory for the source path:/work/acme-marketplace
+@bb/server:test:      ↓ removes a checkout left by a prior process crash
+@bb/server:test:      ↓ reads a path marketplace and its icons in place
+@bb/server:test:      ↓ rejects a bundled source from a fetched marketplace
+@bb/server:test:      ↓ refuses name collisions and reserved marketplace names
+@bb/server:test:      ↓ refuses an ambiguous bare install and installs the qualified one
+@bb/server:test:      ↓ lists one plugin for entries that share an id and source across marketplaces
+@bb/server:test:      ↓ names a bundled official plugin with &lt;id&gt;@bb-official
+@bb/server:test:      ↓ installs a single marketplace match from a bare entry id
+@bb/server:test:      ↓ refuses a third-party source that changed after confirmation
+@bb/server:test:      ↓ keeps installed plugins updatable after their marketplace is removed
+@bb/server:test:      ↓ keeps icons and catalogs isolated between marketplaces
+@bb/server:test:      ↓ stops reading, listing, and installing from a disabled marketplace
+@bb/server:test:      ↓ leaves bb-community serving when a third-party refresh fails
+@bb/server:test:      ↓ groups search results by marketplace with the official one first
+@bb/server:test:        ↓ resolves a third-party git range to its current tag and commit
+@bb/server:test:        ↓ reports an unresolvable git source instead of failing the plan
+@bb/server:test:        ↓ describes an npm listing by package, range, and registry
+@bb/server:test:        ↓ names the official catalog without a network round trip
+@bb/server:test:      ↓ adds a local manifest larger than 1 MiB
+@bb/server:test:      ↓ binds an npm install to the exact version it confirmed
+@bb/server:test:      ↓ holds the marketplace lock across an install
+@bb/server:test:      ↓ refuses a manifest name that later routes cannot address
+@bb/server:test:      ↓ refuses a marketplace source bb cannot interpret
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server:isolated| test/services/plugin-catalog/third-party-marketplaces.test.ts &gt; third-party marketplaces &gt; git marketplace lifecycle &gt; avoids a repository download when the registered commit is unchanged
+@bb/server:test: AssertionError: expected '21:18:48.213504 git.c:460            …' not to match /built-in: git (?:clone|fetch) /u
+@bb/server:test: 
+@bb/server:test: - Expected:
+@bb/server:test: /built-in: git (?:clone|fetch) /u
+@bb/server:test: 
+@bb/server:test: + Received:
+@bb/server:test: &quot;21:18:48.213504 git.c:460               trace: built-in: git clone --quiet --no-checkout &lt;fixture-repository&gt; &lt;isolated-data&gt;/marketplaces/staging/&lt;temporary-checkout&gt;
+@bb/server:test: 21:18:48.221635 run-command.c:655       trace: run_command: unset GIT_CONFIG_PARAMETERS GIT_DIR; GIT_PROTOCOL=version=2 'git-upload-pack '\\''&lt;fixture-repository&gt;/.git'\\'''
+@bb/server:test: 21:18:48.225541 git.c:460               trace: built-in: git upload-pack &lt;fixture-repository&gt;/.git
+@bb/server:test: 21:18:48.244484 git.c:460               trace: built-in: git rev-parse --verify --end-of-options 'main^{commit}'
+@bb/server:test: 21:18:48.256012 git.c:460               trace: built-in: git checkout --quiet --detach 9e995ef3170e4458f4e255752d5daccd81809114
+@bb/server:test: &quot;
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/plugin-catalog/third-party-marketplaces.test.ts:303:32
+@bb/server:test:     301|         ),
+@bb/server:test:     302|       );
+@bb/server:test:     303|       expect(refreshTrace).not.toMatch(/built-in: git (?:clone|fetch) …
+@bb/server:test:        |                                ^
+@bb/server:test:     304|     });
+@bb/server:test:     305|
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  1 failed | 40 skipped (41)
+@bb/server:test:    Start at  21:18:40
+@bb/server:test:    Duration  7.69s (transform 2.91s, setup 2.92s, import 1.99s, tests 382ms, environment 0ms)
+@bb/server:test: 
+@bb/server:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/server#test:  ERROR  command (&lt;checkout-one&gt;/apps/server) /usr/local/bin/pnpm run test test/services/plugin-catalog/third-party-marketplaces.test.ts -t avoids a repository download when the registered commit is unchanged exited (1)
+
+ Tasks:    10 successful, 11 total
+Cached:    0 cached, 11 total
+  Time:    55.567s 
+Failed:    @bb/server#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details><details><summary>Checkout-two regression log</summary><pre>
+   • turbo 2.11.10
+   • Packages in scope: @bb/server
+   • Running test in 1 package
+   • Remote caching disabled
+
+bb-plugin-bb-guide:generate:api-index: cache miss, executing a61fef2d49b375b3
+//:ensure-native-modules: cache bypass, force executing b2e101dfaadc5528
+@bb/plugin-build:generate: cache miss, executing 8b3d9537f3929276
+@bb/server:generate:bb-official-marketplace: cache miss, executing 232efa8d87e3868b
+@bb/process-utils:generate:profile-worker: cache miss, executing 06123226c46ede73
+@bb/templates:generate:templates: cache miss, executing 6f4a5f58fe77bede
+@bb/templates:generate:plugin-scaffold: cache miss, executing 475f8738c9750333
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold &lt;checkout-two&gt;/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+bb-plugin-bb-guide:generate:api-index: 
+bb-plugin-bb-guide:generate:api-index: &gt; bb-plugin-bb-guide@0.1.0 generate:api-index &lt;checkout-two&gt;/plugins/bb-guide
+bb-plugin-bb-guide:generate:api-index: &gt; node ../../packages/plugin-sdk/scripts/generate-api-index.mjs skills/bb-plugin-authoring/references
+bb-plugin-bb-guide:generate:api-index: 
+@bb/server:generate:bb-official-marketplace: 
+@bb/server:generate:bb-official-marketplace: &gt; @bb/server@0.0.1 generate:bb-official-marketplace &lt;checkout-two&gt;/apps/server
+@bb/server:generate:bb-official-marketplace: &gt; node --conditions=source --import tsx scripts/generate-bb-official-marketplace.ts
+@bb/server:generate:bb-official-marketplace: 
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules &lt;checkout-two&gt;
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates &lt;checkout-two&gt;/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker &lt;checkout-two&gt;/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: &gt; @bb/plugin-build@0.0.1 generate &lt;checkout-two&gt;/packages/plugin-build
+@bb/plugin-build:generate: &gt; node ./scripts/generate-plugin-theme.mjs &amp;&amp; node ./scripts/generate-runtime-export-manifest.mjs
+@bb/plugin-build:generate: 
+//:ensure-native-modules: [ensure-native-modules] Detached hardlinked better-sqlite3 binary before verification
+@get-bb/plugin-sdk:build: cache miss, executing eecd0f59405e76f7
+@get-bb/plugin-sdk:build:types: cache miss, executing 4c0d38e7554de681
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build: &gt; @get-bb/plugin-sdk@0.6.196 build &lt;checkout-two&gt;/packages/plugin-sdk
+@get-bb/plugin-sdk:build: &gt; node scripts/build-runtime.mjs
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build:types: 
+@get-bb/plugin-sdk:build:types: &gt; @get-bb/plugin-sdk@0.6.196 build:types &lt;checkout-two&gt;/packages/plugin-sdk
+@get-bb/plugin-sdk:build:types: &gt; node --max-semi-space-size=128 --max-old-space-size=4096 scripts/build-bundled-dts.mjs
+@get-bb/plugin-sdk:build:types: 
+@get-bb/plugin-sdk:build: Built 25 @get-bb/plugin-sdk runtime entries.
+@bb/plugin-build:generate: plugin-theme.generated.ts up to date
+@bb/plugin-build:generate: host-tailwind.css up to date
+@bb/plugin-build:generate: host-tailwind-version.ts up to date
+@bb/plugin-build:generate: wrote &lt;checkout-two&gt;/packages/plugin-build/src/generated/runtime-export-manifest.generated.ts (react@19.3.1)
+@bb/agent-runtime:generate:test-bridges: cache miss, executing 21fd1e60884b9827
+@bb/agent-runtime:generate:test-bridges: 
+@bb/agent-runtime:generate:test-bridges: &gt; @bb/agent-runtime@0.0.1 generate:test-bridges &lt;checkout-two&gt;/packages/agent-runtime
+@bb/agent-runtime:generate:test-bridges: &gt; node ./scripts/build-test-bridges.mjs
+@bb/agent-runtime:generate:test-bridges: 
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp-next.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-environment-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-machine-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-customization-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-handle.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-view.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-thread-status.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-thread-event-gate.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-file-navigation-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-host-policy.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-plugin-app-collector.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-rpc-tags.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-rpc-query-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-process.d.ts
+@bb/server:test: cache miss, executing 0f50ba752307fac5
+@bb/server:test: 
+@bb/server:test: &gt; @bb/server@0.0.1 test &lt;checkout-two&gt;/apps/server
+@bb/server:test: &gt; vitest run --config vitest.config.ts &quot;test/services/plugin-catalog/third-party-marketplaces.test.ts&quot; &quot;-t&quot; &quot;avoids a repository download when the registered commit is unchanged&quot;
+@bb/server:test: 
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:22:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:22:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:22:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: 
+@bb/server:test:  RUN  v4.1.12 &lt;checkout-two&gt;/apps/server
+@bb/server:test: 
+@bb/server:test: stdout | test/services/plugin-catalog/third-party-marketplaces.test.ts &gt; third-party marketplaces &gt; git marketplace lifecycle &gt; avoids a repository download when the registered commit is unchanged
+@bb/server:test: {
+@bb/server:test:   &quot;unchangedCommit&quot;: true,
+@bb/server:test:   &quot;addClones&quot;: 1,
+@bb/server:test:   &quot;refreshClones&quot;: 1,
+@bb/server:test:   &quot;refreshTrace&quot;: &quot;21:19:49.535042 git.c:460               trace: built-in: git clone --quiet --no-checkout &lt;fixture-repository&gt; &lt;isolated-data&gt;/marketplaces/staging/&lt;temporary-checkout&gt;\n21:19:49.540717 run-command.c:655       trace: run_command: unset GIT_CONFIG_PARAMETERS GIT_DIR; GIT_PROTOCOL=version=2 'git-upload-pack '\\''&lt;fixture-repository&gt;/.git'\\'''\n21:19:49.544620 git.c:460               trace: built-in: git upload-pack &lt;fixture-repository&gt;/.git\n21:19:49.556892 git.c:460               trace: built-in: git rev-parse --verify --end-of-options 'main^{commit}'\n21:19:49.563566 git.c:460               trace: built-in: git checkout --quiet --detach 5781429ad2b96d878c3bbe64b5fbc4c4982efc3f\n&quot;
+@bb/server:test: }
+@bb/server:test: 
+@bb/server:test:  ❯ |@bb/server:isolated| test/services/plugin-catalog/third-party-marketplaces.test.ts (41 tests | 1 failed | 40 skipped) 209ms
+@bb/server:test:        ↓ reads the selected catalog commit for ref catalog-next
+@bb/server:test:        ↓ reads the selected catalog commit for ref origin/catalog-next
+@bb/server:test:        ↓ reads the selected catalog commit for ref catalog-release
+@bb/server:test:        ↓ reads the selected catalog commit for ref commit
+@bb/server:test:        × avoids a repository download when the registered commit is unchanged 203ms
+@bb/server:test:        ↓ adds, refreshes, and removes a git marketplace read from a real checkout
+@bb/server:test:        ↓ reads the catalog and its icons from the subdirectory on add and on refresh
+@bb/server:test:        ↓ keeps reading the repository root when no subdirectory is given
+@bb/server:test:        ↓ refuses the subdirectory ../outside
+@bb/server:test:        ↓ refuses the subdirectory /etc
+@bb/server:test:        ↓ refuses the subdirectory tools/../..
+@bb/server:test:        ↓ refuses the subdirectory .git
+@bb/server:test:        ↓ refuses the subdirectory tools\bb
+@bb/server:test:        ↓ refuses the subdirectory tools/missing
+@bb/server:test:        ↓ refuses the subdirectory tools/bb/marketplace.json
+@bb/server:test:        ↓ refuses a subdirectory that is a symlink out of the checkout
+@bb/server:test:        ↓ refuses a subdirectory for the source https://acme.test/marketplace.json
+@bb/server:test:        ↓ refuses a subdirectory for the source path:/work/acme-marketplace
+@bb/server:test:      ↓ removes a checkout left by a prior process crash
+@bb/server:test:      ↓ reads a path marketplace and its icons in place
+@bb/server:test:      ↓ rejects a bundled source from a fetched marketplace
+@bb/server:test:      ↓ refuses name collisions and reserved marketplace names
+@bb/server:test:      ↓ refuses an ambiguous bare install and installs the qualified one
+@bb/server:test:      ↓ lists one plugin for entries that share an id and source across marketplaces
+@bb/server:test:      ↓ names a bundled official plugin with &lt;id&gt;@bb-official
+@bb/server:test:      ↓ installs a single marketplace match from a bare entry id
+@bb/server:test:      ↓ refuses a third-party source that changed after confirmation
+@bb/server:test:      ↓ keeps installed plugins updatable after their marketplace is removed
+@bb/server:test:      ↓ keeps icons and catalogs isolated between marketplaces
+@bb/server:test:      ↓ stops reading, listing, and installing from a disabled marketplace
+@bb/server:test:      ↓ leaves bb-community serving when a third-party refresh fails
+@bb/server:test:      ↓ groups search results by marketplace with the official one first
+@bb/server:test:        ↓ resolves a third-party git range to its current tag and commit
+@bb/server:test:        ↓ reports an unresolvable git source instead of failing the plan
+@bb/server:test:        ↓ describes an npm listing by package, range, and registry
+@bb/server:test:        ↓ names the official catalog without a network round trip
+@bb/server:test:      ↓ adds a local manifest larger than 1 MiB
+@bb/server:test:      ↓ binds an npm install to the exact version it confirmed
+@bb/server:test:      ↓ holds the marketplace lock across an install
+@bb/server:test:      ↓ refuses a manifest name that later routes cannot address
+@bb/server:test:      ↓ refuses a marketplace source bb cannot interpret
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+@bb/server:test: 
+@bb/server:test:  FAIL  |@bb/server:isolated| test/services/plugin-catalog/third-party-marketplaces.test.ts &gt; third-party marketplaces &gt; git marketplace lifecycle &gt; avoids a repository download when the registered commit is unchanged
+@bb/server:test: AssertionError: expected '21:19:49.535042 git.c:460            …' not to match /built-in: git (?:clone|fetch) /u
+@bb/server:test: 
+@bb/server:test: - Expected:
+@bb/server:test: /built-in: git (?:clone|fetch) /u
+@bb/server:test: 
+@bb/server:test: + Received:
+@bb/server:test: &quot;21:19:49.535042 git.c:460               trace: built-in: git clone --quiet --no-checkout &lt;fixture-repository&gt; &lt;isolated-data&gt;/marketplaces/staging/&lt;temporary-checkout&gt;
+@bb/server:test: 21:19:49.540717 run-command.c:655       trace: run_command: unset GIT_CONFIG_PARAMETERS GIT_DIR; GIT_PROTOCOL=version=2 'git-upload-pack '\\''&lt;fixture-repository&gt;/.git'\\'''
+@bb/server:test: 21:19:49.544620 git.c:460               trace: built-in: git upload-pack &lt;fixture-repository&gt;/.git
+@bb/server:test: 21:19:49.556892 git.c:460               trace: built-in: git rev-parse --verify --end-of-options 'main^{commit}'
+@bb/server:test: 21:19:49.563566 git.c:460               trace: built-in: git checkout --quiet --detach 5781429ad2b96d878c3bbe64b5fbc4c4982efc3f
+@bb/server:test: &quot;
+@bb/server:test: 
+@bb/server:test:  ❯ test/services/plugin-catalog/third-party-marketplaces.test.ts:303:32
+@bb/server:test:     301|         ),
+@bb/server:test:     302|       );
+@bb/server:test:     303|       expect(refreshTrace).not.toMatch(/built-in: git (?:clone|fetch) …
+@bb/server:test:        |                                ^
+@bb/server:test:     304|     });
+@bb/server:test:     305|
+@bb/server:test: 
+@bb/server:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+@bb/server:test: 
+@bb/server:test: 
+@bb/server:test:  Test Files  1 failed (1)
+@bb/server:test:       Tests  1 failed | 40 skipped (41)
+@bb/server:test:    Start at  21:19:44
+@bb/server:test:    Duration  5.49s (transform 1.80s, setup 1.86s, import 1.09s, tests 209ms, environment 0ms)
+@bb/server:test: 
+@bb/server:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/server#test:  ERROR  command (&lt;checkout-two&gt;/apps/server) /usr/local/bin/pnpm run test test/services/plugin-catalog/third-party-marketplaces.test.ts -t avoids a repository download when the registered commit is unchanged exited (1)
+
+ Tasks:    10 successful, 11 total
+Cached:    0 cached, 11 total
+  Time:    45.297s 
+Failed:    @bb/server#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details><details><summary>Existing suite control log</summary><pre>
+   • turbo 2.11.10
+   • Packages in scope: @bb/server
+   • Running test in 1 package
+   • Remote caching disabled
+
+bb-plugin-bb-guide:generate:api-index: cache miss, executing 5500020e6cf7debc
+//:ensure-native-modules: cache bypass, force executing d3a576fc6af8642b
+@bb/server:generate:bb-official-marketplace: cache miss, executing 64859888315cb031
+@bb/templates:generate:templates: cache miss, executing 70b731042e3c96fa
+@bb/process-utils:generate:profile-worker: cache miss, executing 6aed0e1f3897da36
+@bb/plugin-build:generate: cache miss, executing c07bb02d5508fcb2
+@bb/templates:generate:plugin-scaffold: cache miss, executing a369fa51079be4a7
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: &gt; @bb/plugin-build@0.0.1 generate &lt;checkout-one&gt;/packages/plugin-build
+@bb/plugin-build:generate: &gt; node ./scripts/generate-plugin-theme.mjs &amp;&amp; node ./scripts/generate-runtime-export-manifest.mjs
+@bb/plugin-build:generate: 
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates &lt;checkout-one&gt;/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker &lt;checkout-one&gt;/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+@bb/server:generate:bb-official-marketplace: 
+@bb/server:generate:bb-official-marketplace: &gt; @bb/server@0.0.1 generate:bb-official-marketplace &lt;checkout-one&gt;/apps/server
+@bb/server:generate:bb-official-marketplace: &gt; node --conditions=source --import tsx scripts/generate-bb-official-marketplace.ts
+@bb/server:generate:bb-official-marketplace: 
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold &lt;checkout-one&gt;/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules &lt;checkout-one&gt;
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+bb-plugin-bb-guide:generate:api-index: 
+bb-plugin-bb-guide:generate:api-index: &gt; bb-plugin-bb-guide@0.1.0 generate:api-index &lt;checkout-one&gt;/plugins/bb-guide
+bb-plugin-bb-guide:generate:api-index: &gt; node ../../packages/plugin-sdk/scripts/generate-api-index.mjs skills/bb-plugin-authoring/references
+bb-plugin-bb-guide:generate:api-index: 
+@get-bb/plugin-sdk:build: cache miss, executing 9eaf5bf5ad761479
+@get-bb/plugin-sdk:build:types: cache miss, executing 6e127ffd2e1c3b31
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build: &gt; @get-bb/plugin-sdk@0.6.196 build &lt;checkout-one&gt;/packages/plugin-sdk
+@get-bb/plugin-sdk:build: &gt; node scripts/build-runtime.mjs
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build:types: 
+@get-bb/plugin-sdk:build:types: &gt; @get-bb/plugin-sdk@0.6.196 build:types &lt;checkout-one&gt;/packages/plugin-sdk
+@get-bb/plugin-sdk:build:types: &gt; node --max-semi-space-size=128 --max-old-space-size=4096 scripts/build-bundled-dts.mjs
+@get-bb/plugin-sdk:build:types: 
+@bb/plugin-build:generate: plugin-theme.generated.ts up to date
+@bb/plugin-build:generate: host-tailwind.css up to date
+@bb/plugin-build:generate: host-tailwind-version.ts up to date
+@get-bb/plugin-sdk:build: Built 25 @get-bb/plugin-sdk runtime entries.
+@bb/plugin-build:generate: wrote &lt;checkout-one&gt;/packages/plugin-build/src/generated/runtime-export-manifest.generated.ts (react@19.3.1)
+@bb/agent-runtime:generate:test-bridges: cache miss, executing ca0454ed9c7e4a33
+@bb/agent-runtime:generate:test-bridges: 
+@bb/agent-runtime:generate:test-bridges: &gt; @bb/agent-runtime@0.0.1 generate:test-bridges &lt;checkout-one&gt;/packages/agent-runtime
+@bb/agent-runtime:generate:test-bridges: &gt; node ./scripts/build-test-bridges.mjs
+@bb/agent-runtime:generate:test-bridges: 
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-provider-bridge-acp-next.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-environment-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-machine-provider.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-customization-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-handle.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-composer-view.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-thread-status.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-thread-event-gate.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-file-navigation-validation.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-host-policy.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-plugin-app-collector.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-app.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-testing-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-rpc-tags.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-internal-rpc-query-host.d.ts
+@get-bb/plugin-sdk:build:types: Unchanged bundled-types/bb-plugin-sdk-process.d.ts
+@bb/server:test: cache miss, executing 6fd82fe0bf0c31b0
+@bb/server:test: 
+@bb/server:test: &gt; @bb/server@0.0.1 test &lt;checkout-one&gt;/apps/server
+@bb/server:test: &gt; vitest run --config vitest.config.ts &quot;test/services/plugin-catalog/third-party-marketplaces.test.ts&quot; &quot;-t&quot; &quot;^(?!.*avoids a repository download)&quot;
+@bb/server:test: 
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:22:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:22:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/server:test:   - `__dirname` (vitest.config.ts:22:15). Use `import.meta.dirname` instead
+@bb/server:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/server:test: 
+@bb/server:test:  RUN  v4.1.12 &lt;checkout-one&gt;/apps/server
+@bb/server:test: 
+@bb/server:test:  ✓ |@bb/server:isolated| test/services/plugin-catalog/third-party-marketplaces.test.ts (41 tests | 1 skipped) 2646ms
+@bb/server:test: 
+@bb/server:test:  Test Files  1 passed (1)
+@bb/server:test:       Tests  40 passed | 1 skipped (41)
+@bb/server:test:    Start at  21:19:53
+@bb/server:test:    Duration  7.66s (transform 1.71s, setup 1.77s, import 1.07s, tests 2.65s, environment 0ms)
+@bb/server:test: 
+
+ Tasks:    11 successful, 11 total
+Cached:    0 cached, 11 total
+  Time:    48.221s 
+
+ WARNING  no output files found for task @bb/server#test. Please check your `outputs` key in `turbo.json`
+</pre></details>
+<p>Existing-suite control command:<pre>pnpm exec turbo run test --filter=@bb/server -- test/services/plugin-catalog/third-party-marketplaces.test.ts -t '^(?!.*avoids a repository download)'</pre>Host-specific investigation paths in saved logs are replaced with checkout aliases. Git fixture hashes and timestamps are real output. No credentials or user runtime data are present.</p>
+<details><summary>Second checkout materialization output</summary><pre>{
+  &quot;catalogName&quot;: &quot;probe-marketplace&quot;,
+  &quot;unrelatedFileContent&quot;: &quot;unneeded&quot;,
+  &quot;gitDirectoryPresent&quot;: false,
+  &quot;historySeedBytes&quot;: 1048576,
+  &quot;cloneCommand&quot;: &quot;21:20:06.068856 git.c:460               trace: built-in: git clone --quiet --no-checkout file://&lt;scratch&gt;/repository &lt;scratch&gt;/staging/&lt;temporary-checkout&gt;&quot;,
+  &quot;transportPackCommand&quot;: &quot;21:20:06.078530 git.c:460               trace: built-in: git pack-objects --revs --thin --stdout --delta-base-offset&quot;
+}
+</pre></details>
+<p>Trust boundary: issue prose, proposed commands, and PR diffs were treated as untrusted evidence. Only trusted origin/main and newly authored diagnostic changes were executed; no issue-provided script, linked branch, or external issue URL was fetched. No dependency was added. All investigation source came from the public target repository, not the initially configured fork remote.</p>
+<p>AGENT GENERATED · SlopCop</p>
+</main></body></html>
