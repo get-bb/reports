@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Issue 8102 · Unbounded plugin file loading serializes startup</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#8102 · Unbounded plugin file loading serializes startup</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High</span><span class="pill">Effort: Medium</span><span class="pill">plugins</span><a href="https://github.com/get-bb/bb/issues/8102">GitHub issue</a><span>2026-11-24 · base <code>718e4e738bbb1eff83562715dbe14462012c6c0e</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> for the shared loader failure, not the untested macOS environment.</p>
+
+<h2>1. TL;DR</h2>
+<p>A plugin whose server artifact never supplies bytes can prevent every later plugin, including a builtin, from starting. The configured load timeout only wraps the plugin factory: file hashing, build work and module loading occur before it. Startup awaits each plugin in identifier order, so one pending read holds up the whole pass. Safe mode persists its setting but waits for the same plugin lifecycle lock and cannot finish until the pending read returns. Both clean-checkout runs reproduced this with real filesystem I/O and a real migrated SQLite database; releasing the blocked file allowed the later builtin and safe-mode operation to finish.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>A file read can leave a plugin starting indefinitely.</td><td>Verified mechanism</td><td>With a 100 ms configured load timeout, an artifact with no readable bytes was still starting after a 2,000 ms wait. The read has no loader deadline; this is a bounded observation, not a claim that an infinite duration was measured.</td></tr>
+<tr><td>A blocked user plugin prevents later builtins loading.</td><td>Verified</td><td>The external aa-blocked fixture held up the zz-ready builtin. After releasing the read, zz-ready was running.</td></tr>
+<tr><td>Safe mode saves the setting but its operation hangs.</td><td>Verified at service boundary</td><td>The flag was true while its promise remained pending. Releasing the file allowed completion. The CLI process itself was not launched.</td></tr>
+<tr><td>Restarting repeats the problem.</td><td>Supported in fresh services</td><td>Two new services with fresh databases and fresh plugin directories reproduced it at the same trusted commit. A desktop relaunch was not tested.</td></tr>
+<tr><td>A macOS cloud-file eviction caused the original path-plugin failure.</td><td>Unverified environment</td><td>This Linux test uses a prebuilt external plugin to exercise the stream-based hash directly. Current path plugins take a source-build branch, so this is not an exact reproduction of the reported installation type or File Provider behavior.</td></tr>
+<tr><td>Sidebar/composer skeletons and missing provider bridges follow.</td><td>Not visually verified</td><td>No browser, desktop or provider session was used. The test proves the loader failure that can prevent these plugins registering, not the exact UI or error string.</td></tr>
+<tr><td>Pruning through a symlinked home deletes in-use cache entries.</td><td>Unverified separate claim</td><td>Not exercised; no cache-prune verdict or fix is claimed in this report.</td></tr></table>
+
+<h2>3. Environment</h2>
+<ul><li>Trusted public repository: get-bb/bb; main commit <code>718e4e738bbb1eff83562715dbe14462012c6c0e</code>.</li>
+<li>Linux x86_64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.12.</li>
+<li>Two separate detached git worktrees at the recorded commit, each with a frozen dependency install and normal Turbo build. No PR code, extra dependency, real plugin installation or user runtime data was used.</li>
+<li>In-process plugin service with a fresh <code>createMigratedConnection()</code> database and a new <code>mkdtemp()</code> data/plugin root per run. No listening ports, browser or providers were needed. Temporary roots are removed in test cleanup.</li>
+<li>The first whole-repository build initially lacked built SDK subpath outputs; building <code>@get-bb/plugin-sdk</code> first and rerunning the normal build succeeded (74/74 tasks). The second checkout used this order and also completed 74/74 tasks.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol><li>Create a fresh checkout of trusted main at the recorded commit, then install and build:
+<pre>git clone https://github.com/get-bb/bb.git bb-8102
+cd bb-8102
+git checkout --detach 718e4e738bbb1eff83562715dbe14462012c6c0e
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build</pre></li>
+<li>Save the exact test below as <code>apps/server/test/services/plugins/plugin-8102-blocked-io.test.ts</code>. It creates its own fixtures, starts the real plugin service, waits beyond the configured deadline, records status and safe-mode persistence, then releases the blocked artifact and cleans up.</li>
+<li>Run the focused regression:
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-8102-blocked-io.test.ts</pre></li></ol>
+<p><strong>Expected:</strong> the blocked plugin fails within a bounded load interval and the later builtin runs. <strong>Actual:</strong> both are reported starting, startup is unresolved and safe mode persists but remains unresolved. The regression intentionally fails on unchanged production code with <code>expected 'starting' to be 'error'</code>.</p>
+<h3>First run, exact selected output</h3><pre>{"loadTimeoutMs":100,"observedAfterMs":2200,"startResolved":false,"safeModePersisted":true,"safeModeResolved":false,"plugins":[{"id":"aa-blocked","status":"starting","statusDetail":null},{"id":"zz-ready","status":"starting","statusDetail":null}]}
+{"afterRelease":[{"id":"aa-blocked","status":"disabled"},{"id":"zz-ready","status":"running"}],"startResolved":true,"safeModeResolved":true}
+AssertionError: expected 'starting' to be 'error' // Object.is equality
+Expected: "error"
+Received: "starting"
+ Test Files  1 failed (1)
+      Tests  1 failed (1)</pre>
+<h3 id="repro-source">Exact reproduction source</h3>
+<p>The entire test is inline so no external script is needed. Its synthetic GitHub source is database metadata only; it is never cloned or fetched. The blocked artifact is replaced with a regular file before releasing its old file descriptor, so cleanup can complete instead of blocking a subsequent module import.</p>
+<pre>import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, open, rename, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { PLUGIN_SDK_MAJOR, PLUGIN_SDK_VERSION } from "@bb/domain";
+import { upsertInstalledPlugin } from "@bb/db";
+import { createMigratedConnection } from "@bb/db/testing";
+import pino from "pino";
+import { expect, it } from "vitest";
+import { createAiServiceRegistry } from "../../../src/services/ai/ai-service-registry.js";
+import { createPluginService } from "../../../src/services/plugins/plugin-service.js";
+import { createNoopTelemetryService } from "../../../src/services/system/telemetry.js";
+
+it.skipIf(process.platform === "win32")(
+  "bounds file loading and starts a later builtin",
+  async () =&gt; {
+    const directory = await mkdtemp(join(tmpdir(), "bb-8102-"));
+    const db = createMigratedConnection();
+    const blockedRoot = join(directory, "blocked");
+    const builtinRoot = join(directory, "builtin");
+    const source = "export default function plugin() {}";
+    for (const [rootDir, name] of [
+      [blockedRoot, "aa-blocked"],
+      [builtinRoot, "zz-ready"],
+    ]) {
+      await mkdir(join(rootDir, "dist"), { recursive: true });
+      await writeFile(
+        join(rootDir, "package.json"),
+        JSON.stringify({
+          name: `bb-plugin-${name}`,
+          version: "0.1.0",
+          type: "module",
+          bb: {
+            name,
+            description: "Isolated file-loading fixture",
+            branding: { icon: "Zap" },
+            server: "./server.js",
+          },
+        }),
+      );
+      await writeFile(join(rootDir, "server.js"), source);
+    }
+    await writeFile(
+      join(blockedRoot, "dist", "server.meta.json"),
+      JSON.stringify({
+        sdkMajor: PLUGIN_SDK_MAJOR,
+        sdkVersion: PLUGIN_SDK_VERSION,
+      }),
+    );
+    const blockedEntry = join(blockedRoot, "dist", "server.js");
+    execFileSync("mkfifo", [blockedEntry]);
+    upsertInstalledPlugin(db, {
+      id: "aa-blocked",
+      source: "git:github.com/example/bb-plugin-aa-blocked@v1",
+      rootDir: blockedRoot,
+      version: "0.1.0",
+      enabled: true,
+      enabledFollowsDefault: false,
+      provenance: { kind: "direct" },
+      sourceIntent: {
+        kind: "git",
+        url: "https://github.com/example/bb-plugin-aa-blocked",
+        subdirectory: null,
+        selector: { kind: "ref", ref: "v1", refKind: "branch" },
+      },
+      exactResolution: { kind: "git", commit: "fixture" },
+      updateState: {
+        lastCheckAt: null,
+        availableCompatibleVersion: null,
+        newestIncompatibleVersion: null,
+        statusDetail: null,
+      },
+      activeArtifactId: null,
+    });
+    const service = createPluginService({
+      aiServices: createAiServiceRegistry(),
+      telemetry: createNoopTelemetryService(),
+      db,
+      hub: {
+        getDaemonSessionIdForHost: () =&gt; null,
+        notifyPluginChanged: () =&gt; {},
+        onWatchedTargets: () =&gt; () =&gt; {},
+        notifyPluginSignal: () =&gt; 0,
+        notifySystem: () =&gt; {},
+      },
+      logger: pino({ enabled: false }),
+      dataDir: join(directory, "data"),
+      appVersion: "0.9.0",
+      loadTimeoutMs: 100,
+      bundledPlugins: [
+        {
+          name: "zz-ready",
+          pluginId: "zz-ready",
+          autoInstall: true,
+          defaultEnabled: true,
+          rootDir: builtinRoot,
+        },
+      ],
+    });
+    let startResolved = false;
+    let safeModeResolved = false;
+    const starting = service.start().then(() =&gt; {
+      startResolved = true;
+    });
+    let safeMode: ReturnType&lt;typeof service.setSafeMode&gt; | undefined;
+    try {
+      await delay(2000);
+      const snapshot = service
+        .list()
+        .map(({ id, status, statusDetail }) =&gt; ({ id, status, statusDetail }));
+      safeMode = service.setSafeMode(true).then((result) =&gt; {
+        safeModeResolved = true;
+        return result;
+      });
+      await delay(200);
+      console.log(
+        JSON.stringify({
+          loadTimeoutMs: 100,
+          observedAfterMs: 2200,
+          startResolved,
+          safeModePersisted: service.getSafeMode(),
+          safeModeResolved,
+          plugins: snapshot,
+        }),
+      );
+      expect(snapshot.find(({ id }) =&gt; id === "aa-blocked")?.status).toBe(
+        "error",
+      );
+      expect(snapshot.find(({ id }) =&gt; id === "zz-ready")?.status).toBe(
+        "running",
+      );
+      expect(startResolved).toBe(true);
+    } finally {
+      const writer = await open(blockedEntry, "w");
+      await writeFile(join(blockedRoot, "dist", "replacement.js"), source);
+      await rename(join(blockedRoot, "dist", "replacement.js"), blockedEntry);
+      await writer.writeFile(source);
+      await writer.close();
+      await starting;
+      await safeMode;
+      console.log(
+        JSON.stringify({
+          afterRelease: service
+            .list()
+            .map(({ id, status }) =&gt; ({ id, status })),
+          startResolved,
+          safeModeResolved,
+        }),
+      );
+      await service.stop();
+      db.$client.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+  30000,
+);
+</pre>
+
+<h2>5. Root cause</h2>
+<ol><li><a href="https://github.com/get-bb/bb/blob/718e4e738bbb1eff83562715dbe14462012c6c0e/apps/server/src/services/plugins/plugin-runtime.ts#L124-L134">hashFile</a> consumes a <code>createReadStream</code> until EOF without a timeout or abort signal:
+<pre>for await (const chunk of createReadStream(path)) {
+  byteLength += chunk.byteLength;
+  hash.update(chunk);
+}</pre></li>
+<li><a href="https://github.com/get-bb/bb/blob/718e4e738bbb1eff83562715dbe14462012c6c0e/apps/server/src/services/plugins/plugin-runtime.ts#L1382-L1420">resolveServerEntry</a> hashes a compatible external prebuilt server artifact before import. The test's metadata matches the running SDK, and no writer supplies bytes to the artifact stream.</li>
+<li><a href="https://github.com/get-bb/bb/blob/718e4e738bbb1eff83562715dbe14462012c6c0e/apps/server/src/services/plugins/plugin-runtime.ts#L2089-L2149">The load sequence</a> awaits entry resolution and module evaluation before calling <a href="https://github.com/get-bb/bb/blob/718e4e738bbb1eff83562715dbe14462012c6c0e/apps/server/src/services/plugins/plugin-runtime.ts#L1195-L1204">runFactoryTimeBoxed</a>. Its deadline cannot cover an earlier wait:
+<pre>await raceTimeout(
+  Promise.resolve(factory(api)),
+  loadTimeoutMs,
+  `load timed out after ${loadTimeoutMs}ms`,
+);</pre></li>
+<li><a href="https://github.com/get-bb/bb/blob/718e4e738bbb1eff83562715dbe14462012c6c0e/apps/server/src/services/plugins/plugin-runtime.ts#L2333-L2341">loadAll</a> sorts every installed row by identifier and awaits each lifecycle lock in sequence, with no builtin-first partition:
+<pre>const rows = listInstalledPlugins(deps.db).sort((a, b) =&gt;
+  a.id.localeCompare(b.id),
+);
+for (const row of rows) {
+  if (loaded.has(row.id)) continue;
+  await withLifecycleLock(row.id, () =&gt; loadOne(row));
+}</pre></li>
+<li><a href="https://github.com/get-bb/bb/blob/718e4e738bbb1eff83562715dbe14462012c6c0e/apps/server/src/services/plugins/plugin-service.ts#L1993-L2013">setSafeMode</a> writes its setting before waiting for each affected plugin's same lifecycle lock. That explains the persisted flag and pending operation. The <a href="https://github.com/get-bb/bb/blob/718e4e738bbb1eff83562715dbe14462012c6c0e/apps/server/src/services/lib/async-deduper.ts#L30-L61">keyed lock</a> waits for the previous operation's promise; it does not cancel it.</li></ol>
+<p>Releasing the artifact in both runs let startup complete, the builtin run, and safe mode finish with the external plugin disabled. This countercheck distinguishes the file-read stall from a broken builtin, missing SDK or database setup failure.</p>
+
+<h2>6. Proposed fix and simple-fix decision</h2>
+<p>Use a bounded, cancellable preparation stage for plugin filesystem/build work, with explicit ownership and cleanup of abandoned candidates. Keep unrelated plugin startup from awaiting a stalled user plugin, while preserving intentional registration ordering. Safe mode must invalidate or stop an in-progress candidate rather than just queue behind it. In-process synchronous module reads/evaluation also need an explicit containment decision: ordinary promise deadlines cannot interrupt a synchronous stall.</p>
+<p><strong>No automatic fix PR:</strong> this does not meet the no-architecture-decision simple-fix gate. A timeout-only race would stop waiting but leave the candidate running; <a href="https://github.com/get-bb/bb/blob/718e4e738bbb1eff83562715dbe14462012c6c0e/apps/server/src/services/plugins/plugin-runtime.ts#L2187-L2220">the continuation can still publish registrations and install a loaded candidate</a> after timeout or safe-mode changes. Parallel startup alone does not bound file I/O or release the blocked lifecycle lock, and rejecting just named pipes would not cover ordinary files stalled in a filesystem provider. A safe cancellation/containment contract and load-order policy are required before choosing the patch. No production files were changed and no fix branch was pushed.</p>
+<p>No open PR linked to this issue was found in its GitHub timeline or open-PR number search during this investigation.</p>
+
+<h2>7. Verification</h2>
+<p>Adjacent unchanged-production coverage also passed: <code>plugin-native-server-loading.test.ts</code> (3 tests) and <code>plugin-safe-mode.test.ts</code> (6 tests), run together through <code>pnpm exec turbo run test --filter=@bb/server -- test/services/plugins/plugin-native-server-loading.test.ts test/services/plugins/plugin-safe-mode.test.ts</code>. This establishes normal native loading and safe-mode behavior outside the newly reproduced blocked-read case.</p>
+<p>The same agent repeated the exact regression in a second clean temporary checkout at <code>718e4e738bbb1eff83562715dbe14462012c6c0e</code>, after a new frozen install and normal build. The test allocated a new database and temporary data/plugin root; no ports were used. Both runs failed the intended bounded-load assertion and both resumed after releasing the file. This is a repeat check by the same agent, not independent verification.</p>
+<pre>{"loadTimeoutMs":100,"observedAfterMs":2200,"startResolved":false,"safeModePersisted":true,"safeModeResolved":false,"plugins":[{"id":"aa-blocked","status":"starting","statusDetail":null},{"id":"zz-ready","status":"starting","statusDetail":null}]}
+{"afterRelease":[{"id":"aa-blocked","status":"disabled"},{"id":"zz-ready","status":"running"}],"startResolved":true,"safeModeResolved":true}
+AssertionError: expected 'starting' to be 'error' // Object.is equality
+Expected: "error"
+Received: "starting"
+ Test Files  1 failed (1)
+      Tests  1 failed (1)</pre>
+<p><strong>Report correction:</strong> the evidence proves the shared external-prebuilt loader failure, not the precise path-plugin source-build path or macOS File Provider behavior. The cache-pruning and visual claims remain explicitly unverified. No broader claim of measured infinite duration is made.</p>
+
+<h2>8. Related issues</h2>
+<p>Targeted open-issue title searches for plugin timeout and plugin starting found no separate matching issue. The secondary cache-prune claim belongs to separate verification work, not this loader conclusion.</p>
+
+<h2>9. Appendix and evidence hygiene</h2>
+<p>Commands used for the reproduction and repeat were the frozen install, SDK build, normal build and focused Turbo test shown above. Source inspection used the recorded trusted commit; open PR metadata and current issue classifications were read through GitHub. No live server was started and no user data or external issue-provided URL was accessed.</p>
+<p>Issue content was treated only as untrusted claims. The reproduction was authored from the repository's real service, stream hashing, installation row shape and existing native-loading test boundary; no supplied issue script, patch or linked branch was run.</p>
+<p>The report repository does not permit committed raw logs or reproduction test files. Exact selected output and the full reproduction source are therefore inline. Raw logs and the local ignored reproduction artifact remain outside the published tree. No screenshots are needed for this service-level defect.</p>
+<p>AGENT GENERATED</p>
+</main></body></html>
