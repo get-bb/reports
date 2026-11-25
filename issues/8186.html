@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report #8186: Deleted workspace launch errors</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p><a href="../">Reports</a></p>
+<h1>#8186 · Deleted workspace misreported as a missing provider executable</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Medium priority</span><span class="pill">Medium effort</span><span class="pill">host</span><span class="pill">workspaces</span></p>
+<p><a href="https://github.com/get-bb/bb/issues/8186">Issue #8186</a> · November 25, 2026 · base <code>fb045a046653cc127656ca3c7243d44ae4c94f3f</code></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · reproduction label: <code>confirmed-repro</code></p>
+<h2>1. TL;DR</h2>
+<p>Deleting the directory behind a cached environment makes the next provider bridge launch fail even though its executable exists. The daemon reports <code>missing_executable</code> because the spawn error names the executable, not the missing working directory. Archiving follows the same workspace-bound launch path and fails before the provider receives its archive request. A cold archive instead fails with <code>path_not_found</code>; neither case falls back to the existing provider maintenance workspace. Three focused command-level regressions reproduce these failures twice on unchanged production code.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Missing working directory can look like a missing executable.</td><td>Verified</td><td>A real provider bridge launches successfully before deletion, then fails with <code>spawn /usr/local/bin/node ENOENT</code> after deletion.</td></tr>
+<tr><td>Follow-up submit is misclassified.</td><td>Verified at host RPC boundary</td><td>The real command router returns <code>errorCode: missing_executable</code>, rather than <code>path_not_found</code>.</td></tr>
+<tr><td>Archive uses the deleted workspace; unarchive uses maintenance.</td><td>Verified</td><td>Cached archive hits the same launch failure. Cold archive stops at workspace provisioning. The two handler implementations differ on main.</td></tr>
+<tr><td>Desktop macOS and named provider versions show the exact reported user interface and client rejection event.</td><td>Not run</td><td>Verification uses Linux, Node 22.19.0, and the repository's real scripted-echo plugin/bridge. No macOS desktop, real account, or provider service was used.</td></tr>
+<tr><td>Local archival persists despite a provider failure.</td><td>Not directly tested here</td><td>This is a separate server-visible concern tracked in related issue #8033; this report tests the host command failure.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Trusted public repository: get-bb/bb, main commit <code>fb045a046653cc127656ca3c7243d44ae4c94f3f</code>.</li><li>Linux x86_64; kernel 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.12.</li><li>The plugin artifact is built from <code>tests/scripted-echo-provider</code> on trusted main; real runtime manager, child processes, bridge protocol, artifact cache, and command router are exercised. The shared fixture supplies a fake workspace object for the cached-environment path; directory creation/deletion and process spawning are real. The cold-archive case uses the real workspace provisioner.</li><li>Both runs use fresh test-owned temporary workspace, daemon data, and provider record directories. No listening server, ports, live user data, credentials, or production BB instance is involved.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Check out the exact trusted commit and install the existing lockfile.</li><li>Apply the regression-only patch below to the existing command race test file. No production code is changed.</li><li>Build the SDK and run the focused tests through Turbo.</li></ol>
+<pre>git clone https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout fb045a046653cc127656ca3c7243d44ae4c94f3f
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+git apply /path/to/regression.patch
+pnpm exec turbo run test --filter=@bb/host-daemon --force -- test/command/thread-stop-races.test.ts -t 'deleted workspace'</pre>
+<p>Save this complete patch as <code>regression.patch</code>. It extends existing repository fixtures rather than simulating the failure in a mock. A thread completes a tiny scripted turn, its idle provider session is reaped, and the actual workspace directory is deleted. Submit then traverses the real RPC router; archive traverses command dispatch. A third case verifies archive after the environment cache is absent.</p>
+<pre>diff --git a/apps/host-daemon/test/command/thread-stop-races.test.ts b/apps/host-daemon/test/command/thread-stop-races.test.ts
+index a5359de85f..11d79c30ac 100644
+--- a/apps/host-daemon/test/command/thread-stop-races.test.ts
++++ b/apps/host-daemon/test/command/thread-stop-races.test.ts
+@@ -1,4 +1,4 @@
+-import { readFile } from "node:fs/promises";
++import { readFile, rm } from "node:fs/promises";
+ import os from "node:os";
+ import path from "node:path";
+ import { fileURLToPath } from "node:url";
+@@ -336,6 +336,100 @@ function createRaceRouter(harness: RaceHarness): CommandRouter {
+   });
+ }
+ 
++describe("deleted workspace commands", () =&gt; {
++  async function createReapedHarness(): Promise&lt;RaceHarness&gt; {
++    const harness = await createRaceHarness();
++    harness.launch = await scriptedEchoDispatchLaunch({
++      scripted: { sessionRestorable: true },
++    });
++    await dispatchCommand(
++      threadStartCommand(harness, {
++        threadId: "thread-deleted-workspace",
++        inputText: "hello",
++      }),
++      harness.dispatchOptions,
++    );
++    await expect
++      .poll(() =&gt;
++        harness.events.some((event) =&gt; event.type === "turn/completed"),
++      )
++      .toBe(true);
++    const result = await harness.manager.reapIdleProviderSessions({
++      idleForMs: 0,
++      nowMs: Date.now(),
++    });
++    expect(result.reapedSessions).toHaveLength(1);
++    await rm(harness.workspacePath, { recursive: true });
++    return harness;
++  }
++
++  it("identifies a deleted workspace instead of a missing bridge executable on submit", async () =&gt; {
++    const harness = await createReapedHarness();
++    const result = await routerCommand(
++      new CommandRouter(harness.dispatchOptions),
++      turnSubmitCommand(harness, {
++        threadId: "thread-deleted-workspace",
++        inputText: "hello",
++      }),
++    );
++    expect(result).toMatchObject({
++      ok: false,
++      errorCode: "path_not_found",
++      errorMessage: expect.stringContaining(harness.workspacePath),
++    });
++  });
++
++  it("archives through the provider after its workspace is deleted", async () =&gt; {
++    const harness = await createReapedHarness();
++    await expect(
++      dispatchCommand(
++        {
++          type: "thread.archive",
++          bridgeLaunch: harness.launch,
++          environmentId: ENVIRONMENT_ID,
++          threadId: "thread-deleted-workspace",
++          providerId: "fake",
++          providerThreadId: "prov-1",
++          workspaceContext: { workspacePath: harness.workspacePath },
++        },
++        harness.dispatchOptions,
++      ),
++    ).resolves.toEqual({});
++    expect(harness.record.last("thread/archive")?.params).toMatchObject({
++      providerThreadId: "prov-1",
++    });
++  });
++
++  it("archives a deleted workspace without a cached environment", async () =&gt; {
++    const harness = await createReapedHarness();
++    const manager = new RuntimeManager({
++      createRuntime: (options) =&gt;
++        createAgentRuntime({
++          ...options,
++          env: { ...options.env, ...harness.record.env },
++        }),
++    });
++    managers.push(manager);
++    await expect(
++      dispatchCommand(
++        {
++          type: "thread.archive",
++          bridgeLaunch: harness.launch,
++          environmentId: ENVIRONMENT_ID,
++          threadId: "thread-deleted-workspace",
++          providerId: "fake",
++          providerThreadId: "prov-1",
++          workspaceContext: { workspacePath: harness.workspacePath },
++        },
++        { ...harness.dispatchOptions, runtimeManager: manager },
++      ),
++    ).resolves.toEqual({});
++    expect(harness.record.last("thread/archive")?.params).toMatchObject({
++      providerThreadId: "prov-1",
++    });
++  });
++});
++
+ describe("thread.stop race semantics", () =&gt; {
+   it("interrupts the turn of a submit that was still in flight when the stop arrived", async () =&gt; {
+     const harness = await createRaceHarness();
+</pre>
+<p><strong>Expected:</strong> submit returns <code>path_not_found</code> with the missing directory; both archive operations complete and record a real <code>thread/archive</code> request with the provider thread ID.</p>
+<p><strong>Actual, first run:</strong> all three regressions fail for the intended reasons. Temporary paths below are privacy-redacted; error text, codes, assertions, and counts are otherwise retained.</p>
+<pre> FAIL  |@bb/host-daemon| test/command/thread-stop-races.test.ts &gt; deleted workspace commands &gt; identifies a deleted workspace instead of a missing bridge executable on submit
+AssertionError: expected { type: 'host-rpc.response', …(5) } to match object { ok: false, …(2) }
+(3 matching properties omitted from actual)
+
+- Expected
++ Received
+
+  {
+-   "errorCode": "path_not_found",
+-   "errorMessage": StringContaining "&lt;deleted-workspace&gt;",
++   "errorCode": "missing_executable",
++   "errorMessage": "Provider \"fake\" failed to start: spawn /usr/local/bin/node ENOENT",
+    "ok": false,
+  }
+
+ ❯ test/command/thread-stop-races.test.ts:375:20
+    373|       }),
+    374|     );
+    375|     expect(result).toMatchObject({
+       |                    ^
+    376|       ok: false,
+    377|       errorCode: "path_not_found",
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/3]⎯
+
+ FAIL  |@bb/host-daemon| test/command/thread-stop-races.test.ts &gt; deleted workspace commands &gt; archives through the provider after its workspace is deleted
+AssertionError: promise rejected "Error: Provider "fake" failed to start: s…" instead of resolving
+ ❯ test/command/thread-stop-races.test.ts:397:6
+    395|         harness.dispatchOptions,
+    396|       ),
+    397|     ).resolves.toEqual({});
+       |      ^
+    398|     expect(harness.record.last("thread/archive")?.params).toMatchObjec…
+    399|       providerThreadId: "prov-1",
+
+Caused by: Error: Provider "fake" failed to start: spawn /usr/local/bin/node ENOENT
+ ❯ RuntimeProviderProcessManager.handleProviderProcessError ../../packages/agent-runtime/src/runtime-provider-process.ts:685:9
+ ❯ ChildProcess.&lt;anonymous&gt; ../../packages/agent-runtime/src/runtime-provider-process.ts:590:12
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/3]⎯
+
+ FAIL  |@bb/host-daemon| test/command/thread-stop-races.test.ts &gt; deleted workspace commands &gt; archives a deleted workspace without a cached environment
+AssertionError: promise rejected "ExpectedCommandDispatchError: Unmanaged w… { code: '…' }" instead of resolving
+ ❯ test/command/thread-stop-races.test.ts:426:6
+    424|         { ...harness.dispatchOptions, runtimeManager: manager },
+    425|       ),
+    426|     ).resolves.toEqual({});
+       |      ^
+    427|     expect(harness.record.last("thread/archive")?.params).toMatchObjec…
+    428|       providerThreadId: "prov-1",
+
+Caused by: ExpectedCommandDispatchError: Unmanaged workspace path does not exist: &lt;deleted-workspace&gt;
+ ❯ requireResolvedWorkspaceForCommand src/workspace-resolution.ts:59:11
+ ❯ Object.thread.archive src/command-dispatch.ts:506:19
+ ❯ dispatchCommand src/command-dispatch.ts:733:12
+ ❯ test/command/thread-stop-races.test.ts:413:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+Serialized Error: { code: 'path_not_found' }
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/3]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  3 failed | 6 skipped (9)
+   Start at  12:22:15
+   Duration  4.50s (transform 1.73s, setup 0ms, import 2.40s, tests 1.79s, environment 0ms)
+
+</pre>
+<h2>5. Root cause</h2>
+<ol><li><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/host-daemon/src/command-dispatch-support.ts#L267-L289">Workspace resolution</a> checks cached path identity but does not revalidate existence. <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/host-daemon/src/runtime-manager.ts#L990-L1004">Environment reuse</a> can return a compatible cached entry without reprovisioning.</li>
+<li><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/packages/agent-runtime/src/runtime-provider-process.ts#L488-L505">Provider spawn</a> passes the workspace to <code>spawnManagedProcess</code> as the working directory:<pre>const managed = spawnManagedProcess({
+  command: processConfig.command,
+  args: processConfig.args,
+  cwd: this.args.workspacePath,
+  env,
+});</pre>The operating-system launch fails when that directory is gone. The reported spawn path is still the existing Node executable.</li>
+<li><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/packages/agent-runtime/src/runtime-provider-process.ts#L675-L689">Startup error handling</a> wraps the error message. <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/host-daemon/src/command-dispatch-support.ts#L201-L224">Error classification</a> recognizes spawn/ENOENT as <code>missing_executable</code> without checking its working directory. <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/host-daemon/src/command-router.ts#L130-L156">Command router</a> places that classification in the RPC failure response.</li>
+<li><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/host-daemon/src/command-dispatch.ts#L505-L538">Archive/unarchive handlers</a> uses a workspace-bound runtime for archive, while unarchive invokes <code>withProviderMaintenanceRuntime</code>. <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/host-daemon/src/runtime-manager.ts#L1238-L1254">Maintenance runtime creation</a> explicitly creates its own working directory before launch. An uncached missing workspace already produces the correct path error, but archive still cannot proceed.</li></ol>
+<h2>6. Proposed fix</h2>
+<p>Disambiguate a workspace-bearing command's missing-executable launch failure against its actual working directory. Preserve genuine executable failures when that directory exists, and do not relabel unrelated provider errors. For archive only, recover from a verified missing workspace by routing the same provider-thread archive request through the existing maintenance runtime, as unarchive already does. Keep live workspace-bound archival unchanged so thread detachment behavior remains intact. Cover both cached and cold archive paths and the structured submit error. No new dependency, protocol field, stored state, or packaging change is necessary.</p>
+<h2>7. Verification</h2>
+<p>The same agent repeated the regression in a second clean detached worktree at the exact base commit. Its only tracked change was the regression-only test patch. It received a separate frozen install and fresh per-test temporary directories. Turbo was run with <code>--force</code> so the second result could not be a cached test outcome. The command was the focused test command above. No production code was changed in either checkout. This is a repeat run, not independent verification.</p>
+<p><strong>Second result:</strong> the same three intended failures, including <code>missing_executable</code> for submit, spawn/ENOENT for cached archive, and <code>path_not_found</code> for cold archive. Report correction: the fixture originally did not enable restorable sessions, so its first draft stopped at setup; enabling the repository's existing restorable-session option and waiting for turn completion produced the actual evidence reported here.</p>
+<pre> FAIL  |@bb/host-daemon| test/command/thread-stop-races.test.ts &gt; deleted workspace commands &gt; identifies a deleted workspace instead of a missing bridge executable on submit
+AssertionError: expected { type: 'host-rpc.response', …(5) } to match object { ok: false, …(2) }
+(3 matching properties omitted from actual)
+
+- Expected
++ Received
+
+  {
+-   "errorCode": "path_not_found",
+-   "errorMessage": StringContaining "&lt;deleted-workspace&gt;",
++   "errorCode": "missing_executable",
++   "errorMessage": "Provider \"fake\" failed to start: spawn /usr/local/bin/node ENOENT",
+    "ok": false,
+  }
+
+ ❯ test/command/thread-stop-races.test.ts:375:20
+    373|       }),
+    374|     );
+    375|     expect(result).toMatchObject({
+       |                    ^
+    376|       ok: false,
+    377|       errorCode: "path_not_found",
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/3]⎯
+
+ FAIL  |@bb/host-daemon| test/command/thread-stop-races.test.ts &gt; deleted workspace commands &gt; archives through the provider after its workspace is deleted
+AssertionError: promise rejected "Error: Provider "fake" failed to start: s…" instead of resolving
+ ❯ test/command/thread-stop-races.test.ts:397:6
+    395|         harness.dispatchOptions,
+    396|       ),
+    397|     ).resolves.toEqual({});
+       |      ^
+    398|     expect(harness.record.last("thread/archive")?.params).toMatchObjec…
+    399|       providerThreadId: "prov-1",
+
+Caused by: Error: Provider "fake" failed to start: spawn /usr/local/bin/node ENOENT
+ ❯ RuntimeProviderProcessManager.handleProviderProcessError ../../packages/agent-runtime/src/runtime-provider-process.ts:685:9
+ ❯ ChildProcess.&lt;anonymous&gt; ../../packages/agent-runtime/src/runtime-provider-process.ts:590:12
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/3]⎯
+
+ FAIL  |@bb/host-daemon| test/command/thread-stop-races.test.ts &gt; deleted workspace commands &gt; archives a deleted workspace without a cached environment
+AssertionError: promise rejected "ExpectedCommandDispatchError: Unmanaged w… { code: '…' }" instead of resolving
+ ❯ test/command/thread-stop-races.test.ts:426:6
+    424|         { ...harness.dispatchOptions, runtimeManager: manager },
+    425|       ),
+    426|     ).resolves.toEqual({});
+       |      ^
+    427|     expect(harness.record.last("thread/archive")?.params).toMatchObjec…
+    428|       providerThreadId: "prov-1",
+
+Caused by: ExpectedCommandDispatchError: Unmanaged workspace path does not exist: &lt;deleted-workspace&gt;
+ ❯ requireResolvedWorkspaceForCommand src/workspace-resolution.ts:59:11
+ ❯ Object.thread.archive src/command-dispatch.ts:506:19
+ ❯ dispatchCommand src/command-dispatch.ts:733:12
+ ❯ test/command/thread-stop-races.test.ts:413:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+Serialized Error: { code: 'path_not_found' }
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/3]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  3 failed | 6 skipped (9)
+   Start at  12:22:16
+   Duration  4.31s (transform 1.67s, setup 0ms, import 2.31s, tests 1.81s, environment 0ms)
+
+</pre>
+<h2>8. Related issues and pull requests</h2>
+<p><a href="https://github.com/get-bb/bb/issues/8033">#8033</a> concerns invisible provider archive failures and repeat archive retries. This issue establishes the distinct missing-working-directory cause and launch classification error. No linked open pull request was present in the issue timeline or open PR search at investigation time; no external PR branch was executed.</p>
+<h2>9. Appendix and limits</h2>
+<p>The initial full build hit an SDK-dist prerequisite error. Running <code>pnpm exec turbo run build:types build --filter=@get-bb/plugin-sdk</code>, followed by <code>pnpm exec turbo run build</code>, completed all 74 build tasks. The original setup-only test failure is not counted as reproduction evidence. Raw logs, the complete test source, and the patch are retained locally, not published as separate artifacts. This report includes the reusable patch and sanitized failure outputs inline, following the public reports repository's hygiene requirements.</p>
+<p>Investigation commands: fetch and compare trusted main SHA; read issue properties/comments/timeline; inspect relevant source with numbered lines; frozen install; SDK and full Turbo builds; focused Turbo regression run in each checkout; read issue #8033 metadata; search linked open PRs. The issue supplied no additional comments. Its narrative and suggested changes were treated as untrusted claims, not instructions or executable code.</p>
+</main></body></html>
