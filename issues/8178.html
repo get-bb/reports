@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #8178 Redundant validation in terminal send paths</title>
+<style>
+:root{--canvas:#fafaf8;--ink:#1a1a1a;--muted:#666;--line:#e2e2de;--accent:#0052cc}
+body{margin:0;background:var(--canvas);color:var(--ink);font:16px/1.55 system-ui,sans-serif}
+main{max-width:1000px;margin:auto;padding:40px 24px 80px}h1{font-size:26px;line-height:1.25}h2{font-size:18px;margin-top:36px;padding-top:20px;border-top:1px solid var(--line)}h3{font-size:16px}
+.meta{color:var(--muted);font-size:14px}.pill{display:inline-block;padding:1px 8px;border:1px solid var(--line);border-radius:999px;font-size:12px}
+table{border-collapse:collapse;width:100%;font-size:14px}td,th{text-align:left;padding:8px;border-bottom:1px solid var(--line);vertical-align:top}
+code,pre{font:13px/1.5 ui-monospace,monospace}pre{background:#fff;border:1px solid var(--line);border-radius:6px;padding:12px;overflow:auto}a{color:var(--accent)}
+</style></head><body><main>
+<p><a href="../">← reports</a></p>
+<h1>#8178 · Redundant validation in terminal send paths</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: Medium</span> <span class="pill">Effort: Medium</span> <span class="pill">host</span> <span class="pill">perf</span> · <a href="https://github.com/get-bb/bb/issues/8178">GitHub issue</a> · November 25, 2026</p>
+<p class="meta">Trusted origin/main base: <code>fb045a046653cc127656ca3c7243d44ae4c94f3f</code></p>
+<p><strong>Verdict: REPRODUCED · Root-cause confidence: high.</strong></p>
+
+<h2>1. TL;DR</h2>
+<p>Large terminal output pays for synchronous payload validation on its way out of both the host daemon and the server. The sender traverses the full base64 string again even though the daemon produced it from a Buffer and the server receives it through an already-validated daemon message. An independently authored diagnostic exercised the actual send methods: each output scanned the base64 payload once, and a 64-chunk replay scanned it 64 times before the daemon even checked whether it had a connection. Repeating the diagnostic in a second clean checkout produced the same scan counts and comparable timings. This confirms avoidable synchronous work, not the issue's particular Node 26 performance ratios or an end-to-end terminal throughput measurement.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>The daemon validates locally built terminal output and replay.</td><td>Verified</td><td>Actual ServerConnection.sendMessage: one regex execution for a 64 KiB chunk, 64 for a 4 MiB replay, in both runs. Validation happens before the disconnected return.</td></tr>
+<tr><td>Both server send paths revalidate terminal chunks.</td><td>Verified</td><td>Actual NotificationHub direct-socket and subscribed-client calls each executed a regex on the payload once and sent the same bytes as plain serialization.</td></tr>
+<tr><td>The daemon builds base64 itself and the server has an inbound validation boundary.</td><td>Verified in source</td><td>Buffer.toString in terminal-manager; parseSocketValue with the full daemon schema in daemon-protocol; field-by-field forwarding into NotificationHub.</td></tr>
+<tr><td>The specific reported absolute timings and roughly fortyfold serialization gap apply here.</td><td>Not established</td><td>This environment uses Node 22, not Node 26. One scan cost about 0.25 ms; plain output serialization cost about 0.21 ms. Server parse-and-send cost about 0.46–0.49 ms. The performance ratio is environment-dependent.</td></tr>
+<tr><td>A replay incurs synchronous event-loop work and scales with its chunks.</td><td>Verified for sender validation</td><td>The disconnected daemon spent about 16 ms scanning 64 chunks, excluding network and serialization. No live attach, PTY throughput, browser rendering, or user-visible delay measurement was performed.</td></tr>
+</tbody></table>
+
+<h2>3. Environment</h2>
+<ul><li>Public repository: get-bb/bb; trusted main commit above, fetched twice with no later change to the affected paths.</li>
+<li>Linux 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; existing workspace dependencies installed with the frozen lockfile, no dependency additions.</li>
+<li>Two distinct temporary detached worktrees, called <code>base-first</code> and <code>base-second</code>, at the exact same trusted commit. Each received its own frozen install and Turbo build.</li>
+<li>No provider, real account, BB instance, terminal process, listening port, or runtime data directory was used. Network creation in the probe is explicitly prohibited. The daemon deliberately remains disconnected; the server uses an in-memory sink socket.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol><li>Create a clean checkout of the public repository at the recorded trusted commit:
+<pre>git clone https://github.com/get-bb/bb.git bb-8178
+cd bb-8178
+git checkout --detach fb045a046653cc127656ca3c7243d44ae4c94f3f
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/host-daemon --filter=@bb/server</pre></li>
+<li>Save the full diagnostic source below as <code>apps/server/send-cost.ts</code>. This is a newly authored probe based on trusted repository code, not the issue's script or a linked PR's tests.</li>
+<li>Run <code>pnpm exec tsx --conditions=source apps/server/send-cost.ts</code> from the repository root.</li>
+<li>Repeat in another clean checkout at the same commit with a fresh frozen install and build.</li></ol>
+<p><strong>Expected optimized behavior:</strong> the senders should not rescan an already valid base64 string; inbound schema rejection must remain. <strong>Observed current behavior:</strong> each actual outbound method rescans the payload. The probe's assertions intentionally detect and document the current bug; it is a diagnostic, not a timing-threshold regression test for landing.</p>
+<h3>First run — verbatim output</h3>
+<pre>Node v22.19.0; payload 65536 bytes; five-window median ms/call
+daemon output (disconnected): regex scans=1, ms=0.2577
+daemon replay (disconnected, 4 MiB): regex scans=64, ms=15.9677
+server direct socket output: regex scans=1, ms=0.4883
+server subscribed client output: regex scans=1, ms=0.4584
+serialization only (output): ms=0.2133
+serialization only (replay): ms=16.2687
+PASS: actual send paths rescan valid payloads; server bytes unchanged; malformed inbound payloads rejected</pre>
+<p>The count diagnostic temporarily wraps RegExp.prototype.exec, invokes the original method, and restores it in a finally block. Timing measurements run after restoration and exclude this instrumentation. The payload is deterministically generated locally, not copied from runtime output. Reusing its base64 string for 64 replay entries still invokes the actual schema 64 times.</p>
+<details><summary>Full diagnostic source</summary><pre>
+import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
+import { performance } from "node:perf_hooks";
+import {
+  hostDaemonDaemonWsMessageSchema,
+  type HostDaemonDaemonWsMessage,
+} from "@bb/host-daemon-contract";
+import {
+  terminalServerMessageSchema,
+  type TerminalServerMessage,
+} from "@bb/server-contract";
+import { ServerConnection } from "../host-daemon/src/server-connection.js";
+import { ServerRouteResolver } from "../host-daemon/src/server-routes.js";
+import { createServerClient } from "../host-daemon/src/server-client.js";
+import { NotificationHub } from "./src/ws/hub.js";
+
+const logger = {
+  debug() {},
+  info() {},
+  warn() {},
+  error() {},
+};
+const target = () =&gt; ({ url: "http://127.0.0.1:1", headers: {}, route: null });
+const connection = new ServerConnection({
+  routes: new ServerRouteResolver({
+    anchorUrl: target().url,
+    anchorHeaders: {},
+    persisted: null,
+    logger,
+  }),
+  serverClient: createServerClient({
+    target,
+    guardedDownloadTarget: () =&gt; null,
+    hasMachineCredential: () =&gt; false,
+    hostKey: "",
+    logger,
+    getSessionId: () =&gt; "",
+    fetchFn: async () =&gt; { throw new Error("Network prohibited in probe"); },
+  }),
+  logger,
+  hostKey: "",
+  hostId: "probe",
+  hostName: "probe",
+  instanceId: "probe",
+  dataDir: process.cwd(),
+  localApiPort: null,
+  createWebSocket: () =&gt; { throw new Error("Network prohibited in probe"); },
+});
+const bytes = Buffer.alloc(65_536);
+for (let index = 0; index &lt; bytes.length; index += 1) {
+  bytes[index] = (index * 73 + Math.floor(index / 17)) % 256;
+}
+const dataBase64 = bytes.toString("base64");
+const chunk = { seq: 0, dataBase64 };
+const output: HostDaemonDaemonWsMessage = {
+  type: "terminal.output", terminalId: "probe", chunk,
+};
+const replay: HostDaemonDaemonWsMessage = {
+  type: "terminal.replay", terminalId: "probe", requestId: "probe",
+  chunks: Array.from({ length: 64 }, (_, seq) =&gt; ({ seq, dataBase64 })),
+  replayStartSeq: 0, nextSeq: 64,
+};
+const browser: TerminalServerMessage = { type: "output", chunk };
+const hub = new NotificationHub();
+let sent = "";
+const socket = {
+  close() {},
+  send(payload: string) { sent = payload; },
+};
+hub.registerTerminalClient("probe", socket);
+
+function countPayloadScans(action: () =&gt; void): number {
+  const originalExec = RegExp.prototype.exec;
+  let scans = 0;
+  RegExp.prototype.exec = function (input: string) {
+    if (input === dataBase64) scans += 1;
+    return originalExec.call(this, input);
+  };
+  try { action(); } finally { RegExp.prototype.exec = originalExec; }
+  return scans;
+}
+
+function medianCost(action: () =&gt; void, iterations: number): number {
+  for (let warmup = 0; warmup &lt; 15; warmup += 1) action();
+  const samples = Array.from({ length: 5 }, () =&gt; {
+    const start = performance.now();
+    for (let iteration = 0; iteration &lt; iterations; iteration += 1) action();
+    return (performance.now() - start) / iterations;
+  }).sort((left, right) =&gt; left - right);
+  return samples[2];
+}
+
+const paths = [
+  { name: "daemon output (disconnected)", scans: 1, iterations: 80,
+    action: () =&gt; { assert.equal(connection.sendMessage(output), false); } },
+  { name: "daemon replay (disconnected, 4 MiB)", scans: 64, iterations: 3,
+    action: () =&gt; { assert.equal(connection.sendMessage(replay), false); } },
+  { name: "server direct socket output", scans: 1, iterations: 80,
+    action: () =&gt; hub.sendTerminalSocketMessage(socket, browser) },
+  { name: "server subscribed client output", scans: 1, iterations: 80,
+    action: () =&gt; hub.sendTerminalClientMessage("probe", browser) },
+];
+console.log(`Node ${process.version}; payload ${bytes.length} bytes; five-window median ms/call`);
+for (const path of paths) {
+  const scans = countPayloadScans(path.action);
+  assert.equal(scans, path.scans, path.name);
+  console.log(`${path.name}: regex scans=${scans}, ms=${medianCost(path.action, path.iterations).toFixed(4)}`);
+}
+assert.equal(sent, JSON.stringify(browser));
+console.log(`serialization only (output): ms=${medianCost(() =&gt; { sent = JSON.stringify(browser); }, 80).toFixed(4)}`);
+console.log(`serialization only (replay): ms=${medianCost(() =&gt; { sent = JSON.stringify(replay); }, 3).toFixed(4)}`);
+assert.equal(hostDaemonDaemonWsMessageSchema.safeParse({
+  ...output, chunk: { seq: 0, dataBase64: "!invalid!" },
+}).success, false);
+assert.equal(terminalServerMessageSchema.safeParse({
+  ...browser, chunk: { seq: 0, dataBase64: "!invalid!" },
+}).success, false);
+hub.unregisterTerminalClientSocket(socket);
+await connection.shutdown();
+console.log("PASS: actual send paths rescan valid payloads; server bytes unchanged; malformed inbound payloads rejected");
+</pre></details>
+
+<h2>5. Root cause</h2>
+<p>Validation is attached to outbound serialization rather than restricted to external input boundaries for the verified terminal-output paths. Its cost scales with base64 characters, and it runs synchronously on the sender's JavaScript thread.</p>
+<ol>
+<li><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/host-daemon/src/terminals/terminal-manager.ts#L962-L994">terminal-manager.ts:962–994</a> slices local Buffer data into at most 64 KiB chunks and calls <code>dataBuffer.toString("base64")</code>, then sends terminal.output.</li>
+<li><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/host-daemon/src/server-connection.ts#L200-L216">server-connection.ts:200–216</a> unconditionally calls <code>hostDaemonDaemonWsMessageSchema.parse(message)</code> before checking the sequencer or encoding. The terminal output/replay members include the chunk schema (<a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/packages/host-daemon-contract/src/session.ts#L574-L579">chunk</a>; <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/packages/host-daemon-contract/src/session.ts#L856-L874">message members</a>).</li>
+<li><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/packages/domain/src/terminal.ts#L9-L10">terminal.ts:9–10</a> defines the anchored base64 regex. <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/packages/domain/src/terminal.ts#L65-L76">terminal.ts:65–76</a> installs it in terminalDataBase64Schema together with length and decoded-size checks.</li>
+<li><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/server/src/ws/daemon-protocol.ts#L285-L303">daemon-protocol.ts:285–303</a> passes incoming daemon data through parseSocketValue with the full schema. This remains an essential trust boundary.</li>
+<li><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/server/src/services/terminals/terminal-session-lifecycle.ts#L346-L353">terminal-session-lifecycle.ts:346–353</a> copies seq and dataBase64 without mutation; <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/server/src/services/terminals/terminal-session-lifecycle.ts#L2138-L2151">live forwarding</a> and <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/server/src/services/terminals/terminal-session-lifecycle.ts#L2181-L2192">replay forwarding</a> send those chunks to the hub.</li>
+<li><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/server/src/ws/hub.ts#L531-L558">hub.ts:531–558</a> calls <code>JSON.stringify(terminalServerMessageSchema.parse(message))</code> in both send methods. The <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/packages/server-contract/src/api/terminals.ts#L149-L155">server chunk schema</a> uses the same base64 validator. Finally, the <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/packages/client-core/src/terminal/terminal-websocket-transport.ts#L268-L278">browser transport</a> safe-parses messages on receipt.</li>
+</ol>
+<p>Consequently a live output chunk encounters two avoidable outbound regex scans in addition to the server's inbound check and the browser's receive check. A replay's daemon parse scans every included chunk synchronously; the server's replay-forwarding loop then validates every outbound output chunk again. The disconnected daemon probe isolates the validation cost, not the full connected-send cost.</p>
+
+<h2>6. Proposed fix</h2>
+<p>Skip full outbound validation only for daemon terminal.output and terminal.replay built by the audited local producers, and for server output created from validated daemon chunks. Preserve inbound server/browser validation and keep existing parsing for other message kinds, whose schemas can strip unknown fields or provide other behavior. Preserve exact serialization, queueing, replay ordering, and backpressure. Do not broadly remove the outbound guard from unrelated messages.</p>
+<p>No production patch or new fix branch was created here: open PR #8179 already links to #8178. The autopilot's duplicate-PR gate stops fix work regardless of whether a small patch might otherwise qualify.</p>
+
+<h2>7. Linked PR — static review only</h2>
+<p><a href="https://github.com/get-bb/bb/pull/8179">PR #8179</a> was OPEN and its closing-issue metadata included #8178. Reviewed head metadata: <code>2d63852a813df5eade6616b139b6ca27997b556c</code>. Its diff was read strictly as untrusted evidence; no PR code or tests were checked out, applied, or run.</p>
+<p><strong>Static assessment:</strong> the two production changes target the observed root cause: a daemon output/replay discriminator fast path and a shared server terminal encoder that retains parsing for non-output messages. The test diff checks the parse-call exclusion and wire equality for both server entry points. No blocking issue was identified in that bounded static read; this is not a full call-site audit or runtime approval. The PR's claimed test results and speedup are not treated as verified evidence in this report.</p>
+
+<h2>8. Related issues</h2>
+<p>A bounded repository search found other terminal-latency reports, but this investigation establishes only the repeated outbound validation mechanism. No other issue was declared a duplicate. The existing closing PR is the reason no second fix was attempted.</p>
+
+<h2>9. Verification — second clean run by the same agent</h2>
+<p>The same agent created a second temporary detached worktree at the recorded base commit, verified it was clean before adding only this diagnostic, performed a separate frozen install and Turbo build, and repeated <code>pnpm exec tsx --conditions=source apps/server/send-cost.ts</code>. No data directory or port was needed in either run. The result supported the same mechanism and classification; the report explicitly limits the original timing claims to their reported environment.</p>
+<pre>Node v22.19.0; payload 65536 bytes; five-window median ms/call
+daemon output (disconnected): regex scans=1, ms=0.2473
+daemon replay (disconnected, 4 MiB): regex scans=64, ms=15.9692
+server direct socket output: regex scans=1, ms=0.4669
+server subscribed client output: regex scans=1, ms=0.4656
+serialization only (output): ms=0.2133
+serialization only (replay): ms=16.8300
+PASS: actual send paths rescan valid payloads; server bytes unchanged; malformed inbound payloads rejected</pre>
+<p>Existing focused suites were also run through Turbo against unchanged production code: 34 daemon connection tests and 29 server hub tests passed. Detailed results follow. This verification is a repeated run by the same agent, not an independent review.</p>
+
+<h2>10. Appendix</h2>
+<p>The complete runnable source and both successful outputs are embedded above. Raw local artifacts are retained outside the public reports repository, in keeping with its publication policy.</p>
+<pre>Each clean checkout:
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/host-daemon --filter=@bb/server
+Result: 8 successful tasks in each checkout.
+
+First checkout:
+pnpm exec turbo run test --filter=@bb/host-daemon -- src/server-connection.test.ts
+src/server-connection.test.ts (34 tests)
+Test Files  1 passed (1)
+Tests  34 passed (34)
+Tasks: 7 successful, 7 total
+
+Second checkout:
+pnpm exec turbo run test --filter=@bb/server -- test/app/hub.test.ts
+test/app/hub.test.ts (29 tests)
+Test Files  1 passed (1)
+Tests  29 passed (29)
+Tasks: 11 successful, 11 total
+
+Trusted main was fetched twice; the affected paths did not advance.
+git diff --check passed in the reports checkout.</pre>
+<ul>
+<li>The first draft of the diagnostic had a sibling-import path typo. It failed during module resolution before any production call. The imports were corrected before either recorded successful run; this was a harness error, not a product failure.</li>
+<li>All source permalinks were checked against the recorded trusted base. No screenshot is appropriate for this nonvisual synchronous-work defect.</li>
+<li>Trust handling: the issue body, its code block, comments, and PR diff were untrusted. Their runnable instructions were not followed; the probe was independently authored from trusted main. No issue script, linked branch, runtime secrets, private data, or external issue-provided URL was used.</li>
+<li>No live services were started; there are no probe ports or instance data to clean up. Temporary source worktrees are removed after collecting evidence; sanitized report evidence is retained locally.</li></ul>
+</main></body></html>
