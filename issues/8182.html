@@ -1,0 +1,150 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Report · #8182 Status wait request amplification</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main><p class="meta"><a href="../">← reports</a></p><h1>#8182 · Status wait request amplification</h1><p class="meta"><span class="pill">Bug</span><span class="pill">Low priority</span><span class="pill">Effort: Medium</span><span class="pill">threads · cli · perf</span><a href="https://github.com/get-bb/bb/issues/8182">GitHub issue</a><span>2026-11-25 · base <code>fb045a046653cc127656ca3c7243d44ae4c94f3f</code></span></p><p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · reproduction label: <code>confirmed-repro</code></p><h2>1. TL;DR</h2><p>Waiting for a thread to become idle repeatedly fetches its complete record instead of leaving a server request pending. The real SDK issued 21 thread GETs during five seconds of simulated waiting in each of two fresh trusted checkouts. Its default 20-minute deadline produced 4,801 GETs with a zero-latency transport fixture. This confirms the request-amplification mechanism, not the reported production byte counts or network latency. An existing open pull request already targets this issue, so this investigation creates no duplicate fix.</p><h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr><tr><td>Status waits use a 250 ms polling loop.</td><td class="ok">Verified</td><td>Production SDK loop and default constant; 21 transport GETs from t=0 through t=5000 ms.</td></tr><tr><td>The CLI uses the same SDK path.</td><td class="ok">Verified statically</td><td><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/cli/src/commands/thread/wait.ts#L50-L74">apps/cli/src/commands/thread/wait.ts:50</a> delegates to sdk.threads.wait.</td></tr><tr><td>Event waits already use server wakeups.</td><td class="ok">Verified statically</td><td>SDK event branch invokes events.wait; server registers a hub waiter and checks again.</td></tr><tr><td>A default 20-minute wait makes approximately 3,100 requests.</td><td>Environment-dependent, not a universal count</td><td>4,801 with zero transport latency. Each real round trip adds time before the next 250 ms sleep; slower paths can issue fewer requests.</td></tr><tr><td>Live proxy counts, response bytes, server cost and status-change latency.</td><td class="unv">Unverified here</td><td>No live server, daemon proxy or database was exercised. Those measurements cannot be inferred from this fixture.</td></tr></table><h2>3. Environment</h2><ul><li>Public repository get-bb/bb; trusted origin/main at <code>fb045a046653cc127656ca3c7243d44ae4c94f3f</code>. A final fetch returned the same commit.</li><li>Linux 4.19.0-gvisor x86_64; Node v22.19.0; Vitest v4.1.12.</li><li>Two separately installed, detached temporary worktrees, base-a and base-b, at the same recorded commit. Production source remains unchanged.</li><li>Frozen pnpm installs and Turbo SDK builds completed in both checkouts. No new dependencies.</li><li>Only the real SDK and HTTP transport run. An injected fetch fixture supplies active/idle responses; fake timers advance the clock. No database is mocked or opened. No provider, listening port, data directory or real user instance is used.</li></ul><h2>4. Minimal reproduction</h2><ol><li>From a trusted checkout of get-bb/bb, create a detached worktree and prepare the SDK:</li></ol><pre>git fetch origin main
+git worktree add --detach ../base-a fb045a046653cc127656ca3c7243d44ae4c94f3f
+cd ../base-a
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/sdk
+# Save the test below as packages/sdk/test/issue-8182-repro.test.ts
+pnpm exec turbo run test --filter=@bb/sdk -- test/issue-8182-repro.test.ts
+pnpm exec turbo run test --filter=@bb/sdk -- test/sdk.test.ts</pre><p>Expected: a status wait should not repeatedly invoke the complete-thread GET while nothing changes. The two assertions allow up to two such reads (initial and final), without specifying an alternative endpoint or its total request count. Actual: matching and timeout semantics succeed, but both complete-thread request-budget assertions fail. These are intentional red regression tests, not a claimed passing fix.</p><h3>Reproduction test</h3><pre>import { afterEach, expect, it, vi } from &quot;vitest&quot;;
+import { createBbSdk } from &quot;../src/core.js&quot;;
+import { createHttpTransport } from &quot;../src/transport-http.js&quot;;
+import { ThreadWaitTimeoutError } from &quot;../src/areas/threads.js&quot;;
+
+afterEach(() =&gt; {
+  vi.useRealTimers();
+});
+
+function createFixture(transitionAfterMs: number) {
+  const startedAt = Date.now();
+  const requests: { method: string; path: string; atMs: number }[] = [];
+  const sdk = createBbSdk({
+    transport: createHttpTransport({
+      baseUrl: &quot;http://fixture.invalid&quot;,
+      runtime: &quot;node&quot;,
+      fetch: async (input, init) =&gt; {
+        const url = new URL(String(input));
+        const atMs = Date.now() - startedAt;
+        requests.push({
+          method: init?.method ?? &quot;GET&quot;,
+          path: url.pathname,
+          atMs,
+        });
+        return Response.json({
+          id: &quot;thr_repro&quot;,
+          status: atMs &gt;= transitionAfterMs ? &quot;idle&quot; : &quot;active&quot;,
+        });
+      },
+    }),
+  });
+  return { sdk, requests };
+}
+
+it(&quot;does not repeatedly fetch a full thread while waiting for idle&quot;, async () =&gt; {
+  vi.useFakeTimers();
+  const { sdk, requests } = createFixture(5_000);
+  const pending = sdk.threads.wait({
+    threadId: &quot;thr_repro&quot;,
+    status: &quot;idle&quot;,
+    timeoutMs: 6_000,
+  });
+  await vi.advanceTimersByTimeAsync(5_000);
+  await expect(pending).resolves.toMatchObject({
+    matched: true,
+    thread: { status: &quot;idle&quot; },
+  });
+  console.log(
+    JSON.stringify({
+      scenario: &quot;idle-after-five-seconds&quot;,
+      requests: requests.length,
+      first: requests[0],
+      last: requests.at(-1),
+    }),
+  );
+  expect(
+    requests.filter((request) =&gt; request.path === &quot;/api/v1/threads/thr_repro&quot;)
+      .length,
+  ).toBeLessThanOrEqual(2);
+});
+
+it(&quot;does not repeatedly fetch a full thread until the default deadline&quot;, async () =&gt; {
+  vi.useFakeTimers();
+  const { sdk, requests } = createFixture(Infinity);
+  const outcome = sdk.threads
+    .wait({ threadId: &quot;thr_repro&quot;, status: &quot;idle&quot; })
+    .catch((error: unknown) =&gt; error);
+  await vi.advanceTimersByTimeAsync(1_200_000);
+  expect(await outcome).toBeInstanceOf(ThreadWaitTimeoutError);
+  console.log(
+    JSON.stringify({
+      scenario: &quot;default-deadline&quot;,
+      requests: requests.length,
+      first: requests[0],
+      last: requests.at(-1),
+    }),
+  );
+  expect(
+    requests.filter((request) =&gt; request.path === &quot;/api/v1/threads/thr_repro&quot;)
+      .length,
+  ).toBeLessThanOrEqual(2);
+});
+</pre><h3>First run: exact relevant output</h3><pre>@bb/sdk:test: {&quot;scenario&quot;:&quot;idle-after-five-seconds&quot;,&quot;requests&quot;:21,&quot;first&quot;:{&quot;method&quot;:&quot;GET&quot;,&quot;path&quot;:&quot;/api/v1/threads/thr_repro&quot;,&quot;atMs&quot;:0},&quot;last&quot;:{&quot;method&quot;:&quot;GET&quot;,&quot;path&quot;:&quot;/api/v1/threads/thr_repro&quot;,&quot;atMs&quot;:5000}}
+@bb/sdk:test: {&quot;scenario&quot;:&quot;default-deadline&quot;,&quot;requests&quot;:4801,&quot;first&quot;:{&quot;method&quot;:&quot;GET&quot;,&quot;path&quot;:&quot;/api/v1/threads/thr_repro&quot;,&quot;atMs&quot;:0},&quot;last&quot;:{&quot;method&quot;:&quot;GET&quot;,&quot;path&quot;:&quot;/api/v1/threads/thr_repro&quot;,&quot;atMs&quot;:1200000}}
+@bb/sdk:test: AssertionError: expected 21 to be less than or equal to 2
+@bb/sdk:test: AssertionError: expected 4801 to be less than or equal to 2
+@bb/sdk:test:  Test Files  1 failed (1)
+@bb/sdk:test:       Tests  2 failed (2)
+ Tasks:    4 successful, 5 total
+Cached:    0 cached, 5 total</pre><h2>5. Root cause</h2><p>The default interval is 250 ms and the deadline is 20 minutes: <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/packages/sdk/src/areas/threads.ts#L94-L95">packages/sdk/src/areas/threads.ts:94</a>. The status branch reads a thread before checking the target, reachability and deadline, sleeps, and starts the loop over. Therefore unchanged active status causes one full read per interval plus transport latency. This is request amplification rather than incorrect eventual status matching.</p><p><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/packages/sdk/src/areas/threads.ts#L1803-L1848">packages/sdk/src/areas/threads.ts:1803</a></p><pre>    async wait(input) {
+      const { pollIntervalMs, target, timeoutMs } =
+        validateThreadWaitArgs(input);
+      const deadline = Date.now() + timeoutMs;
+      while (true) {
+        if (target.kind === &quot;status&quot;) {
+          const thread = await getThread({
+            signal: input.signal,
+            threadId: input.threadId,
+          });
+          if (thread.status === target.status) {
+            return {
+              matched: true,
+              target,
+              thread,
+              threadId: input.threadId,
+            };
+          }
+…
+          if (Date.now() &gt;= deadline) {
+            throw new ThreadWaitTimeoutError({
+              pendingRetry,
+              target,
+              threadId: input.threadId,
+            });
+          }
+          await sleep(pollIntervalMs);
+          continue;</pre><p>The helper is a normal GET, not a status-only query: <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/packages/sdk/src/areas/threads.ts#L1060-L1073">packages/sdk/src/areas/threads.ts:1060</a>. Its server handler uses buildThreadResponse: <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/server/src/routes/threads/base.ts#L413-L421">apps/server/src/routes/threads/base.ts:413</a>. The reproduction counts SDK transport invocations; this full-response server cost is established from source, not timed in this test.</p><p>The event branch is different: <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/packages/sdk/src/areas/threads.ts#L1851-L1864">packages/sdk/src/areas/threads.ts:1851</a>. Its server route registers a waiter before a second lookup, preventing a missed notification in the lookup/register gap: <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/server/src/routes/threads/data.ts#L403-L422">apps/server/src/routes/threads/data.ts:403</a>. The existing notification hub wakes thread waiters on changes: <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/server/src/ws/hub.ts#L1099-L1128">apps/server/src/ws/hub.ts:1099</a>. Persisted event selection is not itself a safe replacement for current status: a historical event can match after the current status has changed again.</p><h2>6. Proposed fix</h2><p>Use a server-owned bounded status wait: check current state, register a notification waiter, recheck to avoid missed transitions, then wait until the condition changes or the deadline expires. The SDK should perform one initial read and consume the bounded wait rather than fetching at 250 ms intervals. Preserve unreachable-state and pending-retry handling, cancellation, queued-message wakeups, and compatibility with older servers. This crosses SDK, server routing and a public request contract; it is not an SDK-only sleep adjustment.</p><h2>7. Linked PR review</h2><h3><a href="https://github.com/get-bb/bb/pull/8183">PR #8183</a> — static review only</h3><p>GitHub issue timeline metadata links this open PR to #8182. The inspected diff adds a server status-wait route, changes SDK status waiting to use it, adds missing-route fallback and expands tests. That direction addresses the verified polling mechanism. The diff also handles queued-message wakeups, which matter when retries become unreachable without a status change. No PR branch was fetched, checked out, built or executed. The PR tests and claimed performance results were not validated here, and this limited static review is not a merge approval. No new pull request is opened because an open linked fix already exists.</p><h2>8. Related issues</h2><p>No additional issue is used as evidence for the verdict. The existing linked PR is the relevant duplicate-work guard.</p><h2>9. Verification</h2><p>The same agent repeated the reproduction in a second fresh trusted worktree, base-b, with a separate frozen install and SDK build. The production commit and test content matched base-a. The command was <code>pnpm exec turbo run test --filter=@bb/sdk -- test/issue-8182-repro.test.ts</code>. Both request-budget assertions failed for the same intended reasons; neither run was a replayed test result. No ports or data directories were needed. This is a second clean run, not an independent-agent check.</p><pre>@bb/sdk:test: {&quot;scenario&quot;:&quot;idle-after-five-seconds&quot;,&quot;requests&quot;:21,&quot;first&quot;:{&quot;method&quot;:&quot;GET&quot;,&quot;path&quot;:&quot;/api/v1/threads/thr_repro&quot;,&quot;atMs&quot;:0},&quot;last&quot;:{&quot;method&quot;:&quot;GET&quot;,&quot;path&quot;:&quot;/api/v1/threads/thr_repro&quot;,&quot;atMs&quot;:5000}}
+@bb/sdk:test: {&quot;scenario&quot;:&quot;default-deadline&quot;,&quot;requests&quot;:4801,&quot;first&quot;:{&quot;method&quot;:&quot;GET&quot;,&quot;path&quot;:&quot;/api/v1/threads/thr_repro&quot;,&quot;atMs&quot;:0},&quot;last&quot;:{&quot;method&quot;:&quot;GET&quot;,&quot;path&quot;:&quot;/api/v1/threads/thr_repro&quot;,&quot;atMs&quot;:1200000}}
+@bb/sdk:test: AssertionError: expected 21 to be less than or equal to 2
+@bb/sdk:test: AssertionError: expected 4801 to be less than or equal to 2
+@bb/sdk:test:  Test Files  1 failed (1)
+@bb/sdk:test:       Tests  2 failed (2)
+ Tasks:    4 successful, 5 total
+Cached:    3 cached, 5 total</pre><p>Control: the existing SDK owner suite was run unmodified in base-a with <code>pnpm exec turbo run test --filter=@bb/sdk -- test/sdk.test.ts</code>:</p><pre>@bb/sdk:test:  Test Files  1 passed (1)
+@bb/sdk:test:       Tests  57 passed (57)
+ Tasks:    5 successful, 5 total
+Cached:    0 cached, 5 total</pre><p>Report correction: replace any universal estimate of 3,100 default-timeout requests with the measured zero-latency result of 4,801; real request counts depend on round-trip latency. Scope stays at the real SDK boundary; live daemon latency, full response size and database cost remain unverified.</p><h2>10. Appendix</h2><p>Commands additionally used: GitHub read-only repository visibility, issue properties, labels, comments, linked-PR metadata and diff; trusted-source inspection; <code>git fetch origin main</code>; <code>git rev-parse origin/main</code>; <code>node --version</code>; <code>uname -srm</code>; formatting the authored test with <code>pnpm exec oxfmt</code>. The initial repository URL redirects to the same public GitHub repository ID as get-bb/bb.</p><p>Issue and PR content were treated only as untrusted claims; no supplied script, patch or branch was executed. Raw logs and the standalone test are retained locally and not committed to this public report repository; the complete test and relevant verbatim output are embedded above. No production code was changed or pushed. Cleanup removes both temporary code worktrees; the report backup retains the evidence.</p></main></body></html>
