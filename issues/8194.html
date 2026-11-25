@@ -1,0 +1,1896 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #8194 Agent page throttling after controller release</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main><p class="meta"><a href="../">← reports</a></p>
+<h1>#8194 · Agent page throttling after controller release</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Low</span><span class="pill">desktop, perf</span><a href="https://github.com/get-bb/bb/issues/8194">Issue #8194</a></p>
+<p>2026-11-25 · trusted main <code>fb045a046653cc127656ca3c7243d44ae4c94f3f</code></p>
+<p><strong>Verdict: REPRODUCED</strong> (throttling lifecycle) · <strong>Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>Hidden agent-created browser pages retain disabled background throttling after the automation controller detaches. A focused regression exercises the real view manager and CDP adapter, with Electron replaced by the repository's existing boundary fake. Both fresh pages and pages recreated after eviction return false where background throttling should return true. The same two failures repeat in a second clean checkout of trusted main. This confirms the lifecycle defect, not the macOS CPU percentages or compositor measurements reported by the author.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Agent pages retain disabled throttling after release</td><td>Verified at the owner boundary</td><td>Two failing regression cases in each clean baseline run; attach and CDP send succeed before the release assertion.</td></tr>
+<tr><td>Fresh and restored agent pages share the defect</td><td>Verified</td><td>Table cases cover creation and eviction/restoration through the production manager.</td></tr>
+<tr><td>Automation still needs an unthrottled page while attached</td><td>Verified at the owner boundary</td><td>Both repaired cases assert false during attachment and successfully send Runtime.enable.</td></tr>
+<tr><td>Packaged macOS builds consume CPU and produce hidden frames</td><td>Unverified here</td><td>No macOS host, runnable Electron GUI libraries, real frame counter, CPU sample, or compositor trace in this Linux environment.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Repository: public get-bb/bb; base commit above, fetched from origin/main.</li><li>Linux x86_64, gVisor kernel 4.19.0; Node v22.19.0; pnpm 9.15.0; desktop package 0.50.1; Electron dependency 44.10.2; Vitest 4.1.12.</li><li>No user runtime/profile, providers, live app, ports, browser automation session, or network fixture used. Vitest uses isolated workers and repository fakes; each checkout has separate generated test scratch directories.</li><li>The normal full build initially needed SDK runtime/type outputs; after building those through Turbo, all 74 build tasks passed.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<ol><li>Save the full test-only patch below as <code>/tmp/8194-regression.patch</code>. Make a clean checkout of trusted main at the recorded commit. Install and apply only that independently authored test patch:
+<pre>git checkout --detach fb045a046653cc127656ca3c7243d44ae4c94f3f
+pnpm install --frozen-lockfile --prefer-offline
+git apply /tmp/8194-regression.patch
+pnpm exec turbo run test --filter=@bb/desktop -- test/desktop-browser-view-manager.test.ts -t 'resumes throttling after automation ends'</pre></li>
+<li>The test creates a hidden agent page; the restored case first discards and recreates it. It attaches the real CDP adapter, sends Runtime.enable, detaches, and checks the final throttling flag.</li>
+<li>Expected: false while attached; true after detachment; page stays hidden and agent-owned. Actual on unchanged production code:
+<pre>AssertionError: expected false to be true // Object.is equality
+- Expected
++ Received
+- true
++ false
+Tests  2 failed | 114 skipped (116)</pre></li></ol>
+<p>This is a non-visual lifecycle/performance regression, not a screenshot-based UI claim. The case excerpt is followed by the complete runnable patch, including its existing repository helpers.</p>
+<pre>  it.each([false, true])(
+    &quot;resumes throttling after automation ends and retains agent ownership (restored: %s)&quot;,
+    async (restored) =&gt; {
+      vi.useFakeTimers();
+      const manager = createDesktopBrowserViewManager();
+      const hostWindow = new FakeHostWindow({
+        webContentsId: 1,
+        contentBounds: { width: 1000, height: 800 },
+      });
+      manager.createTab({
+        hostWindow,
+        tabId: &quot;agent&quot;,
+        threadId: &quot;thread-1&quot;,
+        url: &quot;https://example.com/agent&quot;,
+        viewport: { width: 800, height: 600 },
+      });
+      if (restored) {
+        setDiscarded(manager, hostWindow, true);
+        expect(requireFakeView(0).webContents.isDestroyed()).toBe(true);
+        setDiscarded(manager, hostWindow, false);
+      }
+
+      await manager.evaluate({
+        hostWindow,
+        request: {
+          tabId: &quot;agent&quot;,
+          expression: &quot;null&quot;,
+          world: &quot;main&quot;,
+          channel: &quot;test&quot;,
+        },
+      });
+      const view = requireFakeView(restored ? 1 : 0);
+      const adapter = createDesktopBrowserCdpAdapter({
+        manager,
+        createTab: async () =&gt; &quot;agent&quot;,
+        activateTab: async () =&gt; undefined,
+        closeTab: async () =&gt; undefined,
+      });
+      const [page] = adapter.listTabs({
+        hostWebContentsId: 1,
+        threadId: &quot;thread-1&quot;,
+      });
+      if (!page) throw new Error(&quot;Expected the agent page&quot;);
+      try {
+        page.attach();
+        expect(view.webContents.getBackgroundThrottling()).toBe(false);
+        await expect(page.send(&quot;Runtime.enable&quot;, {})).resolves.toEqual({});
+        page.detach();
+        expect(view.visible).toBe(false);
+        expect(view.webContents.getBackgroundThrottling()).toBe(true);
+        vi.advanceTimersByTime(6 * 60_000);
+        expect(view.webContents.isDestroyed()).toBe(false);
+      } finally {
+        page.detach();
+        manager.destroyAll();
+      }
+    },
+  );</pre>
+<details><summary>Full test-only regression.patch (save this block to /tmp/8194-regression.patch)</summary><pre>diff --git a/apps/desktop/test/desktop-browser-view-manager.test.ts b/apps/desktop/test/desktop-browser-view-manager.test.ts
+index 83e9028938..04d584d447 100644
+--- a/apps/desktop/test/desktop-browser-view-manager.test.ts
++++ b/apps/desktop/test/desktop-browser-view-manager.test.ts
+@@ -2656,7 +2656,7 @@ describe(&quot;DesktopBrowserViewManager&quot;, () =&gt; {
+           ...attached,
+         ]);
+         expect(parkingWindow.isDestroyed()).toBe(true);
+-        expect(view.webContents.getBackgroundThrottling()).toBe(false);
++        expect(view.webContents.getBackgroundThrottling()).toBe(true);
+         expect(requireFakeView(0).webContents.getBackgroundThrottling()).toBe(
+           true,
+         );
+@@ -2909,7 +2909,7 @@ describe(&quot;DesktopBrowserViewManager&quot;, () =&gt; {
+       expect(view.options.webPreferences.partition).toBe(
+         userTab.options.webPreferences.partition,
+       );
+-      expect(view.options.webPreferences.backgroundThrottling).toBe(false);
++      expect(view.options.webPreferences.backgroundThrottling).toBe(true);
+     }
+     expect(userTab.options.webPreferences.backgroundThrottling).toBe(true);
+     expect(electronMock.fakeSessions).toHaveLength(1);
+@@ -5251,35 +5251,62 @@ describe(&quot;archived thread discarding&quot;, () =&gt; {
+     manager.destroyAll();
+   });
+ 
+-  it(&quot;restores an evicted agent tab as an agent tab&quot;, async () =&gt; {
+-    vi.useFakeTimers();
+-    const manager = createDesktopBrowserViewManager();
+-    const hostWindow = new FakeHostWindow({
+-      webContentsId: 1,
+-      contentBounds: { width: 1000, height: 800 },
+-    });
+-    manager.createTab({
+-      hostWindow,
+-      tabId: &quot;agent&quot;,
+-      threadId: &quot;thread-1&quot;,
+-      url: &quot;https://example.com/agent&quot;,
+-      viewport: { width: 800, height: 600 },
+-    });
+-    setDiscarded(manager, hostWindow, true);
+-    expect(requireFakeView(0).webContents.isDestroyed()).toBe(true);
+-    setDiscarded(manager, hostWindow, false);
+-
+-    await manager.evaluate({
+-      hostWindow,
+-      request: {
++  it.each([false, true])(
++    &quot;resumes throttling after automation ends and retains agent ownership (restored: %s)&quot;,
++    async (restored) =&gt; {
++      vi.useFakeTimers();
++      const manager = createDesktopBrowserViewManager();
++      const hostWindow = new FakeHostWindow({
++        webContentsId: 1,
++        contentBounds: { width: 1000, height: 800 },
++      });
++      manager.createTab({
++        hostWindow,
+         tabId: &quot;agent&quot;,
+-        expression: &quot;null&quot;,
+-        world: &quot;main&quot;,
+-        channel: &quot;test&quot;,
+-      },
+-    });
+-    vi.advanceTimersByTime(6 * 60_000);
+-    expect(requireFakeView(1).webContents.isDestroyed()).toBe(false);
+-    manager.destroyAll();
+-  });
++        threadId: &quot;thread-1&quot;,
++        url: &quot;https://example.com/agent&quot;,
++        viewport: { width: 800, height: 600 },
++      });
++      if (restored) {
++        setDiscarded(manager, hostWindow, true);
++        expect(requireFakeView(0).webContents.isDestroyed()).toBe(true);
++        setDiscarded(manager, hostWindow, false);
++      }
++
++      await manager.evaluate({
++        hostWindow,
++        request: {
++          tabId: &quot;agent&quot;,
++          expression: &quot;null&quot;,
++          world: &quot;main&quot;,
++          channel: &quot;test&quot;,
++        },
++      });
++      const view = requireFakeView(restored ? 1 : 0);
++      const adapter = createDesktopBrowserCdpAdapter({
++        manager,
++        createTab: async () =&gt; &quot;agent&quot;,
++        activateTab: async () =&gt; undefined,
++        closeTab: async () =&gt; undefined,
++      });
++      const [page] = adapter.listTabs({
++        hostWebContentsId: 1,
++        threadId: &quot;thread-1&quot;,
++      });
++      if (!page) throw new Error(&quot;Expected the agent page&quot;);
++      try {
++        page.attach();
++        expect(view.webContents.getBackgroundThrottling()).toBe(false);
++        await expect(page.send(&quot;Runtime.enable&quot;, {})).resolves.toEqual({});
++        page.detach();
++        expect(view.visible).toBe(false);
++        expect(view.webContents.getBackgroundThrottling()).toBe(true);
++        vi.advanceTimersByTime(6 * 60_000);
++        expect(view.webContents.isDestroyed()).toBe(false);
++      } finally {
++        page.detach();
++        manager.destroyAll();
++      }
++    },
++  );
+ });
+</pre></details>
+<h2>5. Root cause</h2>
+<p>The <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/desktop/src/desktop-browser-view.ts#L1583-L1588">new agent page path</a> explicitly disables throttling; the <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/desktop/src/desktop-browser-view.ts#L632-L640">cold page restoration path</a> derives its initial setting from agent ownership. Both feed the <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/desktop/src/desktop-browser-view.ts#L1283-L1290">WebContentsView factory</a>.</p>
+<p>The <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/desktop/src/desktop-browser-cdp-adapter.ts#L90-L108">CDP attach path</a> saves that initial setting before temporarily disabling throttling. The <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/desktop/src/desktop-browser-cdp-adapter.ts#L48-L60">release path</a> faithfully restores the saved setting, which is already false for agent-owned pages. Therefore ending the controller lifetime cannot restore ordinary hidden-page throttling. Ownership and active control are different lifetimes; ownership must not permanently request unthrottled rendering.</p>
+<p>History: the fresh-page false default is attributed to commit fe3ca9385b6 by git blame. The server-inactive override is separate and already forces true; existing coverage is retained to ensure controller release cannot defeat that override. Actual Electron visibility/frame scheduling is outside this unit reproduction.</p>
+<h2>6. Proposed fix and validation</h2>
+<p>Initialize all native browser entries with background throttling enabled at the existing shared factory, removing the per-caller creation option. Keep the existing CDP/capture temporary overrides and release restoration unchanged. This covers new, restored, and user-created tabs without new public API, protocol, dependency, persisted data, packaging, or release changes.</p>
+<p>The candidate changes only two desktop subsystem files: 60 additions plus 37 deletions = <strong>97 changed text lines</strong> (production 1/5; tests 59/32). The previous restored-agent ownership test is extended, not removed: both table cases still check retention beyond the idle deadline.</p>
+<ul><li>Before fix, both cases fail at the intended post-detachment assertion in each trusted baseline checkout.</li><li>After fix, the owning view-manager file passes all 116 tests; seven relevant browser suites pass all 158 tests.</li><li>Desktop typecheck passes. Full build passes 74 tasks. Formatting and git diff --check pass.</li><li>The broader desktop suite reports 656 passed, 2 skipped, and one unrelated packaging test failure: Electron cannot load libglib-2.0.so.0. That same packaging failure reproduces on unchanged production code in checkout B. No attempt was made to change packaging or install dependencies.</li><li>Remaining release check: repeat hidden-window frame/CPU measurements and hidden-page input/screenshot operations on macOS. No signed bundle or release is claimed.</li></ul>
+<h2>7. Verification</h2>
+<p>The same agent created a second clean detached worktree, checkout B, at exactly fb045a046653cc127656ca3c7243d44ae4c94f3f. Only the authored test patch was copied; the production tree remained unchanged. After a separate frozen install, the identical Turbo command above again failed both fresh/restored cases with false instead of true. This is a repeat run, not independent verification. There were no corrections to the lifecycle finding; CPU/GPU and macOS claims remain explicitly unverified.</p>
+<p>GitHub timeline and open-PR search showed no linked open pull request at investigation time. Related-issue search found no narrower duplicate root cause.</p>
+<h2>8. Appendix</h2>
+<p>Issue content was treated solely as untrusted claims. No supplied script, fixture, patch, binary, branch, or external link was executed or fetched. The reproduction was designed from trusted repository source and existing test infrastructure.</p>
+<details><summary>first-before.log</summary><pre>
+   • turbo 2.11.10
+   • Packages in scope: @bb/desktop
+   • Running test in 1 package
+   • Remote caching disabled
+
+//:ensure-native-modules: cache bypass, force executing 6b779808202bee78
+@bb/templates:generate:templates: cache miss, executing 4f6365f30911491f
+@bb/process-utils:generate:profile-worker: cache miss, executing 567551600e6ca6ca
+@bb/templates:generate:plugin-scaffold: cache miss, executing 4cc2c22b7362c3fd
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates CHECKOUT_A/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules CHECKOUT_A
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker CHECKOUT_A/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold CHECKOUT_A/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/desktop:test: cache miss, executing 81f01e029e4586e5
+@bb/desktop:test: 
+@bb/desktop:test: &gt; @bb/desktop@0.50.1 test CHECKOUT_A/apps/desktop
+@bb/desktop:test: &gt; install-electron &amp;&amp; vitest run --config vitest.config.ts &quot;test/desktop-browser-view-manager.test.ts&quot; &quot;-t&quot; &quot;resumes throttling after automation ends&quot;
+@bb/desktop:test: 
+@bb/desktop:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/desktop:test:   - ESM syntax in a file loaded as CommonJS (vitest.config.ts:1:1). Use a `.mjs` extension or set `&quot;type&quot;: &quot;module&quot;` in the closest package.json
+@bb/desktop:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/desktop:test: 
+@bb/desktop:test:  RUN  v4.1.12 CHECKOUT_A/apps/desktop
+@bb/desktop:test: 
+@bb/desktop:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/desktop:test:   - ESM syntax in a file loaded as CommonJS (vitest.config.ts:1:1). Use a `.mjs` extension or set `&quot;type&quot;: &quot;module&quot;` in the closest package.json
+@bb/desktop:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/desktop:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/desktop:test:   - ESM syntax in a file loaded as CommonJS (vitest.config.ts:1:1). Use a `.mjs` extension or set `&quot;type&quot;: &quot;module&quot;` in the closest package.json
+@bb/desktop:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/desktop:test:  ❯ |@bb/desktop:isolated| test/desktop-browser-view-manager.test.ts (116 tests | 2 failed | 114 skipped) 18ms
+@bb/desktop:test:      ↓ awaits JSON values and binds the isolated bridge to the request channel
+@bb/desktop:test:      ↓ routes evaluation to the requested world and rejects malformed results
+@bb/desktop:test:      ↓ forwards only well-formed guest messages to the owning host window
+@bb/desktop:test:      ↓ keeps isolated page scripts unavailable without the page preload
+@bb/desktop:test:      ↓ requests frames only while a native screenshot is pending: complete
+@bb/desktop:test:      ↓ requests frames only while a native screenshot is pending: timeout
+@bb/desktop:test:      ↓ blocks commands when initialization encounters failure
+@bb/desktop:test:      ↓ blocks commands when initialization encounters cancel
+@bb/desktop:test:      ↓ blocks commands when initialization encounters reattach
+@bb/desktop:test:      ↓ retains live wrappers while hidden and stops exposing removed targets
+@bb/desktop:test:      ↓ validates debugger JSON and forwards native child session IDs
+@bb/desktop:test:      ↓ rejects another debugger controller and invalidates commands across detach and reattach
+@bb/desktop:test:      ↓ shares the initial render barrier without reordering pointer commands
+@bb/desktop:test:      ↓ rejects buffered input after navigation changes the page
+@bb/desktop:test:      ↓ rejects buffered input after reattach changes the page
+@bb/desktop:test:      ↓ retries a failed render capture before dispatching later input
+@bb/desktop:test:      ↓ cancels one session's buffered pointer without cancelling another session's input
+@bb/desktop:test:      ↓ reports the destination before navigation commits from 
+@bb/desktop:test:      ↓ reports the destination before navigation commits from https://example.com/original
+@bb/desktop:test:      ↓ routes lifecycle callbacks only for registered scoped tabs and forwards manager notifications
+@bb/desktop:test:      ↓ returns native focus to the host while a controller owns the tab
+@bb/desktop:test:      ↓ returns focus a visible tab takes while its page loads on its own
+@bb/desktop:test:      ↓ lets a reloaded visible tab keep focus from 'a press that lands before the focus'
+@bb/desktop:test:      ↓ lets a reloaded visible tab keep focus from 'a press that follows the focus'
+@bb/desktop:test:      ↓ lets a reloaded visible tab keep focus from 'an explicit focus'
+@bb/desktop:test:      ↓ returns native focus to the host from a hidden tab
+@bb/desktop:test:      ↓ offers shared browser actions for 'image' with contents=true
+@bb/desktop:test:      ↓ offers shared browser actions for 'image' with contents=false
+@bb/desktop:test:      ↓ offers shared browser actions for 'none' with contents=false
+@bb/desktop:test:      ↓ pauses media inside nested open shadow roots when hidden
+@bb/desktop:test:      ↓ keeps newly created hidden tabs silent, including autoplay after loading
+@bb/desktop:test:      ↓ setVisible pauses hidden media in every frame without resuming it on reveal
+@bb/desktop:test:      ↓ setVisibleWithoutFocus pauses hidden media in every frame without resuming it on reveal
+@bb/desktop:test:      ↓ preserves native pages across server switches without publishing them to another server (local daemon)
+@bb/desktop:test:      ↓ preserves native pages across server switches without publishing them to another server (enrolled daemon)
+@bb/desktop:test:      ↓ isolates colliding server tabs and background events, then cleans up every server through releaseWindow
+@bb/desktop:test:      ↓ isolates colliding server tabs and background events, then cleans up every server through destroyAll
+@bb/desktop:test:      ↓ keeps an inactive server throttled when automation releases the page
+@bb/desktop:test:      ↓ keeps an inactive server throttled when capture releases the page
+@bb/desktop:test:      ↓ captures an unpainted hidden page without detaching another controller
+@bb/desktop:test:      ↓ requests reveal without activating the window for pages created through a controlled CDP connection
+@bb/desktop:test:      ↓ revokes native debugger control synchronously on takeover and fences reconnect generations
+@bb/desktop:test:      ↓ creates hidden automation tabs in the hardened browser session and preserves them on presentation attach
+@bb/desktop:test:      ↓ captures bounded hidden pages without focus and rejects a removed target during capture
+@bb/desktop:test:      ↓ initiates a new blank page load before announcing the automation target
+@bb/desktop:test:      ↓ preserves navigation when revealing a tab but loads every explicit navigation
+@bb/desktop:test:      ↓ rejects a different thread reattaching the same native tab without mutating it
+@bb/desktop:test:      ↓ discovers hidden live tabs only in the requested window and thread
+@bb/desktop:test:      ↓ publishes favicons, retains them within an origin, and restores cached icons when returning
+@bb/desktop:test:      ↓ bounds cached favicon origins and isolates them between servers
+@bb/desktop:test:      ↓ notifies subscribers of native creation and hidden navigation until unsubscribed
+@bb/desktop:test:      ↓ tolerates a missing guest during visibility
+@bb/desktop:test:      ↓ tolerates a missing guest during destroyed
+@bb/desktop:test:      ↓ tolerates a missing guest during detach
+@bb/desktop:test:      ↓ cleans up through guest after the host is destroyed
+@bb/desktop:test:      ↓ cleans up through releaseWindow after the host is destroyed
+@bb/desktop:test:      ↓ cleans up through destroyAll after the host is destroyed
+@bb/desktop:test:      ↓ notifies once after removing a native target through detach
+@bb/desktop:test:      ↓ notifies once after removing a native target through releaseWindow
+@bb/desktop:test:      ↓ notifies once after removing a native target through destroyAll
+@bb/desktop:test:      ↓ notifies once after removing a native target through destroyed
+@bb/desktop:test:      ↓ forwards resolved browser shortcuts and suppresses the untrusted page
+@bb/desktop:test:      ↓ takes host focus for browser.find so the selected target can receive typing
+@bb/desktop:test:      ↓ takes host focus for panel.previousTab so the selected target can receive typing
+@bb/desktop:test:      ↓ takes host focus for panel.nextTab so the selected target can receive typing
+@bb/desktop:test:      ↓ takes host focus for pane.focus.previous so the selected target can receive typing
+@bb/desktop:test:      ↓ takes host focus for pane.focus.next so the selected target can receive typing
+@bb/desktop:test:      ↓ leaves native page focus and input untouched when pane.focus.previous is unavailable
+@bb/desktop:test:      ↓ leaves native page focus and input untouched when pane.focus.next is unavailable
+@bb/desktop:test:      ↓ drives webContents find-in-page and relays results to the host renderer
+@bb/desktop:test:      ↓ relays only results of the latest find request and none after stop
+@bb/desktop:test:      ↓ surfaces 'a loopback popup' as an in-panel tab with its source tab id, never a native window
+@bb/desktop:test:      ↓ surfaces 'a public popup' as an in-panel tab with its source tab id, never a native window
+@bb/desktop:test:      ↓ surfaces 'a noopener blank link' as an in-panel tab with its source tab id, never a native window
+@bb/desktop:test:      ↓ opens popup dispositions in a hardened native window
+@bb/desktop:test:      ↓ loads the URL itself when Electron supplies no child webContents
+@bb/desktop:test:      ↓ supports blank-first OAuth navigation with secure remote URLs
+@bb/desktop:test:      ↓ caps live native popups across successive rate windows
+@bb/desktop:test:      ↓ snapshots then hides visible views on resize, revealing them clamped to the shrunken window
+@bb/desktop:test:      ↓ drops a capture that resolves after the resize burst already ended
+@bb/desktop:test:      ↓ applies renderer pushes that land mid-resize on the reveal
+@bb/desktop:test:      ↓ defers renderer visibility changes made during a resize burst to the reveal
+@bb/desktop:test:      ↓ keeps hidden views hidden and untouched across a resize burst
+@bb/desktop:test:      ↓ reports user focus but suppresses programmatic focus used for restoration
+@bb/desktop:test:      ↓ defers hidden memory-eviction recovery until the panel shows the current page
+@bb/desktop:test:      ↓ stops automatic recovery after two repeated renderer crashes
+@bb/desktop:test:      ↓ does not automatically retry a launch-failed renderer failure
+@bb/desktop:test:      ↓ does not automatically retry a integrity-failure renderer failure
+@bb/desktop:test:      ↓ resets the renderer recovery limit after a page finishes loading
+@bb/desktop:test:      ↓ focuses on a real hidden → visible setVisible transition only once
+@bb/desktop:test:      ↓ re-focuses after a hide → show cycle
+@bb/desktop:test:      ↓ does not let an unfocused split view steal focus on mount or restore
+@bb/desktop:test:      ↓ shows a browser beside a focused non-browser pane without stealing focus
+@bb/desktop:test:      ↓ lets logical focus override first-visible mount order
+@bb/desktop:test:      ↓ hides only the reloading window's browser views until they reattach
+@bb/desktop:test:      ↓ handles microphone consent: allow
+@bb/desktop:test:      ↓ handles microphone consent: deny
+@bb/desktop:test:      ↓ handles microphone consent: navigate
+@bb/desktop:test:      ↓ handles microphone consent: system-deny
+@bb/desktop:test:      ↓ handles microphone consent: dialog-error
+@bb/desktop:test:      ↓ allows clipboard-sanitized-write but denies clipboard-read and device permissions
+@bb/desktop:test:      ↓ evicts the oldest hidden renderers, restores navigation on reveal, and forgets closed cold tabs
+@bb/desktop:test:      ↓ keeps a hidden page with no committed navigation alive so revealing it cannot fail
+@bb/desktop:test:      ↓ keeps a page restored for an agent hidden and muted
+@bb/desktop:test:      ↓ reattaches a hidden cold tab without recreating its page
+@bb/desktop:test:      ↓ closes a cold tab without recreating its page
+@bb/desktop:test:      ↓ pins a user page from lease acquisition until release even before a CDP connection opens
+@bb/desktop:test:      ↓ keeps downloads, control leases, debugger sessions, and agent-created pages alive beyond the idle deadline
+@bb/desktop:test:      ↓ keeps a page alive through an in-flight capture and counts it as use
+@bb/desktop:test:      ↓ keeps a page alive through an in-flight evaluate and counts it as use
+@bb/desktop:test:      ↓ still sweeps while another page is used more often than the sweep interval
+@bb/desktop:test:      ↓ evicts parked server pages and discards cold entries when their window closes
+@bb/desktop:test:      ↓ evicts the thread's hidden pages at once, including agent tabs and downloads, and keeps leased pages until the lease ends
+@bb/desktop:test:      ↓ evicts a visible page once it is hidden, and leaves pages to the idle rule after unarchiving
+@bb/desktop:test:      × resumes throttling after automation ends and retains agent ownership (restored: false) 15ms
+@bb/desktop:test:      × resumes throttling after automation ends and retains agent ownership (restored: true) 2ms
+@bb/desktop:test: 
+@bb/desktop:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+@bb/desktop:test: 
+@bb/desktop:test:  FAIL  |@bb/desktop:isolated| test/desktop-browser-view-manager.test.ts &gt; archived thread discarding &gt; resumes throttling after automation ends and retains agent ownership (restored: false)
+@bb/desktop:test:  FAIL  |@bb/desktop:isolated| test/desktop-browser-view-manager.test.ts &gt; archived thread discarding &gt; resumes throttling after automation ends and retains agent ownership (restored: true)
+@bb/desktop:test: AssertionError: expected false to be true // Object.is equality
+@bb/desktop:test: 
+@bb/desktop:test: - Expected
+@bb/desktop:test: + Received
+@bb/desktop:test: 
+@bb/desktop:test: - true
+@bb/desktop:test: + false
+@bb/desktop:test: 
+@bb/desktop:test:  ❯ test/desktop-browser-view-manager.test.ts:5303:60
+@bb/desktop:test:     5301|         page.detach();
+@bb/desktop:test:     5302|         expect(view.visible).toBe(false);
+@bb/desktop:test:     5303|         expect(view.webContents.getBackgroundThrottling()).toBe(true);
+@bb/desktop:test:        |                                                            ^
+@bb/desktop:test:     5304|         vi.advanceTimersByTime(6 * 60_000);
+@bb/desktop:test:     5305|         expect(view.webContents.isDestroyed()).toBe(false);
+@bb/desktop:test: 
+@bb/desktop:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+@bb/desktop:test: 
+@bb/desktop:test: 
+@bb/desktop:test:  Test Files  1 failed (1)
+@bb/desktop:test:       Tests  2 failed | 114 skipped (116)
+@bb/desktop:test:    Start at  17:50:18
+@bb/desktop:test:    Duration  3.53s (transform 2.94s, setup 0ms, import 3.33s, tests 18ms, environment 0ms)
+@bb/desktop:test: 
+@bb/desktop:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/desktop#test:  ERROR  command (CHECKOUT_A/apps/desktop) /usr/local/bin/pnpm run test test/desktop-browser-view-manager.test.ts -t resumes throttling after automation ends exited (1)
+
+ Tasks:    4 successful, 5 total
+Cached:    0 cached, 5 total
+  Time:    13.335s 
+Failed:    @bb/desktop#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details>
+<details><summary>second-before.log</summary><pre>
+   • turbo 2.11.10
+   • Packages in scope: @bb/desktop
+   • Running test in 1 package
+   • Remote caching disabled, using shared worktree cache
+
+//:ensure-native-modules: cache bypass, force executing 6b779808202bee78
+@bb/process-utils:generate:profile-worker: cache hit, replaying logs 567551600e6ca6ca
+@bb/templates:generate:plugin-scaffold: cache hit, replaying logs 4cc2c22b7362c3fd
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker CHECKOUT_A/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold CHECKOUT_A/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:templates: cache hit, replaying logs 4f6365f30911491f
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates CHECKOUT_A/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules CHECKOUT_B
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+//:ensure-native-modules: [ensure-native-modules] Detached hardlinked better-sqlite3 binary before verification
+@bb/desktop:test: cache miss, executing 81f01e029e4586e5
+@bb/desktop:test: 
+@bb/desktop:test: &gt; @bb/desktop@0.50.1 test CHECKOUT_B/apps/desktop
+@bb/desktop:test: &gt; install-electron &amp;&amp; vitest run --config vitest.config.ts &quot;test/desktop-browser-view-manager.test.ts&quot; &quot;-t&quot; &quot;resumes throttling after automation ends&quot;
+@bb/desktop:test: 
+@bb/desktop:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/desktop:test:   - ESM syntax in a file loaded as CommonJS (vitest.config.ts:1:1). Use a `.mjs` extension or set `&quot;type&quot;: &quot;module&quot;` in the closest package.json
+@bb/desktop:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/desktop:test: 
+@bb/desktop:test:  RUN  v4.1.12 CHECKOUT_B/apps/desktop
+@bb/desktop:test: 
+@bb/desktop:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/desktop:test:   - ESM syntax in a file loaded as CommonJS (vitest.config.ts:1:1). Use a `.mjs` extension or set `&quot;type&quot;: &quot;module&quot;` in the closest package.json
+@bb/desktop:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/desktop:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/desktop:test:   - ESM syntax in a file loaded as CommonJS (vitest.config.ts:1:1). Use a `.mjs` extension or set `&quot;type&quot;: &quot;module&quot;` in the closest package.json
+@bb/desktop:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/desktop:test:  ❯ |@bb/desktop:isolated| test/desktop-browser-view-manager.test.ts (116 tests | 2 failed | 114 skipped) 20ms
+@bb/desktop:test:      ↓ awaits JSON values and binds the isolated bridge to the request channel
+@bb/desktop:test:      ↓ routes evaluation to the requested world and rejects malformed results
+@bb/desktop:test:      ↓ forwards only well-formed guest messages to the owning host window
+@bb/desktop:test:      ↓ keeps isolated page scripts unavailable without the page preload
+@bb/desktop:test:      ↓ requests frames only while a native screenshot is pending: complete
+@bb/desktop:test:      ↓ requests frames only while a native screenshot is pending: timeout
+@bb/desktop:test:      ↓ blocks commands when initialization encounters failure
+@bb/desktop:test:      ↓ blocks commands when initialization encounters cancel
+@bb/desktop:test:      ↓ blocks commands when initialization encounters reattach
+@bb/desktop:test:      ↓ retains live wrappers while hidden and stops exposing removed targets
+@bb/desktop:test:      ↓ validates debugger JSON and forwards native child session IDs
+@bb/desktop:test:      ↓ rejects another debugger controller and invalidates commands across detach and reattach
+@bb/desktop:test:      ↓ shares the initial render barrier without reordering pointer commands
+@bb/desktop:test:      ↓ rejects buffered input after navigation changes the page
+@bb/desktop:test:      ↓ rejects buffered input after reattach changes the page
+@bb/desktop:test:      ↓ retries a failed render capture before dispatching later input
+@bb/desktop:test:      ↓ cancels one session's buffered pointer without cancelling another session's input
+@bb/desktop:test:      ↓ reports the destination before navigation commits from 
+@bb/desktop:test:      ↓ reports the destination before navigation commits from https://example.com/original
+@bb/desktop:test:      ↓ routes lifecycle callbacks only for registered scoped tabs and forwards manager notifications
+@bb/desktop:test:      ↓ returns native focus to the host while a controller owns the tab
+@bb/desktop:test:      ↓ returns focus a visible tab takes while its page loads on its own
+@bb/desktop:test:      ↓ lets a reloaded visible tab keep focus from 'a press that lands before the focus'
+@bb/desktop:test:      ↓ lets a reloaded visible tab keep focus from 'a press that follows the focus'
+@bb/desktop:test:      ↓ lets a reloaded visible tab keep focus from 'an explicit focus'
+@bb/desktop:test:      ↓ returns native focus to the host from a hidden tab
+@bb/desktop:test:      ↓ offers shared browser actions for 'image' with contents=true
+@bb/desktop:test:      ↓ offers shared browser actions for 'image' with contents=false
+@bb/desktop:test:      ↓ offers shared browser actions for 'none' with contents=false
+@bb/desktop:test:      ↓ pauses media inside nested open shadow roots when hidden
+@bb/desktop:test:      ↓ keeps newly created hidden tabs silent, including autoplay after loading
+@bb/desktop:test:      ↓ setVisible pauses hidden media in every frame without resuming it on reveal
+@bb/desktop:test:      ↓ setVisibleWithoutFocus pauses hidden media in every frame without resuming it on reveal
+@bb/desktop:test:      ↓ preserves native pages across server switches without publishing them to another server (local daemon)
+@bb/desktop:test:      ↓ preserves native pages across server switches without publishing them to another server (enrolled daemon)
+@bb/desktop:test:      ↓ isolates colliding server tabs and background events, then cleans up every server through releaseWindow
+@bb/desktop:test:      ↓ isolates colliding server tabs and background events, then cleans up every server through destroyAll
+@bb/desktop:test:      ↓ keeps an inactive server throttled when automation releases the page
+@bb/desktop:test:      ↓ keeps an inactive server throttled when capture releases the page
+@bb/desktop:test:      ↓ captures an unpainted hidden page without detaching another controller
+@bb/desktop:test:      ↓ requests reveal without activating the window for pages created through a controlled CDP connection
+@bb/desktop:test:      ↓ revokes native debugger control synchronously on takeover and fences reconnect generations
+@bb/desktop:test:      ↓ creates hidden automation tabs in the hardened browser session and preserves them on presentation attach
+@bb/desktop:test:      ↓ captures bounded hidden pages without focus and rejects a removed target during capture
+@bb/desktop:test:      ↓ initiates a new blank page load before announcing the automation target
+@bb/desktop:test:      ↓ preserves navigation when revealing a tab but loads every explicit navigation
+@bb/desktop:test:      ↓ rejects a different thread reattaching the same native tab without mutating it
+@bb/desktop:test:      ↓ discovers hidden live tabs only in the requested window and thread
+@bb/desktop:test:      ↓ publishes favicons, retains them within an origin, and restores cached icons when returning
+@bb/desktop:test:      ↓ bounds cached favicon origins and isolates them between servers
+@bb/desktop:test:      ↓ notifies subscribers of native creation and hidden navigation until unsubscribed
+@bb/desktop:test:      ↓ tolerates a missing guest during visibility
+@bb/desktop:test:      ↓ tolerates a missing guest during destroyed
+@bb/desktop:test:      ↓ tolerates a missing guest during detach
+@bb/desktop:test:      ↓ cleans up through guest after the host is destroyed
+@bb/desktop:test:      ↓ cleans up through releaseWindow after the host is destroyed
+@bb/desktop:test:      ↓ cleans up through destroyAll after the host is destroyed
+@bb/desktop:test:      ↓ notifies once after removing a native target through detach
+@bb/desktop:test:      ↓ notifies once after removing a native target through releaseWindow
+@bb/desktop:test:      ↓ notifies once after removing a native target through destroyAll
+@bb/desktop:test:      ↓ notifies once after removing a native target through destroyed
+@bb/desktop:test:      ↓ forwards resolved browser shortcuts and suppresses the untrusted page
+@bb/desktop:test:      ↓ takes host focus for browser.find so the selected target can receive typing
+@bb/desktop:test:      ↓ takes host focus for panel.previousTab so the selected target can receive typing
+@bb/desktop:test:      ↓ takes host focus for panel.nextTab so the selected target can receive typing
+@bb/desktop:test:      ↓ takes host focus for pane.focus.previous so the selected target can receive typing
+@bb/desktop:test:      ↓ takes host focus for pane.focus.next so the selected target can receive typing
+@bb/desktop:test:      ↓ leaves native page focus and input untouched when pane.focus.previous is unavailable
+@bb/desktop:test:      ↓ leaves native page focus and input untouched when pane.focus.next is unavailable
+@bb/desktop:test:      ↓ drives webContents find-in-page and relays results to the host renderer
+@bb/desktop:test:      ↓ relays only results of the latest find request and none after stop
+@bb/desktop:test:      ↓ surfaces 'a loopback popup' as an in-panel tab with its source tab id, never a native window
+@bb/desktop:test:      ↓ surfaces 'a public popup' as an in-panel tab with its source tab id, never a native window
+@bb/desktop:test:      ↓ surfaces 'a noopener blank link' as an in-panel tab with its source tab id, never a native window
+@bb/desktop:test:      ↓ opens popup dispositions in a hardened native window
+@bb/desktop:test:      ↓ loads the URL itself when Electron supplies no child webContents
+@bb/desktop:test:      ↓ supports blank-first OAuth navigation with secure remote URLs
+@bb/desktop:test:      ↓ caps live native popups across successive rate windows
+@bb/desktop:test:      ↓ snapshots then hides visible views on resize, revealing them clamped to the shrunken window
+@bb/desktop:test:      ↓ drops a capture that resolves after the resize burst already ended
+@bb/desktop:test:      ↓ applies renderer pushes that land mid-resize on the reveal
+@bb/desktop:test:      ↓ defers renderer visibility changes made during a resize burst to the reveal
+@bb/desktop:test:      ↓ keeps hidden views hidden and untouched across a resize burst
+@bb/desktop:test:      ↓ reports user focus but suppresses programmatic focus used for restoration
+@bb/desktop:test:      ↓ defers hidden memory-eviction recovery until the panel shows the current page
+@bb/desktop:test:      ↓ stops automatic recovery after two repeated renderer crashes
+@bb/desktop:test:      ↓ does not automatically retry a launch-failed renderer failure
+@bb/desktop:test:      ↓ does not automatically retry a integrity-failure renderer failure
+@bb/desktop:test:      ↓ resets the renderer recovery limit after a page finishes loading
+@bb/desktop:test:      ↓ focuses on a real hidden → visible setVisible transition only once
+@bb/desktop:test:      ↓ re-focuses after a hide → show cycle
+@bb/desktop:test:      ↓ does not let an unfocused split view steal focus on mount or restore
+@bb/desktop:test:      ↓ shows a browser beside a focused non-browser pane without stealing focus
+@bb/desktop:test:      ↓ lets logical focus override first-visible mount order
+@bb/desktop:test:      ↓ hides only the reloading window's browser views until they reattach
+@bb/desktop:test:      ↓ handles microphone consent: allow
+@bb/desktop:test:      ↓ handles microphone consent: deny
+@bb/desktop:test:      ↓ handles microphone consent: navigate
+@bb/desktop:test:      ↓ handles microphone consent: system-deny
+@bb/desktop:test:      ↓ handles microphone consent: dialog-error
+@bb/desktop:test:      ↓ allows clipboard-sanitized-write but denies clipboard-read and device permissions
+@bb/desktop:test:      ↓ evicts the oldest hidden renderers, restores navigation on reveal, and forgets closed cold tabs
+@bb/desktop:test:      ↓ keeps a hidden page with no committed navigation alive so revealing it cannot fail
+@bb/desktop:test:      ↓ keeps a page restored for an agent hidden and muted
+@bb/desktop:test:      ↓ reattaches a hidden cold tab without recreating its page
+@bb/desktop:test:      ↓ closes a cold tab without recreating its page
+@bb/desktop:test:      ↓ pins a user page from lease acquisition until release even before a CDP connection opens
+@bb/desktop:test:      ↓ keeps downloads, control leases, debugger sessions, and agent-created pages alive beyond the idle deadline
+@bb/desktop:test:      ↓ keeps a page alive through an in-flight capture and counts it as use
+@bb/desktop:test:      ↓ keeps a page alive through an in-flight evaluate and counts it as use
+@bb/desktop:test:      ↓ still sweeps while another page is used more often than the sweep interval
+@bb/desktop:test:      ↓ evicts parked server pages and discards cold entries when their window closes
+@bb/desktop:test:      ↓ evicts the thread's hidden pages at once, including agent tabs and downloads, and keeps leased pages until the lease ends
+@bb/desktop:test:      ↓ evicts a visible page once it is hidden, and leaves pages to the idle rule after unarchiving
+@bb/desktop:test:      × resumes throttling after automation ends and retains agent ownership (restored: false) 16ms
+@bb/desktop:test:      × resumes throttling after automation ends and retains agent ownership (restored: true) 2ms
+@bb/desktop:test: 
+@bb/desktop:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+@bb/desktop:test: 
+@bb/desktop:test:  FAIL  |@bb/desktop:isolated| test/desktop-browser-view-manager.test.ts &gt; archived thread discarding &gt; resumes throttling after automation ends and retains agent ownership (restored: false)
+@bb/desktop:test:  FAIL  |@bb/desktop:isolated| test/desktop-browser-view-manager.test.ts &gt; archived thread discarding &gt; resumes throttling after automation ends and retains agent ownership (restored: true)
+@bb/desktop:test: AssertionError: expected false to be true // Object.is equality
+@bb/desktop:test: 
+@bb/desktop:test: - Expected
+@bb/desktop:test: + Received
+@bb/desktop:test: 
+@bb/desktop:test: - true
+@bb/desktop:test: + false
+@bb/desktop:test: 
+@bb/desktop:test:  ❯ test/desktop-browser-view-manager.test.ts:5303:60
+@bb/desktop:test:     5301|         page.detach();
+@bb/desktop:test:     5302|         expect(view.visible).toBe(false);
+@bb/desktop:test:     5303|         expect(view.webContents.getBackgroundThrottling()).toBe(true);
+@bb/desktop:test:        |                                                            ^
+@bb/desktop:test:     5304|         vi.advanceTimersByTime(6 * 60_000);
+@bb/desktop:test:     5305|         expect(view.webContents.isDestroyed()).toBe(false);
+@bb/desktop:test: 
+@bb/desktop:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+@bb/desktop:test: 
+@bb/desktop:test: 
+@bb/desktop:test:  Test Files  1 failed (1)
+@bb/desktop:test:       Tests  2 failed | 114 skipped (116)
+@bb/desktop:test:    Start at  17:51:22
+@bb/desktop:test:    Duration  3.67s (transform 2.92s, setup 0ms, import 3.37s, tests 20ms, environment 0ms)
+@bb/desktop:test: 
+@bb/desktop:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/desktop#test:  ERROR  command (CHECKOUT_B/apps/desktop) /usr/local/bin/pnpm run test test/desktop-browser-view-manager.test.ts -t resumes throttling after automation ends exited (1)
+
+ Tasks:    4 successful, 5 total
+Cached:    3 cached, 5 total
+  Time:    11.36s 
+Failed:    @bb/desktop#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details>
+<details><summary>relevant-after.log</summary><pre>
+   • turbo 2.11.10
+   • Packages in scope: @bb/desktop
+   • Running test in 1 package
+   • Remote caching disabled
+
+@bb/process-utils:generate:profile-worker: cache miss, executing 1f7f72dde6235a2f
+@bb/templates:generate:templates: cache miss, executing 3505d92ecbb6ea18
+//:ensure-native-modules: cache bypass, force executing 8cdb19c4470e3c5e
+@bb/templates:generate:plugin-scaffold: cache miss, executing 37225db3a1ada287
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates CHECKOUT_A/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker CHECKOUT_A/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules CHECKOUT_A
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold CHECKOUT_A/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/desktop:test: cache miss, executing 3534e65f85856467
+@bb/desktop:test: 
+@bb/desktop:test: &gt; @bb/desktop@0.50.1 test CHECKOUT_A/apps/desktop
+@bb/desktop:test: &gt; install-electron &amp;&amp; vitest run --config vitest.config.ts &quot;test/desktop-browser-view-manager.test.ts&quot; &quot;test/desktop-browser-cdp.test.ts&quot; &quot;test/desktop-browser-broker-client.test.ts&quot; &quot;test/desktop-browser-broker-import.test.ts&quot; &quot;test/desktop-browser-broker-snapshots.test.ts&quot; &quot;test/desktop-browser-broker-descriptor.test.ts&quot; &quot;test/desktop-browser-main-ipc.test.ts&quot;
+@bb/desktop:test: 
+@bb/desktop:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/desktop:test:   - ESM syntax in a file loaded as CommonJS (vitest.config.ts:1:1). Use a `.mjs` extension or set `&quot;type&quot;: &quot;module&quot;` in the closest package.json
+@bb/desktop:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/desktop:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/desktop:test:   - ESM syntax in a file loaded as CommonJS (vitest.config.ts:1:1). Use a `.mjs` extension or set `&quot;type&quot;: &quot;module&quot;` in the closest package.json
+@bb/desktop:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/desktop:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/desktop:test:   - ESM syntax in a file loaded as CommonJS (vitest.config.ts:1:1). Use a `.mjs` extension or set `&quot;type&quot;: &quot;module&quot;` in the closest package.json
+@bb/desktop:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/desktop:test: 
+@bb/desktop:test:  RUN  v4.1.12 CHECKOUT_A/apps/desktop
+@bb/desktop:test: 
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/desktop-browser-broker-import.test.ts (3 tests) 7ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/desktop-browser-broker-snapshots.test.ts (4 tests) 6ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/desktop-browser-cdp.test.ts (18 tests) 138ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/desktop-browser-main-ipc.test.ts (7 tests) 12ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/desktop-browser-broker-descriptor.test.ts (4 tests) 3ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/desktop-browser-view-manager.test.ts (116 tests) 1101ms
+@bb/desktop:test:      ✓ preserves native pages across server switches without publishing them to another server (local daemon)  444ms
+@bb/desktop:test:      ✓ preserves native pages across server switches without publishing them to another server (enrolled daemon)  318ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/desktop-browser-broker-client.test.ts (6 tests) 6824ms
+@bb/desktop:test:    ✓ validates 'timed out broker' before registering  6109ms
+@bb/desktop:test: 
+@bb/desktop:test:  Test Files  7 passed (7)
+@bb/desktop:test:       Tests  158 passed (158)
+@bb/desktop:test:    Start at  17:52:02
+@bb/desktop:test:    Duration  8.87s (transform 8.01s, setup 0ms, import 11.91s, tests 8.09s, environment 0ms)
+@bb/desktop:test: 
+
+ Tasks:    5 successful, 5 total
+Cached:    0 cached, 5 total
+  Time:    10.736s 
+
+</pre></details>
+<details><summary>full-after.log</summary><pre>
+   • turbo 2.11.10
+   • Packages in scope: @bb/desktop
+   • Running test, typecheck in 1 package
+   • Remote caching disabled
+
+//:ensure-native-modules: cache bypass, force executing 136e678038a32fa1
+@bb/process-utils:generate:profile-worker: cache hit, replaying logs c43b040cacf9642e
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker CHECKOUT_A/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+@bb/templates:generate:plugin-scaffold: cache hit, replaying logs 4f471c06e08c9620
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold CHECKOUT_A/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:templates: cache hit, replaying logs 91caca3dc3194f67
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates CHECKOUT_A/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/desktop:typecheck: cache miss, executing 8c989aaafb338251
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules CHECKOUT_A
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+@bb/desktop:typecheck: 
+@bb/desktop:typecheck: &gt; @bb/desktop@0.50.1 typecheck CHECKOUT_A/apps/desktop
+@bb/desktop:typecheck: &gt; tsrs --noEmit
+@bb/desktop:typecheck: 
+@bb/desktop:test: cache miss, executing 7ceecec5dbcce5ff
+@bb/desktop:test: 
+@bb/desktop:test: &gt; @bb/desktop@0.50.1 test CHECKOUT_A/apps/desktop
+@bb/desktop:test: &gt; install-electron &amp;&amp; vitest run --config vitest.config.ts
+@bb/desktop:test: 
+@bb/desktop:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/desktop:test:   - ESM syntax in a file loaded as CommonJS (vitest.config.ts:1:1). Use a `.mjs` extension or set `&quot;type&quot;: &quot;module&quot;` in the closest package.json
+@bb/desktop:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/desktop:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/desktop:test:   - ESM syntax in a file loaded as CommonJS (vitest.config.ts:1:1). Use a `.mjs` extension or set `&quot;type&quot;: &quot;module&quot;` in the closest package.json
+@bb/desktop:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/desktop:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/desktop:test:   - ESM syntax in a file loaded as CommonJS (vitest.config.ts:1:1). Use a `.mjs` extension or set `&quot;type&quot;: &quot;module&quot;` in the closest package.json
+@bb/desktop:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/desktop:test: 
+@bb/desktop:test:  RUN  v4.1.12 CHECKOUT_A/apps/desktop
+@bb/desktop:test: 
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/desktop-context-menu.test.ts (12 tests) 7ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/desktop-attention.test.ts (3 tests) 7ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/desktop-dialog-window.test.ts (5 tests) 4ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/desktop-window-focus.test.ts (6 tests) 9ms
+@bb/desktop:test: (node:9461) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/desktop:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/application-url.test.ts (2 tests) 4ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/desktop-renderer-recovery.test.ts (10 tests) 16ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/connect-server-sync.test.ts (13 tests) 26ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/owned-runtime-supervisor.test.ts (4 tests) 30ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/server-target-persistence.test.ts (24 tests) 567ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/server-target.test.ts (15 tests) 6ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/connect-desktop-session.test.ts (13 tests) 9ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/preload-build.test.ts (2 tests | 1 skipped) 1027ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/desktop-browser-broker-import.test.ts (3 tests) 7ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/desktop-browser-broker-snapshots.test.ts (4 tests) 6ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/connect-session-renewal.test.ts (8 tests) 6ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/desktop-browser-cdp.test.ts (18 tests) 134ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/foreign-runtime.test.ts (11 tests) 128ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/server-probe.test.ts (6 tests) 39ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/remote-server-load.test.ts (5 tests) 3ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/desktop-browser-shortcuts.test.ts (10 tests) 3ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/desktop-clipboard.test.ts (4 tests) 7ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/desktop-update-check.test.ts (11 tests) 30ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/browser-import.test.ts (36 tests) 6074ms
+@bb/desktop:test:      ✓ discovers a registered browser while excluding Electron and mail cookie stores  962ms
+@bb/desktop:test:      ✓ discovers an unlisted Chromium store on linux and imports only the selected profile  545ms
+@bb/desktop:test:      ✓ discovers Firefox-format profiles in &quot;.var&quot; without a browser entry  335ms
+@bb/desktop:test:      ✓ discovers Firefox-format profiles in &quot;snap&quot; without a browser entry  320ms
+@bb/desktop:test:      ✓ keeps known encryption metadata, deduplicates stores, and excludes the BB profile  580ms
+@bb/desktop:test:      ✓ reads a Chromium database, skipping partitioned and keyring-only rows  337ms
+@bb/desktop:test:      ✓ reads Firefox cookies from the default container with schema-aware expiry  468ms
+@bb/desktop:test:      ✓ lists Chromium profiles from Local State and rejects traversal entries  676ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/desktop-browser-main-ipc.test.ts (7 tests) 13ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/menu.test.ts (25 tests) 13ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/preload-browser-api.test.ts (8 tests) 8865ms
+@bb/desktop:test:      ✓ lists the same servers for current and older pages  8559ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/desktop-find-view.test.ts (4 tests) 9ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/local-view.test.ts (5 tests) 95ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/connect-credential-cache.test.ts (4 tests) 6ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/connect-machine-enrollment.test.ts (4 tests) 21ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/server-list.test.ts (2 tests) 4ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/server-choice-ipc.test.ts (4 tests) 12ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/desktop-reload-shortcut.test.ts (11 tests) 6ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/server-update-control.test.ts (2 tests) 957ms
+@bb/desktop:test:      ✓ reports install failure and retries through launcher IPC (direct)  507ms
+@bb/desktop:test:      ✓ reports install failure and retries through launcher IPC (appimage)  449ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/app-paths.test.ts (5 tests) 1ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/existing-server-dialog.test.ts (7 tests) 2ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/desktop-window-factory.test.ts (24 tests) 1235ms
+@bb/desktop:test:      ✓ saves move and resize events without quitting, including simultaneous windows  678ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/desktop-version-feed.test.ts (3 tests) 1085ms
+@bb/desktop:test:      ✓ publishes the OS requirement for 'darwin' 'latest' without losing update fields  405ms
+@bb/desktop:test:      ✓ publishes the OS requirement for 'darwin' 'nightly' without losing update fields  354ms
+@bb/desktop:test:      ✓ publishes the OS requirement for 'linux' 'latest' without losing update fields  324ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/desktop-shutdown.test.ts (2 tests) 6ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/bb-process.test.ts (9 tests) 767ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/desktop-update-info.test.ts (3 tests) 1ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/desktop-menu-shortcuts.test.ts (4 tests) 3ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/desktop-linux-window-options.test.ts (6 tests) 1ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/desktop-browser-legacy-partitions.test.ts (2 tests) 12ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/desktop-system-config.test.ts (5 tests) 6ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/desktop-logger.test.ts (4 tests) 810ms
+@bb/desktop:test:    ✓ rotates at the byte limit and retains only the four latest archives  672ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/packaged-app-launch.test.ts (3 tests) 1ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/desktop-platform.test.ts (1 test) 0ms
+@bb/desktop:test: (node:9626) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+@bb/desktop:test: (Use `node --trace-warnings ...` to show where the warning was created)
+@bb/desktop:test:  ✓ |@bb/desktop| test/browser-applications.test.ts (2 tests) 3ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/log-file-follower.test.ts (3 tests) 498ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/desktop-external-url.test.ts (11 tests) 1ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/desktop-browser-policy.test.ts (5 tests) 3ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/moved-machine-service.test.ts (6 tests) 59ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/desktop-browser-broker-descriptor.test.ts (4 tests) 1ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/desktop-update-provider.test.ts (6 tests) 3ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/desktop-auto-update.test.ts (13 tests | 1 skipped) 19ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/desktop-zoom.test.ts (3 tests) 2ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/electron-builder-windows-config.test.ts (3 tests) 135ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/window-state.test.ts (8 tests) 331ms
+@bb/desktop:test:      ✓ reads legacy geometry and defaults invalid zoom 100  306ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/windows-installer.test.ts (5 tests) 284ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/log-viewer.test.ts (13 tests) 1520ms
+@bb/desktop:test:      ✓ shows persisted desktop diagnostics and follows new entries alongside an attached server  1124ms
+@bb/desktop:test:  ❯ |@bb/desktop| test/electron-builder-config.test.ts (25 tests | 1 failed) 942ms
+@bb/desktop:test:      ✓ keeps package metadata compatible with electron universal's CJS entry asar 5ms
+@bb/desktop:test:      ✓ ships no plugin build toolchain binaries 1ms
+@bb/desktop:test:      ✓ unpacks the ESM bb-app bridge with an explicit module extension 6ms
+@bb/desktop:test:      ✓ runs a native module preparation hook after packaging 1ms
+@bb/desktop:test:      ✓ passes the standalone platform through to better-sqlite3 prebuild-install 1ms
+@bb/desktop:test:      ✓ preserves the macOS better-sqlite3 prebuild-install arguments 0ms
+@bb/desktop:test:      ✓ installs native plugin build packages for arm64 and x64 2ms
+@bb/desktop:test:      ✓ disables in-place native rebuilds so the shared pnpm store is not mutated 1ms
+@bb/desktop:test:      ✓ excludes source maps from packaged app files 1ms
+@bb/desktop:test:      ✓ copies the app scaffold template as a dedicated file set 1ms
+@bb/desktop:test:      ✓ patches packaged node-pty helper path handling  510ms
+@bb/desktop:test:      × validates bundled N-API SQLite without using the legacy prebuild installer 186ms
+@bb/desktop:test:      ✓ points mac signing entitlements at checked-in plist files 1ms
+@bb/desktop:test:      ✓ packages macOS artifacts for arm64 only 1ms
+@bb/desktop:test:      ✓ packages a Linux AppImage for x64 1ms
+@bb/desktop:test:      ✓ grants audio input to the signed app and helper processes 2ms
+@bb/desktop:test:      ✓ permits computer-use cleanup Apple Events from the signed app 1ms
+@bb/desktop:test:      ✓ includes the usage description required for macOS Automation permission 1ms
+@bb/desktop:test:      ✓ keeps the updater provider pointed at desktop-latest release assets 1ms
+@bb/desktop:test:      ✓ creates a separate nightly app identity and update feed 51ms
+@bb/desktop:test:      ✓ rejects unknown desktop release channels 33ms
+@bb/desktop:test:      ✓ signs local builds via keychain auto-discovery when signing secrets are absent 37ms
+@bb/desktop:test:      ✓ keeps builds unsigned when keychain auto-discovery is explicitly disabled 31ms
+@bb/desktop:test:      ✓ rejects partial signing secret sets 32ms
+@bb/desktop:test:      ✓ enables app signing and notarization when signing and Apple credentials are complete 31ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/desktop-browser-view-manager.test.ts (116 tests) 1432ms
+@bb/desktop:test:      ✓ preserves native pages across server switches without publishing them to another server (local daemon)  568ms
+@bb/desktop:test:      ✓ preserves native pages across server switches without publishing them to another server (enrolled daemon)  501ms
+@bb/desktop:test:  ✓ |@bb/desktop| test/server-moved.test.ts (51 tests) 2048ms
+@bb/desktop:test:  ✓ |@bb/desktop:isolated| test/desktop-browser-broker-client.test.ts (6 tests) 7565ms
+@bb/desktop:test:    ✓ validates 'same broker at an unrelated address' before registering  327ms
+@bb/desktop:test:    ✓ validates 'replayed proof for another challenge' before registering  313ms
+@bb/desktop:test:    ✓ validates 'timed out broker' before registering  6290ms
+@bb/desktop:test: 
+@bb/desktop:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+@bb/desktop:test: 
+@bb/desktop:test:  FAIL  |@bb/desktop| test/electron-builder-config.test.ts &gt; electron-builder signing config &gt; validates bundled N-API SQLite without using the legacy prebuild installer
+@bb/desktop:test: AssertionError: expected 'Error: Command failed: HOST_PATH to be '' // Object.is equality
+@bb/desktop:test: 
+@bb/desktop:test: - Expected
+@bb/desktop:test: + Received
+@bb/desktop:test: 
+@bb/desktop:test: + Error: Command failed: CHECKOUT_A/node_modules/.pnpm/electron@44.10.2/node_modules/electron/dist/electron -e const Database = require(process.argv[1]); const db = new Database(':memory:'); if (db.prepare('SELECT 1 AS value').get().value !== 1) throw new Error('SQLite verification failed'); db.close(); /tmp/TEST_ARTIFACT
+@bb/desktop:test: + CHECKOUT_A/node_modules/.pnpm/electron@44.10.2/node_modules/electron/dist/electron: error while loading shared libraries: libglib-2.0.so.0: cannot open shared object file: No such file or directory
+@bb/desktop:test: +
+@bb/desktop:test: +     at genericNodeError (node:internal/errors:983:15)
+@bb/desktop:test: +     at wrappedFn (node:internal/errors:537:14)
+@bb/desktop:test: +     at checkExecSyncError (node:child_process:915:11)
+@bb/desktop:test: +     at execFileSync (node:child_process:951:15)
+@bb/desktop:test: +     at verify (CHECKOUT_A/apps/desktop/scripts/prepare-native-modules.cjs:197:5)
+@bb/desktop:test: +     at prepareBetterSqlite3PackageDirectory (CHECKOUT_A/apps/desktop/scripts/prepare-native-modules.cjs:212:7)
+@bb/desktop:test: +     at async Promise.all (index 0)
+@bb/desktop:test: +     at async preparePackagedNativeModules (CHECKOUT_A/apps/desktop/scripts/prepare-native-modules.cjs:314:3)
+@bb/desktop:test: +     at async main (CHECKOUT_A/apps/desktop/scripts/prepare-native-modules.cjs:441:3)
+@bb/desktop:test: +
+@bb/desktop:test: 
+@bb/desktop:test:  ❯ test/electron-builder-config.test.ts:482:29
+@bb/desktop:test:     480|         &quot;--electron-version=44.10.2&quot;,
+@bb/desktop:test:     481|       ]);
+@bb/desktop:test:     482|       expect(result.stderr).toBe(&quot;&quot;);
+@bb/desktop:test:        |                             ^
+@bb/desktop:test:     483|       expect(result.exitCode).toBe(0);
+@bb/desktop:test:     484|       const binaryPath = resolve(
+@bb/desktop:test: 
+@bb/desktop:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+@bb/desktop:test: 
+@bb/desktop:test: 
+@bb/desktop:test:  Test Files  1 failed | 64 passed (65)
+@bb/desktop:test:       Tests  1 failed | 656 passed | 2 skipped (659)
+@bb/desktop:test:    Start at  17:51:25
+@bb/desktop:test:    Duration  16.48s (transform 158.15s, setup 0ms, import 197.68s, tests 36.93s, environment 4ms)
+@bb/desktop:test: 
+@bb/desktop:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/desktop#test:  ERROR  command (CHECKOUT_A/apps/desktop) /usr/local/bin/pnpm run test exited (1)
+
+ Tasks:    5 successful, 6 total
+Cached:    3 cached, 6 total
+  Time:    18.133s 
+Failed:    @bb/desktop#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details>
+<details><summary>base-packaging.log</summary><pre>
+   • turbo 2.11.10
+   • Packages in scope: @bb/desktop
+   • Running test in 1 package
+   • Remote caching disabled, using shared worktree cache
+
+//:ensure-native-modules: cache bypass, force executing ffb67a9ebda7f16d
+@bb/templates:generate:templates: cache miss, executing 71646419ade0ca66
+@bb/templates:generate:plugin-scaffold: cache miss, executing 7619fa1617210642
+@bb/process-utils:generate:profile-worker: cache miss, executing cb1ab34b466b0625
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates CHECKOUT_B/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker CHECKOUT_B/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+//:ensure-native-modules: 
+//:ensure-native-modules: &gt; bb@ ensure-native-modules CHECKOUT_B
+//:ensure-native-modules: &gt; node scripts/ensure-native-modules.mjs
+//:ensure-native-modules: 
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold CHECKOUT_B/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/desktop:test: cache miss, executing 7977f2c852843289
+@bb/desktop:test: 
+@bb/desktop:test: &gt; @bb/desktop@0.50.1 test CHECKOUT_B/apps/desktop
+@bb/desktop:test: &gt; install-electron &amp;&amp; vitest run --config vitest.config.ts &quot;test/electron-builder-config.test.ts&quot; &quot;-t&quot; &quot;validates bundled N-API SQLite&quot;
+@bb/desktop:test: 
+@bb/desktop:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/desktop:test:   - ESM syntax in a file loaded as CommonJS (vitest.config.ts:1:1). Use a `.mjs` extension or set `&quot;type&quot;: &quot;module&quot;` in the closest package.json
+@bb/desktop:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/desktop:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/desktop:test:   - ESM syntax in a file loaded as CommonJS (vitest.config.ts:1:1). Use a `.mjs` extension or set `&quot;type&quot;: &quot;module&quot;` in the closest package.json
+@bb/desktop:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/desktop:test: (!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+@bb/desktop:test:   - ESM syntax in a file loaded as CommonJS (vitest.config.ts:1:1). Use a `.mjs` extension or set `&quot;type&quot;: &quot;module&quot;` in the closest package.json
+@bb/desktop:test: Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+@bb/desktop:test: 
+@bb/desktop:test:  RUN  v4.1.12 CHECKOUT_B/apps/desktop
+@bb/desktop:test: 
+@bb/desktop:test:  ❯ |@bb/desktop| test/electron-builder-config.test.ts (25 tests | 1 failed | 24 skipped) 170ms
+@bb/desktop:test:      ↓ keeps package metadata compatible with electron universal's CJS entry asar
+@bb/desktop:test:      ↓ ships no plugin build toolchain binaries
+@bb/desktop:test:      ↓ unpacks the ESM bb-app bridge with an explicit module extension
+@bb/desktop:test:      ↓ runs a native module preparation hook after packaging
+@bb/desktop:test:      ↓ passes the standalone platform through to better-sqlite3 prebuild-install
+@bb/desktop:test:      ↓ preserves the macOS better-sqlite3 prebuild-install arguments
+@bb/desktop:test:      ↓ installs native plugin build packages for arm64 and x64
+@bb/desktop:test:      ↓ disables in-place native rebuilds so the shared pnpm store is not mutated
+@bb/desktop:test:      ↓ excludes source maps from packaged app files
+@bb/desktop:test:      ↓ copies the app scaffold template as a dedicated file set
+@bb/desktop:test:      ↓ patches packaged node-pty helper path handling
+@bb/desktop:test:      × validates bundled N-API SQLite without using the legacy prebuild installer 168ms
+@bb/desktop:test:      ↓ points mac signing entitlements at checked-in plist files
+@bb/desktop:test:      ↓ packages macOS artifacts for arm64 only
+@bb/desktop:test:      ↓ packages a Linux AppImage for x64
+@bb/desktop:test:      ↓ grants audio input to the signed app and helper processes
+@bb/desktop:test:      ↓ permits computer-use cleanup Apple Events from the signed app
+@bb/desktop:test:      ↓ includes the usage description required for macOS Automation permission
+@bb/desktop:test:      ↓ keeps the updater provider pointed at desktop-latest release assets
+@bb/desktop:test:      ↓ creates a separate nightly app identity and update feed
+@bb/desktop:test:      ↓ rejects unknown desktop release channels
+@bb/desktop:test:      ↓ signs local builds via keychain auto-discovery when signing secrets are absent
+@bb/desktop:test:      ↓ keeps builds unsigned when keychain auto-discovery is explicitly disabled
+@bb/desktop:test:      ↓ rejects partial signing secret sets
+@bb/desktop:test:      ↓ enables app signing and notarization when signing and Apple credentials are complete
+@bb/desktop:test: 
+@bb/desktop:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+@bb/desktop:test: 
+@bb/desktop:test:  FAIL  |@bb/desktop| test/electron-builder-config.test.ts &gt; electron-builder signing config &gt; validates bundled N-API SQLite without using the legacy prebuild installer
+@bb/desktop:test: AssertionError: expected 'Error: Command failed: /tmp/TEST_ARTIFACT to be '' // Object.is equality
+@bb/desktop:test: 
+@bb/desktop:test: - Expected
+@bb/desktop:test: + Received
+@bb/desktop:test: 
+@bb/desktop:test: + Error: Command failed: CHECKOUT_B/node_modules/.pnpm/electron@44.10.2/node_modules/electron/dist/electron -e const Database = require(process.argv[1]); const db = new Database(':memory:'); if (db.prepare('SELECT 1 AS value').get().value !== 1) throw new Error('SQLite verification failed'); db.close(); /tmp/TEST_ARTIFACT
+@bb/desktop:test: + CHECKOUT_B/node_modules/.pnpm/electron@44.10.2/node_modules/electron/dist/electron: error while loading shared libraries: libglib-2.0.so.0: cannot open shared object file: No such file or directory
+@bb/desktop:test: +
+@bb/desktop:test: +     at genericNodeError (node:internal/errors:983:15)
+@bb/desktop:test: +     at wrappedFn (node:internal/errors:537:14)
+@bb/desktop:test: +     at checkExecSyncError (node:child_process:915:11)
+@bb/desktop:test: +     at execFileSync (node:child_process:951:15)
+@bb/desktop:test: +     at verify (CHECKOUT_B/apps/desktop/scripts/prepare-native-modules.cjs:197:5)
+@bb/desktop:test: +     at prepareBetterSqlite3PackageDirectory (CHECKOUT_B/apps/desktop/scripts/prepare-native-modules.cjs:212:7)
+@bb/desktop:test: +     at async Promise.all (index 0)
+@bb/desktop:test: +     at async preparePackagedNativeModules (CHECKOUT_B/apps/desktop/scripts/prepare-native-modules.cjs:314:3)
+@bb/desktop:test: +     at async main (CHECKOUT_B/apps/desktop/scripts/prepare-native-modules.cjs:441:3)
+@bb/desktop:test: +
+@bb/desktop:test: 
+@bb/desktop:test:  ❯ test/electron-builder-config.test.ts:482:29
+@bb/desktop:test:     480|         &quot;--electron-version=44.10.2&quot;,
+@bb/desktop:test:     481|       ]);
+@bb/desktop:test:     482|       expect(result.stderr).toBe(&quot;&quot;);
+@bb/desktop:test:        |                             ^
+@bb/desktop:test:     483|       expect(result.exitCode).toBe(0);
+@bb/desktop:test:     484|       const binaryPath = resolve(
+@bb/desktop:test: 
+@bb/desktop:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+@bb/desktop:test: 
+@bb/desktop:test: 
+@bb/desktop:test:  Test Files  1 failed (1)
+@bb/desktop:test:       Tests  1 failed | 24 skipped (25)
+@bb/desktop:test:    Start at  17:52:12
+@bb/desktop:test:    Duration  1.46s (transform 890ms, setup 0ms, import 1.10s, tests 170ms, environment 0ms)
+@bb/desktop:test: 
+@bb/desktop:test:  ELIFECYCLE  Test failed. See above for more details.
+@bb/desktop#test:  ERROR  command (CHECKOUT_B/apps/desktop) /usr/local/bin/pnpm run test test/electron-builder-config.test.ts -t validates bundled N-API SQLite exited (1)
+
+ Tasks:    4 successful, 5 total
+Cached:    0 cached, 5 total
+  Time:    3.05s 
+Failed:    @bb/desktop#test
+
+ ERROR  run failed: command  exited (1)
+</pre></details>
+<details><summary>build.log</summary><pre>
+   • turbo 2.11.10
+   • Packages in scope: @bb/agent-runtime, @bb/ai-gateway, @bb/app, @bb/async-cache, @bb/bundled-plugins, @bb/cli, @bb/client-core, @bb/config, @bb/connect, @bb/connect-client, @bb/connect-db, @bb/connect-db-pg, @bb/core-ui, @bb/db, @bb/demo-server, @bb/desktop, @bb/desktop-contract, @bb/domain, @bb/file-transfer, @bb/fuzzy-match, @bb/hono-typed-routes, @bb/host-daemon, @bb/host-daemon-contract, @bb/host-watcher, @bb/host-workspace, @bb/integration-tests, @bb/local-open-targets, @bb/logger, @bb/mobile, @bb/mobile-bridge, @bb/plugin-build, @bb/plugin-registry, @bb/process-utils, @bb/provider-bridge-acp, @bb/provider-bridge-protocol, @bb/provider-parity, @bb/qa, @bb/query-tags, @bb/render-invariants, @bb/scripts, @bb/sdk, @bb/secret-storage, @bb/server, @bb/server-archive, @bb/server-contract, @bb/shared-ui, @bb/skill-index, @bb/templates, @bb/test-helpers, @bb/text-utils, @bb/thread-view, @bb/tsconfig, @bb/tunnel-client, @bb/tunnel-contract, @bb/web, @get-bb/plugin-sdk, bb-app, bb-environment-provider-host, bb-plugin-account-pool, bb-plugin-agent-annotations, bb-plugin-agent-enrichment, bb-plugin-ask-user-question, bb-plugin-automations, bb-plugin-bb--composer, bb-plugin-bb--git, bb-plugin-bb--github-pr-status, bb-plugin-bb--github-star, bb-plugin-bb--mcp, bb-plugin-bb--prompt-library, bb-plugin-bb--provider-usage, bb-plugin-bb--server-switcher, bb-plugin-bb--storage-retention, bb-plugin-bb--tailscale, bb-plugin-bb-account, bb-plugin-bb-ai, bb-plugin-bb-guide, bb-plugin-browser-automation, bb-plugin-composer-customization, bb-plugin-concurrency-limit, bb-plugin-conductor, bb-plugin-connect, bb-plugin-content-script-example, bb-plugin-custom-instructions, bb-plugin-drafts, bb-plugin-echo-provider, bb-plugin-environment-git-worktree, bb-plugin-environment-modal-sandbox, bb-plugin-environment-personal-workspace, bb-plugin-environment-project-checkout, bb-plugin-github, bb-plugin-inline-vis, bb-plugin-keep-awake, bb-plugin-memory, bb-plugin-monaco-editor, bb-plugin-navigation, bb-plugin-pdf-preview, bb-plugin-plugin-api-docs, bb-plugin-plugin-api-tester, bb-plugin-provider-acp, bb-plugin-provider-claude-code, bb-plugin-provider-codex, bb-plugin-provider-pi, bb-plugin-provider-retry, bb-plugin-push-notifications, bb-plugin-replacement-lab-alpha, bb-plugin-replacement-lab-beta, bb-plugin-scheduled-send, bb-plugin-scripted-echo-provider, bb-plugin-secrets, bb-plugin-side-chat, bb-plugin-simple-notes, bb-plugin-slack-bot, bb-plugin-tasks, bb-plugin-theme-preview, bb-plugin-thread-chat-demo, bb-plugin-thread-list, bb-plugin-workflows
+   • Running build in 117 packages
+   • Remote caching disabled
+
+@bb/templates:generate:templates: cache hit, replaying logs 91caca3dc3194f67
+@bb/templates:generate:templates: 
+@bb/templates:generate:templates: &gt; @bb/templates@0.0.1 generate:templates CHECKOUT_A/packages/templates
+@bb/templates:generate:templates: &gt; node ./scripts/generate-templates.mjs
+@bb/templates:generate:templates: 
+@bb/plugin-build:generate: cache hit, replaying logs 793b8f156b12f1b0
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: &gt; @bb/plugin-build@0.0.1 generate CHECKOUT_A/packages/plugin-build
+@bb/plugin-build:generate: &gt; node ./scripts/generate-plugin-theme.mjs &amp;&amp; node ./scripts/generate-runtime-export-manifest.mjs
+@bb/plugin-build:generate: 
+@bb/plugin-build:generate: wrote packages/plugin-build/src/generated/plugin-theme.generated.ts
+@bb/plugin-build:generate: wrote packages/plugin-build/src/generated/host-tailwind.css
+@bb/plugin-build:generate: wrote packages/plugin-build/src/generated/host-tailwind-version.ts
+@bb/plugin-build:generate: wrote CHECKOUT_A/packages/plugin-build/src/generated/runtime-export-manifest.generated.ts (react@19.3.1)
+@bb/process-utils:generate:profile-worker: cache hit, replaying logs c43b040cacf9642e
+bb-plugin-bb-guide:generate:api-index: cache hit, replaying logs 45d798b7516539c0
+@bb/process-utils:generate:profile-worker: 
+@bb/process-utils:generate:profile-worker: &gt; @bb/process-utils@0.0.1 generate:profile-worker CHECKOUT_A/packages/process-utils
+@bb/process-utils:generate:profile-worker: &gt; node scripts/generate-profile-worker.mjs
+@bb/process-utils:generate:profile-worker: 
+bb-plugin-bb-guide:generate:api-index: 
+bb-plugin-bb-guide:generate:api-index: &gt; bb-plugin-bb-guide@0.1.0 generate:api-index CHECKOUT_A/plugins/bb-guide
+bb-plugin-bb-guide:generate:api-index: &gt; node ../../packages/plugin-sdk/scripts/generate-api-index.mjs skills/bb-plugin-authoring/references
+bb-plugin-bb-guide:generate:api-index: 
+bb-plugin-bb-guide:generate:api-index: Wrote skills/bb-plugin-authoring/references/frontend-api-index.md
+bb-plugin-bb-guide:generate:api-index: Wrote skills/bb-plugin-authoring/references/backend-api-index.md
+bb-plugin-bb-guide:generate:api-index: Wrote skills/bb-plugin-authoring/references/frontend-testing-api-index.md
+bb-plugin-bb-guide:generate:api-index: Wrote skills/bb-plugin-authoring/references/provider-bridge-api-index.md
+@bb/server:generate:bb-official-marketplace: cache hit, replaying logs a2669871f4981f08
+@bb/templates:generate:plugin-scaffold: cache hit, replaying logs 4f471c06e08c9620
+@bb/templates:generate:plugin-scaffold: 
+@bb/templates:generate:plugin-scaffold: &gt; @bb/templates@0.0.1 generate:plugin-scaffold CHECKOUT_A/packages/templates
+@bb/templates:generate:plugin-scaffold: &gt; node ./scripts/generate-plugin-scaffold.mjs
+@bb/templates:generate:plugin-scaffold: 
+@bb/server:generate:bb-official-marketplace: 
+@bb/server:generate:bb-official-marketplace: &gt; @bb/server@0.0.1 generate:bb-official-marketplace CHECKOUT_A/apps/server
+@bb/server:generate:bb-official-marketplace: &gt; node --conditions=source --import tsx scripts/generate-bb-official-marketplace.ts
+@bb/server:generate:bb-official-marketplace: 
+@bb/plugin-build:build: cache miss, executing 097a212e2ccc1d9c
+bb-plugin-simple-notes:build: cache miss, executing d15f90c5217dc0b3
+bb-plugin-github:build: cache miss, executing e5b7605f38fa102c
+@bb/web:build: cache miss, executing 04e84716fe0768b0
+@bb/server:build: cache miss, executing 1e6df67b9cbfc64d
+bb-plugin-memory:build: cache miss, executing dfe5a255801ec3aa
+@get-bb/plugin-sdk:build: cache hit, replaying logs facbad0b8cd0d356
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build: &gt; @get-bb/plugin-sdk@0.6.202 build CHECKOUT_A/packages/plugin-sdk
+@get-bb/plugin-sdk:build: &gt; node scripts/build-runtime.mjs
+@get-bb/plugin-sdk:build: 
+@get-bb/plugin-sdk:build: Built 25 @get-bb/plugin-sdk runtime entries.
+@bb/scripts:build: cache hit, replaying logs da5eb79f33431eec
+@bb/scripts:build: 
+@bb/scripts:build: &gt; @bb/scripts@0.0.1 build CHECKOUT_A/packages/scripts
+@bb/scripts:build: &gt; node ../../scripts/build-package.mjs
+@bb/scripts:build: 
+@bb/scripts:build: @bb/scripts: built 4 entries
+@bb/sdk:build: cache hit, replaying logs dda2e18a2c4598d8
+@bb/sdk:build: 
+@bb/sdk:build: &gt; @bb/sdk@0.0.1 build CHECKOUT_A/packages/sdk
+@bb/sdk:build: &gt; node ../../scripts/build-package.mjs
+@bb/sdk:build: 
+@bb/sdk:build: @bb/sdk: built 5 entries
+@bb/cli:build: cache miss, executing 7bf1dce38a631738
+@get-bb/plugin-sdk:build:types: cache hit, replaying logs 6c2dcd4f454bbfcd
+@get-bb/plugin-sdk:build:types: 
+@get-bb/plugin-sdk:build:types: &gt; @get-bb/plugin-sdk@0.6.202 build:types CHECKOUT_A/packages/plugin-sdk
+@get-bb/plugin-sdk:build:types: &gt; node --max-semi-space-size=128 --max-old-space-size=4096 scripts/build-bundled-dts.mjs
+@get-bb/plugin-sdk:build:types: 
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: [build-bundled-dts] UNRESOLVED_IMPORT: &quot;child_process&quot; is imported by &quot;../process-utils/src/host-process.d.ts&quot;, but could not be resolved – treating it as an external dependency.
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-provider-bridge.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-provider-bridge-testing.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-provider-bridge-acp.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-provider-bridge-acp-next.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-environment-provider.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-machine-provider.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-app.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-host.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-internal-composer-customization-validation.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-internal-composer-handle.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-internal-composer-view.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-internal-thread-status.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-internal-thread-event-gate.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-internal-file-navigation-validation.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-internal-host-policy.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-internal-plugin-app-collector.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-testing.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-testing-app.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-testing-host.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-internal-rpc-tags.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-internal-rpc-query-host.d.ts
+@get-bb/plugin-sdk:build:types: Wrote bundled-types/bb-plugin-sdk-process.d.ts
+@bb/host-daemon:build: cache miss, executing 22ba690a66c54f3a
+@bb/app:build: cache miss, executing 5e07416622db619d
+bb-plugin-tasks:build: cache miss, executing bd72667eb619b7d6
+bb-plugin-simple-notes:build: 
+bb-plugin-simple-notes:build: &gt; bb-plugin-simple-notes@0.2.3 build CHECKOUT_A/plugins/docs
+bb-plugin-simple-notes:build: &gt; node --conditions=source --import tsx ../../scripts/build-official-plugins.mjs docs
+bb-plugin-simple-notes:build: 
+@bb/plugin-build:build: 
+@bb/plugin-build:build: &gt; @bb/plugin-build@0.0.1 build CHECKOUT_A/packages/plugin-build
+@bb/plugin-build:build: &gt; node ../../scripts/build-node-entry.mjs src/cli.ts dist/cli.js --clean-dist
+@bb/plugin-build:build: 
+@bb/web:build: 
+@bb/web:build: &gt; @bb/web@0.0.1 build CHECKOUT_A/apps/web
+@bb/web:build: &gt; vite build
+@bb/web:build: 
+bb-plugin-github:build: 
+bb-plugin-github:build: &gt; bb-plugin-github@0.2.1 build CHECKOUT_A/plugins/github
+bb-plugin-github:build: &gt; node --conditions=source --import tsx ../../scripts/build-official-plugins.mjs github
+bb-plugin-github:build: 
+@bb/server:build: 
+@bb/server:build: &gt; @bb/server@0.0.1 build CHECKOUT_A/apps/server
+@bb/server:build: &gt; node ../../scripts/build-node-entry.mjs src/index.ts dist/index.js --clean-dist --external ./start-server.js --copy-dir ../../packages/db/drizzle dist/drizzle --copy-dir src/assets dist/assets &amp;&amp; node --import tsx scripts/copy-builtin-skills.ts &amp;&amp; node ../../scripts/build-node-entry.mjs src/start-server.ts dist/start-server.js &amp;&amp; node ../../scripts/build-node-entry.mjs ../../packages/plugin-sdk/src/index.ts dist/plugin-sdk-runtime.js &amp;&amp; node ../../scripts/build-node-entry.mjs src/services/plugins/zod-runtime.ts dist/zod-runtime.js
+@bb/server:build: 
+bb-plugin-tasks:build: 
+bb-plugin-tasks:build: &gt; bb-plugin-tasks@0.1.2 build CHECKOUT_A/plugins/tasks
+bb-plugin-tasks:build: &gt; node --conditions=source --import tsx ../../scripts/build-official-plugins.mjs tasks
+bb-plugin-tasks:build: 
+@bb/host-daemon:build: 
+@bb/host-daemon:build: &gt; @bb/host-daemon@0.0.1 build CHECKOUT_A/apps/host-daemon
+@bb/host-daemon:build: &gt; node ../../scripts/build-node-entry.mjs src/index.ts dist/index.js --clean-dist --external ./start-host-daemon.js &amp;&amp; node ../../scripts/build-node-entry.mjs src/start-host-daemon.ts dist/start-host-daemon.js &amp;&amp; node ../../scripts/build-node-entry.mjs src/plugin-host-worker.ts dist/plugin-host-worker.js &amp;&amp; node ./scripts/build-bundles.mjs
+@bb/host-daemon:build: 
+bb-plugin-memory:build: 
+bb-plugin-memory:build: &gt; bb-plugin-memory@0.2.0 build CHECKOUT_A/plugins/memory
+bb-plugin-memory:build: &gt; node --conditions=source --import tsx ../../scripts/build-official-plugins.mjs memory
+bb-plugin-memory:build: 
+@bb/app:build: 
+@bb/app:build: &gt; @bb/app@0.0.1 build CHECKOUT_A/apps/app
+@bb/app:build: &gt; node scripts/generate-pwa-icons.mjs &amp;&amp; vite build --logLevel warn &amp;&amp; node ../../scripts/precompress-app-dist.mjs dist
+@bb/app:build: 
+@bb/cli:build: 
+@bb/cli:build: &gt; @bb/cli@0.0.1 build CHECKOUT_A/apps/cli
+@bb/cli:build: &gt; node ../../scripts/build-node-entry.mjs src/index.ts dist/index.js --clean-dist --split
+@bb/cli:build: 
+bb-plugin-workflows:prepare:bundled: cache miss, executing 562c9f5fb392899f
+bb-plugin-workflows:prepare:bundled: 
+bb-plugin-workflows:prepare:bundled: &gt; bb-plugin-workflows@0.1.0 prepare:bundled CHECKOUT_A/plugins/workflows
+bb-plugin-workflows:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-workflows:prepare:bundled: 
+bb-plugin-account-pool:prepare:bundled: cache miss, executing d9d02f99cd6541f0
+bb-plugin-account-pool:prepare:bundled: 
+bb-plugin-account-pool:prepare:bundled: &gt; bb-plugin-account-pool@0.1.0 prepare:bundled CHECKOUT_A/plugins/account-pool
+bb-plugin-account-pool:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-account-pool:prepare:bundled: 
+bb-plugin-agent-annotations:prepare:bundled: cache miss, executing fb8a650d299c4059
+bb-plugin-memory:build: memory: built CHECKOUT_A/plugins/memory/dist/server.js, CHECKOUT_A/plugins/memory/dist/server.meta.json, CHECKOUT_A/plugins/memory/dist/app.js, CHECKOUT_A/plugins/memory/dist/app.css, CHECKOUT_A/plugins/memory/dist/app.meta.json
+bb-plugin-github:build: github: built CHECKOUT_A/plugins/github/dist/server.js, CHECKOUT_A/plugins/github/dist/server.meta.json, CHECKOUT_A/plugins/github/dist/app.js, CHECKOUT_A/plugins/github/dist/app.css, CHECKOUT_A/plugins/github/dist/app.meta.json
+bb-plugin-environment-project-checkout:prepare:bundled: cache miss, executing 0e9d5d2564a8590d
+bb-plugin-github:prepare:bundled: cache miss, executing d3bbac55ce9fbcee
+bb-plugin-agent-annotations:prepare:bundled: 
+bb-plugin-agent-annotations:prepare:bundled: &gt; bb-plugin-agent-annotations@0.1.0 prepare:bundled CHECKOUT_A/plugins/agent-annotations
+bb-plugin-agent-annotations:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-agent-annotations:prepare:bundled: 
+@bb/host-daemon:build: daemon: 1483965 bytes
+bb-plugin-environment-project-checkout:prepare:bundled: 
+bb-plugin-environment-project-checkout:prepare:bundled: &gt; bb-plugin-environment-project-checkout@0.1.0 prepare:bundled CHECKOUT_A/plugins/environment-project-checkout
+bb-plugin-environment-project-checkout:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-environment-project-checkout:prepare:bundled: 
+@bb/app:build: 
+@bb/app:build:  WARN  advancedChunks option is deprecated, please use codeSplitting instead.
+@bb/app:build: 
+@bb/app:build: `output.advancedChunks.groups[2].name` is a function. Set `output.advancedChunks.groups[2].debugName` so the bundler timing report can identify this group.
+@bb/app:build: `output.advancedChunks.groups[3].name` is a function. Set `output.advancedChunks.groups[3].debugName` so the bundler timing report can identify this group.
+@bb/app:build: `output.advancedChunks.groups[4].name` is a function. Set `output.advancedChunks.groups[4].debugName` so the bundler timing report can identify this group.
+@bb/app:build: `output.advancedChunks.groups[5].name` is a function. Set `output.advancedChunks.groups[5].debugName` so the bundler timing report can identify this group.
+@bb/app:build: `output.advancedChunks.groups[6].name` is a function. Set `output.advancedChunks.groups[6].debugName` so the bundler timing report can identify this group.
+bb-plugin-github:prepare:bundled: 
+bb-plugin-github:prepare:bundled: &gt; bb-plugin-github@0.2.1 prepare:bundled CHECKOUT_A/plugins/github
+bb-plugin-github:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-github:prepare:bundled: 
+@bb/host-daemon:build: provider bridge worker: 25186 bytes
+bb-plugin-simple-notes:build: docs: built CHECKOUT_A/plugins/docs/dist/server.js, CHECKOUT_A/plugins/docs/dist/server.meta.json, CHECKOUT_A/plugins/docs/dist/app.js, CHECKOUT_A/plugins/docs/dist/app.css, CHECKOUT_A/plugins/docs/dist/app.meta.json
+bb-plugin-inline-vis:prepare:bundled: cache miss, executing a0945a75eaaba561
+@bb/host-daemon:build: plugin host worker: 200747 bytes
+bb-plugin-tasks:build: tasks: built CHECKOUT_A/plugins/tasks/dist/server.js, CHECKOUT_A/plugins/tasks/dist/server.meta.json, CHECKOUT_A/plugins/tasks/dist/app.js, CHECKOUT_A/plugins/tasks/dist/app.css, CHECKOUT_A/plugins/tasks/dist/app.meta.json
+bb-plugin-keep-awake:prepare:bundled: cache miss, executing 26b09fea65c0a438
+bb-plugin-memory:prepare:bundled: cache miss, executing fbe2004862013302
+bb-plugin-inline-vis:prepare:bundled: 
+bb-plugin-inline-vis:prepare:bundled: &gt; bb-plugin-inline-vis@0.1.0 prepare:bundled CHECKOUT_A/plugins/inline-vis
+bb-plugin-inline-vis:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-inline-vis:prepare:bundled: 
+bb-plugin-memory:prepare:bundled: 
+bb-plugin-memory:prepare:bundled: &gt; bb-plugin-memory@0.2.0 prepare:bundled CHECKOUT_A/plugins/memory
+bb-plugin-memory:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-memory:prepare:bundled: 
+bb-plugin-keep-awake:prepare:bundled: 
+bb-plugin-keep-awake:prepare:bundled: &gt; bb-plugin-keep-awake@0.1.0 prepare:bundled CHECKOUT_A/plugins/keep-awake
+bb-plugin-keep-awake:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-keep-awake:prepare:bundled: 
+bb-plugin-environment-personal-workspace:prepare:bundled: cache miss, executing 14605f0ad64454e8
+@bb/host-daemon:build: bb cli: 5458 bytes
+@bb/host-daemon:build: parcel watcher child: 2250 bytes
+bb-plugin-secrets:prepare:bundled: cache miss, executing ca79026e1e644256
+bb-plugin-monaco-editor:prepare:bundled: cache miss, executing 431abf1dd9c709c9
+bb-plugin-environment-personal-workspace:prepare:bundled: 
+bb-plugin-environment-personal-workspace:prepare:bundled: &gt; bb-plugin-environment-personal-workspace@0.1.0 prepare:bundled CHECKOUT_A/plugins/environment-personal-workspace
+bb-plugin-environment-personal-workspace:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-environment-personal-workspace:prepare:bundled: 
+bb-plugin-pdf-preview:prepare:bundled: cache miss, executing 23e82bbb0b520cde
+bb-plugin-secrets:prepare:bundled: 
+bb-plugin-secrets:prepare:bundled: &gt; bb-plugin-secrets@0.1.0 prepare:bundled CHECKOUT_A/plugins/secrets
+bb-plugin-secrets:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-secrets:prepare:bundled: 
+bb-plugin-monaco-editor:prepare:bundled: 
+bb-plugin-monaco-editor:prepare:bundled: &gt; bb-plugin-monaco-editor@0.1.0 prepare:bundled CHECKOUT_A/plugins/monaco-editor
+bb-plugin-monaco-editor:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-monaco-editor:prepare:bundled: 
+bb-plugin-thread-list:prepare:bundled: cache miss, executing 832c75f0bde7f5c7
+bb-plugin-navigation:prepare:bundled: cache miss, executing 6417e57dff19ed3d
+bb-plugin-pdf-preview:prepare:bundled: 
+bb-plugin-pdf-preview:prepare:bundled: &gt; bb-plugin-pdf-preview@0.1.0 prepare:bundled CHECKOUT_A/plugins/pdf-preview
+bb-plugin-pdf-preview:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-pdf-preview:prepare:bundled: 
+bb-plugin-thread-list:prepare:bundled: 
+bb-plugin-thread-list:prepare:bundled: &gt; bb-plugin-thread-list@0.1.0 prepare:bundled CHECKOUT_A/plugins/thread-list
+bb-plugin-thread-list:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-thread-list:prepare:bundled: 
+bb-plugin-navigation:prepare:bundled: 
+bb-plugin-navigation:prepare:bundled: &gt; bb-plugin-navigation@0.1.0 prepare:bundled CHECKOUT_A/plugins/navigation
+bb-plugin-navigation:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-navigation:prepare:bundled: 
+bb-plugin-provider-pi:prepare:bundled: cache miss, executing f93d3f2be40e2c40
+bb-plugin-provider-retry:prepare:bundled: cache miss, executing dd84ce1073d68d47
+bb-plugin-push-notifications:prepare:bundled: cache miss, executing 3b7bcf495c353bab
+bb-plugin-provider-pi:prepare:bundled: 
+bb-plugin-provider-pi:prepare:bundled: &gt; bb-plugin-provider-pi@0.1.0 prepare:bundled CHECKOUT_A/plugins/provider-pi
+bb-plugin-provider-pi:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-provider-pi:prepare:bundled: 
+bb-plugin-provider-retry:prepare:bundled: 
+bb-plugin-provider-retry:prepare:bundled: &gt; bb-plugin-provider-retry@0.1.0 prepare:bundled CHECKOUT_A/plugins/provider-retry
+bb-plugin-provider-retry:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-provider-retry:prepare:bundled: 
+bb-plugin-push-notifications:prepare:bundled: 
+bb-plugin-push-notifications:prepare:bundled: &gt; bb-plugin-push-notifications@0.1.0 prepare:bundled CHECKOUT_A/plugins/push-notifications
+bb-plugin-push-notifications:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-push-notifications:prepare:bundled: 
+@bb/web:build: vite v8.3.6 building client environment for production...
+bb-plugin-scheduled-send:prepare:bundled: cache miss, executing fbd3a9dbfe170023
+@bb/web:build: transforming...
+bb-plugin-provider-codex:prepare:bundled: cache miss, executing 5945f598667b013b
+bb-plugin-monaco-editor:prepare:bundled: monaco: built CHECKOUT_A/plugins/.bundled-stage-b8BPqW/dist/monaco (4.70 MB editor + worker)
+bb-plugin-scheduled-send:prepare:bundled: 
+bb-plugin-scheduled-send:prepare:bundled: &gt; bb-plugin-scheduled-send@0.1.0 prepare:bundled CHECKOUT_A/plugins/scheduled-send
+bb-plugin-scheduled-send:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-scheduled-send:prepare:bundled: 
+bb-plugin-bb--github-pr-status:prepare:bundled: cache miss, executing 0c2017f39d00a6cb
+bb-plugin-provider-codex:prepare:bundled: 
+bb-plugin-provider-codex:prepare:bundled: &gt; bb-plugin-provider-codex@0.1.1 prepare:bundled CHECKOUT_A/plugins/provider-codex
+bb-plugin-provider-codex:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-provider-codex:prepare:bundled: 
+bb-plugin-bb--github-pr-status:prepare:bundled: 
+bb-plugin-bb--github-pr-status:prepare:bundled: &gt; bb-plugin-bb--github-pr-status@0.1.0 prepare:bundled CHECKOUT_A/plugins/github-pr-status
+bb-plugin-bb--github-pr-status:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-bb--github-pr-status:prepare:bundled: 
+bb-plugin-plugin-api-docs:prepare:bundled: cache miss, executing 7ab8a3dc6c78d76b
+bb-plugin-side-chat:prepare:bundled: cache miss, executing d770fed9eb3ef8b4
+bb-plugin-plugin-api-docs:prepare:bundled: 
+bb-plugin-plugin-api-docs:prepare:bundled: &gt; bb-plugin-plugin-api-docs@0.1.0 prepare:bundled CHECKOUT_A/plugins/plugin-api-docs
+bb-plugin-plugin-api-docs:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-plugin-api-docs:prepare:bundled: 
+@bb/web:build: ✓ 1191 modules transformed.
+bb-plugin-side-chat:prepare:bundled: 
+bb-plugin-side-chat:prepare:bundled: &gt; bb-plugin-side-chat@0.1.0 prepare:bundled CHECKOUT_A/plugins/side-chat
+bb-plugin-side-chat:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-side-chat:prepare:bundled: 
+bb-plugin-plugin-api-tester:prepare:bundled: cache miss, executing b22590a15791751c
+bb-plugin-simple-notes:prepare:bundled: cache miss, executing e27e6c20e53c38e9
+bb-plugin-plugin-api-tester:prepare:bundled: 
+bb-plugin-plugin-api-tester:prepare:bundled: &gt; bb-plugin-plugin-api-tester@0.1.0 prepare:bundled CHECKOUT_A/plugins/plugin-api-tester
+bb-plugin-plugin-api-tester:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-plugin-api-tester:prepare:bundled: 
+bb-plugin-simple-notes:prepare:bundled: 
+bb-plugin-simple-notes:prepare:bundled: &gt; bb-plugin-simple-notes@0.2.3 prepare:bundled CHECKOUT_A/plugins/docs
+bb-plugin-simple-notes:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-simple-notes:prepare:bundled: 
+@bb/web:build: rendering chunks...
+bb-plugin-provider-acp:prepare:bundled: cache miss, executing dbacdfa26c58f87a
+bb-plugin-tasks:prepare:bundled: cache miss, executing 6a7394779c25b40a
+bb-plugin-provider-claude-code:prepare:bundled: cache miss, executing 72ac6576123a0710
+@bb/web:build: computing gzip size...
+@bb/web:build: dist/client/.assetsignore                                           0.02 kB
+@bb/web:build: dist/client/assets/cursor-B5880gRe.png                              4.29 kB
+@bb/web:build: dist/client/assets/registry-goose-y93b4F4V.svg                      4.86 kB │ gzip:   2.13 kB
+@bb/web:build: dist/client/assets/superset-CKholE2m.png                            5.19 kB
+@bb/web:build: dist/client/assets/conductor-v7Excaaz.png                           5.38 kB
+@bb/web:build: dist/client/assets/registry-sigit-DPmZBS3L.svg                      5.40 kB │ gzip:   2.33 kB
+@bb/web:build: dist/client/assets/scott-sunarto-B12tYAPe.jpg                       5.98 kB
+@bb/web:build: dist/client/assets/chris-banes-Cn6VkJmR.jpg                         6.89 kB
+@bb/web:build: dist/client/assets/david-ondrej-Ct0dcOfA.jpg                        7.40 kB
+@bb/web:build: dist/client/assets/bb-logo-BA9hTSLL.svg                             8.00 kB │ gzip:   2.28 kB
+@bb/web:build: dist/client/assets/meta-B2grV-lW.svg                                8.91 kB │ gzip:   2.98 kB
+@bb/web:build: dist/client/assets/registry-autohand-bkvwPcbN.svg                   8.96 kB │ gzip:   1.92 kB
+@bb/web:build: dist/client/assets/ben-tossell-CaLjAWvA.jpg                         9.22 kB
+@bb/web:build: dist/client/assets/alana-goyal-CzG_3JNX.jpg                        10.16 kB
+@bb/web:build: dist/client/assets/inter-vietnamese-wght-normal-CBcvBZtf.woff2     10.25 kB
+@bb/web:build: dist/client/assets/inter-vietnamese-wght-italic-K3WlGtc8.woff2     10.59 kB
+@bb/web:build: dist/client/assets/inter-greek-ext-wght-normal-DlzME5K_.woff2      11.23 kB
+@bb/web:build: dist/client/assets/rob-haisfield-B5-BZ9ZJ.jpg                      11.37 kB
+@bb/web:build: dist/client/assets/tobi-lutke-CNPLW13p.jpg                         11.83 kB
+@bb/web:build: dist/client/assets/inter-greek-ext-wght-italic-DcOpz6Lw.woff2      12.09 kB
+@bb/web:build: dist/client/assets/registry-fast-agent-C0GPnwYP.svg                13.58 kB │ gzip:   1.14 kB
+@bb/web:build: dist/client/assets/bb-icon-dark-CL0vkmJf.png                       15.13 kB
+@bb/web:build: dist/client/assets/bb-icon-EIIi112a.png                            15.99 kB
+@bb/web:build: dist/client/assets/vibe-kanban-CzP5CWnN.png                        18.29 kB
+@bb/web:build: dist/client/assets/t3-code-fc0RTlyJ.png                            18.61 kB
+@bb/web:build: dist/client/assets/inter-cyrillic-wght-normal-DqGufNeO.woff2       18.74 kB
+@bb/web:build: dist/client/assets/inter-greek-wght-normal-CkhJZR-_.woff2          18.99 kB
+@bb/web:build: dist/client/assets/hermes-agent-joUCstwe.svg                       19.72 kB │ gzip:   8.64 kB
+@bb/web:build: dist/client/assets/inter-cyrillic-wght-italic-DzZdc28x.woff2       19.98 kB
+@bb/web:build: dist/client/assets/inter-greek-wght-italic-CILZdfAp.woff2          20.48 kB
+@bb/web:build: dist/client/assets/inter-cyrillic-ext-wght-normal-BOeWTOD4.woff2   25.96 kB
+@bb/web:build: dist/client/assets/inter-cyrillic-ext-wght-italic-B5xAaiFk.woff2   27.38 kB
+@bb/web:build: dist/client/assets/inter-latin-wght-normal-Dx4kXJAl.woff2          48.25 kB
+@bb/web:build: dist/client/assets/inter-latin-wght-italic-DpCbqKDY.woff2          51.83 kB
+@bb/web:build: dist/client/assets/inter-latin-ext-wght-normal-DO1Apj_S.woff2      85.06 kB
+@bb/web:build: dist/client/assets/inter-latin-ext-wght-italic-0pjOp8NU.woff2      91.90 kB
+@bb/web:build: dist/client/assets/brand-ZI_Fo13Q.css                               0.89 kB │ gzip:   0.44 kB
+@bb/web:build: dist/client/assets/changelog-BwJY-FGN.css                           4.17 kB │ gzip:   1.30 kB
+@bb/web:build: dist/client/assets/blog-lcHXLIJX.css                                6.19 kB │ gzip:   1.70 kB
+@bb/web:build: dist/client/assets/guides-Bmhopm8T.css                             19.13 kB │ gzip:   4.14 kB
+@bb/web:build: dist/client/assets/marketplace-DPo7bo2V.css                        21.59 kB │ gzip:   4.35 kB
+@bb/web:build: dist/client/assets/hero-window-DnXnDiAc.css                        33.47 kB │ gzip:   6.74 kB
+@bb/web:build: dist/client/assets/styles-BTwds4MY.css                             35.42 kB │ gzip:   7.15 kB
+@bb/web:build: dist/client/assets/compare-Ea9WTEAA.css                            38.67 kB │ gzip:   7.67 kB
+@bb/web:build: dist/client/assets/plugin-guide-HI3oSjtR.css                       56.03 kB │ gzip:   9.89 kB
+@bb/web:build: dist/client/assets/landing-Dg5BASBm.css                            84.40 kB │ gzip:  17.83 kB
+@bb/web:build: dist/client/assets/blog-CnGUpuk6.js                                 0.04 kB │ gzip:   0.06 kB
+@bb/web:build: dist/client/assets/plugin-guide-ZQ7yuo_y.js                         0.05 kB │ gzip:   0.07 kB
+@bb/web:build: dist/client/assets/marketplace_-CN5R0LX_.js                         0.09 kB │ gzip:   0.10 kB
+@bb/web:build: dist/client/assets/not-found-i5RsCZif.js                            0.11 kB │ gzip:   0.11 kB
+@bb/web:build: dist/client/assets/ime-keyboard-CkMNhzHg.js                         0.14 kB │ gzip:   0.13 kB
+@bb/web:build: dist/client/assets/MinusSignIcon-DGIm2EHe.js                        0.14 kB │ gzip:   0.13 kB
+@bb/web:build: dist/client/assets/PlusSignIcon-CwG3nxfu.js                         0.14 kB │ gzip:   0.13 kB
+@bb/web:build: dist/client/assets/ArrowLeft01Icon-BJdQ1Oac.js                      0.19 kB │ gzip:   0.16 kB
+@bb/web:build: dist/client/assets/landing-route-data-_-A3eseA.js                   0.19 kB │ gzip:   0.17 kB
+@bb/web:build: dist/client/assets/download.index-Cpi-hPdb.js                       0.20 kB │ gzip:   0.17 kB
+@bb/web:build: dist/client/assets/Clock01Icon-Caopc-kj.js                          0.23 kB │ gzip:   0.16 kB
+@bb/web:build: dist/client/assets/compare-route-data-71eefcuU.js                   0.23 kB │ gzip:   0.18 kB
+@bb/web:build: dist/client/assets/ArrowUpRight01Icon-C9pA22LI.js                   0.24 kB │ gzip:   0.18 kB
+@bb/web:build: dist/client/assets/guides._slug-DgNkG50o.js                         0.30 kB │ gzip:   0.24 kB
+@bb/web:build: dist/client/assets/_slug-B5e7k7UN.js                                0.30 kB │ gzip:   0.24 kB
+@bb/web:build: dist/client/assets/compare._slug-kPnU-uRS.js                        0.34 kB │ gzip:   0.25 kB
+@bb/web:build: dist/client/assets/ArrowTurnForwardIcon-BrYZ2cGg.js                 0.36 kB │ gzip:   0.20 kB
+@bb/web:build: dist/client/assets/connect-return-to-BsbPywoP.js                    0.39 kB │ gzip:   0.26 kB
+@bb/web:build: dist/client/assets/page-head-DvI7yH7T.js                            0.40 kB │ gzip:   0.28 kB
+@bb/web:build: dist/client/assets/marketplace_._pluginId-B7RxbnTB.js               0.43 kB │ gzip:   0.29 kB
+@bb/web:build: dist/client/assets/marketplace_.author._github-C-4c_in1.js          0.57 kB │ gzip:   0.36 kB
+@bb/web:build: dist/client/assets/LaptopIcon-bfM_4rhY.js                           0.58 kB │ gzip:   0.29 kB
+@bb/web:build: dist/client/assets/ArrowRight01Icon-mNpbAGs_.js                     0.68 kB │ gzip:   0.26 kB
+@bb/web:build: dist/client/assets/MoreHorizontalIcon-CBUy2huH.js                   0.72 kB │ gzip:   0.28 kB
+@bb/web:build: dist/client/assets/marketplace_-BBKJkhed.js                         0.79 kB │ gzip:   0.44 kB
+@bb/web:build: dist/client/assets/Mail01Icon-qGLuNJQs.js                           0.86 kB │ gzip:   0.41 kB
+@bb/web:build: dist/client/assets/Loading03Icon-BcN5iSGp.js                        0.87 kB │ gzip:   0.22 kB
+@bb/web:build: dist/client/assets/Copy01Icon-DrPxamgF.js                           0.88 kB │ gzip:   0.36 kB
+@bb/web:build: dist/client/assets/plugin-guide-CsoBHXG_.js                         0.99 kB │ gzip:   0.52 kB
+@bb/web:build: dist/client/assets/blog_._slug-Dr79IZZd.js                          1.03 kB │ gzip:   0.51 kB
+@bb/web:build: dist/client/assets/PlayIcon-d76b5Amh.js                             1.17 kB │ gzip:   0.51 kB
+@bb/web:build: dist/client/assets/GithubIcon-BdENgktT.js                           1.28 kB │ gzip:   0.59 kB
+@bb/web:build: dist/client/assets/brand-DPBbfibN.js                                1.29 kB │ gzip:   0.56 kB
+@bb/web:build: dist/client/assets/command-button-CVED9wAM.js                       1.41 kB │ gzip:   0.75 kB
+@bb/web:build: dist/client/assets/blog-Df1q4717.js                                 1.46 kB │ gzip:   0.64 kB
+@bb/web:build: dist/client/assets/FilterHorizontalIcon-BD-jVvJt.js                 1.53 kB │ gzip:   0.51 kB
+@bb/web:build: dist/client/assets/preload-helper-7y9sWmk5.js                       1.61 kB │ gzip:   0.82 kB
+@bb/web:build: dist/client/assets/marketplace-route-data-D10bjlR3.js               1.64 kB │ gzip:   0.84 kB
+@bb/web:build: dist/client/assets/changelog-inline-CpcdJukZ.js                     1.80 kB │ gzip:   0.85 kB
+@bb/web:build: dist/client/assets/lazy-plugin-guide-DI1KKorU.js                    1.86 kB │ gzip:   0.95 kB
+@bb/web:build: dist/client/assets/fns-6L0nkXr5.js                                  1.91 kB │ gzip:   0.92 kB
+@bb/web:build: dist/client/assets/LockIcon-BqrMZ2JK.js                             2.06 kB │ gzip:   0.64 kB
+@bb/web:build: dist/client/assets/lightbox-BNNDOW6Z.js                             2.40 kB │ gzip:   1.04 kB
+@bb/web:build: dist/client/assets/uninstall-C7U5Hgdd.js                            2.48 kB │ gzip:   0.88 kB
+@bb/web:build: dist/client/assets/parse-post-DPHNqGMs.js                           3.11 kB │ gzip:   1.46 kB
+@bb/web:build: dist/client/assets/SquareIcon-Ck5X1X96.js                           3.27 kB │ gzip:   1.07 kB
+@bb/web:build: dist/client/assets/changelog-JoL3fO0E.js                            3.47 kB │ gzip:   1.20 kB
+@bb/web:build: dist/client/assets/oauth.authorize-CSiHWbBb.js                      4.52 kB │ gzip:   1.70 kB
+@bb/web:build: dist/client/assets/post-body-XBAjRp-u.js                            4.94 kB │ gzip:   1.77 kB
+@bb/web:build: dist/client/assets/UserIcon-B8viC0wM.js                             5.03 kB │ gzip:   1.50 kB
+@bb/web:build: dist/client/assets/landing-template-BKrBymLZ.js                     6.36 kB │ gzip:   2.50 kB
+@bb/web:build: dist/client/assets/SidebarLeftIcon-DZR73ZoC.js                      6.82 kB │ gzip:   2.17 kB
+@bb/web:build: dist/client/assets/Layers01Icon-B8Af82fd.js                         7.59 kB │ gzip:   2.04 kB
+@bb/web:build: dist/client/assets/shared-resize-observer-CaFnrAkW.js               7.93 kB │ gzip:   2.93 kB
+@bb/web:build: dist/client/assets/privacy-BnHVZAsd.js                              9.36 kB │ gzip:   3.41 kB
+@bb/web:build: dist/client/assets/link-DAEIp5fH.js                                 9.53 kB │ gzip:   3.27 kB
+@bb/web:build: dist/client/assets/HugeiconsIcon-W4-erZsd.js                        9.75 kB │ gzip:   3.80 kB
+@bb/web:build: dist/client/assets/compare-content-CQI_3c26.js                      9.93 kB │ gzip:   3.74 kB
+@bb/web:build: dist/client/assets/posts-CuUqx80G.js                               12.63 kB │ gzip:   5.29 kB
+@bb/web:build: dist/client/assets/ZoomInAreaIcon-DUtsR-yI.js                      16.70 kB │ gzip:   4.86 kB
+@bb/web:build: dist/client/assets/site-chrome-DGF04qnL.js                         16.79 kB │ gzip:   5.77 kB
+@bb/web:build: dist/client/assets/dashboard-B0Dabx_y.js                           19.40 kB │ gzip:   5.96 kB
+@bb/web:build: dist/client/assets/utils-CrqvL5p7.js                               27.57 kB │ gzip:   8.73 kB
+@bb/web:build: dist/client/assets/comparisons-CkLKgAMB.js                         31.17 kB │ gzip:   8.57 kB
+@bb/web:build: dist/client/assets/icons-BA4p0Zwv.js                               35.51 kB │ gzip:  15.19 kB
+@bb/web:build: dist/client/assets/createServerFn-CFXCHukH.js                      36.01 kB │ gzip:  12.43 kB
+@bb/web:build: dist/client/assets/compare-page-Bpeu_EgJ.js                        41.95 kB │ gzip:  10.27 kB
+@bb/web:build: dist/client/assets/hero-window-stage-BKBO8oBS.js                   48.34 kB │ gzip:  15.21 kB
+@bb/web:build: dist/client/assets/connect-ui-BziQDi0B.js                          55.12 kB │ gzip:  14.91 kB
+@bb/web:build: dist/client/assets/landing-visuals-CMYegh1X.js                     61.21 kB │ gzip:  17.23 kB
+@bb/web:build: dist/client/assets/icon-extended-BoMpWFz7.js                       62.09 kB │ gzip:  16.26 kB
+@bb/web:build: dist/client/assets/lazyRouteComponent-BA1fo8T5.js                  69.86 kB │ gzip:  24.70 kB
+@bb/web:build: dist/client/assets/routes-DIYDhO1W.js                              77.55 kB │ gzip:  43.04 kB
+@bb/web:build: dist/client/assets/bundled-marketplace-elTK5cvb.js                 86.95 kB │ gzip:  25.40 kB
+@bb/web:build: dist/client/assets/guide-page-BBWanp9l.js                         122.17 kB │ gzip:  33.39 kB
+@bb/web:build: dist/client/assets/public-marketplace-Dmo3BVrq.js                 189.48 kB │ gzip:  56.67 kB
+@bb/web:build: dist/client/assets/plugin-guide-Dv12fvnB.js                       355.40 kB │ gzip:  89.82 kB
+@bb/web:build: dist/client/assets/index-C3fH3sey.js                              394.69 kB │ gzip: 127.42 kB
+@bb/web:build: 
+@bb/web:build: ✓ built in 2.75s
+@bb/web:build: vite v8.3.6 building ssr environment for production...
+@bb/web:build: transforming...
+bb-plugin-theme-preview:prepare:bundled: cache miss, executing 60fdcac2eaaf5f40
+bb-plugin-provider-acp:prepare:bundled: 
+bb-plugin-provider-acp:prepare:bundled: &gt; bb-plugin-provider-acp@0.1.0 prepare:bundled CHECKOUT_A/plugins/provider-acp
+bb-plugin-provider-acp:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-provider-acp:prepare:bundled: 
+bb-plugin-drafts:prepare:bundled: cache miss, executing 0c06f38fbd45f482
+bb-plugin-tasks:prepare:bundled: 
+bb-plugin-tasks:prepare:bundled: &gt; bb-plugin-tasks@0.1.2 prepare:bundled CHECKOUT_A/plugins/tasks
+bb-plugin-tasks:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-tasks:prepare:bundled: 
+bb-plugin-provider-claude-code:prepare:bundled: 
+bb-plugin-provider-claude-code:prepare:bundled: &gt; bb-plugin-provider-claude-code@0.1.0 prepare:bundled CHECKOUT_A/plugins/provider-claude-code
+bb-plugin-provider-claude-code:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-provider-claude-code:prepare:bundled: 
+bb-plugin-theme-preview:prepare:bundled: 
+bb-plugin-theme-preview:prepare:bundled: &gt; bb-plugin-theme-preview@0.1.0 prepare:bundled CHECKOUT_A/plugins/theme-preview
+bb-plugin-theme-preview:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-theme-preview:prepare:bundled: 
+bb-plugin-drafts:prepare:bundled: 
+bb-plugin-drafts:prepare:bundled: &gt; bb-plugin-drafts@0.1.0 prepare:bundled CHECKOUT_A/plugins/drafts
+bb-plugin-drafts:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-drafts:prepare:bundled: 
+bb-plugin-bb--storage-retention:prepare:bundled: cache miss, executing e5d91622316e9242
+bb-plugin-bb--storage-retention:prepare:bundled: 
+bb-plugin-bb--storage-retention:prepare:bundled: &gt; bb-plugin-bb--storage-retention@0.1.0 prepare:bundled CHECKOUT_A/plugins/storage-retention
+bb-plugin-bb--storage-retention:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-bb--storage-retention:prepare:bundled: 
+bb-plugin-automations:prepare:bundled: cache miss, executing d344eaa10a9e3fa9
+bb-plugin-automations:prepare:bundled: 
+bb-plugin-automations:prepare:bundled: &gt; bb-plugin-automations@0.1.0 prepare:bundled CHECKOUT_A/plugins/automations
+bb-plugin-automations:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-automations:prepare:bundled: 
+bb-plugin-bb--composer:prepare:bundled: cache miss, executing aa0c001b50d3c411
+bb-plugin-bb--github-star:prepare:bundled: cache miss, executing e11c998ff1285ef7
+bb-plugin-bb--composer:prepare:bundled: 
+bb-plugin-bb--composer:prepare:bundled: &gt; bb-plugin-bb--composer@0.1.0 prepare:bundled CHECKOUT_A/plugins/composer
+bb-plugin-bb--composer:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-bb--composer:prepare:bundled: 
+@bb/web:build: ✓ 1690 modules transformed.
+@bb/web:build: rendering chunks...
+bb-plugin-bb--git:prepare:bundled: cache miss, executing cde199e3eca95978
+bb-plugin-bb--github-star:prepare:bundled: 
+bb-plugin-bb--github-star:prepare:bundled: &gt; bb-plugin-bb--github-star@0.1.0 prepare:bundled CHECKOUT_A/plugins/github-star
+bb-plugin-bb--github-star:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-bb--github-star:prepare:bundled: 
+bb-plugin-bb--mcp:prepare:bundled: cache miss, executing 145fa8506ea5986e
+@bb/web:build: Using secrets defined in process.env
+bb-plugin-bb--git:prepare:bundled: 
+bb-plugin-bb--git:prepare:bundled: &gt; bb-plugin-bb--git@0.1.0 prepare:bundled CHECKOUT_A/plugins/git
+bb-plugin-bb--git:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-bb--git:prepare:bundled: 
+@bb/web:build: ▲ [WARNING] Missing required secrets: GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, BETTER_AUTH_SECRET, LANDING_POSTHOG_KEY, RESEND_API_KEY. Add them to .dev.vars, .env, or set as environment variables.
+@bb/web:build: 
+@bb/web:build: 
+bb-plugin-bb--mcp:prepare:bundled: 
+bb-plugin-bb--mcp:prepare:bundled: &gt; bb-plugin-bb--mcp@0.1.0 prepare:bundled CHECKOUT_A/plugins/mcp
+bb-plugin-bb--mcp:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-bb--mcp:prepare:bundled: 
+bb-plugin-bb-guide:prepare:bundled: cache miss, executing 9e2b96991a912a59
+bb-plugin-bb-ai:prepare:bundled: cache miss, executing 726435d40be7c5ad
+@bb/web:build: computing gzip size...
+bb-plugin-browser-automation:prepare:bundled: cache miss, executing 547cb6685044034d
+@bb/web:build: dist/server/wrangler.json                                                 2.17 kB │ gzip:   1.16 kB
+@bb/web:build: dist/server/assets/cursor-B5880gRe.png                                    4.29 kB
+@bb/web:build: dist/server/assets/registry-goose-y93b4F4V.svg                            4.86 kB │ gzip:   2.13 kB
+@bb/web:build: dist/server/assets/superset-CKholE2m.png                                  5.19 kB
+@bb/web:build: dist/server/assets/conductor-v7Excaaz.png                                 5.38 kB
+@bb/web:build: dist/server/assets/registry-sigit-DPmZBS3L.svg                            5.40 kB │ gzip:   2.33 kB
+@bb/web:build: dist/server/assets/scott-sunarto-B12tYAPe.jpg                             5.98 kB
+@bb/web:build: dist/server/assets/chris-banes-Cn6VkJmR.jpg                               6.89 kB
+@bb/web:build: dist/server/assets/david-ondrej-Ct0dcOfA.jpg                              7.40 kB
+@bb/web:build: dist/server/assets/meta-B2grV-lW.svg                                      8.91 kB │ gzip:   2.98 kB
+@bb/web:build: dist/server/assets/registry-autohand-bkvwPcbN.svg                         8.96 kB │ gzip:   1.92 kB
+@bb/web:build: dist/server/assets/ben-tossell-CaLjAWvA.jpg                               9.22 kB
+@bb/web:build: dist/server/assets/alana-goyal-CzG_3JNX.jpg                              10.16 kB
+@bb/web:build: dist/server/assets/inter-vietnamese-wght-normal-CBcvBZtf.woff2           10.25 kB
+@bb/web:build: dist/server/assets/inter-vietnamese-wght-italic-K3WlGtc8.woff2           10.59 kB
+@bb/web:build: dist/server/assets/inter-greek-ext-wght-normal-DlzME5K_.woff2            11.23 kB
+@bb/web:build: dist/server/assets/rob-haisfield-B5-BZ9ZJ.jpg                            11.37 kB
+@bb/web:build: dist/server/assets/tobi-lutke-CNPLW13p.jpg                               11.83 kB
+@bb/web:build: dist/server/assets/inter-greek-ext-wght-italic-DcOpz6Lw.woff2            12.09 kB
+@bb/web:build: dist/server/assets/registry-fast-agent-C0GPnwYP.svg                      13.58 kB │ gzip:   1.14 kB
+@bb/web:build: dist/server/assets/bb-icon-dark-CL0vkmJf.png                             15.13 kB
+@bb/web:build: dist/server/assets/bb-icon-EIIi112a.png                                  15.99 kB
+@bb/web:build: dist/server/assets/vibe-kanban-CzP5CWnN.png                              18.29 kB
+@bb/web:build: dist/server/assets/t3-code-fc0RTlyJ.png                                  18.61 kB
+@bb/web:build: dist/server/assets/inter-cyrillic-wght-normal-DqGufNeO.woff2             18.74 kB
+@bb/web:build: dist/server/assets/inter-greek-wght-normal-CkhJZR-_.woff2                18.99 kB
+@bb/web:build: dist/server/assets/hermes-agent-joUCstwe.svg                             19.72 kB │ gzip:   8.64 kB
+@bb/web:build: dist/server/assets/inter-cyrillic-wght-italic-DzZdc28x.woff2             19.98 kB
+@bb/web:build: dist/server/assets/inter-greek-wght-italic-CILZdfAp.woff2                20.48 kB
+@bb/web:build: dist/server/assets/inter-cyrillic-ext-wght-normal-BOeWTOD4.woff2         25.96 kB
+@bb/web:build: dist/server/assets/inter-cyrillic-ext-wght-italic-B5xAaiFk.woff2         27.38 kB
+@bb/web:build: dist/server/.vite/manifest.json                                          44.67 kB │ gzip:   5.47 kB
+@bb/web:build: dist/server/assets/inter-latin-wght-normal-Dx4kXJAl.woff2                48.25 kB
+@bb/web:build: dist/server/assets/inter-latin-wght-italic-DpCbqKDY.woff2                51.83 kB
+@bb/web:build: dist/server/assets/yoga-sbSbVeWy.wasm                                    71.73 kB │ gzip:  28.99 kB
+@bb/web:build: dist/server/assets/inter-latin-ext-wght-normal-DO1Apj_S.woff2            85.06 kB
+@bb/web:build: dist/server/assets/inter-latin-ext-wght-italic-0pjOp8NU.woff2            91.90 kB
+@bb/web:build: dist/server/assets/resvg-Blvrv-U2.wasm                                2,478.60 kB │ gzip: 965.21 kB
+@bb/web:build: dist/server/assets/brand-ZI_Fo13Q.css                                     0.89 kB │ gzip:   0.44 kB
+@bb/web:build: dist/server/assets/changelog-BwJY-FGN.css                                 4.17 kB │ gzip:   1.30 kB
+@bb/web:build: dist/server/assets/blog-lcHXLIJX.css                                      6.19 kB │ gzip:   1.70 kB
+@bb/web:build: dist/server/assets/guides-Bmhopm8T.css                                   19.13 kB │ gzip:   4.14 kB
+@bb/web:build: dist/server/assets/marketplace-DPo7bo2V.css                              21.59 kB │ gzip:   4.35 kB
+@bb/web:build: dist/server/assets/hero-window-DnXnDiAc.css                              33.47 kB │ gzip:   6.74 kB
+@bb/web:build: dist/server/assets/styles-BTwds4MY.css                                   35.42 kB │ gzip:   7.15 kB
+@bb/web:build: dist/server/assets/compare-Ea9WTEAA.css                                  38.67 kB │ gzip:   7.67 kB
+@bb/web:build: dist/server/assets/plugin-guide-HI3oSjtR.css                             56.03 kB │ gzip:   9.89 kB
+@bb/web:build: dist/server/assets/landing-Dg5BASBm.css                                  84.40 kB │ gzip:  17.83 kB
+@bb/web:build: dist/server/assets/kysely-adapter-B7O16G38.js                             0.08 kB │ gzip:   0.09 kB
+@bb/web:build: dist/server/assets/blog-DmutS-Tq.js                                       0.14 kB │ gzip:   0.13 kB │ map:     0.52 kB
+@bb/web:build: dist/server/assets/plugin-guide-MN44xx_p.js                               0.19 kB │ gzip:   0.14 kB │ map:     0.59 kB
+@bb/web:build: dist/server/assets/marketplace_-DhBql1FS.js                               0.31 kB │ gzip:   0.20 kB │ map:     3.33 kB
+@bb/web:build: dist/server/assets/start-BDALa4vk.js                                      0.31 kB │ gzip:   0.23 kB │ map:     0.40 kB
+@bb/web:build: dist/server/assets/empty-plugin-adapters-BsRz-CQL.js                      0.32 kB │ gzip:   0.21 kB │ map:     0.55 kB
+@bb/web:build: dist/server/assets/PlusSignIcon-D1zPWTCE.js                               0.37 kB │ gzip:   0.25 kB │ map:     0.63 kB
+@bb/web:build: dist/server/assets/landing-route-data-D2fbPa6k.js                         0.42 kB │ gzip:   0.26 kB │ map:     0.64 kB
+@bb/web:build: dist/server/assets/ArrowLeft01Icon-BHcK9-C9.js                            0.42 kB │ gzip:   0.28 kB │ map:     0.69 kB
+@bb/web:build: dist/server/assets/Clock01Icon-CTuyDR9s.js                                0.47 kB │ gzip:   0.28 kB │ map:     0.82 kB
+@bb/web:build: dist/server/assets/compare-route-data-3qDYNhP7.js                         0.47 kB │ gzip:   0.28 kB │ map:     0.64 kB
+@bb/web:build: dist/server/assets/createServerRpc-CCUCNFTD.js                            0.49 kB │ gzip:   0.32 kB │ map:     0.82 kB
+@bb/web:build: dist/server/assets/download.index-CADWLn2q.js                             0.50 kB │ gzip:   0.31 kB │ map:     1.12 kB
+@bb/web:build: dist/server/assets/guides._slug-BC98Rze_.js                               0.61 kB │ gzip:   0.37 kB │ map:     1.17 kB
+@bb/web:build: dist/server/assets/_slug-DmiaJIgc.js                                      0.64 kB │ gzip:   0.38 kB │ map:     1.19 kB
+@bb/web:build: dist/server/assets/lazy-plugin-guide-DjkcatsA.js                          0.65 kB │ gzip:   0.36 kB │ map:     1.21 kB
+@bb/web:build: dist/server/assets/createSsrRpc-CDf_MzVP.js                               0.69 kB │ gzip:   0.41 kB │ map:     1.11 kB
+@bb/web:build: dist/server/assets/compare._slug-HzxD4lZJ.js                              0.70 kB │ gzip:   0.39 kB │ map:     1.22 kB
+@bb/web:build: dist/server/assets/LaptopIcon-BbWhO0-W.js                                 0.82 kB │ gzip:   0.42 kB │ map:     1.18 kB
+@bb/web:build: dist/server/assets/connect-return-to-C1kILKG3.js                          0.88 kB │ gzip:   0.44 kB │ map:     1.65 kB
+@bb/web:build: dist/server/assets/Search01Icon-B1DMdNL4.js                               0.95 kB │ gzip:   0.36 kB │ map:     1.51 kB
+@bb/web:build: dist/server/assets/MoreHorizontalIcon-CycE_WbJ.js                         0.97 kB │ gzip:   0.42 kB │ map:     1.24 kB
+@bb/web:build: dist/server/assets/not-found-Deaom0h1.js                                  0.98 kB │ gzip:   0.53 kB │ map:     1.30 kB
+@bb/web:build: dist/server/assets/page-head-WQhSNEBY.js                                  0.99 kB │ gzip:   0.49 kB │ map:     2.02 kB
+@bb/web:build: dist/server/assets/marketplace_._pluginId-BLHEedJx.js                     1.04 kB │ gzip:   0.47 kB │ map:     2.88 kB
+@bb/web:build: dist/server/assets/Mail01Icon-D_Z7GjZo.js                                 1.09 kB │ gzip:   0.54 kB │ map:     1.43 kB
+@bb/web:build: dist/server/assets/AppleIcon-D5Y9N6OX.js                                  1.09 kB │ gzip:   0.56 kB │ map:     1.43 kB
+@bb/web:build: dist/server/assets/Loading03Icon-andMq2lA.js                              1.28 kB │ gzip:   0.35 kB │ map:     2.09 kB
+@bb/web:build: dist/server/assets/marketplace_.author._github-Dra57lfA.js                1.30 kB │ gzip:   0.57 kB │ map:     3.24 kB
+@bb/web:build: dist/server/assets/ClientOnly-BFrMj6-c.js                                 1.39 kB │ gzip:   0.70 kB │ map:     1.72 kB
+@bb/web:build: dist/server/assets/send-to-computer-button-DYomcqyl.js                    1.75 kB │ gzip:   0.85 kB │ map:     2.59 kB
+@bb/web:build: dist/server/assets/redirect-3Vy3u2Da.js                                   1.78 kB │ gzip:   0.87 kB │ map:     2.62 kB
+@bb/web:build: dist/server/assets/marketplace_-CZYcan9u.js                               1.81 kB │ gzip:   0.69 kB │ map:     4.43 kB
+@bb/web:build: dist/server/assets/ime-keyboard-pBggpzD8.js                               1.89 kB │ gzip:   0.95 kB │ map:     2.74 kB
+@bb/web:build: dist/server/assets/HugeiconsIcon-IUV04fpb.js                              2.01 kB │ gzip:   0.88 kB │ map:     3.77 kB
+@bb/web:build: dist/server/assets/manifest-KjurXAon.js                                   2.02 kB │ gzip:   0.77 kB │ map:     3.51 kB
+@bb/web:build: dist/server/assets/plugin-guide-ClQsNUDD.js                               2.04 kB │ gzip:   0.76 kB │ map:     3.65 kB
+@bb/web:build: dist/server/assets/blog_._slug-rWZISJTA.js                                2.29 kB │ gzip:   0.81 kB │ map:     4.02 kB
+@bb/web:build: dist/server/assets/command-button-BzeUDuui.js                             2.53 kB │ gzip:   1.03 kB │ map:     4.04 kB
+@bb/web:build: dist/server/assets/brand-BPEpajyd.js                                      2.65 kB │ gzip:   0.82 kB │ map:     4.29 kB
+@bb/web:build: dist/server/assets/WorkflowCircle03Icon-BwEWhkBd.js                       2.84 kB │ gzip:   0.92 kB │ map:     3.71 kB
+@bb/web:build: dist/server/assets/node-sqlite-dialect-BcPJfzXv.js                        3.27 kB │ gzip:   1.15 kB │ map:     5.63 kB
+@bb/web:build: dist/server/assets/bun-sqlite-dialect-DN2jcl8c-DBw8HEXG.js                3.28 kB │ gzip:   1.17 kB │ map:     5.63 kB
+@bb/web:build: dist/server/assets/blog-DAnP9nyA.js                                       3.31 kB │ gzip:   1.01 kB │ map:     4.67 kB
+@bb/web:build: dist/server/assets/marketplace-route-data-auVMCCrU.js                     3.50 kB │ gzip:   1.23 kB │ map:     6.03 kB
+@bb/web:build: dist/server/assets/LockIcon-7Ea84RQ9.js                                   3.62 kB │ gzip:   1.07 kB │ map:     4.72 kB
+@bb/web:build: dist/server/assets/__23tanstack-start-server-fn-resolver-X8RmLlTm.js      3.84 kB │ gzip:   1.31 kB
+@bb/web:build: dist/server/assets/marketplace-server-DTGRZefv.js                         4.03 kB │ gzip:   1.47 kB │ map:     8.47 kB
+@bb/web:build: dist/server/assets/lightbox-B0sAZLtn.js                                   4.21 kB │ gzip:   1.45 kB │ map:     7.01 kB
+@bb/web:build: dist/server/assets/changelog-inline-py1vQYQe.js                           4.30 kB │ gzip:   1.33 kB │ map:     7.81 kB
+@bb/web:build: dist/server/assets/uninstall-CpBN4hmT.js                                  4.77 kB │ gzip:   1.11 kB │ map:     5.80 kB
+@bb/web:build: dist/server/assets/fns-B3M1R3mk.js                                        5.04 kB │ gzip:   1.76 kB │ map:    13.77 kB
+@bb/web:build: dist/server/assets/d1-sqlite-dialect-BgJMzZQp-CK5FWOV7.js                 5.39 kB │ gzip:   1.83 kB │ map:     9.27 kB
+@bb/web:build: dist/server/assets/parse-post-D4FHsfMZ.js                                 5.61 kB │ gzip:   1.96 kB │ map:    11.65 kB
+@bb/web:build: dist/server/assets/react-dom-BMg70-Nd.js                                  7.20 kB │ gzip:   2.08 kB │ map:    13.31 kB
+@bb/web:build: dist/server/assets/changelog-qluSm-Lf.js                                  7.47 kB │ gzip:   1.78 kB │ map:    10.96 kB
+@bb/web:build: dist/server/assets/oauth.authorize-BGP4tj-m.js                            7.91 kB │ gzip:   2.27 kB │ map:    12.71 kB
+@bb/web:build: dist/server/assets/post-body-FxF4vZbs.js                                  8.81 kB │ gzip:   2.24 kB │ map:    13.70 kB
+@bb/web:build: dist/server/assets/_tanstack-start-manifest_v-Dvsb39Yx.js                 9.89 kB │ gzip:   2.00 kB
+@bb/web:build: dist/server/assets/landing-template-DRfZP-eD.js                          10.82 kB │ gzip:   3.41 kB │ map:    16.47 kB
+@bb/web:build: dist/server/assets/Match-AXRrJsOz.js                                     11.70 kB │ gzip:   3.08 kB │ map:    23.70 kB
+@bb/web:build: dist/server/assets/UserIcon-ahiTF_4I.js                                  11.92 kB │ gzip:   3.29 kB │ map:    16.37 kB
+@bb/web:build: dist/server/assets/fns-Dywci2RP.js                                       12.83 kB │ gzip:   3.01 kB │ map:    19.85 kB
+@bb/web:build: dist/server/assets/posts-B5DOL3wZ.js                                     13.07 kB │ gzip:   5.45 kB │ map:     1.26 kB
+@bb/web:build: dist/server/assets/compare-content-Zz4TyBc-.js                           13.19 kB │ gzip:   4.21 kB │ map:    17.47 kB
+@bb/web:build: dist/server/assets/privacy-Dstp_TPh.js                                   13.22 kB │ gzip:   3.76 kB │ map:    16.22 kB
+@bb/web:build: dist/server/assets/dist-D6ignmus.js                                      14.96 kB │ gzip:   4.17 kB │ map:    25.10 kB
+@bb/web:build: dist/server/assets/createServerFn-CBqVa129.js                            15.54 kB │ gzip:   4.74 kB │ map:    35.36 kB
+@bb/web:build: dist/server/assets/link-_QMmYFxa.js                                      16.93 kB │ gzip:   4.35 kB │ map:    29.02 kB
+@bb/web:build: dist/server/assets/internal-request-response-MbP1K7QC.js                 17.85 kB │ gzip:   4.99 kB │ map:    43.62 kB
+@bb/web:build: dist/server/assets/jsx-runtime-VxVrhz9Z.js                               19.66 kB │ gzip:   5.30 kB │ map:    30.77 kB
+@bb/web:build: dist/server/assets/lazyRouteComponent-CY4Sbyif.js                        22.07 kB │ gzip:   5.67 kB │ map:    51.26 kB
+@bb/web:build: dist/server/assets/site-chrome-DePwaQCK.js                               30.50 kB │ gzip:   7.71 kB │ map:    55.59 kB
+@bb/web:build: dist/server/assets/dashboard-Cb9OnxJm.js                                 35.00 kB │ gzip:   8.22 kB │ map:    59.83 kB
+@bb/web:build: dist/server/assets/icons-CeJLVYLi.js                                     39.08 kB │ gzip:  15.86 kB │ map:    41.93 kB
+@bb/web:build: dist/server/assets/marketplace-icons-DTdFhcSY.js                         42.15 kB │ gzip:  10.68 kB │ map:    66.75 kB
+@bb/web:build: dist/server/assets/comparisons-DBVmgHV8.js                               45.29 kB │ gzip:   9.82 kB │ map:    67.25 kB
+@bb/web:build: dist/server/assets/compare-page-D6cLfri0.js                              82.02 kB │ gzip:  14.40 kB │ map:   111.09 kB
+@bb/web:build: dist/server/assets/hero-window-stage-CJgTucaq.js                         88.73 kB │ gzip:  21.24 kB │ map:   155.60 kB
+@bb/web:build: dist/server/assets/routes-DLztuWl4.js                                    90.35 kB │ gzip:  45.31 kB │ map:   110.93 kB
+@bb/web:build: dist/server/assets/factory-D7ezgEhM.js                                  105.30 kB │ gzip:  25.04 kB │ map:   191.24 kB
+@bb/web:build: dist/server/assets/connect-ui-CCEyDha5.js                               120.47 kB │ gzip:  24.49 kB │ map:   199.49 kB
+@bb/web:build: dist/server/assets/useSelector-CeBLy-Xz.js                              129.96 kB │ gzip:  33.05 kB │ map:   286.54 kB
+@bb/web:build: dist/server/assets/meta-BpELo5JL.js                                     131.77 kB │ gzip:  28.05 kB │ map:   197.44 kB
+@bb/web:build: dist/server/assets/guide-page-bqb56LTv.js                               178.00 kB │ gzip:  38.67 kB │ map:   230.94 kB
+@bb/web:build: dist/server/assets/schemas-DUPzem8K.js                                  182.91 kB │ gzip:  40.37 kB │ map:   513.27 kB
+@bb/web:build: dist/server/assets/bundled-marketplace-DR4GCw9O.js                      193.04 kB │ gzip:  61.10 kB │ map:   213.57 kB
+@bb/web:build: dist/server/assets/sqlite-introspector-_wy6Ac6e-D1JfgKTP.js             285.87 kB │ gzip:  47.70 kB │ map:   541.53 kB
+@bb/web:build: dist/server/assets/public-marketplace-C6NN1rDG.js                       674.49 kB │ gzip: 145.51 kB │ map: 1,147.26 kB
+@bb/web:build: dist/server/index.js                                                    715.21 kB │ gzip: 150.40 kB │ map: 1,309.85 kB
+@bb/web:build: dist/server/assets/router-mnzpp4sC.js                                 1,146.29 kB │ gzip: 359.59 kB │ map: 1,811.68 kB
+@bb/web:build: dist/server/assets/auth-B1iWa08a.js                                   1,445.12 kB │ gzip: 315.76 kB │ map: 2,781.35 kB
+@bb/web:build: 
+@bb/web:build: ✓ built in 3.63s
+@bb/web:build: [PLUGIN_TIMINGS] JavaScript callbacks ran for 2.8s of this 3.6s build (77%).
+@bb/web:build: 6 callbacks are listed without a time. Their calls overlapped, so the time inside one call includes work from other calls. To find their cost, profile the build with `node --cpu-prof`:
+@bb/web:build:   - plugin tanstack-start-core:import-protection resolveId (4832 calls)
+@bb/web:build:   - plugin vite:asset load (118 calls)
+@bb/web:build:   - plugin @tailwindcss/vite:generate:build transform (10 calls)
+@bb/web:build:   … and 3 more
+@bb/web:build: See https://rolldown.rs/reference/InputOptions.checks#bundlertimings for more details.
+@bb/web:build: 
+bb-plugin-bb--prompt-library:prepare:bundled: cache miss, executing 938ac80e3afab6b8
+bb-plugin-bb-ai:prepare:bundled: 
+bb-plugin-bb-ai:prepare:bundled: &gt; bb-plugin-bb-ai@0.1.0 prepare:bundled CHECKOUT_A/plugins/bb-ai
+bb-plugin-bb-ai:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-bb-ai:prepare:bundled: 
+bb-plugin-bb-guide:prepare:bundled: 
+bb-plugin-bb-guide:prepare:bundled: &gt; bb-plugin-bb-guide@0.1.0 prepare:bundled CHECKOUT_A/plugins/bb-guide
+bb-plugin-bb-guide:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-bb-guide:prepare:bundled: 
+bb-plugin-bb--provider-usage:prepare:bundled: cache miss, executing 8d88e4314478469c
+bb-plugin-concurrency-limit:prepare:bundled: cache miss, executing fc39d2011b41037e
+bb-plugin-browser-automation:prepare:bundled: 
+bb-plugin-browser-automation:prepare:bundled: &gt; bb-plugin-browser-automation@0.1.1 prepare:bundled CHECKOUT_A/plugins/browser-automation
+bb-plugin-browser-automation:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-browser-automation:prepare:bundled: 
+bb-plugin-bb--server-switcher:prepare:bundled: cache miss, executing d3ecc006080e35db
+bb-plugin-connect:prepare:bundled: cache miss, executing eab75fd18ed644c3
+bb-plugin-bb--prompt-library:prepare:bundled: 
+bb-plugin-bb--prompt-library:prepare:bundled: &gt; bb-plugin-bb--prompt-library@0.1.0 prepare:bundled CHECKOUT_A/plugins/prompt-library
+bb-plugin-bb--prompt-library:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-bb--prompt-library:prepare:bundled: 
+bb-plugin-environment-git-worktree:prepare:bundled: cache miss, executing b0e1fa583cbe0598
+bb-plugin-bb--provider-usage:prepare:bundled: 
+bb-plugin-bb--provider-usage:prepare:bundled: &gt; bb-plugin-bb--provider-usage@0.1.0 prepare:bundled CHECKOUT_A/plugins/provider-usage
+bb-plugin-bb--provider-usage:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-bb--provider-usage:prepare:bundled: 
+bb-plugin-concurrency-limit:prepare:bundled: 
+bb-plugin-concurrency-limit:prepare:bundled: &gt; bb-plugin-concurrency-limit@0.1.0 prepare:bundled CHECKOUT_A/plugins/concurrency-limit
+bb-plugin-concurrency-limit:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-concurrency-limit:prepare:bundled: 
+bb-plugin-connect:prepare:bundled: 
+bb-plugin-connect:prepare:bundled: &gt; bb-plugin-connect@0.1.1 prepare:bundled CHECKOUT_A/plugins/connect
+bb-plugin-connect:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-connect:prepare:bundled: 
+bb-plugin-bb--server-switcher:prepare:bundled: 
+bb-plugin-bb--server-switcher:prepare:bundled: &gt; bb-plugin-bb--server-switcher@0.1.0 prepare:bundled CHECKOUT_A/plugins/server-switcher
+bb-plugin-bb--server-switcher:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-bb--server-switcher:prepare:bundled: 
+bb-plugin-environment-git-worktree:prepare:bundled: 
+bb-plugin-environment-git-worktree:prepare:bundled: &gt; bb-plugin-environment-git-worktree@0.1.0 prepare:bundled CHECKOUT_A/plugins/environment-git-worktree
+bb-plugin-environment-git-worktree:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-environment-git-worktree:prepare:bundled: 
+bb-plugin-custom-instructions:prepare:bundled: cache miss, executing a01d04421f0487ae
+bb-plugin-bb-account:prepare:bundled: cache miss, executing 61c6c4a4fd2c498a
+bb-plugin-custom-instructions:prepare:bundled: 
+bb-plugin-custom-instructions:prepare:bundled: &gt; bb-plugin-custom-instructions@0.1.0 prepare:bundled CHECKOUT_A/plugins/custom-instructions
+bb-plugin-custom-instructions:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-custom-instructions:prepare:bundled: 
+bb-plugin-bb--tailscale:prepare:bundled: cache miss, executing 987b63291b2f918d
+bb-plugin-environment-modal-sandbox:prepare:bundled: cache miss, executing 1f1dcbacfd3ee62f
+bb-plugin-ask-user-question:prepare:bundled: cache miss, executing 333fa8b1cfbf5996
+bb-plugin-bb-account:prepare:bundled: 
+bb-plugin-bb-account:prepare:bundled: &gt; bb-plugin-bb-account@0.1.0 prepare:bundled CHECKOUT_A/plugins/bb-account
+bb-plugin-bb-account:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-bb-account:prepare:bundled: 
+bb-plugin-browser-automation:build: cache bypass, force executing b9b601614b0de6e1
+bb-plugin-bb--tailscale:prepare:bundled: 
+bb-plugin-bb--tailscale:prepare:bundled: &gt; bb-plugin-bb--tailscale@0.1.0 prepare:bundled CHECKOUT_A/plugins/tailscale
+bb-plugin-bb--tailscale:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-bb--tailscale:prepare:bundled: 
+bb-plugin-environment-modal-sandbox:prepare:bundled: 
+bb-plugin-environment-modal-sandbox:prepare:bundled: &gt; bb-plugin-environment-modal-sandbox@0.1.0 prepare:bundled CHECKOUT_A/plugins/environment-modal-sandbox
+bb-plugin-environment-modal-sandbox:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-environment-modal-sandbox:prepare:bundled: 
+bb-plugin-ask-user-question:prepare:bundled: 
+bb-plugin-ask-user-question:prepare:bundled: &gt; bb-plugin-ask-user-question@0.1.0 prepare:bundled CHECKOUT_A/plugins/ask-user-question
+bb-plugin-ask-user-question:prepare:bundled: &gt; bb-plugin-build prepare-bundled
+bb-plugin-ask-user-question:prepare:bundled: 
+bb-plugin-browser-automation:build: 
+bb-plugin-browser-automation:build: &gt; bb-plugin-browser-automation@0.1.1 build CHECKOUT_A/plugins/browser-automation
+bb-plugin-browser-automation:build: &gt; node ../../apps/cli/dist/index.js plugin build
+bb-plugin-browser-automation:build: 
+@bb/bundled-plugins:build: cache miss, executing 65789b3ef15826a0
+bb-plugin-browser-automation:build: dist/server.js
+bb-plugin-browser-automation:build: dist/server.js.map
+bb-plugin-browser-automation:build: dist/server.meta.json
+bb-plugin-browser-automation:build: dist/app.js
+bb-plugin-browser-automation:build: dist/app.css
+bb-plugin-browser-automation:build: dist/app.meta.json
+bb-plugin-browser-automation:build: dist/host.js
+bb-plugin-browser-automation:build: dist/host.js.map
+bb-plugin-browser-automation:build: dist/host.meta.json
+@bb/bundled-plugins:build: 
+@bb/bundled-plugins:build: &gt; @bb/bundled-plugins@0.0.1 build CHECKOUT_A/packages/bundled-plugins
+@bb/bundled-plugins:build: &gt; cd ../.. &amp;&amp; node --conditions=source --import tsx packages/bundled-plugins/build.ts
+@bb/bundled-plugins:build: 
+@bb/app:build: React Compiler cache: 0 hits, 1466 misses
+@bb/app:build: [plugin builtin:vite-reporter] 
+@bb/app:build: (!) Some chunks are larger than 500 kB after minification. Consider:
+@bb/app:build: - Using dynamic import() to code-split the application
+@bb/app:build: - Use build.rolldownOptions.output.codeSplitting to improve chunking: https://rolldown.rs/reference/OutputOptions.codeSplitting
+@bb/app:build: - Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.
+@bb/app:build: [PLUGIN_TIMINGS] JavaScript callbacks ran for 51.6s of this 52.1s build (99%).
+@bb/app:build: The slowest callbacks, timed inside each callback (the wait before a callback starts is excluded, the time it awaits is included):
+@bb/app:build:   - plugin vite:worker-import-meta-url transform (6%, 3.0s, 1 call)
+@bb/app:build:   - plugin @tailwindcss/vite:generate:build transform (3%, 1.5s, 4 calls)
+@bb/app:build:   - plugin vite:css transform (2%, 1.1s, 4 calls)
+@bb/app:build: Additional callback time came from the callbacks below and from callbacks under 1s.
+@bb/app:build: 5 callbacks are listed without a time. Their calls overlapped, so the time inside one call includes work from other calls. To find their cost, profile the build with `node --cpu-prof`:
+@bb/app:build:   - plugin @rolldown/plugin-babel transform (1468 calls)
+@bb/app:build:   - plugin bb:plugin-zod-runtime resolveId (16566 calls)
+@bb/app:build:   - plugin vite:asset load (27 calls)
+@bb/app:build:   … and 2 more
+@bb/app:build: See https://rolldown.rs/reference/InputOptions.checks#bundlertimings for more details.
+@bb/app:build: 
+@bb/app:build: precompressed 464 files (464 br, 464 gzip) in CHECKOUT_A/apps/app/dist
+bb-app:build: cache miss, executing 25409c8244d5a965
+@bb/demo-server:build: cache miss, executing 4f3b03138e614f61
+@bb/demo-server:build: 
+@bb/demo-server:build: &gt; @bb/demo-server@0.0.1 build CHECKOUT_A/apps/demo-server
+@bb/demo-server:build: &gt; tsx scripts/build-assets.ts
+@bb/demo-server:build: 
+bb-app:build: 
+bb-app:build: &gt; bb-app@0.50.1 build CHECKOUT_A/packages/bb-app
+bb-app:build: &gt; node scripts/build.mjs
+bb-app:build: 
+bb-app:build: bb-app: built package assets
+@bb/desktop:build: cache miss, executing 6d7e840e9934ecfe
+@bb/desktop:build: 
+@bb/desktop:build: &gt; @bb/desktop@0.50.1 build CHECKOUT_A/apps/desktop
+@bb/desktop:build: &gt; node scripts/build.mjs
+@bb/desktop:build: 
+@bb/desktop:build: ▲ [WARNING] &quot;import.meta&quot; is not available with the &quot;cjs&quot; output format and will be empty [empty-import-meta]
+@bb/desktop:build: 
+@bb/desktop:build:     ../../packages/bb-app/src/launcher.ts:1497:41:
+@bb/desktop:build:       1497 │   return scriptArgument ?? fileURLToPath(import.meta.url);
+@bb/desktop:build:            ╵                                          ~~~~~~~~~~~
+@bb/desktop:build: 
+@bb/desktop:build:   You need to set the output format to &quot;esm&quot; for &quot;import.meta&quot; to work correctly.
+@bb/desktop:build: 
+@bb/desktop:build: ▲ [WARNING] &quot;import.meta&quot; is not available with the &quot;cjs&quot; output format and will be empty [empty-import-meta]
+@bb/desktop:build: 
+@bb/desktop:build:     ../../packages/bb-app/src/launcher.ts:2566:39:
+@bb/desktop:build:       2566 │     sourceRoot: runsFromSourceCheckout(import.meta.url)
+@bb/desktop:build:            ╵                                        ~~~~~~~~~~~
+@bb/desktop:build: 
+@bb/desktop:build:   You need to set the output format to &quot;esm&quot; for &quot;import.meta&quot; to work correctly.
+@bb/desktop:build: 
+@bb/desktop:build: ▲ [WARNING] &quot;import.meta&quot; is not available with the &quot;cjs&quot; output format and will be empty [empty-import-meta]
+@bb/desktop:build: 
+@bb/desktop:build:     ../../packages/bb-app/src/launcher.ts:2787:19:
+@bb/desktop:build:       2787 │     entrypointUrl: import.meta.url,
+@bb/desktop:build:            ╵                    ~~~~~~~~~~~
+@bb/desktop:build: 
+@bb/desktop:build:   You need to set the output format to &quot;esm&quot; for &quot;import.meta&quot; to work correctly.
+@bb/desktop:build: 
+@bb/desktop:build: ▲ [WARNING] &quot;import.meta&quot; is not available with the &quot;cjs&quot; output format and will be empty [empty-import-meta]
+@bb/desktop:build: 
+@bb/desktop:build:     ../../packages/bb-app/src/launcher.ts:2847:19:
+@bb/desktop:build:       2847 │     entrypointUrl: import.meta.url,
+@bb/desktop:build:            ╵                    ~~~~~~~~~~~
+@bb/desktop:build: 
+@bb/desktop:build:   You need to set the output format to &quot;esm&quot; for &quot;import.meta&quot; to work correctly.
+@bb/desktop:build: 
+@bb/desktop:build: ▲ [WARNING] &quot;import.meta&quot; is not available with the &quot;cjs&quot; output format and will be empty [empty-import-meta]
+@bb/desktop:build: 
+@bb/desktop:build:     ../../packages/bb-app/src/launcher.ts:3085:19:
+@bb/desktop:build:       3085 │     entrypointUrl: import.meta.url,
+@bb/desktop:build:            ╵                    ~~~~~~~~~~~
+@bb/desktop:build: 
+@bb/desktop:build:   You need to set the output format to &quot;esm&quot; for &quot;import.meta&quot; to work correctly.
+@bb/desktop:build: 
+@bb/desktop:build: ▲ [WARNING] &quot;import.meta&quot; is not available with the &quot;cjs&quot; output format and will be empty [empty-import-meta]
+@bb/desktop:build: 
+@bb/desktop:build:     ../../packages/bb-app/src/launcher.ts:3946:28:
+@bb/desktop:build:       3946 │     !runsFromSourceCheckout(import.meta.url) &amp;&amp;
+@bb/desktop:build:            ╵                             ~~~~~~~~~~~
+@bb/desktop:build: 
+@bb/desktop:build:   You need to set the output format to &quot;esm&quot; for &quot;import.meta&quot; to work correctly.
+@bb/desktop:build: 
+@bb/desktop:build: ▲ [WARNING] &quot;import.meta&quot; is not available with the &quot;cjs&quot; output format and will be empty [empty-import-meta]
+@bb/desktop:build: 
+@bb/desktop:build:     ../../packages/bb-app/src/launcher.ts:4014:19:
+@bb/desktop:build:       4014 │     entrypointUrl: import.meta.url,
+@bb/desktop:build:            ╵                    ~~~~~~~~~~~
+@bb/desktop:build: 
+@bb/desktop:build:   You need to set the output format to &quot;esm&quot; for &quot;import.meta&quot; to work correctly.
+@bb/desktop:build: 
+@bb/desktop:build: ▲ [WARNING] &quot;import.meta&quot; is not available with the &quot;cjs&quot; output format and will be empty [empty-import-meta]
+@bb/desktop:build: 
+@bb/desktop:build:     ../../packages/bb-app/src/launcher.ts:4076:19:
+@bb/desktop:build:       4076 │     entrypointUrl: import.meta.url,
+@bb/desktop:build:            ╵                    ~~~~~~~~~~~
+@bb/desktop:build: 
+@bb/desktop:build:   You need to set the output format to &quot;esm&quot; for &quot;import.meta&quot; to work correctly.
+@bb/desktop:build: 
+@bb/desktop:build: ▲ [WARNING] &quot;import.meta&quot; is not available with the &quot;cjs&quot; output format and will be empty [empty-import-meta]
+@bb/desktop:build: 
+@bb/desktop:build:     ../../packages/bb-app/src/launcher.ts:4204:21:
+@bb/desktop:build:       4204 │       entrypointUrl: import.meta.url,
+@bb/desktop:build:            ╵                      ~~~~~~~~~~~
+@bb/desktop:build: 
+@bb/desktop:build:   You need to set the output format to &quot;esm&quot; for &quot;import.meta&quot; to work correctly.
+@bb/desktop:build: 
+@bb/desktop:build: ▲ [WARNING] &quot;import.meta&quot; is not available with the &quot;cjs&quot; output format and will be empty [empty-import-meta]
+@bb/desktop:build: 
+@bb/desktop:build:     ../../packages/bb-app/src/launcher.ts:4253:63:
+@bb/desktop:build:       4253 │ ...ktreePolicy === null &amp;&amp; !runsFromSourceCheckout(import.meta.url)
+@bb/desktop:build:            ╵                                                    ~~~~~~~~~~~
+@bb/desktop:build: 
+@bb/desktop:build:   You need to set the output format to &quot;esm&quot; for &quot;import.meta&quot; to work correctly.
+@bb/desktop:build: 
+@bb/desktop:build: ▲ [WARNING] &quot;import.meta&quot; is not available with the &quot;cjs&quot; output format and will be empty [empty-import-meta]
+@bb/desktop:build: 
+@bb/desktop:build:     ../../packages/bb-app/src/launcher.ts:4396:25:
+@bb/desktop:build:       4396 │           entrypointUrl: import.meta.url,
+@bb/desktop:build:            ╵                          ~~~~~~~~~~~
+@bb/desktop:build: 
+@bb/desktop:build:   You need to set the output format to &quot;esm&quot; for &quot;import.meta&quot; to work correctly.
+@bb/desktop:build: 
+@bb/desktop:build: ▲ [WARNING] &quot;import.meta&quot; is not available with the &quot;cjs&quot; output format and will be empty [empty-import-meta]
+@bb/desktop:build: 
+@bb/desktop:build:     ../../packages/process-utils/src/host-toolchain.ts:432:34:
+@bb/desktop:build:       432 │     const require = createRequire(import.meta.url);
+@bb/desktop:build:           ╵                                   ~~~~~~~~~~~
+@bb/desktop:build: 
+@bb/desktop:build:   You need to set the output format to &quot;esm&quot; for &quot;import.meta&quot; to work correctly.
+@bb/desktop:build: 
+@bb/desktop:build: ▲ [WARNING] &quot;import.meta&quot; is not available with the &quot;cjs&quot; output format and will be empty [empty-import-meta]
+@bb/desktop:build: 
+@bb/desktop:build:     ../../packages/config/src/file-lock.ts:16:39:
+@bb/desktop:build:       16 │ ...: unknown = createRequire(import.meta.url)(&quot;fs-native-extension...
+@bb/desktop:build:          ╵                              ~~~~~~~~~~~
+@bb/desktop:build: 
+@bb/desktop:build:   You need to set the output format to &quot;esm&quot; for &quot;import.meta&quot; to work correctly.
+@bb/desktop:build: 
+@bb/desktop:build: @bb/desktop: built Electron entries
+
+ Tasks:    74 successful, 74 total
+Cached:    10 cached, 74 total
+  Time:    1m9.099s 
+
+</pre></details>
+<p>Other verification commands: <code>pnpm exec turbo run build:types --filter=@get-bb/plugin-sdk</code>; <code>pnpm exec turbo run build --filter=@get-bb/plugin-sdk</code>; <code>pnpm exec turbo run build</code>; <code>pnpm exec turbo run test typecheck --filter=@bb/desktop</code>; <code>pnpm exec oxfmt apps/desktop/src/desktop-browser-view.ts apps/desktop/test/desktop-browser-view-manager.test.ts</code>; <code>git diff --check</code>; <code>git diff --numstat origin/main</code>. The seven relevant suite paths and baseline packaging command are recorded verbatim in their logs. Host checkout paths are normalized in published logs.</p>
+</main></body></html>
