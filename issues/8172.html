@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #8172 Unbounded event batches lose queued data during retry</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#8172 · Unbounded event batches lose queued data during retry</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill high">High priority</span><span class="pill">Effort: Low</span><span class="pill">host · perf</span><a href="https://github.com/get-bb/bb/issues/8172">GitHub issue</a><span>2026-11-25 · base <code>fb045a046653cc127656ca3c7243d44ae4c94f3f</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · reproduction label: <code>confirmed-repro</code>.</p>
+
+<h2>1. TL;DR</h2>
+<p>The host daemon buffers thread events while its session is closed, then uploads all eligible events together.
+A transient upload failure should leave those events queued for retry, but a sufficiently large batch instead causes a JavaScript argument-count overflow while requeueing.
+In both clean trusted-base runs, a 150,000-event backlog produced one failed upload, a RangeError, zero deliveries, and no remaining queued thread IDs even after a second flush.
+A 1,000-event control successfully retried all events.
+The real server route also accepted a 150,000-event POST and delayed a zero-delay timer by more than eight seconds in both runs.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Claim tested</th><th>Status</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>A reconnect backlog is sent without a count bound.</td><td>Verified</td><td>Both sink runs recorded a largest POST of 150,000 envelopes.</td></tr>
+<tr><td>A retryable failure can lose the whole batch.</td><td>Verified</td><td>One injected transient failure led to RangeError, zero delivered events and an empty queue in both runs. The small control passed.</td></tr>
+<tr><td>A large POST stalls the server event loop.</td><td>Verified</td><td>Real route, real migrated SQLite database, HTTP 200; timer delayed 8,715 ms and 8,552 ms.</td></tr>
+<tr><td>The reported exact threshold and timings on Node 26 are portable.</td><td>Not established</td><td>Testing here uses Node 22.19.0. Argument limits and timing depend on runtime, stack, hardware and workload.</td></tr>
+<tr><td>The timer-started batch has an unhandled rejection path.</td><td>Code-supported; not separately exercised</td><td>The tick callback ignores the batch promise; the catch precedes the settlement callback that throws. The direct flush path was tested instead.</td></tr>
+<tr><td>A large queue waiting behind in-flight threads can overflow during compaction.</td><td>Code-supported; not separately exercised</td><td>The waiting array is spread into splice. The direct regression here targets failed-batch requeueing.</td></tr>
+</tbody></table>
+
+<h2>3. Environment</h2>
+<ul><li>Public repository: <code>get-bb/bb</code>; trusted <code>origin/main</code> commit <code>fb045a046653cc127656ca3c7243d44ae4c94f3f</code>, fetched on November 25, 2026.</li>
+<li>Linux 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.12.</li>
+<li>Two separate detached temporary checkouts at the same commit; frozen installs. No linked-PR code checked out or run.</li>
+<li>No real providers, production instance, real user data, browser, or listening HTTP ports. Sink transport is an injected function. Server requests use the existing in-process test harness, its fresh temporary data directories, and real migrated SQLite database copies.</li>
+<li>The first full Turbo build initially failed because the Plugin SDK runtime was not built. Building that existing SDK through Turbo then retrying the normal build passed all 74 build tasks. No dependency or production-code changes were needed. The second checkout used SDK and affected-package Turbo builds.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol><li>Create a new checkout of the trusted public main revision and build existing dependencies:
+<pre>git clone https://github.com/get-bb/bb.git bb-8172
+cd bb-8172
+git checkout --detach fb045a046653cc127656ca3c7243d44ae4c94f3f
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=@bb/host-daemon --filter=@bb/server</pre></li>
+<li>Save <a href="8172/repro/event-sink.test.ts">the authored sink regression</a> as <code>apps/host-daemon/src/slopcop-8172.test.ts</code>. Run:
+<pre>pnpm exec turbo run test --filter=@bb/host-daemon -- src/slopcop-8172.test.ts --silent=false</pre>
+This calls the real event sink, queues indexed text deltas across three threads with the session closed, injects one transient transport error after opening the session, then flushes twice. It records outcomes before making assertions, and disposes timers in a finally block.</li>
+<li>Expected: no flush errors; all indexed deltas delivered in order after retry; no remaining queued thread IDs. Actual, identically in both runs:
+<pre>{&quot;count&quot;:1000,&quot;attempts&quot;:2,&quot;largestPost&quot;:1000,&quot;delivered&quot;:1000,&quot;remainingThreads&quot;:[],&quot;errors&quot;:[]}
+{&quot;count&quot;:150000,&quot;attempts&quot;:1,&quot;largestPost&quot;:150000,&quot;delivered&quot;:0,&quot;remainingThreads&quot;:[],&quot;errors&quot;:[&quot;RangeError: Maximum call stack size exceeded&quot;]}</pre>
+Vitest exits 1: one failed regression (150,000 events), one passed control (1,000 events). The failing assertion is <code>expect(errors).toEqual([])</code>, because a RangeError escapes settlement. This failure is evidence of the unfixed bug, not an infrastructure failure.</li>
+<li>Save <a href="8172/repro/server-events.test.ts">the route measurement</a> as <code>apps/server/test/internal/slopcop-8172.test.ts</code>. Run:
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/internal/slopcop-8172.test.ts --silent=false</pre>
+The test seeds an authenticated host session, owned thread, and turn/started event. It posts text deltas through the real route against the harness database and measures completion plus a zero-delay timer. It asserts HTTP 200, but deliberately avoids a flaky timing threshold.</li></ol>
+<table><thead><tr><th>Run</th><th>Events</th><th>HTTP</th><th>Route elapsed ms</th><th>Timer delay ms</th></tr></thead><tbody><tr><td>First checkout</td><td>500</td><td>200</td><td>46</td><td>51</td></tr><tr><td>First checkout</td><td>150,000</td><td>200</td><td>8,712</td><td>8,715</td></tr><tr><td>Second checkout</td><td>500</td><td>200</td><td>40</td><td>41</td></tr><tr><td>Second checkout</td><td>150,000</td><td>200</td><td>8,551</td><td>8,552</td></tr></tbody></table>
+<p>These timings include JSON serialization, request parsing, validation, persistence, and response work. They are not a transaction-only benchmark, nor a reproduction of the reporter's exact 5.7-second measurement. They demonstrate event-loop starvation during one large request, not a universal throughput estimate.</p>
+<details><summary>Full sink regression source</summary><pre>import { turnScope } from &quot;@bb/domain&quot;;
+import { expect, it } from &quot;vitest&quot;;
+import { createEventSink } from &quot;./event-sink.js&quot;;
+
+it.each([1_000, 150_000])(
+  &quot;retains %i offline deltas through a transient failure&quot;,
+  async (count) =&gt; {
+    let open = false;
+    let attempts = 0;
+    let largestPost = 0;
+    const delivered: string[] = [];
+    const errors: string[] = [];
+    const sink = createEventSink({
+      isSessionOpen: () =&gt; open,
+      logger: { debug() {}, error() {}, warn() {} },
+      postEvents: async (envelopes) =&gt; {
+        attempts += 1;
+        largestPost = Math.max(largestPost, envelopes.length);
+        if (attempts === 1) {
+          throw new Error(&quot;injected transient transport failure&quot;);
+        }
+        for (const envelope of envelopes) {
+          if (envelope.event.type === &quot;item/agentMessage/delta&quot;) {
+            delivered.push(`${envelope.threadId}:${envelope.event.delta}`);
+          }
+        }
+        return { acceptedEvents: [], rejectedEvents: [] };
+      },
+    });
+    const expected: string[] = [];
+    try {
+      for (let index = 0; index &lt; count; index += 1) {
+        const threadId = `thr_repro_${index % 3}`;
+        expected.push(`${threadId}:${index}`);
+        sink.emit({
+          threadId,
+          event: {
+            type: &quot;item/agentMessage/delta&quot;,
+            threadId,
+            providerThreadId: &quot;provider-repro&quot;,
+            scope: turnScope(&quot;turn-repro&quot;),
+            itemId: &quot;item-repro&quot;,
+            delta: String(index),
+          },
+        });
+      }
+      open = true;
+      for (let attempt = 0; attempt &lt; 2; attempt += 1) {
+        try {
+          await sink.flush();
+        } catch (error) {
+          if (!(error instanceof Error)) throw error;
+          errors.push(`${error.name}: ${error.message}`);
+        }
+      }
+      const remainingThreads = sink.listUndeliveredThreadIds();
+      console.log(
+        JSON.stringify({
+          count,
+          attempts,
+          largestPost,
+          delivered: delivered.length,
+          remainingThreads,
+          errors,
+        }),
+      );
+      expect(errors).toEqual([]);
+      expect(delivered).toEqual(expected);
+      expect(remainingThreads).toEqual([]);
+    } finally {
+      await sink.dispose();
+    }
+  },
+);
+</pre></details>
+<details><summary>Full server measurement source</summary><pre>import { performance } from &quot;node:perf_hooks&quot;;
+import { turnScope } from &quot;@bb/domain&quot;;
+import {
+  groupHostDaemonEvents,
+  type HostDaemonEventEnvelope,
+} from &quot;@bb/host-daemon-contract&quot;;
+import { expect, it } from &quot;vitest&quot;;
+import { internalAuthHeaders } from &quot;../helpers/commands.js&quot;;
+import { seedThreadFixture } from &quot;../helpers/seed.js&quot;;
+import { withTestHarness } from &quot;../helpers/test-app.js&quot;;
+
+it(&quot;measures timer starvation while the real route stores a reconnect backlog&quot;, async () =&gt; {
+  await withTestHarness(async (harness) =&gt; {
+    const { session, thread } = seedThreadFixture(harness);
+    const post = (envelopes: HostDaemonEventEnvelope[]) =&gt;
+      harness.app.request(&quot;/internal/session/events&quot;, {
+        method: &quot;POST&quot;,
+        headers: internalAuthHeaders(harness),
+        body: JSON.stringify({
+          sessionId: session.id,
+          eventGroups: groupHostDaemonEvents(envelopes),
+        }),
+      });
+    const started = await post([
+      {
+        threadId: thread.id,
+        event: {
+          type: &quot;turn/started&quot;,
+          threadId: thread.id,
+          providerThreadId: &quot;provider-repro&quot;,
+          scope: turnScope(&quot;turn-repro&quot;),
+        },
+      },
+    ]);
+    expect(started.status).toBe(200);
+    for (const count of [500, 150_000]) {
+      const envelopes: HostDaemonEventEnvelope[] = Array.from(
+        { length: count },
+        (_, index) =&gt; ({
+          threadId: thread.id,
+          event: {
+            type: &quot;item/agentMessage/delta&quot;,
+            threadId: thread.id,
+            providerThreadId: &quot;provider-repro&quot;,
+            scope: turnScope(&quot;turn-repro&quot;),
+            itemId: &quot;item-repro&quot;,
+            delta: `delta-${index}`,
+          },
+        }),
+      );
+      const startedAt = performance.now();
+      const timer = new Promise&lt;number&gt;((resolve) =&gt;
+        setTimeout(() =&gt; resolve(performance.now() - startedAt), 0),
+      );
+      const response = await post(envelopes);
+      const elapsedMs = performance.now() - startedAt;
+      const timerDelayMs = await timer;
+      console.log(
+        JSON.stringify({
+          count,
+          status: response.status,
+          elapsedMs: Math.round(elapsedMs),
+          timerDelayMs: Math.round(timerDelayMs),
+        }),
+      );
+      expect(response.status).toBe(200);
+    }
+  });
+}, 60_000);
+</pre></details>
+
+<h2>5. Root cause</h2>
+<ol><li><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/host-daemon/src/event-sink.ts#L295-L305">takeEligibleBatch</a> selects all eligible envelopes without a bound, and removes them from the queue. Its waiting-array argument spread is a second count-dependent hazard.</li>
+<li><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/host-daemon/src/event-sink.ts#L243-L259">deliverBatch</a> correctly converts a retryable post error into zero delivered events.</li>
+<li><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/host-daemon/src/event-sink.ts#L307-L329">settleBatch</a> first removes in-flight accounting, then attempts <code>queue.unshift(...batch.slice(delivered))</code>. Spreading 150,000 entries as function arguments exceeds this runtime's call argument capacity. No events are restored; queue and in-flight maps now both appear empty.</li>
+<li><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/host-daemon/src/event-sink.ts#L347-L369">The promise chain</a> catches errors from delivery before, not after, settlement. The RangeError therefore rejects flush. A subsequent flush finds nothing left to send, as confirmed by the recording transport.</li>
+<li><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/host-daemon/src/event-sink.ts#L186-L195">The tick timer callback</a> starts a batch without handling that rejected promise. This is a static finding; direct flush supplied the tested path.</li>
+<li><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/host-daemon/src/app.ts#L1030-L1037">Session reconciliation</a> explicitly flushes pending events after reopening, making an accumulated queue reachable in production.</li>
+<li><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/packages/host-daemon-contract/src/session.ts#L279-L297">The request schema</a> has no event-count maximum, and <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/server/src/internal/events.ts#L892-L897">the route</a> appends the request in one synchronous database transaction. <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/packages/db/src/data/events.ts#L832-L866">The database appender</a> processes the supplied event list on that synchronous path; no asynchronous yield divides it into short transactions.</li></ol>
+<p>The underlying coupling is that the entire offline backlog becomes one upload and one synchronous server work unit. Fixing only exception handling would not preserve lost data, and replacing only unshift would leave unbounded server work and the waiting-array overflow.</p>
+
+<h2>6. Proposed fix</h2>
+<p>Bound each daemon upload to a moderate event count, preserve per-thread ordering and existing cross-thread in-flight behavior, and compact the remaining queue without spreading an unbounded array into a function call. Retry the undelivered suffix ahead of newer events. Keep the regression at the real event sink boundary and exercise a large queue waiting behind an in-flight thread as well. A count bound does not bound bytes: oversized individual events and a possible independent byte budget need explicit treatment rather than silently dropping data.</p>
+<p>No production repair was attempted by this run because an open PR already links this issue. The proposed repair here is not claimed as verified-after-fix.</p>
+
+<h2>7. Linked PR review</h2>
+<p><a href="https://github.com/get-bb/bb/pull/8173">PR #8173</a> is OPEN and GitHub's closing-issue metadata links #8172. Its diff was read only as untrusted data, never checked out or executed. Observed head: <code>1fb242d8793a525e669d0a19050973f573901a19</code>; two files, 66 additions and 5 deletions.</p>
+<p><strong>Static assessment:</strong> the diff caps selected batches at 500 events and replaces waiting-array splice spread with in-place queue compaction. That addresses the verified overflow mechanism by bounding the requeue argument count and addresses the second unbounded spread directly. Its added regression checks large-backlog retention and per-thread ordering. No correctness blocker is established from this read, but this is not approval or execution-based verification of the PR. No PR tests were run. A count cap is not a payload-byte cap, and the large waiting-queue branch is not directly covered by the added regression in that diff.</p>
+<p><strong>Fix disposition:</strong> skip a duplicate PR under the autopilot rule. The linked PR must receive its own relevant test and review evidence before landing.</p>
+
+<h2>8. Verification</h2>
+<p>The same investigating agent repeated both tests in a second clean detached checkout at <code>fb045a046653cc127656ca3c7243d44ae4c94f3f</code>. Its status was clean before copying only these newly authored tests. The production sink and server route remained byte-identical to trusted main in both checkouts. Each affected test task logged a cache miss and executed; the second results were not replayed test output. Build/generation cache hits are permitted.</p>
+<pre>pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=@bb/host-daemon --filter=@bb/server
+pnpm exec turbo run test --filter=@bb/host-daemon -- src/slopcop-8172.test.ts --silent=false
+pnpm exec turbo run test --filter=@bb/server -- test/internal/slopcop-8172.test.ts --silent=false</pre>
+<p>Second run: sink exit 1 with the identical intended RangeError/loss and passing small control; server exit 0 with the large request returning 200 and timer delay 8,552 ms. The harness generated fresh temporary data and database copies in this checkout; requests were in-process so no ports were allocated. No correction to the data-loss conclusion was needed. Server timings are reported as measurements here, not the issue's runtime-specific figures. This is a repeated check by the same agent, not an independent investigation.</p>
+
+<h2>9. Related issues</h2>
+<p>No additional issue was established as the same defect. The linked open repair above is the reason a second fix PR was not created.</p>
+
+<h2>10. Appendix and limits</h2>
+<ul><li><a href="8172/repro/sink-first.log">First sink log</a> · <a href="8172/repro/sink-second.log">Second sink log</a>.</li>
+<li><a href="8172/repro/server-first.log">First route log</a> · <a href="8172/repro/server-second.log">Second route log</a>.</li>
+<li>The source-level tests use only existing trusted repository APIs; there is no external reproduction script, linked PR test execution, or new dependency.</li>
+<li>Scope: controlled transient transport rejection at the sink boundary, not a live network outage or daemon process restart. It shows loss from the daemon's retry buffer; it does not claim previously persisted server data was deleted.</li>
+<li>Issue text and PR content were treated as untrusted claims; no embedded instructions or linked code were executed. Source anchors were checked at the recorded trusted base. Artifacts omit local checkout paths and production data.</li>
+<li>No application source fix, push, merge, schema/protocol change, dependency change, or user-runtime interaction was performed by this investigation.</li></ul>
+<p>AGENT GENERATED</p>
+</main></body></html>
