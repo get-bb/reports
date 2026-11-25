@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #8189 · Transient availability errors become cached negative capability</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); } .failure { color:var(--high); font-weight:600; }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#8189 · Transient availability errors become cached negative capability</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Medium priority</span><span class="pill">Effort: Low</span><span class="pill">providers</span><a href="https://github.com/get-bb/bb/issues/8189">GitHub issue</a><span>2026-11-25</span></p>
+<p><strong>Verdict:</strong> <span class="failure">REPRODUCED</span> · <strong>Root-cause confidence:</strong> high · <strong>Reproduction label:</strong> confirmed-repro</p>
+<p>Trusted base: <code>fb045a046653cc127656ca3c7243d44ae4c94f3f</code> from <code>origin/main</code>.</p>
+
+<h2>1. TL;DR</h2>
+<p>A nested server asks its parent which pooled providers are available before contributing routing settings. A single failed availability refresh replaces a previously successful answer with both providers unavailable. That error-derived answer is cached for the same 30 seconds as an authoritative successful response, preventing a recovered parent from being contacted during that interval. Real local HTTP reproductions confirm the failure for both a 503 response and a response that exceeds the actual two-second timeout. This report verifies the capability-cache defect; it does not claim an end-to-end reproduction of a provider login error or retry UI.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><thead><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>A single server error removes previously known availability.</td><td>Verified</td><td>After one real HTTP 503, claude changes from true to false.</td></tr>
+<tr><td>A slow read aborts at approximately two seconds.</td><td>Verified</td><td>A local response delayed three seconds causes TimeoutError after 2001 ms and 2002 ms in the two runs.</td></tr>
+<tr><td>The negative answer prevents refreshes for 30 seconds.</td><td>Verified at the cache boundary</td><td>At controlled cache time 59,999 ms, the parent has still received only two requests; at 60,000 ms a third request restores availability.</td></tr>
+<tr><td>Turn routing follows the negative capability.</td><td>Verified by source tracing</td><td>canServe reads the cached provider boolean; contributeFor falls through to neutralized environment settings when it is false.</td></tr>
+<tr><td>A live provider reports a login error and automatic retry is skipped.</td><td>Unverified here</td><td>No provider process, user credentials, live child instance, or retry UI was exercised.</td></tr>
+<tr><td>The reporter's machine load caused the delay.</td><td>Unverified here</td><td>The experiment injects only the parent HTTP delay, not host load or swap pressure.</td></tr>
+</tbody></table>
+
+<h2>3. Environment</h2>
+<ul>
+<li>Public repository: get-bb/bb. Both detached checkouts use the full trusted base SHA above; no pull-request code was checked out or executed.</li>
+<li>Linux 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.12.</li>
+<li>Real Node HTTP servers bind only to 127.0.0.1 on newly OS-assigned ephemeral ports. Each case creates and closes its own listener.</li>
+<li>No bb server, provider login, account record, production instance, or data directory is used. The request-header value is synthetic.</li>
+<li>The existing clock injection controls cache timestamps only. fetch and AbortSignal.timeout are real; no TTL or timeout override is supplied.</li>
+</ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol>
+<li>Prepare a trusted checkout using the repository's normal dependencies and generate the SDK declarations:
+<pre>git clone https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout --detach fb045a046653cc127656ca3c7243d44ae4c94f3f
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build:types --filter=@get-bb/plugin-sdk</pre></li>
+<li>Save the complete test below as <code>plugins/account-pool/src/availability-regression.test.ts</code>. It independently drives the production ParentAvailability class against a real local parent server.</li>
+<li>Run the existing owner tests alongside the regression:
+<pre>pnpm exec turbo run test --filter=bb-plugin-account-pool -- src/parent-pool.test.ts src/availability-regression.test.ts</pre></li>
+<li>Expected: one transient read failure does not immediately discard the last known positive capability. Actual: both regression cases fail the positive-capability assertion; all 13 existing owner tests pass. The log also proves that the parent is usable on the next refresh.</li>
+</ol>
+<details><summary>Complete reproduction test (expand to copy)</summary><pre>import { once } from &quot;node:events&quot;;
+import { createServer } from &quot;node:http&quot;;
+import { performance } from &quot;node:perf_hooks&quot;;
+import { expect, it } from &quot;vitest&quot;;
+import { ParentAvailability } from &quot;./parent-pool.js&quot;;
+
+it.each([&quot;http-503&quot;, &quot;timeout&quot;])(
+  &quot;preserves known parent availability after one transient %s&quot;,
+  async (failure) =&gt; {
+    let requests = 0;
+    let clock = 0;
+    const errors: string[] = [];
+    const timers: NodeJS.Timeout[] = [];
+    const available = { claude: true, codex: false };
+    const server = createServer((_request, response) =&gt; {
+      requests += 1;
+      if (requests === 2 &amp;&amp; failure === &quot;http-503&quot;) {
+        response.writeHead(503).end();
+        return;
+      }
+      if (requests === 2 &amp;&amp; failure === &quot;timeout&quot;) {
+        timers.push(
+          setTimeout(() =&gt; {
+            response.writeHead(200, { &quot;content-type&quot;: &quot;application/json&quot; });
+            response.end(JSON.stringify(available));
+          }, 3_000),
+        );
+        return;
+      }
+      response.writeHead(200, { &quot;content-type&quot;: &quot;application/json&quot; });
+      response.end(JSON.stringify(available));
+    });
+    server.listen(0, &quot;127.0.0.1&quot;);
+    await once(server, &quot;listening&quot;);
+    const address = server.address();
+    if (address === null || typeof address === &quot;string&quot;) {
+      throw new Error(&quot;Expected a local TCP listener&quot;);
+    }
+    const client = new ParentAvailability({
+      parent: {
+        baseUrl: `http://127.0.0.1:${address.port}`,
+        token: &quot;synthetic-local-test-token&quot;,
+      },
+      fetch,
+      now: () =&gt; clock,
+      onError: (error) =&gt; {
+        errors.push(error instanceof Error ? error.name : String(error));
+      },
+    });
+    try {
+      const initial = await client.get();
+      expect(initial).toEqual(available);
+      clock = 30_000;
+      const startedAt = performance.now();
+      const afterFailure = await client.get();
+      const elapsedMs = Math.round(performance.now() - startedAt);
+      clock = 59_999;
+      const beforeExpiry = await client.get();
+      const requestsBeforeExpiry = requests;
+      clock = 60_000;
+      const recovered = await client.get();
+      console.log(
+        JSON.stringify({
+          failure,
+          initial,
+          afterFailure,
+          beforeExpiry,
+          requestsBeforeExpiry,
+          recovered,
+          totalRequests: requests,
+          elapsedMs,
+          errors,
+        }),
+      );
+      expect(recovered).toEqual(available);
+      expect(afterFailure).toEqual(available);
+    } finally {
+      for (const timer of timers) clearTimeout(timer);
+      server.closeAllConnections();
+      await new Promise&lt;void&gt;((resolve, reject) =&gt; {
+        server.close((error) =&gt; (error ? reject(error) : resolve()));
+      });
+    }
+  },
+  10_000,
+);
+</pre></details>
+<h3>First run: exact captured observations</h3>
+<pre>{&quot;failure&quot;:&quot;http-503&quot;,&quot;initial&quot;:{&quot;claude&quot;:true,&quot;codex&quot;:false},&quot;afterFailure&quot;:{&quot;claude&quot;:false,&quot;codex&quot;:false},&quot;beforeExpiry&quot;:{&quot;claude&quot;:false,&quot;codex&quot;:false},&quot;requestsBeforeExpiry&quot;:2,&quot;recovered&quot;:{&quot;claude&quot;:true,&quot;codex&quot;:false},&quot;totalRequests&quot;:3,&quot;elapsedMs&quot;:3,&quot;errors&quot;:[&quot;Error&quot;]}
+{&quot;failure&quot;:&quot;timeout&quot;,&quot;initial&quot;:{&quot;claude&quot;:true,&quot;codex&quot;:false},&quot;afterFailure&quot;:{&quot;claude&quot;:false,&quot;codex&quot;:false},&quot;beforeExpiry&quot;:{&quot;claude&quot;:false,&quot;codex&quot;:false},&quot;requestsBeforeExpiry&quot;:2,&quot;recovered&quot;:{&quot;claude&quot;:true,&quot;codex&quot;:false},&quot;totalRequests&quot;:3,&quot;elapsedMs&quot;:2001,&quot;errors&quot;:[&quot;TimeoutError&quot;]}
+AssertionError: expected { claude: false, codex: false } to deeply equal { claude: true, codex: false }
+Tests  2 failed | 13 passed (15)</pre>
+<p>The controlled clock is 0 for the initial success, 30,000 for the failed refresh, 59,999 for a cached reread, and 60,000 for recovery. These are logical cache timestamps, not a claimed 60-second wall-clock trace. The timeout still takes two real seconds.</p>
+
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/plugins/account-pool/src/parent-pool.ts#L13-L14">The constants</a> define a 30,000 ms success TTL and a 2,000 ms network timeout. <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/plugins/account-pool/src/parent-pool.ts#L88-L107">load()</a> turns all exceptions, malformed bodies, and non-OK responses into the same unavailable value. It cannot distinguish an unavailable parent from an unsuccessful measurement.</p>
+<pre>return UNAVAILABLE_POOL;</pre>
+<p><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/plugins/account-pool/src/parent-pool.ts#L77-L85">get()</a> then assigns that fallback the full success TTL:</p>
+<pre>const value = await this.load();
+const ttlMs = this.options.ttlMs ?? DEFAULT_AVAILABILITY_TTL_MS;
+this.cached = { value, expiresAt: this.options.now() + ttlMs };
+return value;</pre>
+<p>The defect is loss of measurement provenance: a failed refresh overwrites known capabilities and is treated as an authoritative negative result. The cache window starts after load finishes. This is why a roughly two-second aborted read can suppress refreshes for another 30 seconds.</p>
+<p><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/plugins/account-pool/src/server.ts#L295-L300">canServe()</a> directly returns the provider boolean. <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/plugins/account-pool/src/server.ts#L321-L343">contributeFor()</a> only supplies the routed settings when canServe succeeds; otherwise it deletes the retry-route marker and returns neutralized settings for a configured parent. This source path supports the routing consequence without making an unperformed provider-session claim.</p>
+
+<h2>6. Proposed fix</h2>
+<p>Represent a failed availability measurement separately from a valid positive or negative answer. Preserve last-known-good availability for a bounded transient-failure window, retry failed measurements sooner than successful measurements, and eventually report a persistently unreachable parent unavailable. Keep explicit successful negative answers authoritative. Fail closed when there has never been a valid answer, and verify rejection, invalid-response, recovery, and prolonged-outage behavior. Authentication failures need deliberate handling rather than accidentally inheriting a stale-success policy.</p>
+<p>No fix branch or new PR was created: open PR #8187 already addresses the same verified root cause for the duplicate issue #8188. Choosing new timeout or staleness policy here would also be unnecessary overlap.</p>
+
+<h2>7. Existing PR: static review only</h2>
+<p><a href="https://github.com/get-bb/bb/pull/8187">PR #8187</a> is open and its closing-issue metadata names #8188. Its two changed files are the parent-availability owner and its existing tests. The read-only production diff separates unsuccessful reads from successful values, retains the last successful answer, uses a five-second failed-read retry, introduces a 60-second failure grace period, and raises the read timeout to five seconds.</p>
+<p><strong>Verdict:</strong> targets the verified root cause; not dynamically verified here. The branch, scripts, and tests from that PR were not run. This report's newly authored regression was run only against trusted main. <strong>Review concern, medium:</strong> the failure branch still groups token rejection and invalid payloads with transport failures; at <code>plugins/account-pool/src/parent-pool.ts</code>, the stale-value policy should be checked explicitly for those cases. This is a safety-limit observation, not a claim that unauthorized requests would succeed.</p>
+
+<h2>8. Related issues</h2>
+<p>The closed target #8189 was identified by its author as a duplicate of <a href="https://github.com/get-bb/bb/issues/8188">#8188</a>. This report does not reopen either issue or create a second fix. Issue state is preserved.</p>
+
+<h2>9. Verification: second clean checkout</h2>
+<p>The same agent created a second detached temporary checkout directly at <code>fb045a046653cc127656ca3c7243d44ae4c94f3f</code>, confirmed its tracked working tree was clean, performed a separate frozen install, generated SDK declarations through Turbo, and copied only the newly authored reproduction test. It used new ephemeral local ports and no data directory. This is a repeat verification by the same agent, not an independent review.</p>
+<pre>pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run test --filter=bb-plugin-account-pool -- src/parent-pool.test.ts src/availability-regression.test.ts
+
+{&quot;failure&quot;:&quot;http-503&quot;,&quot;initial&quot;:{&quot;claude&quot;:true,&quot;codex&quot;:false},&quot;afterFailure&quot;:{&quot;claude&quot;:false,&quot;codex&quot;:false},&quot;beforeExpiry&quot;:{&quot;claude&quot;:false,&quot;codex&quot;:false},&quot;requestsBeforeExpiry&quot;:2,&quot;recovered&quot;:{&quot;claude&quot;:true,&quot;codex&quot;:false},&quot;totalRequests&quot;:3,&quot;elapsedMs&quot;:2,&quot;errors&quot;:[&quot;Error&quot;]}
+{&quot;failure&quot;:&quot;timeout&quot;,&quot;initial&quot;:{&quot;claude&quot;:true,&quot;codex&quot;:false},&quot;afterFailure&quot;:{&quot;claude&quot;:false,&quot;codex&quot;:false},&quot;beforeExpiry&quot;:{&quot;claude&quot;:false,&quot;codex&quot;:false},&quot;requestsBeforeExpiry&quot;:2,&quot;recovered&quot;:{&quot;claude&quot;:true,&quot;codex&quot;:false},&quot;totalRequests&quot;:3,&quot;elapsedMs&quot;:2002,&quot;errors&quot;:[&quot;TimeoutError&quot;]}
+AssertionError: expected { claude: false, codex: false } to deeply equal { claude: true, codex: false }
+Tests  2 failed | 13 passed (15)</pre>
+<p>Result: both expected failures were repeated for the same capability assertion; both runs recover on the third request. No correction to the root-cause conclusion was needed. The approximately two-second waits and unchanged request counts were observed again. Verdict scope remains the production availability boundary, not a live Claude session.</p>
+
+<h2>10. Appendix: build and evidence limits</h2>
+<p>The initial full <code>pnpm exec turbo run build</code> failed because clean-checkout plugin SDK declarations were not yet generated. After the documented <code>build:types</code> task, the same full build passed: <strong>74 successful tasks out of 74</strong>. Both focused test invocations exited 1 for the two intended regression failures, with 13 pre-existing tests passing. No repository production file was changed for the experiment, no dependency was added, and no issue-supplied code was executed.</p>
+<p>Untrusted issue and PR content was treated only as claims and read-only evidence. No supplied script, patch, branch, external attachment, or linked command was executed. Reproduction source and essential observations are embedded above; raw local logs and scratch checkouts are not published. No screenshots are appropriate for this nonvisual cache experiment.</p>
+<p>Report generated by an agent.</p>
+</main></body></html>
