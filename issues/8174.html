@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #8174 Unnecessary core initialization during plugin dispatch</title>
+<style>
+:root{--canvas:#fafaf8;--ink:#1a1a1a;--muted:#666;--line:#e2e2de;--accent:#0052cc}body{margin:0;background:var(--canvas);color:var(--ink);font:16px/1.55 system-ui,sans-serif}main{max-width:960px;margin:auto;padding:40px 24px 80px}h1{font-size:26px;line-height:1.25}h2{font-size:18px;margin-top:36px;padding-top:20px;border-top:1px solid var(--line)}.meta{color:var(--muted);font-size:14px}.pill{display:inline-block;padding:1px 8px;border:1px solid var(--line);border-radius:999px}table{border-collapse:collapse;width:100%;font-size:14px}td,th{text-align:left;padding:7px;border-bottom:1px solid var(--line);vertical-align:top}pre{padding:12px;background:white;border:1px solid var(--line);overflow:auto;font-size:13px}a{color:var(--accent)}code{font-size:13px}
+</style>
+</head>
+<body><main>
+<p><a href="../">← reports</a></p>
+<h1>#8174 · Unnecessary core initialization during plugin dispatch</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: Medium</span> <span class="pill">Effort: Low</span> <span class="pill">cli · perf · confirmed-repro</span></p>
+<p class="meta"><a href="https://github.com/get-bb/bb/issues/8174">GitHub issue</a> · November 25, 2026 · trusted base <code>fb045a046653cc127656ca3c7243d44ae4c94f3f</code></p>
+<p><strong>Verdict: REPRODUCED · Root-cause confidence: high</strong></p>
+<h2>1. TL;DR</h2>
+<p>A command owned by a plugin completes successfully, but first imports every core CLI command group and JSON shape help that the plugin does not use. A fresh CLI process connected to an isolated local fixture resolves all 20 core group chunks before completing plugin dispatch. Both clean trusted checkouts show the same result, while version and thread-help controls load zero and one core group respectively. The defect is startup ordering rather than incorrect plugin output. This report confirms avoidable initialization, not a particular CPU or wall-time saving.</p>
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>Plugin dispatch loads every core group.</td><td>Verified</td><td>20 named core chunks in both clean runs; plugin returns <code>probe-ok</code> with exit code 0.</td></tr>
+<tr><td>JSON shape help also loads.</td><td>Verified</td><td><code>json-shapes-YGKRMS2X.js</code> appears in both module-resolution traces; source awaits its setup before the proxy.</td></tr>
+<tr><td>Version and named core commands are already selective.</td><td>Verified</td><td><code>--version</code>: 0 core groups; <code>thread --help</code>: only <code>thread</code>.</td></tr>
+<tr><td>The proxy does not need registered Commander commands.</td><td>Verified</td><td>The known-name table is static; the proxy receives the candidate, URL callback and soft-alias flag, then exits after execution.</td></tr>
+<tr><td>Specific startup-time and CPU savings.</td><td>Unverified</td><td>No timing benchmark or production patch was run. This environment differs from the reporter's machine.</td></tr>
+<tr><td>The historical change introduced the ordering issue.</td><td>Unverified</td><td>Current trusted source establishes the cause without assigning historical responsibility.</td></tr></table>
+<h2>3. Environment</h2>
+<ul><li>Repository visibility: public. Trusted <code>get-bb/bb</code> main: <code>fb045a046653cc127656ca3c7243d44ae4c94f3f</code>, fetched directly from the canonical repository.</li>
+<li>Linux <code>4.19.0-gvisor</code>, x86_64; Node <code>v22.19.0</code>; pnpm <code>9.15.0</code>.</li>
+<li>Two separate clean clones, named <code>first</code> and <code>second</code>; identical recorded commit; no tracked changes before or after reproduction. Each received a frozen install and a Turbo CLI build including upstream dependencies.</li>
+<li>No real bb instance, providers, accounts, database, or runtime data used. Each invocation uses a temporary HOME/XDG configuration; each probe binds a fresh ephemeral loopback port and removes its temporary data on exit. Port numbers are preserved in the result artifacts.</li>
+<li>No screenshots: this is a process-startup/module-graph defect, not a visual defect.</li></ul>
+<h2>4. Minimal reproduction</h2>
+<p>The complete inline probe below was authored from trusted repository code, not copied from the issue or linked PR. It starts its own HTTP fixture, exercises the built CLI, records resolved split chunks, validates successful plugin routing and output, then asserts that dispatch imported no core groups. Node 22.19 or a newer Node with TypeScript stripping is required.</p>
+<ol><li>In a fresh checkout of the canonical public repository, select the recorded base and build:
+<pre>git clone https://github.com/get-bb/bb.git bb-8174
+cd bb-8174
+git checkout --detach fb045a046653cc127656ca3c7243d44ae4c94f3f
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/cli</pre></li>
+<li>Save the complete source below as <code>plugin-startup.mjs</code> outside the checkout, then run:
+<pre>node /absolute/path/to/plugin-startup.mjs "$PWD"</pre></li>
+<li>Expected: plugin output is correct, zero core groups, zero JSON-shape chunks, probe exits 0. Actual: plugin output is correct but 20 groups and one JSON-shape chunk resolve; the regression assertion exits 1:
+<pre>"coreGroupCount": 20,
+"expectedCoreGroupCount": 0
+AssertionError [ERR_ASSERTION]: plugin dispatch must not load core command groups
+20 !== 0</pre></li></ol>
+<p>All loaded groups: browser, status, settings, project, prompt-history, provider, machine, server, updates, terminal, thread, environment, file, theme, plugin, marketplace, skill, guide, diagnostics, voice.</p>
+<details id="probe"><summary>Complete executable reproduction source</summary><pre>
+import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { basename, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
+
+const checkout = resolve(process.argv[2]);
+const scratch = await mkdtemp(join(tmpdir(), "bb-8174-probe-"));
+const execFileAsync = promisify(execFile);
+const { CORE_COMMAND_GROUPS } = await import(
+  pathToFileURL(join(checkout, "apps/cli/src/command-groups.ts"))
+);
+const requests = [];
+const server = createServer(async (request, response) =&gt; {
+  try {
+    requests.push(`${request.method} ${request.url}`);
+    response.setHeader("content-type", "application/json");
+    if (request.method === "GET" &amp;&amp; request.url === "/api/v1/plugins/contributions") {
+      response.end(JSON.stringify({ cliCommands: [{
+        pluginId: "startup-probe",
+        name: "startup-probe",
+        summary: "Local startup probe",
+        commands: [{ name: "ping", summary: "Ping", usage: "bb startup-probe ping" }],
+      }] }));
+      return;
+    }
+    if (request.method === "POST" &amp;&amp; request.url === "/api/v1/plugins/startup-probe/cli") {
+      let body = "";
+      for await (const chunk of request) body += chunk;
+      assert.deepEqual(JSON.parse(body).argv, ["ping"]);
+      response.end(JSON.stringify({ exitCode: 0, stdout: "probe-ok\n", stderr: "" }));
+      return;
+    }
+    response.statusCode = 404;
+    response.end("{}");
+  } catch (error) {
+    response.destroy(error);
+  }
+});
+
+try {
+  await mkdir(join(scratch, "home"));
+  await writeFile(join(scratch, "hook.mjs"), `
+import { appendFileSync } from "node:fs";
+let destination;
+export function initialize(data) { destination = data.destination; }
+export async function resolve(specifier, context, nextResolve) {
+  const resolved = await nextResolve(specifier, context);
+  appendFileSync(destination, resolved.url + "\\n");
+  return resolved;
+}
+`);
+  await writeFile(join(scratch, "register.mjs"), `
+import { register } from "node:module";
+register(new URL("./hook.mjs", import.meta.url), {
+  data: { destination: process.env.PROBE_LOG },
+});
+`);
+  await new Promise((done) =&gt; server.listen(0, "127.0.0.1", done));
+  const address = server.address();
+  assert.ok(address !== null &amp;&amp; typeof address !== "string");
+  async function run(args) {
+    const log = join(scratch, "modules.log");
+    await writeFile(log, "");
+    const result = await execFileAsync(process.execPath, [
+      "--import", pathToFileURL(join(scratch, "register.mjs")).href,
+      join(checkout, "apps/cli/dist/index.js"), ...args,
+    ], {
+      cwd: checkout,
+      timeout: 30000,
+      env: {
+        PATH: process.env.PATH,
+        HOME: join(scratch, "home"),
+        XDG_CONFIG_HOME: join(scratch, "home", "config"),
+        XDG_DATA_HOME: join(scratch, "home", "data"),
+        BB_CLI_REEXEC: "1",
+        BB_CLI_ERROR_LOG: "0",
+        BB_SERVER_URL: `http://127.0.0.1:${address.port}`,
+        PROBE_LOG: log,
+      },
+    });
+    const chunks = [...new Set((await readFile(log, "utf8")).split("\n")
+      .filter((url) =&gt; url.includes("/index-chunks/"))
+      .map((url) =&gt; basename(new URL(url).pathname)))].sort();
+    return {
+      stdout: result.stdout,
+      stderr: result.stderr,
+      coreGroups: CORE_COMMAND_GROUPS.filter((group) =&gt; chunks.some((chunk) =&gt;
+        new RegExp(`^${group.name}-[A-Z0-9]+\\.js$`).test(chunk))).map((group) =&gt; group.name),
+      jsonShapeChunks: chunks.filter((chunk) =&gt; chunk.startsWith("json-shapes-")),
+    };
+  }
+  const version = await run(["--version"]);
+  assert.deepEqual(version.coreGroups, []);
+  const threadHelp = await run(["thread", "--help"]);
+  assert.match(threadHelp.stdout, /Usage: bb thread/);
+  assert.deepEqual(threadHelp.coreGroups, ["thread"]);
+  const plugin = await run(["startup-probe", "ping"]);
+  assert.equal(plugin.stdout, "probe-ok\n");
+  assert.equal(plugin.stderr, "");
+  assert.deepEqual(requests, [
+    "GET /api/v1/plugins/contributions",
+    "POST /api/v1/plugins/startup-probe/cli",
+  ]);
+  console.log(JSON.stringify({
+    node: process.version,
+    fixturePort: address.port,
+    controls: { versionGroups: version.coreGroups, threadHelpGroups: threadHelp.coreGroups },
+    plugin,
+    requests,
+    coreGroupCount: plugin.coreGroups.length,
+    expectedCoreGroupCount: 0,
+  }, null, 2));
+  assert.equal(plugin.coreGroups.length, 0, "plugin dispatch must not load core command groups");
+  assert.deepEqual(plugin.jsonShapeChunks, [], "plugin dispatch must not load JSON shape help");
+} finally {
+  server.closeAllConnections();
+  await new Promise((done) =&gt; server.close(done));
+  await rm(scratch, { recursive: true, force: true });
+}
+</pre></details>
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/cli/src/command-groups.ts#L133-L140">Command selection</a> returns all core groups whenever the first token does not name a core group. A plugin name therefore enters the full-core fallback rather than a selective import.</p>
+<p><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/cli/src/index.ts#L207-L258">The main startup sequence</a> awaits every selected loader, registers each group, and adds JSON help before attempting plugin dispatch:</p>
+<pre>const [contextEnv, ...registrars] = await Promise.all([
+  import("./context-env.js"),
+  ...groups.map((group) =&gt; group.load()),
+]);
+...
+for (const register of registrars) {
+  register(program, deps);
+}
+await addJsonShapeHelp();
+...
+await tryPluginCommandProxy(candidate, deps.getUrl, aliasTarget !== undefined);</pre>
+<p><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/cli/src/index.ts#L28-L31">Known core names</a> already come from the static group table. The <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/cli/src/index.ts#L48-L112">plugin proxy</a> uses that classification, server contributions and process arguments; after running an owned command it calls <code>process.exit(exitCode)</code>. The earlier registration and help initialization are consequently wasted on this path.</p>
+<p>The trace records module resolution rather than per-module CPU or evaluation timing. The awaited dynamic imports and registrar calls in trusted source explain why this is real startup work, not merely a list of available files. The fixture supplies server responses only; it does not replace the CLI entry point, proxy, loader, or group registration.</p>
+<h2>6. Proposed fix</h2>
+<p>Attempt plugin ownership and dispatch after creating the context dependencies but before loading or registering core groups. Successful plugin dispatch exits early. If no plugin owns the token, retain the existing full-core fallback and soft-alias behavior. Preserve top-level/version help, unknown-command suggestions, disabled-plugin diagnostics, unreachable-server handling, plugin-owned help, and argument passthrough.</p>
+<p>No fix branch or duplicate PR was created: open <a href="https://github.com/get-bb/bb/pull/8175">PR #8175</a> already closes this issue. No linked PR code was checked out or executed.</p>
+<h2>7. PR review</h2>
+<h3>PR #8175 — static assessment only</h3>
+<p>Reviewed GitHub metadata and diff at head <code>2a1e4fa975670e81107b6f14f27d3d7fc460c427</code>. The diff moves the plugin-dispatch block ahead of core loader registration, keeps fallback parsing, extends startup-graph assertions, and adds an unknown-name suggestion case. This addresses the verified ordering cause in <code>apps/cli/src/index.ts:215</code>. No blocking defect is evident from this limited static inspection. The PR's runtime behavior is not verified: all executed source and builds came from trusted main, not its branch. Verdict: <strong>addresses the observed cause statically; runtime validation still required</strong>.</p>
+<h2>8. Related issues</h2>
+<p>PR #8175 is the open closing reference found through GitHub's issue timeline and PR closing-reference metadata. A small CLI-startup issue search did not identify another issue with this exact initialization-order defect; this was not an exhaustive duplicate audit.</p>
+<h2>9. Verification</h2>
+<p>The same agent repeated the reproduction in a second clean trusted checkout. This is a clean repeat, not independent-agent verification.</p>
+<table><tr><th>Run</th><th>Commands</th><th>Result</th></tr>
+<tr><td>First checkout</td><td>Frozen install; Turbo CLI build; <code>node plugin-startup.mjs /path/to/first</code></td><td>Plugin succeeds; 20 core groups and JSON help load; intended assertion fails with exit 1.</td></tr>
+<tr><td>Second checkout</td><td>Separate clone at the same SHA; new frozen install/build; <code>node plugin-startup.mjs /path/to/second</code></td><td>Same result using a newly allocated fixture port and new temporary HOME/data directory.</td></tr>
+<tr><td>Existing coverage</td><td><code>pnpm exec turbo run test --filter=@bb/cli -- src/__tests__/startup-graph.test.ts</code></td><td>8 tests pass, 1 test file; confirms current startup coverage does not prohibit this unnecessary plugin-path initialization.</td></tr></table>
+<p>No claim or verdict changed after the second run. No production fix was attempted, so no after-fix or PR-branch test success is claimed. Source checkouts remain clean; fixtures close their sockets and remove temporary data in <code>finally</code>.</p>
+<h2>10. Appendix</h2>
+<details><summary>First reproduction output (probe exits 1; child CLI exits 0)</summary><pre>
+{
+  "node": "v22.19.0",
+  "fixturePort": 16798,
+  "controls": {
+    "versionGroups": [],
+    "threadHelpGroups": [
+      "thread"
+    ]
+  },
+  "plugin": {
+    "stdout": "probe-ok\n",
+    "stderr": "",
+    "coreGroups": [
+      "browser",
+      "status",
+      "settings",
+      "project",
+      "prompt-history",
+      "provider",
+      "machine",
+      "server",
+      "updates",
+      "terminal",
+      "thread",
+      "environment",
+      "file",
+      "theme",
+      "plugin",
+      "marketplace",
+      "skill",
+      "guide",
+      "diagnostics",
+      "voice"
+    ],
+    "jsonShapeChunks": [
+      "json-shapes-YGKRMS2X.js"
+    ]
+  },
+  "requests": [
+    "GET /api/v1/plugins/contributions",
+    "POST /api/v1/plugins/startup-probe/cli"
+  ],
+  "coreGroupCount": 20,
+  "expectedCoreGroupCount": 0
+}
+node:internal/modules/run_main:123
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: plugin dispatch must not load core command groups
+
+20 !== 0
+
+    at file://&lt;report-artifacts&gt;/plugin-startup.mjs:117:10 {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: 20,
+  expected: 0,
+  operator: 'strictEqual',
+  diff: 'simple'
+}
+
+Node.js v22.19.0
+</pre></details>
+<details><summary>Second reproduction output (probe exits 1; child CLI exits 0)</summary><pre>
+{
+  "node": "v22.19.0",
+  "fixturePort": 20460,
+  "controls": {
+    "versionGroups": [],
+    "threadHelpGroups": [
+      "thread"
+    ]
+  },
+  "plugin": {
+    "stdout": "probe-ok\n",
+    "stderr": "",
+    "coreGroups": [
+      "browser",
+      "status",
+      "settings",
+      "project",
+      "prompt-history",
+      "provider",
+      "machine",
+      "server",
+      "updates",
+      "terminal",
+      "thread",
+      "environment",
+      "file",
+      "theme",
+      "plugin",
+      "marketplace",
+      "skill",
+      "guide",
+      "diagnostics",
+      "voice"
+    ],
+    "jsonShapeChunks": [
+      "json-shapes-YGKRMS2X.js"
+    ]
+  },
+  "requests": [
+    "GET /api/v1/plugins/contributions",
+    "POST /api/v1/plugins/startup-probe/cli"
+  ],
+  "coreGroupCount": 20,
+  "expectedCoreGroupCount": 0
+}
+node:internal/modules/run_main:123
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: plugin dispatch must not load core command groups
+
+20 !== 0
+
+    at file://&lt;report-artifacts&gt;/plugin-startup.mjs:117:10 {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: 20,
+  expected: 0,
+  operator: 'strictEqual',
+  diff: 'simple'
+}
+
+Node.js v22.19.0
+</pre></details>
+<details><summary>Build and existing-suite summaries</summary><pre>
+Trusted base: fb045a046653cc127656ca3c7243d44ae4c94f3f
+Repository: get-bb/bb (PUBLIC)
+Node v22.19.0; pnpm 9.15.0; Linux 4.19.0-gvisor x86_64
+
+Both separate clones: git status --porcelain produced no output before/after probes.
+
+First install: pnpm install --frozen-lockfile --prefer-offline
+Exit 0; Done in 24.3s
+First build: pnpm exec turbo run build --filter=@bb/cli
+Tasks: 5 successful, 5 total
+Cached: 3 cached, 5 total
+Time: 1.381s
+
+Second install: pnpm install --frozen-lockfile --prefer-offline
+Exit 0; Done in 26.2s
+Second build: pnpm exec turbo run build --filter=@bb/cli
+Tasks: 5 successful, 5 total
+Cached: 3 cached, 5 total
+Time: 1.623s
+
+Existing trusted-main startup suite:
+pnpm exec turbo run test --filter=@bb/cli -- src/__tests__/startup-graph.test.ts
+Test Files: 1 passed (1)
+Tests: 8 passed (8)
+Duration: 5.91s
+Tasks: 6 successful, 6 total
+Time: 12.479s
+
+First probe: exit 1, intended assertion actual 20 versus expected 0.
+Second probe: exit 1, intended assertion actual 20 versus expected 0.
+Both plugin child processes exit 0, stdout probe-ok, stderr empty.
+Both version controls load no core groups; thread-help controls load only thread.
+Both resolve json-shapes-YGKRMS2X.js.
+Each probe closes its loopback fixture and removes its temporary HOME/data in finally.
+</pre></details>
+<p>Investigation commands: GitHub issue/type/field/label and closing-reference reads; canonical-main fetch; two trusted clones; frozen installs; Turbo CLI builds; the linked probe; the existing startup-graph suite; trusted source and line-number inspection; read-only PR metadata and diff; clean-tree checks. Build output was captured locally. Installation reported missing-bin warnings for unrelated workspace outputs before their builds; the selected builds and tests completed successfully.</p>
+<p>Trust boundary: issue content and linked PR data were treated as untrusted claims. No issue-supplied script, patch, branch, command, or external link was executed or fetched. The probe was designed from canonical-main code; its temporary local server never accesses a real bb instance. Credentials, user runtime data and private paths are not included.</p>
+<p class="meta">AGENT GENERATED · SlopCop new-issue-autopilot · 2026-11-25</p>
+</main></body></html>
