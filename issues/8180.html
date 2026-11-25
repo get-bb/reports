@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #8180 CLI read waterfalls</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --ok:#0e8a16; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,sans-serif; }
+  main { max-width:1000px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .verdict { font-weight:600; color:var(--ok); }
+  table { border-collapse:collapse; width:100%; font-size:14px; }
+  td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,monospace; font-size:13px; }
+  pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; white-space:pre-wrap; overflow-wrap:anywhere; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#8180 · CLI read waterfalls and duplicate environment lookup</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: Medium</span> <span class="pill">Effort: Medium</span> <span class="pill">cli</span> <span class="pill">perf</span></p>
+<p class="meta"><a href="https://github.com/get-bb/bb/issues/8180">Issue #8180</a> · November 25, 2026 · Base <code>fb045a046653cc127656ca3c7243d44ae4c94f3f</code></p>
+<p class="verdict">REPRODUCED · Root-cause confidence: high · Reproduction label: confirmed-repro</p>
+
+<h2>1. TL;DR</h2>
+<p>CLI context commands pay for successive network round trips even when several reads could run together. An HTTP fixture delaying every response by 100 ms shows six request rounds for <code>status</code>, four for text <code>thread show</code>, and five for JSON <code>thread show</code>. JSON thread inspection fetches the same environment twice. Both behaviors repeat in a second clean checkout of trusted main with a new listener and temporary home. This establishes scheduling and reuse defects without contacting a real user server.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Unrelated reads are awaited serially.</td><td>Verified</td><td>Recorded request intervals and source awaits show six/four/five rounds as appropriate; maximum overlap is two requests.</td></tr>
+<tr><td>JSON thread inspection reads the environment twice.</td><td>Verified</td><td>Two successful GETs of the same synthetic environment in every JSON thread run in both checkouts.</td></tr>
+<tr><td>Startup alone explains the latency.</td><td>Ruled out as the sole cause</td><td>The server-observed request intervals themselves contain successive 100 ms waits.</td></tr>
+<tr><td>Specific live-server and patched timings.</td><td>Unverified</td><td>No real user server or proposed production patch was run. Absolute timings here differ with Node and host.</td></tr>
+<tr><td>Every read is independent.</td><td>Qualified</td><td>Environment and annotation reads require the initial thread result. The status SDK exposes the environment ID only after its aggregate read completes; those real dependency edges remain.</td></tr></table>
+
+<h2>3. Environment</h2>
+<ul>
+<li>Two separate clean clones of public <code>get-bb/bb</code>, both at <code>fb045a046653cc127656ca3c7243d44ae4c94f3f</code>, fetched from trusted <code>origin/main</code>. Main was fetched again and had not advanced.</li>
+<li>Linux 4.19.0-gvisor; Node v22.19.0; pnpm 9.15.0. Frozen dependency installs and Turbo CLI builds succeeded in both clones.</li>
+<li>Three samples per command per checkout, plus one assertion-mode sample per command in each checkout. Timing includes CLI startup; every HTTP response waits 100 ms.</li>
+<li>A fixture-only HTTP listener binds atomically to <code>127.0.0.1:0</code>. Each invocation gets a new OS-selected port and a new temporary home/data directory. No real bb server, database, enrolled machine, provider session, credential or production data is involved.</li>
+<li>The probe closes its listener and deletes its scratch directory in <code>finally</code>. Checkout paths and ephemeral directory identifiers are omitted under this site's privacy policy; the separate clones are called A and B.</li>
+</ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol>
+<li>Run the clone/build commands below. After creating <code>WORK</code>, save the complete inline probe as <code>$WORK/probe.mjs</code> before running its two commands.</li>
+<li>The probe launches the actual built CLI with isolated environment variables, serves synthetic responses at its real HTTP boundary, and validates command output, successful exit status, request counts and intervals.</li>
+<li>Observation mode exits zero and writes the trace. Assertion mode should pass after a repair, but exits one on this base for the scheduling and reuse violations below.</li>
+</ol>
+<pre>WORK=$(mktemp -d)
+git clone --single-branch --branch main https://github.com/get-bb/bb.git "$WORK/bb"
+cd "$WORK/bb"
+git checkout --detach fb045a046653cc127656ca3c7243d44ae4c94f3f
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/cli
+node "$WORK/probe.mjs" "$WORK/bb" 3 &gt; "$WORK/trace.json"
+node "$WORK/probe.mjs" "$WORK/bb" 1 --assert-efficient</pre>
+<p><strong>Expected:</strong> independent reads overlap after resource IDs are known, and the environment is fetched once per command. A contained scheduling repair can achieve at most three rounds for status without changing its SDK result, and two for thread inspection. These are network-round bounds, not wall-clock thresholds.</p>
+<p><strong>Actual:</strong> all subprocesses exit zero with empty stderr and valid expected output, but assertion mode exits one with this diagnostic in both checkouts:</p>
+<pre>AssertionError [ERR_ASSERTION]: Independent reads must overlap and each command must fetch its environment once
++ actual - expected
+
++ [
++   'status: 6 rounds, expected at most 3',
++   'status --json: 6 rounds, expected at most 3',
++   'thread show qa-thread: 4 rounds, expected at most 2',
++   'thread show qa-thread --json: 5 rounds, expected at most 2',
++   'thread show qa-thread --json: 2 environment reads, expected 1'
++ ]
+- []</pre>
+<table><tr><th>Command</th><th>Requests</th><th>Max in flight</th><th>Rounds</th><th>Environment reads</th><th>Median A / B</th></tr>
+<tr><td>status</td><td>7</td><td>2</td><td>6</td><td>1</td><td>839 / 842 ms</td></tr>
+<tr><td>status --json</td><td>7</td><td>2</td><td>6</td><td>1</td><td>835 / 839 ms</td></tr>
+<tr><td>thread show qa-thread</td><td>5</td><td>2</td><td>4</td><td>1</td><td>681 / 693 ms</td></tr>
+<tr><td>thread show qa-thread --json</td><td>6</td><td>2</td><td>5</td><td>2</td><td>785 / 792 ms</td></tr></table>
+<p>Counts and rounds match in every sample. A round is one plus the highest completed round when a request arrives at the fixture: the observed serialization chain. The only two-request overlaps on this base are project/thread reads for status and thread/execution-options reads for thread show.</p>
+<details><summary>Complete standalone reproduction and regression probe</summary><pre>import { strict as assert } from 'node:assert';
+import { spawn } from 'node:child_process';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { createServer } from 'node:http';
+import { tmpdir } from 'node:os';
+import { resolve, join } from 'node:path';
+
+const checkout = resolve(process.argv[2] ?? '.');
+const repetitions = Number(process.argv[3] ?? 3);
+assert(Number.isSafeInteger(repetitions) &amp;&amp; repetitions &gt; 0);
+const scratch = await mkdtemp(join(tmpdir(), 'cli-read-probe-'));
+const thread = {
+  id: 'qa-thread', projectId: 'qa-project', providerId: 'qa-provider',
+  environmentId: 'qa-environment', status: 'idle', title: 'Probe',
+  titleFallback: null, sectionId: null, parentThreadId: null,
+  lifecycleOwnerThreadId: null, sourceThreadId: null, originKind: null,
+  originPluginId: null, visibility: 'visible', parentNotifications: 'auto',
+  archivedAt: null, pinnedAt: null, deletedAt: null, lastReadAt: null,
+  latestAttentionAt: 0, createdAt: 0, updatedAt: 0,
+};
+const environment = {
+  id: 'qa-environment', projectId: 'qa-project', hostId: 'qa-host',
+  name: null, path: '/tmp/qa-workspace', additionalPaths: [],
+  isGitRepo: true, isWorktree: false, branchName: 'qa', defaultBranch: 'main',
+  baseBranch: null, mergeBaseBranch: null, environmentProviderId: null,
+  environmentProviderSelection: null, environmentProviderInstanceKey: null,
+  lifecycle: { phase: 'active', retireAt: null, teardown: null },
+  hostLifecycle: 'active', managed: false, heldBy: null, statusMessage: null,
+  workspaceProvisionType: null, status: 'ready', createdAt: 0, updatedAt: 0,
+};
+const routes = new Map([
+  ['GET /api/v1/system/config', { serverId: 'qa-server', routes: [], dataDir: scratch }],
+  ['GET /api/v1/plugins', { plugins: [] }],
+  ['GET /api/v1/projects/qa-project', { id: 'qa-project', name: 'Probe' }],
+  ['GET /api/v1/threads/qa-thread', thread],
+  ['GET /api/v1/threads/qa-thread/default-execution-options', null],
+  ['GET /api/v1/threads/qa-thread/head-state', {
+    activePromptMode: null, contextWindowUsage: null, extensionStates: {},
+    modelFallback: null, pendingTodos: null, providerCommands: null, sessionOptions: null,
+  }],
+  ['GET /api/v1/threads', []],
+  ['GET /api/v1/environments/qa-environment', environment],
+  ['POST /api/v1/plugins/bb--github-pr-status/rpc/pullRequests', {
+    ok: true, result: { 'qa-environment': { outcome: 'absent' } },
+  }],
+]);
+let trace = [];
+let active = 0;
+let maximumActive = 0;
+let epoch = 0;
+const server = createServer((request, response) =&gt; {
+  const pathname = new URL(request.url, 'http://localhost').pathname;
+  const key = `${request.method} ${pathname}`;
+  const depth = 1 + Math.max(0, ...trace.filter(entry =&gt; entry.end !== null).map(entry =&gt; entry.depth));
+  const entry = { key, start: Math.round(performance.now() - epoch), end: null, depth };
+  trace.push(entry);
+  maximumActive = Math.max(maximumActive, ++active);
+  request.resume();
+  setTimeout(() =&gt; {
+    const known = routes.has(key);
+    response.writeHead(known ? 200 : 404, { 'content-type': 'application/json' });
+    response.end(JSON.stringify(known ? routes.get(key) : { error: 'Unexpected probe route' }));
+    entry.end = Math.round(performance.now() - epoch);
+    active -= 1;
+  }, 100);
+});
+await new Promise(resolveReady =&gt; server.listen(0, '127.0.0.1', resolveReady));
+const address = server.address();
+assert(address &amp;&amp; typeof address !== 'string');
+const baseUrl = `http://127.0.0.1:${address.port}`;
+const commands = [['status'], ['status', '--json'], ['thread', 'show', 'qa-thread'], ['thread', 'show', 'qa-thread', '--json']];
+const results = [];
+try {
+  for (const args of commands) {
+    const runs = [];
+    for (let iteration = 0; iteration &lt; repetitions; iteration += 1) {
+      trace = [];
+      maximumActive = 0;
+      epoch = performance.now();
+      const child = spawn(process.execPath, [join(checkout, 'apps/cli/dist/index.js'), ...args], {
+        cwd: scratch,
+        env: {
+          PATH: process.env.PATH, HOME: scratch, XDG_CONFIG_HOME: scratch,
+          BB_SERVER_URL: baseUrl, BB_PROJECT_ID: 'qa-project', BB_THREAD_ID: 'qa-thread',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', chunk =&gt; { stdout += chunk; });
+      child.stderr.on('data', chunk =&gt; { stderr += chunk; });
+      const code = await new Promise((resolveExit, rejectExit) =&gt; {
+        child.on('error', rejectExit);
+        child.on('close', resolveExit);
+      });
+      assert.equal(code, 0, `${args.join(' ')} failed: ${stderr}`);
+      assert.equal(stderr, '');
+      assert(trace.every(entry =&gt; routes.has(entry.key)));
+      if (args.includes('--json')) {
+        const payload = JSON.parse(stdout);
+        assert.equal(payload.thread.id, thread.id);
+        const reportedEnvironment = args[0] === 'status' ? payload.thread.environment : payload.environment;
+        assert(reportedEnvironment !== null);
+        assert.equal(payload.pendingTodos, null);
+      } else {
+        assert(stdout.includes('qa-thread'));
+        assert(stdout.includes('qa-environment'));
+      }
+      runs.push({
+        elapsedMs: Math.round(performance.now() - epoch), requests: trace.length,
+        maximumActive, rounds: Math.max(...trace.map(entry =&gt; entry.depth)),
+        environmentReads: trace.filter(entry =&gt; entry.key === 'GET /api/v1/environments/qa-environment').length,
+        trace: structuredClone(trace),
+      });
+    }
+    const elapsed = runs.map(run =&gt; run.elapsedMs).sort((left, right) =&gt; left - right);
+    results.push({ command: args.join(' '), medianMs: elapsed[Math.floor(elapsed.length / 2)], runs });
+  }
+  console.log(JSON.stringify({ node: process.version, delayMs: 100, repetitions, results }, null, 2));
+  if (process.argv.includes('--assert-efficient')) {
+    const violations = [];
+    for (const result of results) {
+      const allowedRounds = result.command.startsWith('status') ? 3 : 2;
+      for (const run of result.runs) {
+        if (run.rounds &gt; allowedRounds) violations.push(`${result.command}: ${run.rounds} rounds, expected at most ${allowedRounds}`);
+        if (run.environmentReads !== 1) violations.push(`${result.command}: ${run.environmentReads} environment reads, expected 1`);
+      }
+    }
+    assert.deepEqual(violations, [], 'Independent reads must overlap and each command must fetch its environment once');
+  }
+} finally {
+  await new Promise(resolveClosed =&gt; server.close(resolveClosed));
+  await rm(scratch, { recursive: true, force: true });
+}</pre></details>
+<p>The entire probe and evidence are inline. No scripts, tests, raw log artifacts or machine data are committed, as required by the reports repository policy.</p>
+
+<h2>5. Root cause</h2>
+<h3>CLI status serializes independent layers</h3>
+<p><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/cli/src/commands/status.ts#L85-L137">status.ts:85–137</a> awaits configuration, then plugins, then SDK context, then environment display. Configuration gates presentation and failure handling but is not an input to plugin or context reads. This abbreviated excerpt preserves the await order; the link contains the complete guards and arguments:</p>
+<pre>const response = await cliFetch(`${getUrl()}/api/v1/system/config`);
+const { plugins } = await createCliBbSdk(getUrl()).plugins.list();
+const status = await sdk.status.get({ projectId: context.projectId, threadId: context.threadId });
+environmentInfo = await fetchEnvironmentInfo({ environmentId: status.thread.environmentId, sdk });</pre>
+<h3>The SDK adds another serial edge</h3>
+<p><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/packages/sdk/src/areas/status.ts#L77-L130">SDK status.ts:77–130</a> already overlaps project and thread reads, but then awaits head-state before listing child threads. Both need only the known thread ID. Combined with the CLI, the request chain is configuration → plugins → project/thread → head-state → children → environment: six rounds and seven requests.</p>
+<h3>Thread inspection serializes annotations and bypasses its cache</h3>
+<p><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/cli/src/commands/thread/show.ts#L382-L409">show.ts:382–409</a> awaits pull-request lookup, environment display and pending items in sequence, after their inputs are already known. JSON then calls <code>getEnvironment()</code>.</p>
+<pre>const fetchedPullRequest = thread.environmentId ? await fetchPullRequest(...) : null;
+const environmentInfo = thread.environmentId ? await fetchEnvironmentInfo(...) : null;
+const pendingTodos = await fetchThreadPendingTodos({ sdk, threadId });
+if (opts.json) {
+  const environment = await getEnvironment();
+}</pre>
+<p><a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/cli/src/commands/environment-helpers.ts#L37-L55">environment-helpers.ts:37–55</a> performs its own <code>sdk.environments.get</code>, while <a href="https://github.com/get-bb/bb/blob/fb045a046653cc127656ca3c7243d44ae4c94f3f/apps/cli/src/commands/thread/show.ts#L283-L295">show.ts:283–295</a> caches only reads made through the local getter. The display helper does not fill that cache, so ordinary JSON mode reads the same resource again. Separate ownership of environment reads is the underlying reuse defect.</p>
+
+<h2>6. Proposed fix</h2>
+<p>Start configuration, plugins and context reads together, then consume their results while preserving existing output/error-selection rules. Fetch SDK head-state and children together once the thread is known. For thread inspection, share one environment read between display and JSON, and overlap pull-request, pending-item and environment reads. Cover absent resources, failed configuration and failed annotation reads so concurrency does not silently change graceful fallback or error precedence.</p>
+<p>No production fix was attempted: open PR <a href="https://github.com/get-bb/bb/pull/8181">#8181</a> already has a closing reference to this issue. Opening another would violate the duplicate-fix guard.</p>
+
+<h2>7. Linked PR review</h2>
+<h3>PR #8181 — static scope review only</h3>
+<p>Only GitHub metadata and the diff were read as untrusted data. The PR branch, tests and binaries were never checked out or executed. The inspected diff overlaps context reads, parallelizes SDK annotations, and shares an environment source in thread output. Those changes target the mechanisms reproduced here, but this report does not certify the PR's runtime behavior.</p>
+<p><strong>Review concern, not an observed defect:</strong> status reads become speculative when configuration fails; concurrent JSON reads can also change which error wins when several requests fail. Review failure-path coverage in <code>apps/cli/src/commands/status.ts</code> and <code>apps/cli/src/commands/thread/show.ts</code>. No additional confirmed severity finding is claimed. Only trusted main tests and this report's own probe were run.</p>
+
+<h2>8. Related issues</h2>
+<p>No additional issue is needed. This defect belongs to #8180 and already has linked PR #8181. Payload-size optimization and real-server benchmarking remain outside this investigation.</p>
+
+<h2>9. Verification</h2>
+<p>The same agent repeated the reproduction in Checkout B, a separate clean clone at the recorded base. Both clones had empty <code>git status --porcelain</code> output before and after the probe. Checkout B performed its own frozen install and Turbo build, then used a new temporary home and listener. All request shapes and duplicate counts matched Checkout A; three-run medians appear in column B. Assertion mode failed for the same five scheduling/reuse violations. No report correction was needed.</p>
+<pre>VERIFY_WORK=$(mktemp -d)
+git clone --single-branch --branch main https://github.com/get-bb/bb.git "$VERIFY_WORK/bb"
+cd "$VERIFY_WORK/bb"
+git checkout --detach fb045a046653cc127656ca3c7243d44ae4c94f3f
+git status --porcelain
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/cli
+node "$WORK/probe.mjs" "$VERIFY_WORK/bb" 3 &gt; "$VERIFY_WORK/trace.json"
+node "$WORK/probe.mjs" "$VERIFY_WORK/bb" 1 --assert-efficient
+git status --porcelain</pre>
+<p>Existing CLI output coverage also passes unchanged on Checkout A:</p>
+<pre>pnpm exec turbo run test --filter=@bb/cli -- src/__tests__/command-output/status.test.ts src/__tests__/command-output/thread-show.test.ts
+✓ src/__tests__/command-output/status.test.ts (5 tests)
+✓ src/__tests__/command-output/thread-show.test.ts (14 tests)
+Test Files  2 passed (2)
+Tests       19 passed (19)</pre>
+<p>These existing tests cover output but miss the HTTP scheduling and duplicate-read regression. The standalone assertion probe demonstrably fails on unchanged trusted main.</p>
+
+<h2>10. Appendix: request evidence and trust boundary</h2>
+<p>Server-observed request start/end offsets, relative to CLI spawn, from one run per command in Checkout A:</p>
+<pre>status
+ 200– 303 ms  round 1  GET /api/v1/system/config
+ 314– 415 ms  round 2  GET /api/v1/plugins
+ 418– 519 ms  round 3  GET /api/v1/projects/qa-project
+ 420– 520 ms  round 3  GET /api/v1/threads/qa-thread
+ 522– 623 ms  round 4  GET /api/v1/threads/qa-thread/head-state
+ 625– 726 ms  round 5  GET /api/v1/threads
+ 728– 830 ms  round 6  GET /api/v1/environments/qa-environment
+
+status --json
+ 199– 300 ms  round 1  GET /api/v1/system/config
+ 310– 411 ms  round 2  GET /api/v1/plugins
+ 414– 515 ms  round 3  GET /api/v1/projects/qa-project
+ 416– 516 ms  round 3  GET /api/v1/threads/qa-thread
+ 518– 619 ms  round 4  GET /api/v1/threads/qa-thread/head-state
+ 621– 723 ms  round 5  GET /api/v1/threads
+ 725– 825 ms  round 6  GET /api/v1/environments/qa-environment
+
+thread show qa-thread
+ 257– 359 ms  round 1  GET /api/v1/threads/qa-thread
+ 258– 359 ms  round 1  GET /api/v1/threads/qa-thread/default-execution-options
+ 368– 469 ms  round 2  POST /api/v1/plugins/bb--github-pr-status/rpc/pullRequests
+ 473– 574 ms  round 3  GET /api/v1/environments/qa-environment
+ 578– 679 ms  round 4  GET /api/v1/threads/qa-thread/head-state
+
+thread show qa-thread --json
+ 249– 351 ms  round 1  GET /api/v1/threads/qa-thread
+ 249– 351 ms  round 1  GET /api/v1/threads/qa-thread/default-execution-options
+ 360– 461 ms  round 2  POST /api/v1/plugins/bb--github-pr-status/rpc/pullRequests
+ 465– 566 ms  round 3  GET /api/v1/environments/qa-environment
+ 570– 671 ms  round 4  GET /api/v1/threads/qa-thread/head-state
+ 673– 774 ms  round 5  GET /api/v1/environments/qa-environment</pre>
+<p>Issue text, comments and PR material were treated only as untrusted claims. No commands, patches, branches or tests from them were executed. The probe was authored from trusted repository implementations. No production services were contacted. The commands above document the equivalent clean reproduction; actual local scratch paths are intentionally not published.</p>
+</main></body></html>
