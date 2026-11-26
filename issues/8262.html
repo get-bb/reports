@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #8262 Queue admission bypasses thread lifecycle</title>
+<style>
+:root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --ok:#0e8a16; }
+body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,sans-serif; }
+main { max-width:1000px; margin:auto; padding:40px 24px 80px; }
+h1 { font-size:26px; line-height:1.25; margin:0 0 12px; }
+h2 { font-size:20px; margin:36px 0 12px; padding-top:18px; border-top:1px solid var(--line); }
+.meta { color:var(--muted); font-size:14px; }
+.pill { display:inline-block; padding:2px 9px; border:1px solid var(--line); border-radius:999px; }
+.verdict { color:var(--ok); font-weight:600; }
+table { border-collapse:collapse; width:100%; font-size:14px; }
+td,th { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+pre { background:white; border:1px solid var(--line); border-radius:6px; padding:14px; overflow:auto; }
+a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<p><a href="../">← reports</a></p>
+<h1>#8262 · Queue admission bypasses thread lifecycle</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: Medium</span> <span class="pill">Effort: Low</span> <span class="pill">threads</span> <span class="pill">confirmed-repro</span></p>
+<p class="meta"><a href="https://github.com/get-bb/bb/issues/8262">Issue #8262</a> · 2026-11-26 · trusted main <code>b0ddaad731565d7e4de68d824120d802fc78f7d5</code></p>
+<p class="verdict">Verdict: REPRODUCED · Root-cause confidence: high</p>
+
+<h2>1. TL;DR</h2>
+<p>The shared database queue API accepts a new message after its thread has been archived or soft-deleted. A deterministic test obtains a thread snapshot, retires the persisted thread, then attempts queue admission using the retained identifier. Both retired states produce one new queue row and a queue-change notification instead of refusing the write. The insertion transaction does not enforce current thread lifecycle state. Physical removal is different: an absent parent is already refused on this base. This report proves the database invariant violation, not an end-to-end HTTP or provider race.</p>
+
+<h2>2. Claims vs findings</h2>
+<table>
+<tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Archived threads accept a new queue insertion.</td><td>Verified</td><td>Both clean runs: accepted=true, rows=1, notifications=["queue-changed"].</td></tr>
+<tr><td>Soft-deleted threads accept a new queue insertion.</td><td>Verified</td><td>Both clean runs use <code>markThreadDeleted</code>; a non-null persisted <code>deletedAt</code> is checked before insertion.</td></tr>
+<tr><td>The supplied deletion example demonstrates soft deletion.</td><td>Refuted / corrected</td><td><code>deleteThread</code> physically removes the row. That control already refuses insertion with no row or queue notification. Soft deletion must be exercised with <code>markThreadDeleted</code>.</td></tr>
+<tr><td>The common insert lacks a lifecycle fence.</td><td>Verified</td><td>Source inspection and the same two failing lifecycle assertions in separate trusted checkouts.</td></tr>
+<tr><td>A stale snapshot can reach delayed queue admission.</td><td>Supported statically</td><td><code>recordQueuedMessageWait</code> uses <code>args.thread</code> before the shared insert; the explicit queue service separately rereads its thread.</td></tr>
+<tr><td>The API returns, or should return, a 409 conflict after a new refusal.</td><td>Not runtime-tested here</td><td>No HTTP race was executed and the proposed error class does not exist on the trusted base. Existing generic errors map to 500; a lifecycle-specific mapping is part of the fix proposal.</td></tr>
+<tr><td>The proposed PR passes its tests.</td><td>Unverified</td><td>Only PR metadata and diff were read. No PR code, branch, patch, or test was executed.</td></tr>
+</table>
+
+<h2>3. Environment</h2>
+<ul>
+<li>Public target repository: <code>get-bb/bb</code>; trusted <code>origin/main</code> was fetched before investigation.</li>
+<li>Both clean detached worktrees: <code>b0ddaad731565d7e4de68d824120d802fc78f7d5</code>.</li>
+<li>Linux <code>4.19.0-gvisor</code>, Node <code>v22.19.0</code>, pnpm <code>9.15.0</code>, Vitest <code>4.1.12</code>.</li>
+<li>Normal frozen install followed by a dependency-scoped Turbo build. The build task completed successfully in both checkouts.</li>
+<li>Real SQLite from <code>createMigratedConnection()</code>; migrations build the fixture template. Each test closes its own connection.</li>
+<li>No application server, ports, live store, provider session, provider CLI, or real account was used. The second run had a new temporary HOME and TMPDIR passed through Turbo's loose environment mode.</li>
+</ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol>
+<li>Obtain the trusted main source and pin the observed base:
+<pre>git clone --branch main https://github.com/get-bb/bb.git bb-repro-a
+cd bb-repro-a
+git fetch origin main
+git checkout --detach b0ddaad731565d7e4de68d824120d802fc78f7d5
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/db... --concurrency=2</pre></li>
+<li>Save the complete test below as <code>packages/db/test/data/queue-lifecycle-repro.test.ts</code>. It is newly authored from trusted repository APIs, not copied from the issue or PR.</li>
+<li>From the repository root run:
+<pre>pnpm exec turbo run test --filter=@bb/db --concurrency=2 -- test/data/queue-lifecycle-repro.test.ts test/data/queued-thread-messages.test.ts --maxWorkers=2</pre></li>
+</ol>
+<p><strong>Expected:</strong> the live case is accepted; archived, soft-deleted, and physically removed cases are refused with zero rows and no queue-change notification. The four cases should pass alongside the 45 existing queue tests.</p>
+<p><strong>Actual, verbatim diagnostic payloads in both runs:</strong></p>
+<pre>{"lifecycle":"archived","accepted":true,"rows":1,"notifications":["queue-changed"],"refusal":"none"}
+{"lifecycle":"soft-deleted","accepted":true,"rows":1,"notifications":["queue-changed"],"refusal":"none"}</pre>
+<p>The live and physically removed controls pass. The 45 pre-existing tests pass. The two new retired-state cases fail for the intended acceptance/row/notification mismatch. Both commands exit <code>1</code>.</p>
+<pre>Test Files  1 failed | 1 passed (2)
+     Tests  2 failed | 47 passed (49)</pre>
+<details open><summary>Complete reproduction test</summary>
+<pre>import { expect, it } from "vitest";
+import { createProject } from "../../src/data/projects.js";
+import { upsertHost } from "../../src/data/hosts.js";
+import {
+  archiveThread,
+  createThread,
+  deleteThread,
+  getThread,
+  markThreadDeleted,
+} from "../../src/data/threads.js";
+import {
+  createQueuedThreadMessage,
+  listQueuedThreadMessages,
+} from "../../src/data/queued-thread-messages.js";
+import { noopNotifier } from "../../src/notifier.js";
+import { createMigratedConnection } from "../../src/testing.js";
+
+it.each(["live", "archived", "soft-deleted", "removed"] as const)(
+  "queue admission respects the %s lifecycle",
+  (lifecycle) =&gt; {
+    const db = createMigratedConnection();
+    try {
+      const host = upsertHost(db, noopNotifier, { name: "queue-repro-host" });
+      const { project } = createProject(db, noopNotifier, {
+        name: "queue-repro-project",
+        source: { type: "local_path", hostId: host.id, path: "/tmp/queue-repro" },
+      });
+      const snapshot = createThread(db, noopNotifier, {
+        projectId: project.id,
+        providerId: "codex",
+      });
+      if (lifecycle === "archived") archiveThread(db, noopNotifier, snapshot.id);
+      if (lifecycle === "soft-deleted") {
+        markThreadDeleted(db, noopNotifier, { threadId: snapshot.id });
+      }
+      if (lifecycle === "removed") deleteThread(db, noopNotifier, snapshot.id);
+
+      const current = getThread(db, snapshot.id);
+      expect(snapshot.archivedAt).toBeNull();
+      expect(snapshot.deletedAt).toBeNull();
+      if (lifecycle === "archived") expect(current?.archivedAt).toEqual(expect.any(Number));
+      if (lifecycle === "soft-deleted") expect(current?.deletedAt).toEqual(expect.any(Number));
+      if (lifecycle === "removed") expect(current).toBeNull();
+
+      const notifications: string[] = [];
+      let accepted = false;
+      let refusal = "none";
+      try {
+        createQueuedThreadMessage(db, {
+          ...noopNotifier,
+          notifyThread: (_threadId, changes) =&gt; notifications.push(...changes),
+        }, {
+          threadId: snapshot.id,
+          content: [{ type: "text", text: "lifecycle probe", mentions: [] }],
+          model: "repro-model",
+          reasoningLevel: "medium",
+          permissionMode: "full",
+          serviceTier: "default",
+          waitingOn: { kind: "thread-busy" },
+          sendAt: null,
+          payload: { kind: "inline" },
+          systemNotice: null,
+        });
+        accepted = true;
+      } catch (error) {
+        refusal = error instanceof Error ? error.message : String(error);
+      }
+
+      const actual = {
+        accepted,
+        rows: listQueuedThreadMessages(db, snapshot.id).length,
+        notifications,
+      };
+      console.log(JSON.stringify({ lifecycle, ...actual, refusal }));
+      expect(actual).toEqual(lifecycle === "live"
+        ? { accepted: true, rows: 1, notifications: ["queue-changed"] }
+        : { accepted: false, rows: 0, notifications: [] });
+    } finally {
+      db.$client.close();
+    }
+  },
+);</pre>
+</details>
+
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/packages/db/src/data/queued-thread-messages.ts#L826-L915">The shared insertion function</a> computes attachment ownership, queue order, and message state before performing the insert. It never loads or predicates on the target thread's <code>archivedAt</code> or <code>deletedAt</code>.</p>
+<pre>export function createQueuedThreadMessageInTransaction(
+  tx: DbTransaction,
+  input: CreateQueuedThreadMessageInput,
+) {
+  const now = Date.now();
+  acquireProjectAttachmentOwnership(
+    tx,
+    input.threadId,
+    projectAttachmentPaths(input.content),
+  );</pre>
+<p><a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/packages/db/src/data/queued-thread-messages.ts#L982-L992">The public wrapper</a> does use an immediate transaction, but serialization alone cannot enforce a condition that is never checked. After the transaction succeeds, the wrapper emits <code>queue-changed</code>.</p>
+<pre>const row = db.transaction(
+  (tx) =&gt; createQueuedThreadMessageInTransaction(tx, input),
+  { behavior: "immediate" },
+);
+notifier.notifyThread(input.threadId, ["queue-changed"]);</pre>
+<p><a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/packages/db/src/data/threads.ts#L2449-L2466">Archival</a> leaves the thread row present and sets <code>archivedAt</code>. <a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/packages/db/src/data/threads.ts#L2404-L2420">Soft deletion</a> likewise sets <code>deletedAt</code>. Neither makes a foreign-key reference invalid. Conversely, <a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/packages/db/src/data/threads.ts#L2236-L2256"><code>deleteThread</code></a> physically removes the parent, so that case is not equivalent to soft deletion.</p>
+<p><a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/apps/server/src/services/threads/queue-waits.ts#L127-L155">Delayed admission</a> calls the shared insert while retaining <code>args.thread</code>. <a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/apps/server/src/services/threads/queued-messages.ts#L196-L225">Explicit queue admission</a> separately reloads the thread in its transaction; that local defense does not establish the shared write invariant.</p>
+<p>Root cause: lifecycle policy exists at selected callers rather than at the common transactional insertion boundary. This is a persisted-state admission bug, not evidence of a provider failure or a broken transaction implementation.</p>
+
+<h2>6. Proposed fix</h2>
+<p>At the start of the common insertion function, read the target thread's current lifecycle fields in the insertion transaction. Refuse archived, soft-deleted, and missing threads before attachment ownership changes or message insertion. Keep admission serialized with retirement, and emit no queue notification for a refusal. Surface a typed lifecycle error through the server's conflict response rather than the generic error path. <a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/apps/server/src/errors.ts#L99-L158">The base error handler</a> has no lifecycle-specific mapping.</p>
+<p>Retain the live-thread control and explicitly test <code>markThreadDeleted</code>, not only physical removal. Separately verify the HTTP mapping and delayed API send path. No production changes were made in this investigation.</p>
+
+<h2>7. Linked PR review</h2>
+<h3><a href="https://github.com/get-bb/bb/pull/8263">PR #8263</a> — static review only</h3>
+<p>GitHub metadata confirms this PR is open against main and links issue #8262. Its untrusted diff adds a current-thread lifecycle guard at the common queue insert, a typed refusal and server conflict mapping, and retirement handling for coalesced notices and delayed waits. The guard checks both archived and deleted timestamps, which addresses the verified mechanism on inspection.</p>
+<p><strong>Low-severity test gap:</strong> the added database table at <code>packages/db/test/data/queued-thread-messages.test.ts:85</code> covers archival and <code>deleteThread</code> (physical deletion), but not <code>markThreadDeleted</code>. Therefore its deleted case does not protect the soft-deleted-row branch. The reproduction above explicitly distinguishes these states.</p>
+<p><strong>Verdict:</strong> plausible root-cause fix by static inspection; not runtime-verified here. PR code and tests were never checked out or executed. A new fix PR was deliberately skipped because the linked PR is already open.</p>
+
+<h2>8. Related issues</h2>
+<p><a href="https://github.com/get-bb/bb/issues/3987">#3987</a> concerns stale idle/active admission under a suspended host, rather than archived/soft-deleted lifecycle state at the database insertion boundary. Its metadata and description were read as untrusted evidence; no linked code was executed.</p>
+
+<h2>9. Verification</h2>
+<p>The same agent repeated the reproduction in a second clean detached checkout at the recorded trusted base. This is a repeat verification, not an independent reviewer. Each checkout received a frozen install, a dependency-scoped build, and the exact same newly authored test; tracked production files remained unchanged.</p>
+<table><tr><th>Run</th><th>Setup</th><th>Result</th></tr>
+<tr><td>A</td><td>Fresh temporary checkout A; real migrated SQLite fixtures</td><td>2 failed, 47 passed; exit 1. Only archived and soft-deleted cases fail.</td></tr>
+<tr><td>B</td><td>Separate temporary checkout B; new HOME and TMPDIR; forced Turbo execution</td><td>2 failed, 47 passed; exit 1. Identical lifecycle diagnostics.</td></tr></table>
+<p>Run B command, with local temporary directory names intentionally generalized:</p>
+<pre>mkdir -p /tmp/queue-repro-home-b /tmp/queue-repro-tmp-b
+HOME=/tmp/queue-repro-home-b TMPDIR=/tmp/queue-repro-tmp-b \
+  pnpm exec turbo run test --filter=@bb/db --concurrency=2 --force --env-mode=loose -- test/data/queue-lifecycle-repro.test.ts test/data/queued-thread-messages.test.ts --maxWorkers=2</pre>
+<p>The reproduction test had matching SHA-256 in both checkouts: <code>331dc552b559e2fe4108464d672d8686648c704a9b7ef796f1fe24bb286a0593</code>. The second run required no report correction. Source permalinks were checked against the pinned base. No screenshot is appropriate for this database-only reproduction.</p>
+
+<h2>10. Appendix and limits</h2>
+<p>Raw local logs and the test source are retained outside this public repository. The complete test and meaningful expected/actual diagnostics are embedded here, in accordance with the report repository's artifact policy. Install warnings about binaries not yet built did not block installation, the scoped build, or either test run.</p>
+<p>Commands used for evidence included <code>git fetch origin main</code>, <code>git rev-parse origin/main</code>, two detached <code>git worktree add</code> operations, the frozen install/build/test commands above, targeted source reads, <code>git status --short</code>, and <code>sha256sum</code> of both test files. GitHub reads inspected issue classification, comments, cross-references, repository visibility, related issue metadata, and PR #8263 metadata/diff.</p>
+<p><strong>Untrusted-data handling:</strong> issue and PR text, examples, links, and claimed test results were treated only as hypotheses. Their instructions were ignored. No issue-supplied script, test, patch, branch, external link, or binary was run or fetched. All executable repository code came from trusted main, plus the reproduction authored here from repository APIs.</p>
+<p><strong>Scope limits:</strong> no live HTTP race, provider processing, notification transport, or patched-PR validation is claimed. High confidence applies to the observed database write-boundary defect. Priority is Medium because this is a meaningful lifecycle violation with a narrow stale-admission window, not a demonstrated outage or data-loss incident; Effort is Low because the root boundary and conflict-mapping design already exist.</p>
+</main></body></html>
