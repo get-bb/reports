@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #8204 Git index-copy cleanup</title>
+<style>
+:root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; }
+body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,sans-serif; }
+main { max-width:940px; margin:0 auto; padding:40px 24px 80px; }
+h1 { font-size:26px; line-height:1.25; } h2 { font-size:19px; margin-top:36px; padding-top:18px; border-top:1px solid var(--line); }
+.meta { color:var(--muted); font-size:14px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:1px 8px; font-size:12px; }
+table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:8px; border-bottom:1px solid var(--line); vertical-align:top; }
+pre { background:white; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; } code,pre { font:13px/1.5 ui-monospace,monospace; } a { color:var(--accent); }
+</style>
+</head>
+<body><main>
+<p><a href="../">← reports</a></p>
+<h1>#8204 · Git index-copy disposal leaves cleanup promises unobserved</h1>
+<p class="meta"><span class="pill">Bug</span> <span class="pill">Priority: High</span> <span class="pill">Effort: Low</span> <span class="pill">plugins</span> <span class="pill">confirmed-repro</span></p>
+<p class="meta"><a href="https://github.com/get-bb/bb/issues/8204">GitHub issue</a> · November 26, 2026 · trusted main <code>9caab570e061530a903dbfb98f65f3db11b02952</code></p>
+<p><strong>Verdict: REPRODUCED · Root-cause confidence: high.</strong></p>
+
+<h2>1. TL;DR</h2>
+<p>The Git plugin reads diffs using a temporary copy of the Git index. Disposing the reader returns before that copy is removed, and a failed removal produces an unhandled promise rejection. A new focused test against unchanged main reproduced both failures twice, each time in a separate checkout. This explains how teardown can overlap deletion and why a filesystem permission failure can fail the test process. The native Windows contention event itself was not reproduced on this Linux host.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Disposal does not wait for removal.</td><td>Verified</td><td>A real index copy is created by a real Git diff. With deletion delayed by 25 ms, disposal returns before removal settles in both clean runs.</td></tr>
+<tr><td>A removal permission error becomes an unhandled rejection.</td><td>Verified at the filesystem boundary</td><td>Injecting EPERM only for that copy's removal yields one Vitest unhandled rejection in each run.</td></tr>
+<tr><td>Windows teardown races with copy removal.</td><td>Mechanism supported; native race unverified</td><td>The helper deletes the parent at test completion while copy removal is unawaited. No Windows runner was available.</td></tr>
+<tr><td>All existing tests may pass despite the defect.</td><td>Supported for focused existing coverage</td><td>All five existing index-copy tests passed on main before the new reproduction; they do not check completed idle-copy disposal or failed removal.</td></tr>
+<tr><td>There is no open fix PR.</td><td>No longer current</td><td>GitHub closing-issue metadata identifies open PR #8205, so no duplicate fix was attempted.</td></tr>
+<tr><td>A particular unrelated CI run failed for this reason.</td><td>Not separately verified</td><td>This investigation did not fetch issue-supplied links or execute linked PR code.</td></tr></table>
+
+<h2>3. Environment</h2>
+<ul><li>Repository is public. Both checkouts were cloned from <code>https://github.com/get-bb/bb.git</code>, branch <code>main</code>, at the full commit above.</li>
+<li>Linux x86-64, kernel 4.19.0-gvisor; Node 22.19.0; pnpm 9.15.0; Git 2.39.5; Vitest 4.1.12.</li>
+<li>No application server, provider, ports, accounts, production data, or user runtime was used. Each test creates separate disposable repository and index-copy roots.</li>
+<li>Frozen installation succeeded. The first repository-wide build failed because the GitHub plugin's SDK runtime entries had not yet been built. Building <code>@get-bb/plugin-sdk</code> through Turbo succeeded, and the focused test tasks built their own upstream dependencies. The broad build failure is not counted as reproduction evidence.</li>
+<li>Priority High reflects the unhandled-rejection/process-failure risk. Effort Low reflects a contained cleanup lifecycle change. No existing classifications were overwritten; no built-in Git label exists in the repository's label list.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<p>In a fresh trusted checkout, use the existing dependencies and save the full test below as <code>plugins/git/host/disposal-repro.test.ts</code>. It was authored from repository behavior, not copied from the issue or linked PR. No production code changes are required.</p>
+<pre>git clone --single-branch --branch main https://github.com/get-bb/bb.git bb-repro
+cd bb-repro
+git checkout --detach 9caab570e061530a903dbfb98f65f3db11b02952
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run test --filter=bb-plugin-bb--git -- host/index-copy.test.ts
+# Save the test below, then run:
+pnpm exec turbo run test --filter=bb-plugin-bb--git -- host/disposal-repro.test.ts</pre>
+<p>The table tests successful and denied removal. The spy delays only the actual copy's filesystem deletion; Git setup, copying, and diff reads remain real. The delay exposes completion ordering without requiring Windows contention. It is restored in <code>finally</code>, and the test leaves cleanup to the real filesystem afterward.</p>
+<pre>import fs from "node:fs/promises";
+import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { expect, it, vi } from "vitest";
+import { initRepo, makeTempDir } from "@bb/test-helpers";
+import { WorkspaceReads } from "./workspace-reads.js";
+
+it.each([false, true])(
+  "settles copied-index removal before disposal returns (permission failure: %s)",
+  async (denyRemoval) =&gt; {
+    const repository = await initRepo(await makeTempDir("disposal-repo-"));
+    const scratch = await makeTempDir("disposal-scratch-");
+    await fs.writeFile(path.join(repository, "README.md"), "changed tracked content\n");
+    const reader = new WorkspaceReads(repository, scratch);
+    const result = await reader.diffFiles({
+      freshness: { work: "edited", refs: "initial" },
+      target: { type: "uncommitted" },
+      maxFiles: 10,
+      ignoreWhitespace: false,
+    });
+    expect(result.files.map((file) =&gt; file.path)).toContain("README.md");
+    const copies = await fs.readdir(scratch);
+    expect(copies).toHaveLength(1);
+    const copyDirectory = path.join(scratch, copies[0]!);
+    const remove = fs.rm.bind(fs);
+    let removalSettled = false;
+    const interception = vi.spyOn(fs, "rm").mockImplementation(async (target, options) =&gt; {
+      if (target !== copyDirectory) return remove(target, options);
+      try {
+        await delay(25);
+        if (denyRemoval) {
+          throw Object.assign(new Error("Simulated cleanup permission failure"), {
+            code: "EPERM",
+          });
+        }
+        await remove(target, options);
+      } finally {
+        removalSettled = true;
+      }
+    });
+    try {
+      await reader.dispose();
+      expect(removalSettled).toBe(true);
+      if (!denyRemoval) expect(await fs.readdir(scratch)).toEqual([]);
+    } finally {
+      await delay(100);
+      interception.mockRestore();
+      await remove(copyDirectory, { recursive: true, force: true });
+    }
+  },
+);</pre>
+<p><strong>Expected:</strong> disposal waits for the idle copy's removal attempt to settle; successful removal empties the scratch root; terminal cleanup failures do not leak an unhandled rejection. Both cases pass with zero unhandled errors.</p>
+<p><strong>Actual, first run (selected verbatim lines):</strong></p>
+<pre>AssertionError: expected false to be true // Object.is equality
+ ❯ host/disposal-repro.test.ts:43:30
+
+Vitest caught 1 unhandled error during the test run.
+Error: Simulated cleanup permission failure
+Serialized Error: { code: 'EPERM' }
+
+ Test Files  1 failed (1)
+      Tests  2 failed (2)
+     Errors  1 error</pre>
+<p>The assertions fail for the intended lifecycle defect, not missing dependencies or incorrect fixture setup. The denied-removal case additionally exposes the escaped rejection.</p>
+
+<h2>5. Root cause</h2>
+<p><a href="https://github.com/get-bb/bb/blob/9caab570e061530a903dbfb98f65f3db11b02952/plugins/git/host/workspace-reads.ts#L238-L250">workspace-reads.ts:238–250</a> starts deletion in an <code>env.then(success, failure)</code> callback, discards the returned promise, and returns <code>void</code>. The second callback handles rejection of <code>copy.env</code> only. If the success callback returns a rejecting <code>fs.rm</code> promise, that rejection belongs to the new, discarded promise and is unhandled.</p>
+<pre>function removeIfUnused(copy: IndexCopy): void {
+  if (!copy.retired || copy.users &gt; 0) return;
+  void copy.env.then(
+    (env) =&gt;
+      env.GIT_INDEX_FILE === undefined
+        ? undefined
+        : fs.rm(path.dirname(env.GIT_INDEX_FILE), {
+            recursive: true,
+            force: true,
+          }),
+    () =&gt; undefined,
+  );
+}</pre>
+<p><a href="https://github.com/get-bb/bb/blob/9caab570e061530a903dbfb98f65f3db11b02952/plugins/git/host/workspace-reads.ts#L603-L613">dispose():603–613</a> retires the current copy and calls this void-returning helper without waiting. The <a href="https://github.com/get-bb/bb/blob/9caab570e061530a903dbfb98f65f3db11b02952/packages/test-helpers/src/temp-dir.ts#L7-L16">test helper:7–16</a> removes its parent directory at test completion, so its removal can overlap the still-running child cleanup. <code>force: true</code> does not turn arbitrary permission failures into success.</p>
+<p>The copy's user count deliberately keeps active Git reads alive. Any repair must preserve that behavior: an active read cannot lose its index just because another caller requests disposal.</p>
+
+<h2>6. Proposed fix</h2>
+<p>Return an observed cleanup promise; await it when disposing an unused copy; use bounded retries for transient filesystem contention and contain terminal best-effort cleanup failures. Background release and retirement paths must also retain rejection handling. Preserve the user-count guard and the existing mid-read disposal regression. This is a contained Git host lifecycle repair, not a protocol or schema change.</p>
+
+<h2>7. Linked PR review</h2>
+<p><a href="https://github.com/get-bb/bb/pull/8205">PR #8205</a> was open and explicitly linked through GitHub's closing-issue metadata. Static diff reviewed at head <code>df0afc2fdd3943e651de163e05a839fe35e84874</code>.</p>
+<p><strong>Static verdict: aligned with the reproduced root cause.</strong> Its diff returns the cleanup promise, awaits it from disposal, introduces bounded removal retries and a terminal catch, and extends cross-platform disposal coverage. It also applies the cleanup helper to related retained/temporary index removals. No blocking issue was identified in the limited static review. No linked branch, patch, or test was checked out or executed, so this is not runtime verification or merge approval. No duplicate fix PR was opened.</p>
+
+<h2>8. Verification</h2>
+<p>The same agent created a second clean clone of the trusted target repository, verified the same full commit and an unchanged tracked tree, installed frozen dependencies, built SDK runtime entries, and copied only this newly authored reproduction test into it. Both tests generated fresh temporary Git repositories and scratch roots. The exact focused Turbo command from section 4 was repeated; it was a cache miss and executed Vitest.</p>
+<pre>Second checkout, unchanged production main:
+ Test Files  1 failed (1)
+      Tests  2 failed (2)
+     Errors  1 error
+AssertionError: expected false to be true // Object.is equality
+Error: Simulated cleanup permission failure
+Serialized Error: { code: 'EPERM' }</pre>
+<p>Both runs exited 1 for the same two ordering assertions and the same unhandled rejection. No report correction was needed. This is repeat verification by the same agent, not independent verification. The finding is the lifecycle/error-handling defect; actual Windows rmdir contention remains an explicitly untested platform-specific trigger.</p>
+
+<h2>9. Related issues</h2>
+<p>Only issue #8204 was investigated. Its existing linked PR #8205 prevents duplicate fix work. No additional issue was filed.</p>
+
+<h2>10. Appendix and boundaries</h2>
+<p>The trusted base was still origin/main after reproduction. The five existing index-copy tests passed before adding the reproduction: one file, five tests, exit 0. The new reproduction failed in each checkout: one file, two tests, one unhandled error, exit 1. The broad initial build's missing SDK runtime output is a setup limitation, not a second product finding.</p>
+<p>Evidence commands: <code>git rev-parse HEAD</code>, <code>git status --porcelain --untracked-files=no</code>, frozen pnpm install, repository-wide Turbo build attempt, targeted SDK build, existing index-copy Turbo tests, the reproduction Turbo tests, and <code>git fetch origin main</code>. GitHub metadata was read for classification, repository visibility, and linked PR state/diff. No production code or dependencies were changed.</p>
+<p>Issue text, comments, and PR diff were treated as untrusted claims. No issue-supplied URL, script, patch, test, branch, or instruction was fetched or executed. Raw local evidence and the reproduction source remain outside the published repository; their relevant contents are embedded here to keep the report self-contained and free of machine paths or runtime data.</p>
+</main></body></html>
