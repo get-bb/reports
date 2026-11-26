@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #8220 Late-created ignored directories leak watcher events</title>
+<style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#8220 · Late-created ignored directories leak watcher events</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Medium</span><span class="pill">host · perf · confirmed-repro</span><a href="https://github.com/get-bb/bb/issues/8220">Issue</a><span>2026-11-26</span></p>
+<p>Trusted main base: <code>b0ddaad731565d7e4de68d824120d802fc78f7d5</code></p>
+<p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong></p>
+
+<h2>1. TL;DR</h2>
+<p>Build output can repeatedly refresh Git status even though Git ignores every file being written. The workspace watcher discovers ignored directories from a Git status read when its root subscription starts, rather than continuously applying ignore rules. A directory created later is absent from that fixed ignore list, so its writes are forwarded as workspace content changes. In two clean main checkouts, twelve writes in a late-created ignored directory produced twelve content-change callbacks and three flushes of the actual Git plugin invalidator; the same writes in an already-existing ignored directory produced none. A tracked-file edit still produced one callback and one flush. An existing open pull request already targets this issue, so no duplicate fix was created.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim tested</th><th>Finding</th><th>Evidence</th></tr>
+<tr><td>Ignore behavior depends on whether the directory exists at subscription time.</td><td class="ok">Verified</td><td>Same ignore file, same twelve-write workload: existing directory 0 callbacks; late directory 12 callbacks, in both runs.</td></tr>
+<tr><td>Ignored churn reaches the Git invalidation path at roughly one-second intervals.</td><td class="ok">Verified at watcher/invalidator boundary</td><td>The real invalidator emitted 3 flushes during the late-output phase. Its source enforces a 1,000 ms minimum interval. The daemon mapping was checked in trusted main source.</td></tr>
+<tr><td>Git status has no meaningful change during ignored writes.</td><td class="ok">Verified</td><td>Porcelain status remained empty before the tracked-file edit; Git reported both output directories as ignored.</td></tr>
+<tr><td>Specific full snapshot timings and process counts on a large checkout.</td><td class="unv">Not measured here</td><td>This report does not execute a live server or full host snapshot harness. Flush counts are invalidations, not measured full snapshots.</td></tr>
+</table>
+
+<h2>3. Environment</h2>
+<ul><li>Public repository <code>get-bb/bb</code>; trusted <code>origin/main</code> at the full SHA above, with production source unchanged in both checkouts.</li>
+<li>Linux 4.19.0-gvisor x86_64; Node v22.19.0; pnpm 9.15.0; Git 2.39.5; Vitest 4.1.12; real <code>@parcel/watcher</code> 2.6.0 in-process backend.</li>
+<li>No application server, provider, credentials, instance ports, or BB runtime data used. Every run created and deleted a fresh scratch Git repository.</li>
+<li>Frozen installs succeeded in both checkouts. The full first-checkout build initially encountered missing SDK runtime output; building the existing SDK runtime and types and rerunning the full build succeeded (74 tasks). The second checkout used the watcher-targeted upstream build.</li></ul>
+
+<h2>4. Minimal reproduction</h2>
+<ol><li>Create a clean checkout of the trusted base and install existing locked dependencies:
+<pre>git clone --branch main https://github.com/get-bb/bb.git /tmp/bb-8220-first
+cd /tmp/bb-8220-first
+git checkout --detach b0ddaad731565d7e4de68d824120d802fc78f7d5
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/host-watcher</pre></li>
+<li>Save the complete test below as <code>packages/host-watcher/test/issue-8220.test.ts</code>. It uses only trusted repository modules and the real filesystem watcher. The callback feeds content-change events to the existing invalidator with the daemon's verified <code>work-status-changed</code> mapping.</li>
+<li>Run the regression through Turbo:
+<pre>pnpm exec turbo run test --filter=@bb/host-watcher -- test/issue-8220.test.ts</pre></li></ol>
+<p><strong>Expected:</strong> existing and late ignored output both produce <code>{events: 0, flushes: 0}</code>; the tracked edit produces <code>{events: 1, flushes: 1}</code>. <strong>Actual:</strong> both runs emit the exact diagnostic line below, then fail only the late-output assertion:</p>
+<pre>REPRO_8220 {&quot;writesPerDirectory&quot;:12,&quot;writeIntervalMs&quot;:180,&quot;phases&quot;:{&quot;existing&quot;:{&quot;events&quot;:0,&quot;flushes&quot;:0},&quot;late&quot;:{&quot;events&quot;:12,&quot;flushes&quot;:3},&quot;tracked&quot;:{&quot;events&quot;:1,&quot;flushes&quot;:1}},&quot;statusBeforeTrackedEdit&quot;:&quot;&quot;,&quot;ignoredDirectories&quot;:[&quot;!! existing-output/&quot;,&quot;!! late-output/&quot;],&quot;errors&quot;:[],&quot;deliveredPaths&quot;:[&quot;late-output&quot;,&quot;late-output/part-0.txt&quot;,&quot;late-output/part-1.txt&quot;,&quot;late-output/part-10.txt&quot;,&quot;late-output/part-11.txt&quot;,&quot;late-output/part-2.txt&quot;,&quot;late-output/part-3.txt&quot;,&quot;late-output/part-4.txt&quot;,&quot;late-output/part-5.txt&quot;,&quot;late-output/part-6.txt&quot;,&quot;late-output/part-7.txt&quot;,&quot;late-output/part-8.txt&quot;,&quot;late-output/part-9.txt&quot;,&quot;tracked.txt&quot;]}
+
+AssertionError: ignored output must not invalidate workspace status: expected { events: 12, flushes: 3 } to deeply equal { events: +0, flushes: +0 }</pre>
+<details><summary>Complete reproduction test (expand and save)</summary><pre>import { execFile } from &quot;node:child_process&quot;;
+import fs from &quot;node:fs/promises&quot;;
+import os from &quot;node:os&quot;;
+import path from &quot;node:path&quot;;
+import { setTimeout as delay } from &quot;node:timers/promises&quot;;
+import { promisify } from &quot;node:util&quot;;
+import { expect, it, vi } from &quot;vitest&quot;;
+import { watchWorkspaceStatus } from &quot;../src/watch-status.js&quot;;
+import {
+  createCoalescedInvalidator,
+  tagsForEnvironmentChanges,
+} from &quot;../../../plugins/git/server/invalidation.js&quot;;
+
+const execute = promisify(execFile);
+
+it(&quot;suppresses ignored output regardless of directory creation time&quot;, async () =&gt; {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), &quot;watch-8220-&quot;));
+  const git = async (...args: string[]) =&gt;
+    (await execute(&quot;git&quot;, args, { cwd: root, encoding: &quot;utf8&quot; })).stdout;
+  const phases = {
+    existing: { events: 0, flushes: 0 },
+    late: { events: 0, flushes: 0 },
+    tracked: { events: 0, flushes: 0 },
+  };
+  let phase: keyof typeof phases = &quot;existing&quot;;
+  let ready = false;
+  const errors: string[] = [];
+  const deliveredPaths = new Set&lt;string&gt;();
+  const invalidator = createCoalescedInvalidator(() =&gt; {
+    phases[phase].flushes += 1;
+  });
+  let stop: (() =&gt; Promise&lt;void&gt;) | undefined;
+
+  try {
+    await git(&quot;init&quot;, &quot;-q&quot;);
+    await fs.writeFile(
+      path.join(root, &quot;.gitignore&quot;),
+      &quot;existing-output/\nlate-output/\n&quot;,
+    );
+    await fs.writeFile(path.join(root, &quot;tracked.txt&quot;), &quot;initial\n&quot;);
+    await fs.mkdir(path.join(root, &quot;existing-output&quot;));
+    await fs.writeFile(
+      path.join(root, &quot;existing-output&quot;, &quot;seed.txt&quot;),
+      &quot;seed\n&quot;,
+    );
+    await git(&quot;add&quot;, &quot;.gitignore&quot;, &quot;tracked.txt&quot;);
+    await git(
+      &quot;-c&quot;,
+      &quot;user.name=Watcher Reproduction&quot;,
+      &quot;-c&quot;,
+      &quot;user.email=watcher@example.invalid&quot;,
+      &quot;commit&quot;,
+      &quot;-qm&quot;,
+      &quot;Initialize watcher fixture&quot;,
+    );
+
+    stop = watchWorkspaceStatus(root, {
+      onReady: () =&gt; {
+        ready = true;
+      },
+      onWatchError: (error) =&gt; {
+        errors.push(error.message);
+      },
+      onChange: (event) =&gt; {
+        if (!event.changeKinds.includes(&quot;workspace-content-changed&quot;)) return;
+        phases[phase].events += 1;
+        for (const changedPath of event.changedPaths) {
+          deliveredPaths.add(path.relative(root, changedPath));
+        }
+        invalidator.invalidate(
+          &quot;repro&quot;,
+          tagsForEnvironmentChanges(&quot;repro&quot;, [&quot;work-status-changed&quot;]).tags,
+        );
+      },
+    });
+    await vi.waitFor(() =&gt; expect(ready).toBe(true), { timeout: 5000 });
+    await delay(300);
+
+    for (const directory of [&quot;existing-output&quot;, &quot;late-output&quot;]) {
+      phase = directory === &quot;existing-output&quot; ? &quot;existing&quot; : &quot;late&quot;;
+      await fs.mkdir(path.join(root, directory), { recursive: true });
+      for (let index = 0; index &lt; 12; index += 1) {
+        await fs.writeFile(
+          path.join(root, directory, `part-${index}.txt`),
+          &quot;output\n&quot;,
+        );
+        await delay(180);
+      }
+      await delay(1300);
+    }
+
+    const statusBeforeTrackedEdit = await git(
+      &quot;--no-optional-locks&quot;,
+      &quot;status&quot;,
+      &quot;--porcelain=v1&quot;,
+    );
+    const ignoredDirectories = (
+      await git(
+        &quot;--no-optional-locks&quot;,
+        &quot;status&quot;,
+        &quot;--porcelain=v1&quot;,
+        &quot;--ignored=matching&quot;,
+      )
+    )
+      .trim()
+      .split(&quot;\n&quot;);
+    phase = &quot;tracked&quot;;
+    await fs.appendFile(path.join(root, &quot;tracked.txt&quot;), &quot;changed\n&quot;);
+    await delay(1500);
+
+    console.log(
+      &quot;REPRO_8220&quot;,
+      JSON.stringify({
+        writesPerDirectory: 12,
+        writeIntervalMs: 180,
+        phases,
+        statusBeforeTrackedEdit,
+        ignoredDirectories,
+        errors,
+        deliveredPaths: [...deliveredPaths].sort(),
+      }),
+    );
+    expect(errors).toEqual([]);
+    expect(statusBeforeTrackedEdit).toBe(&quot;&quot;);
+    expect(ignoredDirectories).toEqual([
+      &quot;!! existing-output/&quot;,
+      &quot;!! late-output/&quot;,
+    ]);
+    expect(phases.existing).toEqual({ events: 0, flushes: 0 });
+    expect(phases.tracked).toEqual({ events: 1, flushes: 1 });
+    expect(
+      phases.late,
+      &quot;ignored output must not invalidate workspace status&quot;,
+    ).toEqual({ events: 0, flushes: 0 });
+  } finally {
+    await stop?.();
+    invalidator.dispose();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}, 25000);
+</pre></details>
+<p>The existing-directory workload is a negative control and the tracked edit is a positive control. These controls and the empty Git status assertion pass before the late-directory assertion fails. No native watcher, database, clock, or production implementation is mocked.</p>
+
+<h2>5. Root cause</h2>
+<ol><li><a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/packages/host-watcher/src/workspace-root-ignores.ts#L38-L96">Ignore discovery reads Git status</a> with <code>--ignored=matching</code> and extracts ignored directory records. This enumerates existing ignored directories; it is not a reusable matcher for directories that do not exist yet.</li>
+<li><a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/packages/host-watcher/src/workspace-root-ignores.ts#L160-L208">The discovered directories form a returned ignore array</a>; <a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/packages/host-watcher/src/workspace-status-watcher.ts#L132-L156">subscription setup computes it once</a> and passes it as <code>options: { ignore }</code>. Neither this setup path nor the <a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/packages/host-watcher/src/workspace-status-watcher.ts#L182-L218">event handler</a> reclassifies newly created directories.</li>
+<li><a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/packages/host-watcher/src/watch-specs.ts#L141-L163">Every workspace-root event is classified as workspace-content-changed</a> after path containment checks, with no dynamic Git ignore check.</li>
+<li><a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/apps/host-daemon/src/watch-manager.ts#L312-L327">The daemon immediately forwards content changes as work-status-changed</a>. The <a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/plugins/git/server/invalidation.ts#L15-L17">Git plugin's timing constants</a> and <a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/plugins/git/server/invalidation.ts#L70-L95">coalescing implementation</a> cap flush frequency rather than suppressing ignored activity.</li>
+<li>For actively watched status/file queries, <a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/plugins/git/server.ts#L98-L117">environment changes enqueue invalidation</a> and <a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/plugins/git/server.ts#L174-L210">the publish path probes a Git snapshot</a>. Discarding unchanged results happens after that work, not before it.</li></ol>
+<pre>const { failures, ignore } = await resolveWorkspaceRootIgnores({
+  cwd: this.args.cwd,
+  gitRoot: this.gitWorkspace,
+});
+...
+this.startWatchSubscription({
+  kind: "workspace-root",
+  options: { ignore },
+  rootPath,
+});</pre>
+<p>The distinction is ignored <em>directories observed at setup</em> versus Git ignore <em>rules</em>. Built-in static globs can cover some late directories, but arbitrary repository-specific ignored output has no such protection. The general setup-only limitation is also visible in the history that introduced nested-repository ignore discovery; this main base has not repaired it.</p>
+
+<h2>6. Proposed fix</h2>
+<p>Keep the existing start-time exclusions, but classify new output directory ancestors before publishing workspace-root content changes. Use each path's owning repository, preserve tracked files and ordinary content notifications, and fail open if Git classification fails. Batch and cache directory classifications so the filter does not run Git once per written file. Cover nested repositories, directory-only creation events, lookup errors, and ignore-rule changes explicitly. A blanket Git-status gate on content notifications would remove unrelated legitimate content signals and is not the targeted repair.</p>
+
+<h2>7. Linked PR: static review only</h2>
+<p>GitHub closing-issue metadata identifies ready, open <a href="https://github.com/get-bb/bb/pull/8221">PR #8221</a> against <code>main</code> as linking #8220. Its untrusted diff was read, never checked out or executed. It adds a directory-ancestor <code>git check-ignore</code> filter in <code>workspace-root-ignores.ts</code>, passes it through the workspace-root subscription, and filters paths before enqueueing notifications. This is aimed at the demonstrated root cause, not a downstream snapshot throttle.</p>
+<p><strong>Static residual risk, low severity:</strong> <code>listAncestorDirectories</code> excludes the event path itself, so a directory-only initial create event can pass before any child event classifies that directory. The new cache is also lifetime-scoped; changing ignore rules requires explicit lifecycle handling. These observations do not establish runtime correctness of the PR.</p>
+<p><strong>Verdict:</strong> directionally relevant; not runtime-verified and not a merge recommendation. Only trusted-main tests were run. No duplicate pull request or production patch is safe or necessary while this linked PR remains open.</p>
+
+<h2>8. Related issues</h2>
+<p><a href="https://github.com/get-bb/bb/issues/5553">#5553</a> concerns large-root watcher resource pressure and led to bounded nested-repository discovery; <a href="https://github.com/get-bb/bb/issues/1779">#1779</a> concerns recursive watcher scale. They are related background, not evidence that the late-created-directory case is fixed.</p>
+
+<h2>9. Verification</h2>
+<p>The same agent repeated the reproduction, not an independent reviewer. A second detached worktree was created from the recorded trusted base before adding only the same reproduction test. It received a separate frozen install, watcher dependency build, fresh scratch Git repository, and fresh native subscription. No application ports or persistent data directories were involved.</p>
+<table><tr><th>Checkout</th><th>Existing output</th><th>Late output</th><th>Tracked edit</th><th>Result</th></tr>
+<tr><td>First, unchanged production</td><td>0 events / 0 flushes</td><td>12 events / 3 flushes</td><td>1 event / 1 flush</td><td>Intended late-output assertion fails</td></tr>
+<tr><td>Second, unchanged production</td><td>0 events / 0 flushes</td><td>12 events / 3 flushes</td><td>1 event / 1 flush</td><td>Same assertion fails</td></tr></table>
+<p>Both runs used <code>pnpm exec turbo run test --filter=@bb/host-watcher -- test/issue-8220.test.ts</code>, exited 1, and emitted identical telemetry. The preliminary test was tightened to read status with <code>--no-optional-locks</code> so the measuring commands would not themselves refresh Git's index. The final two runs shown here use that tightened test. No verdict or root-cause correction was required.</p>
+<p>The existing suites <code>test/watch-status.test.ts</code> and <code>test/workspace-root-ignores.test.ts</code> passed: 2 files, 22 tests. Production-source diffs were empty in both worktrees, and <code>git diff --check</code> passed. Root-cause links were checked against the exact trusted base. The report is nonvisual, so no screenshot is needed.</p>
+
+<h2>10. Appendix and limits</h2>
+<pre>pnpm exec turbo run build build:types --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build
+pnpm exec turbo run test --filter=@bb/host-watcher -- test/watch-status.test.ts test/workspace-root-ignores.test.ts
+
+Test Files  2 passed (2)
+     Tests  22 passed (22)</pre>
+<p>The public report embeds the complete test and relevant output instead of publishing raw logs, test-file attachments, checkout paths, or local process journals, as required by the reports repository. Timing and event coalescing can vary by backend and machine; the invariant being tested is suppression, not an exact event count. Invalidator callbacks were measured, not full server snapshot wall times, process counts, or UI update traffic. Issue and PR content were treated as untrusted claims, and no commands, patches, external links, or instructions from those bodies were executed.</p>
+</main></body></html>
