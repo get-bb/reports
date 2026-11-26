@@ -1,0 +1,136 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Report · #8224</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head><body><main><p><a href="../">← reports</a></p><h1>#8224 · Repeated token resolution during foreground reconciliation</h1><p class="meta">Bug · Priority: Medium · Effort: Low · mobile, remote, perf · 2026-11-26</p><p><a href="https://github.com/get-bb/bb/issues/8224">Issue #8224</a> · Base <code>b0ddaad731565d7e4de68d824120d802fc78f7d5</code></p><p><strong>Verdict: REPRODUCED</strong> · <strong>Root-cause confidence: high</strong> · Reproduction label: confirmed-repro</p><h2>1. TL;DR</h2><p>The mobile controller requests the Expo push token even when an existing server registration is fresh and the returned token is unchanged. The foreground and reconnect paths each request reconciliation, and overlapping calls deliberately schedule a trailing reconciliation. Three simulated foreground/reconnect cycles caused six token resolutions but no server registration writes. The installed Expo implementation makes an HTTP POST on each resolution; physical-device traffic and real AppState delivery were not measured.</p><h2>2. Claims vs findings</h2><table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr><tr><td>Unchanged registrations still resolve tokens</td><td>Verified</td><td>Both clean runs: 6 requests, 0 registration writes after initial registration.</td></tr><tr><td>Two sync triggers can run on resume</td><td>Verified in source and controller simulation</td><td>Foreground handler and connected effect both call sync; an overlapping call queues a trailing run.</td></tr><tr><td>Each resolution can POST to Expo</td><td>Verified in installed dependency source</td><td>expo-notifications 58.1.8 calls fetch with method POST; no response cache guards that call.</td></tr><tr><td>Every physical-device resume causes exactly two network requests</td><td>Unverified on hardware</td><td>The result is conditional on both host triggers running. No proxy or device was used.</td></tr><tr><td>Token roll followed by reconciliation repeats resolution</td><td>Verified</td><td>Both clean runs measured two token requests, with a synthetic unchanged Expo token.</td></tr></table><h2>3. Environment</h2><p>Public repository get-bb/bb, freshly fetched origin/main at the base above. Linux x64, Node v22.19.0, pnpm 9.15.0, Vitest 4.1.12, expo-notifications 58.1.8 from the frozen lockfile. Two separate detached worktrees named <code>base</code> and <code>verify</code> were created from the same trusted commit and installed separately. No provider, device, server, user data, ports, or persistent data directory was used. The real in-memory PushStore was used; only native notifications and the remote subscriptions API were counting fakes.</p><h2>4. Minimal reproduction</h2><ol><li>Check out trusted main at the recorded commit in a new directory.</li><li>Install and build mobile dependencies.</li><li>Save the <a href="#reproduction-test">authored reproduction test</a> as <code>apps/mobile/src/data/notifications/issue-8224.repro.test.ts</code>.</li><li>Run the focused test from the repository root:</li></ol><pre>git checkout --detach b0ddaad731565d7e4de68d824120d802fc78f7d5
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@bb/mobile...
+pnpm exec turbo run test --filter=@bb/mobile -- src/data/notifications/issue-8224.repro.test.ts</pre><p>Expected: initial registration resolves once; unchanged resumes resolve zero additional times and write zero registrations; a token roll plus follow-up resolves once.</p><p>Actual stdout in both runs:</p><pre>{"initialRequests":1,"initialRegistrations":1,"resumeCycles":3,"resumeRequests":6,"resumeRegistrations":0,"rollAndFollowupRequests":2}
+AssertionError: expected 6 to be +0
+Test Files  1 failed (1)
+Tests  1 failed (1)</pre><p>This deliberate regression assertion fails on unchanged production code. The real controller and token comparison run; the fake only counts native token resolutions and returns a fixed synthetic token.</p><details id="reproduction-test"><summary>Complete reproduction test</summary><pre>import { expect, it } from &quot;vitest&quot;;
+import { createPushRegistrationController } from &quot;./push-registration-controller&quot;;
+import type { PushNotificationsModule, PushSyncProfile } from &quot;./push-registration&quot;;
+import { createMemoryPushStorage, createPushStore } from &quot;./push-store&quot;;
+import type { PushSubscriptionsApi } from &quot;./push-subscriptions-api&quot;;
+
+it(&quot;does not resolve an unchanged Expo token again during foreground reconciliation&quot;, async () =&gt; {
+  const store = createPushStore(createMemoryPushStorage());
+  const profile: PushSyncProfile = {
+    id: &quot;repro-profile&quot;,
+    serverUrl: &quot;https://repro.invalid&quot;,
+    mode: &quot;direct&quot;,
+  };
+  let tokenRequests = 0;
+  let serverRegistrations = 0;
+  const notifications: PushNotificationsModule = {
+    projectId: &quot;repro-project&quot;,
+    platform: &quot;ios&quot;,
+    getPermission: async () =&gt; &quot;granted&quot;,
+    requestPermission: async () =&gt; &quot;granted&quot;,
+    getExpoPushToken: async () =&gt; {
+      tokenRequests += 1;
+      return &quot;synthetic-expo-token&quot;;
+    },
+    unregisterDevicePushToken: async () =&gt; undefined,
+    addTokenListener: () =&gt; () =&gt; undefined,
+    setBadgeCount: async () =&gt; undefined,
+  };
+  const api: PushSubscriptionsApi = {
+    register: async () =&gt; {
+      serverRegistrations += 1;
+      return { subscriptionId: &quot;synthetic-subscription&quot; };
+    },
+    unregister: async () =&gt; undefined,
+    list: async () =&gt; [],
+  };
+  const controller = createPushRegistrationController({
+    store,
+    notifications,
+    api,
+    deviceLabel: &quot;repro-device&quot;,
+    now: () =&gt; 1000,
+  });
+  store.setEnabled(profile.id, true);
+  expect(await controller.sync(profile)).toMatchObject({ action: &quot;registered&quot; });
+  const initialRequests = tokenRequests;
+  const initialRegistrations = serverRegistrations;
+  for (let resumeIndex = 0; resumeIndex &lt; 3; resumeIndex += 1) {
+    const reconnect = controller.sync(profile);
+    await controller.refreshPermission();
+    const foreground = controller.sync(profile);
+    await Promise.all([reconnect, foreground]);
+    expect(controller.getSnapshot().byProfileId[profile.id]?.lastOutcome).toEqual({
+      action: &quot;skipped&quot;,
+      reason: &quot;up-to-date&quot;,
+    });
+  }
+  const resumeRequests = tokenRequests - initialRequests;
+  const resumeRegistrations = serverRegistrations - initialRegistrations;
+  const beforeRoll = tokenRequests;
+  await controller.handleTokenRolled([profile], &quot;synthetic-device-token-2&quot;);
+  await controller.sync(profile);
+  console.log(JSON.stringify({
+    initialRequests,
+    initialRegistrations,
+    resumeCycles: 3,
+    resumeRequests,
+    resumeRegistrations,
+    rollAndFollowupRequests: tokenRequests - beforeRoll,
+  }));
+  expect(initialRequests).toBe(1);
+  expect(initialRegistrations).toBe(1);
+  expect(resumeRegistrations).toBe(0);
+  expect(resumeRequests).toBe(0);
+  expect(tokenRequests - beforeRoll).toBe(1);
+});
+</pre></details><h2>5. Root cause</h2><p><a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/apps/mobile/src/notifications/PushNotificationsHost.tsx#L117-L131">The host has two independent reconciliation triggers</a>: the connected effect calls sync, and AppState active refreshes permission then calls sync. Neither should be removed because reconnection and permission changes still need reconciliation.</p><pre>  useEffect(() =&gt; {
+    if (!activeProfile || !connected) return;
+    void controller.sync(activeProfile);
+  }, [controller, activeProfile, connected, activeEnabled]);
+
+  useEffect(() =&gt; {
+    const onChange = (state: AppStateStatus) =&gt; {
+      if (state !== &quot;active&quot;) return;
+      void controller.refreshPermission().then(() =&gt; {
+        if (activeProfile) void controller.sync(activeProfile);
+      });
+    };
+    const subscription = AppState.addEventListener(&quot;change&quot;, onChange);
+    return () =&gt; subscription.remove();
+  }, [controller, activeProfile]);</pre><p><a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/apps/mobile/src/data/notifications/push-registration-controller.ts#L116-L135">The controller coalesces an overlapping sync into a trailing run</a>, rather than dropping it. Each run calls syncPushRegistration.</p><p><a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/apps/mobile/src/data/notifications/push-registration.ts#L140-L160">Token resolution precedes the freshness comparison</a>. Therefore an up-to-date result avoids the server write but cannot avoid the already completed native/Expo request.</p><pre>  let expoPushToken: string;
+  try {
+    expoPushToken = await notifications.getExpoPushToken(
+      notifications.projectId ?? &quot;&quot;,
+    );
+  } catch (error) {
+    return { action: &quot;failed&quot;, step: &quot;token&quot;, error: describeError(error) };
+  }
+  const platform = notifications.platform;
+  if (
+    !shouldReregister({
+      existing,
+      expoPushToken,
+      platform,
+      serverUrl: profile.serverUrl,
+      now: now(),
+      refreshAfterMs,
+    })
+  ) {
+    return { action: &quot;skipped&quot;, reason: &quot;up-to-date&quot; };
+  }</pre><p><a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/apps/mobile/src/notifications/expo-push-module.ts#L70-L74">The native adapter calls getExpoPushTokenAsync</a>. In installed expo-notifications 58.1.8, <code>src/getExpoPushTokenAsync.ts:78-96</code> constructs the default Expo URL and unconditionally calls fetch with POST. This network conclusion is source-backed, not a captured HTTP trace. <a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/apps/mobile/src/data/notifications/push-registration-controller.ts#L177-L185">Token events already request reconciliation</a>, but the controller has no token-result cache to invalidate.</p><h2>6. Proposed fix</h2><p>Cache successful Expo token resolution for the controller process while preserving permission checks and registration-age checks on every sync. Invalidate on genuine device-token changes and Android token release. Preserve cold-start resolution, failed-fetch retry, shared-profile behavior, and the existing 24-hour server re-registration. Exercise token-roll-during-fetch ordering before claiming broader lifecycle correctness.</p><h2>7. Linked PR review</h2><p><a href="https://github.com/get-bb/bb/pull/8225">PR #8225</a> is open and ready against main and is linked through GitHub closing references. Only its metadata and production diff were read as untrusted data; no branch was checked out and no PR code was run. Its controller-local cache and invalidation points target the verified mechanism. Static assessment: relevant root-cause approach, not runtime-verified here; asynchronous invalidation remains a review consideration, not a proven defect. No second fix or PR was created because an open linked PR already exists.</p><h2>8. Verification</h2><p>The same agent repeated the authored reproduction in a second clean detached checkout at exactly <code>b0ddaad731565d7e4de68d824120d802fc78f7d5</code>. Before copying the authored test, git status was empty and HEAD matched the base. A separate frozen install and scoped dependency build completed, then the same Turbo command executed the test (the test task was not replayed from cache). Both runs exited 1 with the same expected assertion failure and identical measured counts. No correction to the controller-level conclusion was necessary. This is a repeated clean run, not independent verification.</p><p>Relevant existing tests were also run on unchanged main: <code>pnpm exec turbo run test --filter=@bb/mobile -- src/data/notifications/push-registration-controller.test.ts src/data/notifications/push-registration.test.ts</code>. Result: 2 files passed, 29 tests passed. The existing coalescing test explicitly accepts two token calls; it does not protect the no-redundant-resolution contract.</p><h2>9. Related issues and limitations</h2><p>No duplicate investigation beyond repository notification search was performed. No real-device timing, battery usage, token stability across reinstalls, or Expo network availability was tested. The regression is a boundary-level controller test, not a React/AppState integration test. Issue content and the linked PR were treated as untrusted claims; no supplied commands, scripts, or linked code were executed.</p><h2>10. Appendix</h2><p>The full test is included inline above; raw logs remain outside the public repository under its publication policy. Both scoped dependency builds passed four tasks. Relevant pre-existing suite output:</p><pre>✓ src/data/notifications/push-registration.test.ts (21 tests)
+✓ src/data/notifications/push-registration-controller.test.ts (8 tests)
+Test Files  2 passed (2)
+Tests  29 passed (29)</pre><p>All tokens and server identities in the reproduction are synthetic. No production source was modified.</p></main></body></html>
