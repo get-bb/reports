@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report · #8295 · Successful catalog refresh discards previously advertised models</title><style>
+  :root { --canvas:#fafaf8; --ink:#1a1a1a; --muted:#666; --line:#e2e2de; --accent:#0052cc; --high:#b60205; --ok:#0e8a16; --warn:#b26a00; }
+  body { margin:0; background:var(--canvas); color:var(--ink); font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:26px; line-height:1.25; margin:0 0 6px; }
+  h2 { font-size:18px; margin:36px 0 10px; padding-top:20px; border-top:1px solid var(--line); }
+  h3 { font-size:15px; margin:22px 0 6px; }
+  .meta { color:var(--muted); font-size:14px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.high { background:var(--high); color:#fff; border-color:var(--high); }
+  .verdict { font-weight:600; }
+  .v-partial { color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:14px; } td,th { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; } pre { background:#fff; border:1px solid var(--line); border-radius:6px; padding:12px; overflow:auto; }
+  a { color:var(--accent); }
+  .ok { color:var(--ok); font-weight:600; } .no { color:var(--high); font-weight:600; } .unv { color:var(--warn); font-weight:600; }
+</style></head>
+<body><main>
+<p class="meta"><a href="../">← reports</a></p>
+<h1>#8295 · Successful catalog refresh discards previously advertised models</h1>
+<p class="meta"><span class="pill">Bug</span><span class="pill">Priority: Medium</span><span class="pill">Effort: Medium</span><span class="pill">providers</span><span class="pill">provider-acp</span>
+<a href="https://github.com/get-bb/bb/issues/8295">GitHub issue</a><span>2026-11-27 · base <code>b0ddaad731565d7e4de68d824120d802fc78f7d5</code></span></p>
+<p><strong>Verdict: REPRODUCED</strong> at the server catalog boundary. <strong>Root-cause confidence: high</strong> for replacement and persistence; the upstream OpenCode startup trigger remains unverified.</p>
+
+<h2>1. TL;DR</h2>
+<p>A successful refresh containing fewer models replaces the cached catalog, even when the provider launch fingerprint has not changed.
+An isolated reproduction begins with two picker models and one selected-only model, then supplies a successful response containing just one picker model.
+The server removes both omitted models from its response and SQLite row, advances the freshness timestamp, reports success without a model-load error, and emits one picker invalidation.
+An otherwise identical failed refresh retains all three models and the original row, demonstrating that failure fallback does not protect this case.
+The same agent repeated this result in a second clean checkout; this report does not claim to have reproduced OpenCode's location-plugin activation race.</p>
+
+<h2>2. Claims vs findings</h2>
+<table><tr><th>Claim</th><th>Status</th><th>Evidence</th></tr>
+<tr><td>A successful subset can remove previously available models.</td><td class="ok">Verified</td><td>Two runs: picker models 2 → 1, selected-only models 1 → 0.</td></tr>
+<tr><td>The subset is persisted as a fresh successful catalog.</td><td class="ok">Verified</td><td>Same fingerprint; SQLite row changes; fetchedAt advances 60,000 ms; outcome=success; changed=true.</td></tr>
+<tr><td>A reported command failure retains the last good catalog.</td><td class="ok">Verified</td><td>Control test passes in both checkouts; second-run trace shows unchanged row and no push.</td></tr>
+<tr><td>Picker readers can initially see the old data, then lose models after background refresh.</td><td class="ok">Verified</td><td>The stale picker read returns the original models before refresh settlement; the next read returns the subset.</td></tr>
+<tr><td>OpenCode produces a transient incomplete successful response during plugin startup.</td><td class="unv">Unverified</td><td>No real provider process or credentials used. Trusted bridge source accepts nonempty session-discovered arrays, but no startup race was exercised.</td></tr>
+<tr><td>The CLI's full count, reported provider versions, and selected-model recovery reproduce end to end.</td><td class="unv">Unverified</td><td>The test exercises the real server store and resolver, not an installed OpenCode process or browser.</td></tr>
+</table>
+
+<h2>3. Environment</h2>
+<ul><li>Public target: get-bb/bb; trusted origin/main fetched at <code>b0ddaad731565d7e4de68d824120d802fc78f7d5</code>.</li>
+<li>Debian GNU/Linux 12, Linux x86-64; Node v22.19.0; pnpm 9.15.0; Vitest 4.1.12.</li>
+<li>Two separate clean temporary clones: <code>first/</code> and <code>second/</code>; unchanged production source in each.</li>
+<li>Each test uses a fresh real migrated SQLite database through <code>createMigratedConnection()</code> and a unique harness temporary data directory. No database is mocked.</li>
+<li>No live app, provider, host daemon, or HTTP listener is launched. No runtime ports are contacted and no user's runtime data or credentials are used.</li>
+<li>Synthetic provider RPC responses enter the real execution-options resolver and catalog store for <code>acp-opencode</code>, using a synthetic host and the host-wide empty scope key.</li>
+</ul>
+
+<h2>4. Minimal reproduction</h2>
+<p>The regression below was written from trusted repository code, not copied from issue instructions. It extends the existing owner-boundary test harness without adding production exports or dependencies. The only substituted boundary is the external host RPC response; persistence, refresh decisions, picker reads, and notification coalescing are real server behavior.</p>
+<ol><li>Clone trusted main and pin the verified base:
+<pre>git clone https://github.com/get-bb/bb.git first
+cd first
+git checkout --detach b0ddaad731565d7e4de68d824120d802fc78f7d5
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=@bb/server</pre></li>
+<li>Save the complete patch below as <code>regression.patch</code> outside the checkout and apply it with <code>git apply ../regression.patch</code>. It inserts two table-driven cases into the existing test file, reusing its local helpers.</li>
+<li>Run the focused reproduction:
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/providers/provider-model-catalog-store.test.ts -t 'issue 8295' --silent=false</pre></li>
+<li>Run existing owner tests separately, excluding the intentional failing regression:
+<pre>pnpm exec turbo run test --filter=@bb/server -- test/providers/provider-model-catalog-store.test.ts -t '^(?!.*issue 8295)'</pre></li></ol>
+<p><strong>Expected under the reported retention requirement:</strong> both old picker models and the selected-only model remain available while discovery is incomplete; the row and timestamp do not change and no picker invalidation is sent.</p>
+<p><strong>Actual:</strong> the successful subset is treated as authoritative. The first stale read still serves the old catalog, but subsequent reads serve only the subset. There is no error telling the caller that discovery might be incomplete.</p>
+<h3>Complete reproduction patch</h3>
+<p>All test code is included inline so the report is reproducible without downloading an external script.</p>
+<pre>diff --git a/apps/server/test/providers/provider-model-catalog-store.test.ts b/apps/server/test/providers/provider-model-catalog-store.test.ts
+index f042667c7e..b96649352c 100644
+--- a/apps/server/test/providers/provider-model-catalog-store.test.ts
++++ b/apps/server/test/providers/provider-model-catalog-store.test.ts
+@@ -154,6 +154,71 @@ function seedEnvironmentPath(
+ }
+ 
+ describe(&quot;provider model catalog store&quot;, () =&gt; {
++  it.each([&quot;successful subset&quot;, &quot;failed refresh&quot;] as const)(
++    &quot;issue 8295 preserves advertised models after a %s&quot;,
++    async (refreshKind) =&gt; {
++      await withTestHarness(async (harness) =&gt; {
++        const logLines = captureLogLines(harness);
++        const host = setupCatalogHost(harness, { id: &quot;host-subset-repro&quot; });
++        host.setAnswer(() =&gt;
++          catalogAnswer(
++            modelList(&quot;fixture/base&quot;, &quot;fixture/plugin&quot;),
++            modelList(&quot;fixture/selected&quot;),
++          ),
++        );
++        const initial = await host.read(&quot;acp-opencode&quot;);
++        expect(modelIds(initial)).toEqual([&quot;fixture/base&quot;, &quot;fixture/plugin&quot;]);
++        expect(initial.selectedOnlyModels.map((model) =&gt; model.model)).toEqual([
++          &quot;fixture/selected&quot;,
++        ]);
++        await settleTimers();
++        const pushes = capturePushes(harness);
++        const rowKey = {
++          hostId: host.hostId,
++          providerId: &quot;acp-opencode&quot;,
++          scopeKey: &quot;&quot;,
++        };
++        const before = getStoredProviderModelCatalog(harness.db, rowKey);
++        expect(before).not.toBeNull();
++        host.setAnswer(() =&gt;
++          refreshKind === &quot;successful subset&quot;
++            ? catalogAnswer(modelList(&quot;fixture/base&quot;))
++            : errorAnswer(&quot;command_failed&quot;),
++        );
++        host.clock.now += MINUTE;
++        expect(modelIds(await host.read(&quot;acp-opencode&quot;))).toEqual([
++          &quot;fixture/base&quot;,
++          &quot;fixture/plugin&quot;,
++        ]);
++        await vi.waitFor(() =&gt; expect(logLines(SETTLED)).toHaveLength(2));
++        await settleTimers();
++        const next = await host.read(&quot;acp-opencode&quot;);
++        const after = getStoredProviderModelCatalog(harness.db, rowKey);
++        expect(after).not.toBeNull();
++        console.info(
++          JSON.stringify({
++            refreshKind,
++            models: modelIds(next),
++            selectedOnlyModels: next.selectedOnlyModels.map((model) =&gt; model.model),
++            modelLoadError: next.modelLoadError,
++            sameFingerprint: before?.fingerprint === after?.fingerprint,
++            fetchedAtDelta: (after?.fetchedAt ?? 0) - (before?.fetchedAt ?? 0),
++            rowUnchanged: JSON.stringify(before) === JSON.stringify(after),
++            pushes: pushes.length,
++            settlement: logLines(SETTLED)[1],
++          }),
++        );
++        expect.soft(next.modelLoadError).toBeNull();
++        expect.soft(modelIds(next)).toEqual([&quot;fixture/base&quot;, &quot;fixture/plugin&quot;]);
++        expect.soft(next.selectedOnlyModels.map((model) =&gt; model.model)).toEqual([
++          &quot;fixture/selected&quot;,
++        ]);
++        expect.soft(after).toEqual(before);
++        expect.soft(pushes).toEqual([]);
++      });
++    },
++  );
++
+   it(&quot;uses a session catalog immediately and pushes picker invalidation&quot;, async () =&gt; {
+     await withTestHarness(async (harness) =&gt; {
+       const host = setupCatalogHost(harness, { id: &quot;host-session-catalog&quot; });
+</pre>
+<h3>Observed output, second run</h3>
+<pre>{
+  &quot;refreshKind&quot;: &quot;successful subset&quot;,
+  &quot;models&quot;: [
+    &quot;fixture/base&quot;
+  ],
+  &quot;selectedOnlyModels&quot;: [],
+  &quot;modelLoadError&quot;: null,
+  &quot;sameFingerprint&quot;: true,
+  &quot;fetchedAtDelta&quot;: 60000,
+  &quot;rowUnchanged&quot;: false,
+  &quot;pushes&quot;: 1,
+  &quot;settlement&quot;: {
+    &quot;level&quot;: &quot;info&quot;,
+    &quot;hostId&quot;: &quot;host-subset-repro&quot;,
+    &quot;providerId&quot;: &quot;acp-opencode&quot;,
+    &quot;scope&quot;: &quot;host&quot;,
+    &quot;durationMs&quot;: 0,
+    &quot;outcome&quot;: &quot;success&quot;,
+    &quot;modelCount&quot;: 1,
+    &quot;changed&quot;: true
+  }
+}
+
+{
+  &quot;refreshKind&quot;: &quot;failed refresh&quot;,
+  &quot;models&quot;: [
+    &quot;fixture/base&quot;,
+    &quot;fixture/plugin&quot;
+  ],
+  &quot;selectedOnlyModels&quot;: [
+    &quot;fixture/selected&quot;
+  ],
+  &quot;modelLoadError&quot;: null,
+  &quot;sameFingerprint&quot;: true,
+  &quot;fetchedAtDelta&quot;: 0,
+  &quot;rowUnchanged&quot;: true,
+  &quot;pushes&quot;: 0,
+  &quot;settlement&quot;: {
+    &quot;level&quot;: &quot;warn&quot;,
+    &quot;hostId&quot;: &quot;host-subset-repro&quot;,
+    &quot;providerId&quot;: &quot;acp-opencode&quot;,
+    &quot;scope&quot;: &quot;host&quot;,
+    &quot;durationMs&quot;: 0,
+    &quot;outcome&quot;: &quot;failed&quot;,
+    &quot;errorCode&quot;: &quot;command_failed&quot;,
+    &quot;errorMessage&quot;: &quot;model list command_failed&quot;,
+    &quot;errorStatus&quot;: 502,
+    &quot;errorRetryable&quot;: false,
+    &quot;changed&quot;: false
+  }
+}</pre>
+<pre>FAIL issue 8295 preserves advertised models after a successful subset
+AssertionError: expected [ 'fixture/base' ] to deeply equal [ 'fixture/base', 'fixture/plugin' ]
+AssertionError: expected [] to deeply equal [ 'fixture/selected' ]
+The stored-row equality and no-push assertions also fail.
+
+PASS issue 8295 preserves advertised models after a failed refresh
+Tests  1 failed | 1 passed | 32 skipped (34)
+Focused command exit status: 1 (expected reproduction failure)
+
+Existing owner tests:
+Tests  32 passed | 2 skipped (34)
+Existing-tests command exit status: 0</pre>
+
+<h2>5. Root cause</h2>
+<p>The store has a last-good fallback for reported failures, but a successful response takes a different branch. Success is not checked for completeness before replacing the cached arrays. Matching fingerprints preserve previously known reasoning metadata only for models still present in the new response; they do not preserve omitted model IDs.</p>
+<h3>Success constructs replacement arrays</h3><p><a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/apps/server/src/services/providers/provider-model-catalog-store.ts#L258-L284">apps/server/src/services/providers/provider-model-catalog-store.ts:258</a></p><pre>function nextGood(
+  entry: CatalogEntry,
+  args: {
+    fingerprint: string;
+    models: AvailableModel[];
+    selectedOnlyModels: AvailableModel[];
+    fetchedAt: number;
+  },
+): CatalogGood {
+  const previous =
+    entry.good?.fingerprint === args.fingerprint
+      ? [...entry.good.models, ...entry.good.selectedOnlyModels]
+      : [];
+  const models = keepDiscoveredReasoning(previous, args.models);
+  const selectedOnlyModels = keepDiscoveredReasoning(
+    previous,
+    args.selectedOnlyModels,
+  );
+  return {
+    fingerprint: args.fingerprint,
+    models,
+    selectedOnlyModels,
+    modelsJson: JSON.stringify(models),
+    selectedOnlyModelsJson: JSON.stringify(selectedOnlyModels),
+    fetchedAt: args.fetchedAt,
+  };
+}</pre>
+<p>Settlement immediately persists the replacement with the current time, clears prior failure state, and logs success. The picker-view comparison sees the reduced list and schedules invalidation. That is why this is both a live picker change and a durable row replacement, not merely a display filter.</p>
+<h3>The successful settlement branch persists the new catalog</h3><p><a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/apps/server/src/services/providers/provider-model-catalog-store.ts#L530-L545">apps/server/src/services/providers/provider-model-catalog-store.ts:530</a></p><pre>    if (settlement.ok) {
+      entry.good = nextGood(entry, {
+        fingerprint: refresh.fingerprint,
+        models: settlement.models,
+        selectedOnlyModels: settlement.selectedOnlyModels,
+        fetchedAt: refresh.markedStale ? 0 : now,
+      });
+      entry.failure = null;
+      entry.unavailableDetail = null;
+      persistGood(deps, entry.key, entry.good);
+      fields = {
+        outcome: &quot;success&quot;,
+        modelCount:
+          settlement.models.length + settlement.selectedOnlyModels.length,
+      };
+    } else {</pre>
+<h3>Changed picker contents schedule a push</h3><p><a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/apps/server/src/services/providers/provider-model-catalog-store.ts#L578-L583">apps/server/src/services/providers/provider-model-catalog-store.ts:578</a></p><pre>    const changed = before !== pickerView(entry, refresh.fingerprint);
+    if (changed) {
+      schedulePush(deps, hostId);
+    }
+    log(level, { ...fields, changed });
+  }</pre>
+<p>The refresh becomes eligible after 60 seconds. Picker access returns stale data immediately and refreshes in the background. The resolver routes cached picker requests through that path.</p>
+<h3>Stale picker reads refresh in the background</h3><p><a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/apps/server/src/services/providers/provider-model-catalog-store.ts#L307-L334">apps/server/src/services/providers/provider-model-catalog-store.ts:307</a></p><pre>function lacksRequiredModel(
+  good: CatalogGood,
+  requiredModel: string | null,
+): boolean {
+  if (requiredModel === null) {
+    return good.models.length === 0;
+  }
+  return ![...good.models, ...good.selectedOnlyModels].some(
+    (entry) =&gt; entry.model === requiredModel,
+  );
+}
+
+function evaluate(
+  entry: CatalogEntry,
+  fingerprint: string,
+  access: ProviderModelCatalogAccess,
+  now: number,
+  refreshed: boolean,
+): CatalogDecision {
+  const { failure, servable } = currentState(entry, fingerprint);
+  const active = failure !== null &amp;&amp; now - failure.failedAt &lt; FAILURE_TTL_MS;
+  if (servable !== null) {
+    const stale = !refreshed &amp;&amp; !active &amp;&amp; now - servable.fetchedAt &gt;= FRESH_MS;
+    if (
+      stale &amp;&amp;
+      access.kind === &quot;validation&quot; &amp;&amp;
+      lacksRequiredModel(servable, access.requiredModel)
+    ) {</pre>
+<h3>Execution options choose picker or validation access</h3><p><a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/apps/server/src/services/system/execution-options.ts#L453-L467">apps/server/src/services/system/execution-options.ts:453</a></p><pre>export function resolveSystemExecutionOptions(
+  deps: LoggedWorkSessionDeps,
+  query: SystemExecutionOptionsRequest,
+): Promise&lt;SystemExecutionOptionsResponse&gt; {
+  return resolveExecutionOptions(
+    deps,
+    query,
+    query.preferCached === &quot;true&quot;
+      ? { kind: &quot;picker&quot;, selectedModel: query.selectedModel }
+      : {
+          kind: &quot;validation&quot;,
+          requiredModel: query.selectedModel ?? null,
+          selectedModel: query.selectedModel,
+        },
+  );</pre>
+<p>The upstream bridge can derive a model list from ACP session initialization. The following is source evidence only; this investigation did not simulate or observe OpenCode plugin activation.</p>
+<h3>Session discovery accepts a nonempty session catalog</h3><p><a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/packages/provider-bridge-acp/src/bridge/bridge.ts#L1234-L1248">packages/provider-bridge-acp/src/bridge/bridge.ts:1234</a></p><pre>    const modelOption = findAcpModelConfigOption(newSession.configOptions);
+    const configOptionModels = buildModelCatalogFromConfigOptions(modelOption);
+    const sessionModels = buildModelCatalogFromSessionModels(newSession.models);
+    if (configOptionModels.length === 0 &amp;&amp; sessionModels.length === 0) {
+      return null;
+    }
+
+    if (configOptionModels.length === 0) {
+      if (selectedModel === undefined) {
+        cachedSessionDiscoveredModels = {
+          key,
+          models: sessionModels,
+          fetchedAt: Date.now(),
+        };
+      }</pre>
+<p><strong>Underlying ambiguity:</strong> the host result contract contains only the two model arrays. It carries no completeness or authoritative-snapshot indicator. An unchanged launch fingerprint describes configuration, not whether the provider has finished discovering models; a legitimate removal can occur under that same fingerprint.</p>
+<h3>The result has no completeness signal</h3><p><a href="https://github.com/get-bb/bb/blob/b0ddaad731565d7e4de68d824120d802fc78f7d5/packages/host-daemon-contract/src/commands.ts#L1245-L1248">packages/host-daemon-contract/src/commands.ts:1245</a></p><pre>const providerListModelsResultSchema = z.object({
+  models: z.array(availableModelSchema),
+  selectedOnlyModels: z.array(availableModelSchema),
+});</pre>
+
+<h2>6. Proposed fix and safety decision</h2>
+<p>First establish how this provider can distinguish an incomplete discovery response from an intentional model removal. Prefer a provider-supported readiness or completeness signal, then preserve the last good catalog only when the response is demonstrably incomplete. If bounded repeated-observation handling is chosen instead, its acceptance threshold, cooldown, restart behavior, and treatment of mixed additions/removals must be defined as product policy.</p>
+<p><strong>No automatic fix PR:</strong> a blanket subset guard would also hide legitimate removals. Choosing how long to retain missing models, or introducing a completeness contract, requires a product or protocol decision. Therefore the simple-fix condition that forbids such decisions is not met. No production patch was made, committed, or pushed.</p>
+<p>The local reproduction changes one test file with 65 additions and no deletions. There are no binary changes; <code>git diff --check</code> passes. Its expected failing assertions document the reported retention requirement, not an already specified authoritative-shrink policy. Follow-up coverage should distinguish temporary incomplete discovery from genuine removal, changed launch fingerprints, and mixed model additions/removals.</p>
+
+<h2>7. Related issues</h2>
+<p>GitHub metadata also contains <a href="https://github.com/get-bb/bb/issues/8294">#8294</a>, a separate report of the same symptom. Only #8295 was classified and processed here. No linked pull requests were found in its timeline or closing-PR metadata; an open-PR search also found none. No linked branch was checked out or executed.</p>
+
+<h2>8. Verification</h2>
+<p>The same agent, not an independent reviewer, cloned the trusted repository again into <code>second/</code>, pinned the identical base commit, confirmed a clean tracked tree, installed with the frozen lockfile, and built the SDK and server there. Only the newly authored regression insertion was then applied. The test harness created new SQLite connections and temporary data directories; no live process or port was reused.</p>
+<pre>Second checkout base: b0ddaad731565d7e4de68d824120d802fc78f7d5
+Second checkout: clean before applying the reproduction patch
+Production source changes: none
+Command:
+pnpm exec turbo run test --filter=@bb/server -- test/providers/provider-model-catalog-store.test.ts -t 'issue 8295' --silent=false
+Result: 1 failed | 1 passed | 32 skipped (34), exit 1
+Successful-subset observation: exactly matches the first run's JSON
+Failed-refresh control: old models and row retained, no push
+Report corrections after verification: none</pre>
+<p>Every root-cause permalink was constructed from the recorded base and checked against its source lines. This is a server-boundary reproduction, not a visual browser reproduction; no screenshot is fabricated or needed to establish the storage defect.</p>
+
+<h2>9. Appendix</h2>
+<p>Relevant commands run, with temporary paths omitted:</p>
+<pre>git fetch origin main
+git rev-parse origin/main
+git clone --shared TRUSTED_CHECKOUT first
+git clone --shared first second
+git checkout --detach b0ddaad731565d7e4de68d824120d802fc78f7d5
+git status --porcelain
+pnpm install --frozen-lockfile --prefer-offline
+pnpm exec turbo run build
+pnpm exec turbo run build --filter=@get-bb/plugin-sdk
+pnpm exec turbo run build --filter=@bb/server
+pnpm exec turbo run test --filter=@bb/server -- test/providers/provider-model-catalog-store.test.ts -t 'issue 8295'
+pnpm exec turbo run test --filter=@bb/server -- test/providers/provider-model-catalog-store.test.ts -t 'issue 8295' --silent=false
+pnpm exec turbo run test --filter=@bb/server -- test/providers/provider-model-catalog-store.test.ts -t '^(?!.*issue 8295)'
+git diff --check
+git diff --numstat origin/main
+git diff --name-only</pre>
+<p>The initial unfiltered build encountered an existing SDK build-order prerequisite: the GitHub plugin could not resolve unbuilt SDK process/host runtime entries. Explicitly building the existing SDK runtime followed by the server succeeded in both clean checkouts. No dependency, lockfile, or source change was needed to resolve that setup issue. The full unfiltered build is not claimed as passing.</p>
+<p><strong>Untrusted-data handling:</strong> the issue contained proposed commands, tests, and fix instructions. Those instructions were not executed or copied. Claims were assessed against the pinned trusted main source, and all reproduction code was authored locally. No external URL from the issue was fetched, no real runtime data was read, and no report is based on a linked PR's executable code.</p>
+<p>&gt; AGENT GENERATED</p>
+</main></body></html>
